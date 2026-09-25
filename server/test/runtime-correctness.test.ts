@@ -24,6 +24,7 @@ const { db } = await import('../db.js');
 const { MemberService } = await import('../member-service.js');
 const { TeamService } = await import('../team-service.js');
 const { CopilotService, isSessionNotFound, isTurnTimeout } = await import('../copilot.js');
+const { singleExecutionId, muteAllMembers } = await import('./support.js');
 
 after(() => {
   db.close();
@@ -414,6 +415,23 @@ const team = new TeamService(db, memberService, stub as never);
 const alice = team.createMember({ name: 'Alice', role: 'Analyst' });
 const bob = team.createMember({ name: 'Bob', role: 'Reviewer' });
 
+const sendRaw = team.sendMessage.bind(team);
+
+/**
+ * `POST /messages` 返回 `wakes[]`，不再有单个 executionId —— group 房间里
+ * 一条消息可以唤醒多个 Member。这个文件的用例都是单收件人场景，包一层
+ * 把那条 execution 找回来。
+ */
+async function sendMessage(input: {
+  conversationId: string;
+  content: string;
+  targetMemberId?: string;
+  replyToMessageId?: string;
+}) {
+  const result = await sendRaw(input);
+  return { ...result, executionId: singleExecutionId(db, input.conversationId, result.wakes) };
+}
+
 function newConversation() {
   return team.createConversation({
     kind: 'direct',
@@ -431,7 +449,7 @@ describe('Execution cancel 状态机', () => {
     });
 
     try {
-      const sent = await team.sendMessage({ conversationId: conv.id, content: 'long task' });
+      const sent = await sendMessage({ conversationId: conv.id, content: 'long task' });
       await waitForStatus(sent.executionId, 'running');
 
       const cancelPromise = team.cancelExecution(sent.executionId);
@@ -463,7 +481,7 @@ describe('Execution cancel 状态机', () => {
     });
 
     try {
-      const sent = await team.sendMessage({ conversationId: conv.id, content: 'long task' });
+      const sent = await sendMessage({ conversationId: conv.id, content: 'long task' });
       await waitForStatus(sent.executionId, 'running');
 
       const cancelPromise = team.cancelExecution(sent.executionId);
@@ -481,36 +499,74 @@ describe('Execution cancel 状态机', () => {
   });
 
   it('queued → cancel：直接落库，且不会在 runtime 锁放开后偷偷跑起来', async () => {
-    const conv = newConversation();
+    // 不能再用「往同一个房间连发两条消息」来造 queued：同一个 Member 上并发的
+    // 唤醒会被 scheduler 合并成排队轮次，第二条 execution 要等第一轮跑完才出现。
+    // 真正会稳定停在 queued 的是 delegation —— 它不走 scheduler，直接堵在
+    // 目标 Member 的 runtime 锁后面。
+    const conv = team.createConversation({
+      kind: 'group',
+      memberIds: [alice.id, bob.id],
+      defaultMemberId: alice.id,
+    });
+    muteAllMembers(team, conv.id);
+
     let release!: () => void;
     stub.hold = new Promise<void>((resolve) => {
       release = resolve;
     });
 
     try {
-      // 第一条占住 runtime
-      const blocker = await team.sendMessage({ conversationId: conv.id, content: 'blocker' });
-      await waitForStatus(blocker.executionId, 'running');
+      // Alice 占住自己的 runtime
+      const aliceHeld = await sendMessage({
+        conversationId: conv.id,
+        content: 'blocker',
+        targetMemberId: alice.id,
+      });
+      await waitForStatus(aliceHeld.executionId, 'running');
 
-      // 第二条被挤在 runtime 锁后面，停在 queued
-      const queued = await team.sendMessage({ conversationId: conv.id, content: 'queued one' });
-      assert.equal(executionRow(queued.executionId).status, 'queued');
+      // Bob 也需要一条 parent execution 才能发起委派
+      const bobHeld = await sendMessage({
+        conversationId: conv.id,
+        content: 'parent',
+        targetMemberId: bob.id,
+      });
+      await waitForStatus(bobHeld.executionId, 'running');
 
-      const cancelled = await team.cancelExecution(queued.executionId);
+      // 不 await：delegateMember 在第一个 await 之前就把 child execution 落库了，
+      // 而它的 turn 会堵在 Alice 的 runtime 锁后面 —— 这就是一个稳定的 queued。
+      const delegation = team.delegateMember({
+        conversationId: conv.id,
+        fromMemberId: bob.id,
+        parentExecutionId: bobHeld.executionId,
+        targetMemberId: alice.id,
+        task: 'queued work',
+      });
+      // 下面会被 cancel 掉，这一轮注定不会跑，拒绝是预期结果
+      void delegation.catch(() => {});
+
+      const child = db
+        .prepare(`SELECT id FROM execution WHERE parent_execution_id = ?`)
+        .get(bobHeld.executionId) as unknown as { id: string } | undefined;
+      assert.ok(child, 'delegation 必须在进引擎之前落库');
+      const queuedId = child.id;
+
+      assert.equal(executionRow(queuedId).status, 'queued');
+
+      const cancelled = await team.cancelExecution(queuedId);
       assert.equal(cancelled.status, 'cancelled');
 
       release();
       stub.hold = null;
-      await waitForStatus(blocker.executionId, 'completed');
+      await waitForStatus(aliceHeld.executionId, 'completed');
       await new Promise((resolve) => setTimeout(resolve, 80));
 
       assert.equal(
-        executionRow(queued.executionId).status,
+        executionRow(queuedId).status,
         'cancelled',
         '被取消的 queued execution 不能在锁放开后跑起来',
       );
       assert.equal(
-        stub.turns.filter((turn) => turn.executionId === queued.executionId).length,
+        stub.turns.filter((turn) => turn.executionId === queuedId).length,
         0,
         '它根本不该进引擎',
       );
@@ -522,7 +578,7 @@ describe('Execution cancel 状态机', () => {
 
   it('已结束 / waiting_for_member 的 execution 不能 cancel', async () => {
     const conv = newConversation();
-    const sent = await team.sendMessage({ conversationId: conv.id, content: 'done' });
+    const sent = await sendMessage({ conversationId: conv.id, content: 'done' });
     await waitForStatus(sent.executionId, 'completed');
 
     await assert.rejects(() => team.cancelExecution(sent.executionId), /已经结束/);
@@ -541,7 +597,7 @@ describe('Execution cancel 状态机', () => {
       release = resolve;
     });
     try {
-      const sent = await team.sendMessage({ conversationId: conv.id, content: 'x' });
+      const sent = await sendMessage({ conversationId: conv.id, content: 'x' });
       await waitForStatus(sent.executionId, 'running');
       const first = team.cancelExecution(sent.executionId);
       release();
@@ -564,8 +620,10 @@ describe('归档 Member 的 conversation 语义', () => {
       memberIds: [alice.id, bob.id],
       defaultMemberId: alice.id,
     });
+    // 这个用例只关心「bob 被点名那一轮」，把自动唤醒关掉
+    muteAllMembers(team, conv.id);
 
-    const sent = await team.sendMessage({
+    const sent = await sendMessage({
       conversationId: conv.id,
       content: 'first',
       targetMemberId: bob.id,
@@ -588,7 +646,7 @@ describe('归档 Member 的 conversation 语义', () => {
 
       // 3) 但不能派新活
       await assert.rejects(
-        () => team.sendMessage({ conversationId: conv.id, content: 'again', targetMemberId: bob.id }),
+        () => sendMessage({ conversationId: conv.id, content: 'again', targetMemberId: bob.id }),
         /已归档/,
       );
       assert.throws(
@@ -619,7 +677,14 @@ describe('listExecutions', () => {
       memberIds: [alice.id, bob.id],
       defaultMemberId: alice.id,
     });
-    const parent = await team.sendMessage({ conversationId: conv.id, content: 'parent' });
+    // 断言的是「恰好 2 条 execution」，所以每一轮都点名，不让讨论自己展开
+    muteAllMembers(team, conv.id);
+
+    const parent = await sendMessage({
+      conversationId: conv.id,
+      content: 'parent',
+      targetMemberId: alice.id,
+    });
     await waitForStatus(parent.executionId, 'completed');
 
     await team.delegateMember({
@@ -652,7 +717,7 @@ describe('retryExecution 的语义', () => {
     stub.failWith = 'transient';
     let failedId = '';
     try {
-      const failed = await team.sendMessage({ conversationId: conv.id, content: 'try' });
+      const failed = await sendMessage({ conversationId: conv.id, content: 'try' });
       failedId = failed.executionId;
       await waitForStatus(failedId, 'failed');
     } finally {

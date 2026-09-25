@@ -804,6 +804,10 @@ export class TeamService {
       error: null,
       waitingForRuntimeId: null,
       retryOfExecutionId: null,
+      decision: null,
+      // delegation 没有触发消息、也没有房间讨论语义：它是一道明确的任务。
+      triggerMessageSequence: null,
+      wakeReason: null,
       startedAt: null,
       endedAt: null,
       createdAt: now(),

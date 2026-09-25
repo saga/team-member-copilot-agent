@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   api,
   type Conversation,
+  type ConversationMemberState,
   type ConversationMessage,
   type DelegationEvent,
   type DeltaEvent,
@@ -26,6 +27,9 @@ interface DelegationLog {
 
 /** 还在推进中的 execution 状态；到了其它状态就说明这条 execution 已经收尾。 */
 const ACTIVE_STATUSES: ExecutionStatus[] = ['queued', 'running', 'waiting_for_member'];
+
+/** 收件人下拉里代表「不点名，交给 GroupDispatcher 决定唤醒谁」的哨兵值。 */
+const EVERYONE = '';
 
 const STATUS_LABEL: Record<ExecutionStatus, string> = {
   queued: '排队中',
@@ -72,7 +76,17 @@ export function TeamChat() {
   const [delegations, setDelegations] = useState<DelegationLog[]>([]);
   /** executionId → 最近一次 execution.updated，用来渲染 runtime 实时状态。 */
   const [executions, setExecutions] = useState<Record<string, ExecutionRecord>>({});
-  const [targetMemberId, setTargetMemberId] = useState('');
+  /**
+   * 收件人。**不是** conversation.defaultMemberId —— 那是「这个房间默认归谁」，
+   * 用它当 group 的默认收件人会把多人共享讨论强制降级成单人聊天。
+   *
+   *   direct → 房间里唯一那个 Member
+   *   group  → ''（Everyone），由服务端 GroupDispatcher 决定唤醒谁
+   */
+  const [recipientMemberId, setRecipientMemberId] = useState<string>(EVERYONE);
+  const [conversationStates, setConversationStates] = useState<
+    Record<string, ConversationMemberState>
+  >({});
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -100,6 +114,37 @@ export function TeamChat() {
 
   function memberLabel(id: string): string {
     return memberById.get(id)?.name ?? `${id.slice(0, 8)}…`;
+  }
+
+  /**
+   * 成员在房间里的状态，用来渲染 ●idle / ●working / 🔇muted。
+   *
+   * muted 以服务端为准（它是 dispatcher 的真实输入）；wakeStatus 只覆盖
+   * 「有唤醒在排队 / 在跑」；两者都没有但有活跃 execution 时兜底成 working，
+   * 免得调度器状态和 UI 出现一瞬不一致。
+   */
+  function memberStatus(memberId: string): { className: string; label: string } {
+    const state = conversationStates[memberId];
+    if (state?.muted) return { className: 'muted', label: '🔇 muted' };
+
+    const wake = state?.wakeStatus;
+    if (wake === 'running' || wake === 'queued') return { className: 'working', label: '● working' };
+
+    if (activeExecutions.some((execution) => execution.memberId === memberId)) {
+      return { className: 'working', label: '● working' };
+    }
+    return { className: 'idle', label: '● idle' };
+  }
+
+  async function toggleMuted(memberId: string): Promise<void> {
+    if (!conversationId) return;
+    const muted = !conversationStates[memberId]?.muted;
+    try {
+      const result = await api.setMemberMuted(conversationId, memberId, muted);
+      setConversationStates((current) => ({ ...current, [memberId]: result.state }));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
   }
 
   /**
@@ -151,8 +196,14 @@ export function TeamChat() {
     setStreaming({});
     setDelegations([]);
     setExecutions({});
+    setConversationStates({});
     setError(null);
-    setTargetMemberId(conversation?.defaultMemberId ?? conversation?.members[0]?.id ?? '');
+
+    if (conversation?.kind === 'group') {
+      setRecipientMemberId(EVERYONE);
+    } else {
+      setRecipientMemberId(conversation?.members[0]?.id ?? EVERYONE);
+    }
 
     void api
       .listMessages(activeId)
@@ -269,6 +320,35 @@ export function TeamChat() {
     };
   }, [conversationId]);
 
+  /**
+   * 拉房间里每个 Member 的房间状态（wakeStatus / muted）。
+   *
+   * 依赖 `messages.length` 而不是 `executions`：wake_status 由服务端调度器在
+   * queued → running → idle 之间推进，而每条消息完成时都会新增一条 message
+   * （skip 除外），这个节奏足够跟上手感，又不会每条 token 增量都去戳一次接口。
+   * 静音切换走 local patch，不依赖这次刷新。
+   */
+  useEffect(() => {
+    if (!conversationId) return;
+
+    let cancelled = false;
+    void api
+      .listConversationState(conversationId)
+      .then((result) => {
+        if (cancelled) return;
+        setConversationStates(
+          Object.fromEntries(result.states.map((state) => [state.memberId, state])),
+        );
+      })
+      .catch(() => {
+        // 状态只是展示增强，拿不到不该打断聊天
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [conversationId, messages.length]);
+
   // 新消息 / 新增量 / runtime 状态变化时贴底
   useEffect(() => {
     const node = scrollRef.current;
@@ -289,7 +369,6 @@ export function TeamChat() {
       kind: 'direct',
       title: member.name,
       memberIds: [member.id],
-      defaultMemberId: member.id,
     });
     setConversations((current) => [
       result.conversation,
@@ -308,7 +387,6 @@ export function TeamChat() {
       kind: 'group',
       title: 'Team Discussion',
       memberIds: selected.map((member) => member.id),
-      defaultMemberId: selected[0].id,
     });
     setConversations((current) => [
       result.conversation,
@@ -346,10 +424,17 @@ export function TeamChat() {
     try {
       const result = await api.sendMessage(conversationId, {
         content,
-        targetMemberId: targetMemberId || undefined,
+        // Everyone（''）必须传 undefined：让服务端 GroupDispatcher 决定唤醒谁。
+        // 传一个具体 memberId = 点名，等价于一次 @mention。
+        targetMemberId: recipientMemberId || undefined,
       });
       // 202：消息已落库。乐观插入，SSE 到达时会按 id 去重。
       setMessages((current) => mergeMessages(current, [result.message]));
+
+      // 房间里没人认领这些 @ —— 服务端刻意不广播，如实告诉用户。
+      if (result.unresolvedMentions.length > 0) {
+        setError(`没有匹配到这些成员：${result.unresolvedMentions.map((m) => `@${m}`).join(' ')}。消息没有派给任何人。`);
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setInput(content);
@@ -437,24 +522,60 @@ export function TeamChat() {
               <div>
                 <h2>{selectedConversation.title}</h2>
                 <div className="member-chips">
-                  {selectedConversation.members.map((member) => (
-                    <span key={member.id} className="member-chip">
-                      @{member.handle}
-                    </span>
-                  ))}
+                  {selectedConversation.members.map((member) => {
+                    const status = memberStatus(member.id);
+                    const className = `member-chip ${status.className}`;
+
+                    // 静音只对 group 有意义：direct / work 房间的 dispatcher 路径
+                    // 不看 muted，点它只会造成「UI 说静音了、其实照样回」的错觉。
+                    if (selectedConversation.kind !== 'group') {
+                      return (
+                        <span key={member.id} className={className}>
+                          <span className="member-chip-status">{status.label}</span>
+                          @{member.handle}
+                        </span>
+                      );
+                    }
+
+                    return (
+                      <button
+                        key={member.id}
+                        type="button"
+                        className={className}
+                        onClick={() => void toggleMuted(member.id)}
+                        title={`${member.name} · ${status.label}（点击${status.className === 'muted' ? '取消静音' : '静音'}）`}
+                      >
+                        <span className="member-chip-status">{status.label}</span>
+                        @{member.handle}
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
-              <select
-                value={targetMemberId}
-                onChange={(e) => setTargetMemberId(e.target.value)}
-                aria-label="选择要回应的 Member"
-              >
-                {selectedConversation.members.map((member) => (
-                  <option key={member.id} value={member.id}>
-                    @{member.handle}
-                  </option>
-                ))}
-              </select>
+
+              {selectedConversation.kind === 'group' ? (
+                <select
+                  className="recipient-select"
+                  value={recipientMemberId}
+                  onChange={(e) => setRecipientMemberId(e.target.value)}
+                  aria-label="选择这条消息的收件人"
+                >
+                  <option value={EVERYONE}>Everyone</option>
+                  {selectedConversation.members
+                    .filter((member) => member.status === 'active')
+                    .map((member) => (
+                      <option key={member.id} value={member.id}>
+                        @{member.handle}
+                      </option>
+                    ))}
+                </select>
+              ) : (
+                <span className="recipient-static">
+                  {selectedConversation.members[0]
+                    ? `To ${selectedConversation.members[0].name}`
+                    : 'No member'}
+                </span>
+              )}
             </header>
 
             {activeExecutions.length > 0 && (
@@ -471,8 +592,9 @@ export function TeamChat() {
             <div className="conversation-messages" ref={scrollRef}>
               {messages.length === 0 && (
                 <p className="hint">
-                  发一条消息，它会被路由到上面选中的 Member；该 Member 也可以用 ask_member 把子任务
-                  委派给其他 Member。
+                  {selectedConversation.kind === 'group'
+                    ? '收件人保持 Everyone 时不点名，消息会派给房间里所有可用成员，各自判断要不要发言（可以沉默）；要指名就选具体成员，或在正文里 @handle。'
+                    : `${selectedConversation.members[0]?.name ?? '该成员'} 会用你自己的记忆、人格和工作区回答；它也可以用 ask_member 把子任务委派给其他成员。`}
                 </p>
               )}
 
@@ -529,7 +651,11 @@ export function TeamChat() {
                     void send();
                   }
                 }}
-                placeholder="Message the team... (Enter 发送 / Shift+Enter 换行)"
+                placeholder={
+                  selectedConversation.kind === 'group'
+                    ? '对团队说点什么…（Enter 发送 / Shift+Enter 换行；@handle 指名，或直接 @ 某人）'
+                    : `给 ${selectedConversation.members[0]?.name ?? '成员'} 发消息…（Enter 发送 / Shift+Enter 换行）`
+                }
                 disabled={!conversationId}
               />
               <button type="button" onClick={() => void send()} disabled={busy || !input.trim()}>

@@ -169,13 +169,66 @@ main {
   display: flex;
   gap: 5px;
   flex-wrap: wrap;
+  align-items: center;
 }
 
 .member-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   font-size: 12px;
   background: #eef1f5;
+  color: inherit;
+  border: 0;
   border-radius: 999px;
   padding: 3px 8px;
+  font-family: inherit;
+  line-height: 1.5;
+}
+
+button.member-chip {
+  cursor: pointer;
+}
+
+button.member-chip:hover {
+  background: #e2e7ee;
+}
+
+.member-chip-status {
+  font-size: 11px;
+  color: #6b7280;
+}
+
+.member-chip.working {
+  background: #e4f6ec;
+}
+
+.member-chip.working .member-chip-status {
+  color: #1f8f4e;
+}
+
+.member-chip.muted {
+  background: #f0f1f3;
+  text-decoration: line-through;
+  text-decoration-color: #b6bcc4;
+}
+
+.member-chip.muted .member-chip-status {
+  color: #9aa3ad;
+  text-decoration: none;
+}
+
+.recipient-select,
+.recipient-static {
+  flex: none;
+  font-size: 13px;
+}
+
+.recipient-static {
+  color: #555;
+  background: #f4f4f5;
+  border-radius: 999px;
+  padding: 4px 10px;
 }
 
 .runtime-strip {

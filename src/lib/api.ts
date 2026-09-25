@@ -79,6 +79,51 @@ export interface ExecutionRecord {
   createdAt: string;
 }
 
+/**
+ * 一条消息唤醒了哪个 Member、为什么。
+ *
+ * 确定性规则的产物（见 server/group-dispatcher.ts），不是 LLM routing：
+ *   direct          1:1 房间，或请求里显式指定了 targetMemberId
+ *   mention         消息里 @ 了它
+ *   open_discussion 用户没 @ 任何人，让房间成员自行判断要不要发言
+ *   follow_up       另一个 Member 发言后顺带被唤醒（受 autoWakeRounds 限制）
+ */
+export interface WakePlan {
+  memberId: string;
+  reason: 'direct' | 'mention' | 'open_discussion' | 'follow_up';
+  triggerSequence: number;
+}
+
+/**
+ * POST /messages 的结果。
+ *
+ * 刻意**没有**单个 executionId：group 房间的一条消息可以唤醒多个 Member，
+ * 各自产生一条 execution，一个字段表达不了。谁被唤醒了看 `wakes`，
+ * 每条 execution 的进展通过 SSE 的 `execution.updated` 到达。
+ */
+export interface SendMessageResult {
+  message: ConversationMessage;
+  wakes: WakePlan[];
+  /** 消息里 @ 了但不属于这个房间的名字；非空时服务端刻意**不**广播给全员。 */
+  unresolvedMentions: string[];
+}
+
+/**
+ * 某 Member 在某 Conversation 里的房间状态。
+ *
+ * 和 MemberRuntime 是两件事：这一层回答「它在房间里看到哪里了、要不要被唤醒」。
+ */
+export interface ConversationMemberState {
+  conversationId: string;
+  memberId: string;
+  lastSeenMessageSequence: number;
+  lastRepliedMessageSequence: number;
+  wakeStatus: 'idle' | 'queued' | 'running' | 'cooldown';
+  pendingWake: boolean;
+  muted: boolean;
+  updatedAt: string;
+}
+
 export interface Health {
   status: string;
   timestamp: string;
@@ -127,6 +172,58 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(input),
     }).then(json<{ member: Member }>);
+  },
+
+  /**
+   * 局部更新。字段省略 = 不改；`model: null` 是**显式清空**（回落默认模型），
+   * 所以这里不能用 `?? ` 合并，服务端按 `!== undefined` 判断。
+   */
+  updateMember(
+    id: string,
+    input: {
+      name?: string;
+      handle?: string;
+      role?: string;
+      description?: string;
+      style?: string;
+      systemPrompt?: string;
+      model?: string | null;
+      toolProfile?: 'safe' | 'coding';
+      status?: 'active' | 'archived';
+    },
+  ): Promise<{ member: Member }> {
+    return fetch(`${API_BASE}/api/members/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    }).then(json<{ member: Member }>);
+  },
+
+  /** 房间里每个 Member 的读游标 / 唤醒状态 / 是否静音。 */
+  listConversationState(
+    conversationId: string,
+  ): Promise<{ states: ConversationMemberState[] }> {
+    return fetch(
+      `${API_BASE}/api/conversations/${encodeURIComponent(conversationId)}/state`,
+    ).then(json<{ states: ConversationMemberState[] }>);
+  },
+
+  /** 静音后 dispatcher 不会唤醒它 —— @ 也唤不醒。 */
+  setMemberMuted(
+    conversationId: string,
+    memberId: string,
+    muted: boolean,
+  ): Promise<{ state: ConversationMemberState }> {
+    return fetch(
+      `${API_BASE}/api/conversations/${encodeURIComponent(
+        conversationId,
+      )}/members/${encodeURIComponent(memberId)}/state`,
+      {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ muted }),
+      },
+    ).then(json<{ state: ConversationMemberState }>);
   },
 
   listConversations(): Promise<{ conversations: Conversation[] }> {
@@ -195,10 +292,17 @@ export const api = {
     }).then(json<{ execution: ExecutionRecord }>);
   },
 
+  /**
+   * 发一条消息。202：消息已落库、唤醒已入队，结果通过 SSE 推。
+   *
+   * `targetMemberId` 只在 UI 明确点名时传（direct 房间自动就是那一个成员）。
+   * group 房间的「Everyone」必须传 undefined —— 由服务端 GroupDispatcher
+   * 决定唤醒谁。前端替服务端挑一个成员会把共享讨论降级成单人聊天。
+   */
   sendMessage(
     conversationId: string,
     input: { content: string; targetMemberId?: string; replyToMessageId?: string },
-  ): Promise<{ message: ConversationMessage; executionId: string }> {
+  ): Promise<SendMessageResult> {
     return fetch(
       `${API_BASE}/api/conversations/${encodeURIComponent(conversationId)}/messages`,
       {
@@ -206,7 +310,7 @@ export const api = {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(input),
       },
-    ).then(json<{ message: ConversationMessage; executionId: string }>);
+    ).then(json<SendMessageResult>);
   },
 
   addMemberToConversation(

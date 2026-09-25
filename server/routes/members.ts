@@ -14,7 +14,25 @@ const createMemberSchema = z.object({
   toolProfile: z.enum(['safe', 'coding']).optional(),
 });
 
-const updateMemberSchema = createMemberSchema.partial().extend({
+/**
+ * 更新用的 schema 单独写，不复用 `createMemberSchema.partial()`：
+ * 两者有两处真实差异 ——
+ *
+ * 1. `model` 允许显式 `null`（清空 → 回落到 COPILOT_MODEL），
+ *    `.partial()` 只会保留 `string | undefined`，`null` 会被 400 掉。
+ * 2. `handle` 可以改（create 时省略则由 name 推导）。
+ *
+ * 所有字段都是 optional：省略 = 不改。
+ */
+const updateMemberSchema = z.object({
+  name: z.string().trim().min(1).max(100).optional(),
+  handle: z.string().trim().min(1).max(50).optional(),
+  role: z.string().trim().min(1).max(200).optional(),
+  description: z.string().max(2000).optional(),
+  style: z.string().max(2000).optional(),
+  systemPrompt: z.string().max(12000).optional(),
+  model: z.string().trim().max(100).nullable().optional(),
+  toolProfile: z.enum(['safe', 'coding']).optional(),
   status: z.enum(['active', 'archived']).optional(),
 });
 

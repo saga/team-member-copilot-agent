@@ -34,6 +34,7 @@ export interface CreateMemberInput {
 
 export interface UpdateMemberInput {
   name?: string;
+  handle?: string;
   role?: string;
   description?: string;
   style?: string;
@@ -104,10 +105,7 @@ export class MemberService {
     const id = randomUUID();
     const createdAt = now();
 
-    let handle = normalizeHandle(input.handle ?? input.name);
-    if (this.db.prepare(`SELECT 1 FROM member WHERE handle = ?`).get(handle)) {
-      handle = `${handle}-${id.slice(0, 6)}`;
-    }
+    const handle = this.resolveHandle(input.handle ?? input.name, id);
 
     const role = input.role.trim();
 
@@ -155,6 +153,7 @@ export class MemberService {
     const current = this.get(id);
     const next = {
       name: input.name ?? current.name,
+      handle: input.handle === undefined ? current.handle : this.resolveHandle(input.handle, id),
       role: input.role ?? current.role,
       description: input.description ?? current.description,
       style: input.style ?? current.style,
@@ -171,6 +170,7 @@ export class MemberService {
         UPDATE member
         SET
           name = ?,
+          handle = ?,
           role = ?,
           description = ?,
           style = ?,
@@ -184,6 +184,7 @@ export class MemberService {
       )
       .run(
         next.name,
+        next.handle,
         next.role,
         next.description,
         next.style,
@@ -235,6 +236,18 @@ export class MemberService {
       'utf8',
     );
     return `已保存到 ${member.name} 的长期记忆。`;
+  }
+
+  /**
+   * handle 在 member 表上唯一（UI 里就是 @handle）。重名时加后缀而不是报错：
+   * 用户改的是「这个 Member 是谁」，不该被一个显示名撞车卡住。
+   */
+  private resolveHandle(value: string, selfId: string): string {
+    const base = normalizeHandle(value);
+    const clash = this.db
+      .prepare(`SELECT id FROM member WHERE handle = ? AND id <> ?`)
+      .get(base, selfId) as unknown as { id: string } | undefined;
+    return clash ? `${base}-${selfId.slice(0, 6)}` : base;
   }
 
   private ensureHome(memberId: string): void {

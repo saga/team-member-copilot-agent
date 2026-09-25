@@ -27,6 +27,7 @@ const { config } = await import('../config.js');
 const { db } = await import('../db.js');
 const { MemberService } = await import('../member-service.js');
 const { TeamService } = await import('../team-service.js');
+const { singleExecutionId, muteAllMembers } = await import('./support.js');
 
 interface RunTurnInput {
   runtime: { id: string; copilotSessionId: string; workspacePath: string };
@@ -68,6 +69,23 @@ interface RuntimeRow {
 const stub = new StubCopilot();
 const memberService = new MemberService(db);
 const team = new TeamService(db, memberService, stub as unknown as CopilotService);
+
+const sendRaw = team.sendMessage.bind(team);
+
+/**
+ * `POST /messages` 返回的是 `wakes[]`（group 房间一条消息可以唤醒多个 Member），
+ * 不再有单个 executionId。这个文件里的用例都是「一个收件人」的场景，
+ * 包一层把那条 execution 找回来，断言本身不用改。
+ */
+async function sendMessage(input: {
+  conversationId: string;
+  content: string;
+  targetMemberId?: string;
+  replyToMessageId?: string;
+}) {
+  const result = await sendRaw(input);
+  return { ...result, executionId: singleExecutionId(db, input.conversationId, result.wakes) };
+}
 
 function executionRow(id: string): ExecutionRow {
   const row = db.prepare(`SELECT * FROM execution WHERE id = ?`).get(id) as unknown as
@@ -141,6 +159,10 @@ before(() => {
     memberIds: [researcher.id, coder.id, reviewer.id, analyst.id, archivist.id],
     defaultMemberId: researcher.id,
   });
+  // 这个 group 是给 delegation / 审计链用例当「同一个房间里的多个 Member」用的。
+  // 静音全体：这些用例每一轮都显式点名，不需要 open_discussion 广播把 5 个人
+  // 同时唤醒。共享讨论本身由 team-chat.test.ts 覆盖。
+  muteAllMembers(team, conversation.id);
   teamConversationId = conversation.id;
 });
 
@@ -183,12 +205,12 @@ describe('Conversation / Runtime 边界', () => {
     });
 
     // Runtime 是懒创建的：先各跑一轮，runtime 才落库
-    const inTeam = await team.sendMessage({
+    const inTeam = await sendMessage({
       conversationId: teamConversationId,
       content: '团队会话里的一轮',
       targetMemberId: researcher.id,
     });
-    const inSolo = await team.sendMessage({
+    const inSolo = await sendMessage({
       conversationId: other.id,
       content: '单独会话里的一轮',
     });
@@ -290,10 +312,12 @@ describe('Conversation / Runtime 边界', () => {
 
     let lastExecutionId = '';
     for (const text of ['first', 'second', 'third']) {
-      const result = await team.sendMessage({ conversationId: conversation.id, content: text });
+      const result = await sendMessage({ conversationId: conversation.id, content: text });
       lastExecutionId = result.executionId;
+      // 必须等这一轮收尾再发下一条：scheduler 会把同一个 Member 上排队的
+      // 唤醒合并成一轮，连着发会让后两条并进前一轮，拿不到各自的 execution。
+      await waitForStatus(lastExecutionId, 'completed');
     }
-    await waitForStatus(lastExecutionId, 'completed');
     await waitForConversationIdle(conversation.id);
 
     const all = team.listMessages(conversation.id, 500);
@@ -312,9 +336,11 @@ describe('Conversation / Runtime 边界', () => {
 
 describe('Execution 审计链', () => {
   it('interactive execution 记录 runtime 与 delegationPath 起点', async () => {
-    const { executionId } = await team.sendMessage({
+    const { executionId } = await sendMessage({
       conversationId: teamConversationId,
       content: '分析一下这个投资研究报告的主要风险',
+      // 显式点名：group 房间不点名就是全员共享讨论，断言不出「一条 execution」
+      targetMemberId: researcher.id,
     });
     await waitForStatus(executionId, 'completed');
 
@@ -331,7 +357,7 @@ describe('Execution 审计链', () => {
 
 describe('delegation 业务控制', () => {
   it('A → B 成功，并留下 parent + delegationPath', async () => {
-    const { executionId } = await team.sendMessage({
+    const { executionId } = await sendMessage({
       conversationId: teamConversationId,
       content: '先研究这个问题',
       targetMemberId: researcher.id,
@@ -361,7 +387,7 @@ describe('delegation 业务控制', () => {
   });
 
   it('A → B → A 被拒绝（cycle）', async () => {
-    const { executionId } = await team.sendMessage({
+    const { executionId } = await sendMessage({
       conversationId: teamConversationId,
       content: 'cycle 测试起点',
       targetMemberId: researcher.id,
@@ -384,7 +410,7 @@ describe('delegation 业务控制', () => {
   });
 
   it('A → B → C → A 被拒绝（cycle 跨层级）', async () => {
-    const { executionId } = await team.sendMessage({
+    const { executionId } = await sendMessage({
       conversationId: teamConversationId,
       content: '多层 cycle 测试起点',
       targetMemberId: researcher.id,
@@ -437,7 +463,7 @@ describe('delegation 业务控制', () => {
   });
 
   it('超过 maxDelegationDepth 被拒绝（depth）', async () => {
-    const { executionId } = await team.sendMessage({
+    const { executionId } = await sendMessage({
       conversationId: teamConversationId,
       content: 'depth 测试起点',
       targetMemberId: researcher.id,
@@ -484,7 +510,7 @@ describe('delegation 业务控制', () => {
   });
 
   it('parent execution 不属于当前 Member 时被拒绝', async () => {
-    const { executionId } = await team.sendMessage({
+    const { executionId } = await sendMessage({
       conversationId: teamConversationId,
       content: 'parent 归属测试',
       targetMemberId: researcher.id,
@@ -505,7 +531,7 @@ describe('delegation 业务控制', () => {
   });
 
   it('delegation 全过程通过 SSE 事件对外暴露', async () => {
-    const { executionId } = await team.sendMessage({
+    const { executionId } = await sendMessage({
       conversationId: teamConversationId,
       content: 'SSE 事件测试',
       targetMemberId: researcher.id,

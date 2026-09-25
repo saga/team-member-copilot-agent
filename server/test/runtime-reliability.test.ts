@@ -30,6 +30,7 @@ const { MemberService } = await import('../member-service.js');
 const { TeamService } = await import('../team-service.js');
 const { ContextAssembler } = await import('../context-assembler.js');
 const { RecoveryService } = await import('../recovery-service.js');
+const { singleExecutionId, muteAllMembers } = await import('./support.js');
 const { migrate, getUserVersion, SCHEMA_VERSION, V1_SCHEMA_SQL } = await import(
   '../db-migrations.js'
 );
@@ -172,7 +173,7 @@ describe('schema migration（PRAGMA user_version）', () => {
     }
   });
 
-  it('v1 旧库升级到 v2：历史数据保留、序号回填、水位线同步', () => {
+  it('v1 旧库升级到最新 schema：历史数据保留、序号回填、水位线同步', () => {
     const handle = openFixture('upgrade');
     try {
       handle.exec(V1_SCHEMA_SQL);
@@ -202,8 +203,10 @@ describe('schema migration（PRAGMA user_version）', () => {
       const result = migrate(handle);
       assert.equal(result.fresh, false);
       assert.equal(result.from, 1);
-      assert.equal(result.to, 2);
-      assert.deepEqual(result.applied, ['v1-to-v2']);
+      // 断言的是「升到最新」而不是某个具体版本号：这条用例保护的是
+      // 「老库能一路升上来」，加一版 schema 不该让它变红。
+      assert.equal(result.to, SCHEMA_VERSION);
+      assert.deepEqual(result.applied, ['v1-to-v2', 'v2-to-v3'].slice(0, SCHEMA_VERSION - 1));
 
       // 1) 消息序号按 (created_at, rowid) 回填成 1..N
       // 注意：node:sqlite 返回的是 null-prototype 对象，断言前要先摊平成普通对象
@@ -272,6 +275,24 @@ describe('schema migration（PRAGMA user_version）', () => {
 
       // 6) 整体外键完整
       assert.deepEqual(handle.prepare('PRAGMA foreign_key_check').all(), []);
+
+      // 7) v3：给已有 roster 补房间状态行，last_seen 直接推到当前水位
+      //    （推 0 的话，升级后第一条新消息会让每个 Member 的「未读」变成整个历史）
+      assert.ok(tableColumns(handle, 'conversation_member_state').includes('wake_status'));
+      const state = handle
+        .prepare(
+          `SELECT last_seen_message_sequence, muted FROM conversation_member_state
+           WHERE conversation_id = 'c1' AND member_id = 'm1'`,
+        )
+        .get() as unknown as { last_seen_message_sequence: number; muted: number } | undefined;
+      assert.ok(state, '已有 roster 必须补上房间状态行');
+      assert.equal(state.last_seen_message_sequence, 2);
+      assert.equal(state.muted, 0);
+
+      // 8) v3：execution 新列默认 NULL
+      assert.ok(tableColumns(handle, 'execution').includes('decision'));
+      assert.ok(tableColumns(handle, 'execution').includes('trigger_message_sequence'));
+      assert.ok(tableColumns(handle, 'execution').includes('wake_reason'));
     } finally {
       handle.close();
     }
@@ -311,6 +332,23 @@ const team = new TeamService(db, memberService, stub as unknown as CopilotServic
 const alice = team.createMember({ name: 'Alice', role: 'Analyst' });
 const bob = team.createMember({ name: 'Bob', role: 'Reviewer' });
 
+const sendRaw = team.sendMessage.bind(team);
+
+/**
+ * `POST /messages` 返回 `wakes[]`，不再有单个 executionId —— group 房间里
+ * 一条消息可以唤醒多个 Member。这个文件的用例都是单收件人场景，包一层
+ * 把那条 execution 找回来。（并发发多条的那个用例只用 message 字段。）
+ */
+async function sendMessage(input: {
+  conversationId: string;
+  content: string;
+  targetMemberId?: string;
+  replyToMessageId?: string;
+}) {
+  const result = await sendRaw(input);
+  return { ...result, executionId: singleExecutionId(db, input.conversationId, result.wakes) };
+}
+
 describe('message_sequence 是会话内严格全序', () => {
   it('同一毫秒内的多条消息也不会撞序号', async () => {
     const solo = team.createConversation({
@@ -319,11 +357,13 @@ describe('message_sequence 是会话内严格全序', () => {
       defaultMemberId: bob.id,
     });
 
-    // 不 await，让三条 sendMessage 在同一个 tick 里排队写入
+    // 不 await，让三条 sendMessage 在同一个 tick 里排队写入。
+    // 用 sendRaw：这个用例只关心 message_sequence，而同一 Member 上并发的
+    // 唤醒会被 scheduler 合并成排队轮次，第二条的 execution 此刻还不存在。
     const results = await Promise.all([
-      team.sendMessage({ conversationId: solo.id, content: 'a' }),
-      team.sendMessage({ conversationId: solo.id, content: 'b' }),
-      team.sendMessage({ conversationId: solo.id, content: 'c' }),
+      sendRaw({ conversationId: solo.id, content: 'a' }),
+      sendRaw({ conversationId: solo.id, content: 'b' }),
+      sendRaw({ conversationId: solo.id, content: 'c' }),
     ]);
     await waitForConversationIdle(solo.id);
 
@@ -354,9 +394,12 @@ describe('ContextAssembler：增量上下文而不是整段重放', () => {
       memberIds: [alice.id, bob.id],
       defaultMemberId: alice.id,
     });
+    // 四轮都由显式 targetMemberId 驱动；自动唤醒只会在中间插进额外的 turn，
+    // 让「谁在什么时候读到了什么」没法断言。
+    muteAllMembers(team, conv.id);
 
     // 1) Alice 先说话
-    const first = await team.sendMessage({
+    const first = await sendMessage({
       conversationId: conv.id,
       content: 'ALICE-FIRST',
       targetMemberId: alice.id,
@@ -364,7 +407,7 @@ describe('ContextAssembler：增量上下文而不是整段重放', () => {
     await waitForStatus(first.executionId, 'completed');
 
     // 2) Bob 第一次发言：应该看到 Alice 的回复
-    const bobFirst = await team.sendMessage({
+    const bobFirst = await sendMessage({
       conversationId: conv.id,
       content: 'BOB-FIRST',
       targetMemberId: bob.id,
@@ -374,12 +417,14 @@ describe('ContextAssembler：增量上下文而不是整段重放', () => {
     const bobTurn1 = stub.turnsFor(bob.id).at(-1);
     assert.ok(bobTurn1);
     assert.match(bobTurn1.prompt, /stub reply from/, 'Bob 应该看到 Alice 的回复');
-    assert.match(bobTurn1.prompt, /Shared conversation context/);
+    // group 房间走 discussion 模式：房间活动以 transcript 形式给出，
+    // 触发消息本身也在 transcript 里（不像 direct 那样单独拎成 Current message）
+    assert.match(bobTurn1.prompt, /Room activity since you last read it/);
     assert.match(bobTurn1.prompt, /ALICE-FIRST/, '也应该看到触发 Alice 的那条用户消息');
-    assert.match(bobTurn1.prompt, /Current task:\s*BOB-FIRST/);
+    assert.match(bobTurn1.prompt, /BOB-FIRST/);
 
     // 3) Alice 再说一句
-    const second = await team.sendMessage({
+    const second = await sendMessage({
       conversationId: conv.id,
       content: 'ALICE-SECOND',
       targetMemberId: alice.id,
@@ -387,7 +432,7 @@ describe('ContextAssembler：增量上下文而不是整段重放', () => {
     await waitForStatus(second.executionId, 'completed');
 
     // 4) Bob 第二次发言：只应该看到 Alice 的第二句
-    const bobSecond = await team.sendMessage({
+    const bobSecond = await sendMessage({
       conversationId: conv.id,
       content: 'BOB-SECOND',
       targetMemberId: bob.id,
@@ -444,7 +489,11 @@ describe('ContextAssembler：增量上下文而不是整段重放', () => {
         lastContextMessageSequence: 0,
         lastUsedAt: null,
       },
-      currentExecutionId: 'exec-now',
+      triggerMessageSequence: 2,
+      wakeReason: 'direct',
+      conversation: conv,
+      member: alice,
+      turnMode: 'direct',
       currentPrompt: 'trigger',
     });
 
@@ -462,7 +511,7 @@ describe('checkpoint 只在 turn 成功后推进', () => {
       defaultMemberId: bob.id,
     });
 
-    const ok = await team.sendMessage({ conversationId: conv.id, content: 'OK-1' });
+    const ok = await sendMessage({ conversationId: conv.id, content: 'OK-1' });
     await waitForStatus(ok.executionId, 'completed');
     const afterSuccess = runtimeRow(conv.id, bob.id);
     assert.ok(afterSuccess);
@@ -471,7 +520,7 @@ describe('checkpoint 只在 turn 成功后推进', () => {
 
     stub.failWith = 'boom';
     try {
-      const failed = await team.sendMessage({ conversationId: conv.id, content: 'WILL-FAIL' });
+      const failed = await sendMessage({ conversationId: conv.id, content: 'WILL-FAIL' });
       await waitForStatus(failed.executionId, 'failed');
     } finally {
       stub.failWith = null;
@@ -499,13 +548,25 @@ describe('runtime 单写者', () => {
     });
 
     const before = stub.turns.length;
-    const [a, b] = await Promise.all([
-      team.sendMessage({ conversationId: conv.id, content: 'one' }),
-      team.sendMessage({ conversationId: conv.id, content: 'two' }),
+    // 用 sendRaw：同一个 Member 上并发的两条唤醒会被 scheduler 合并成
+    // 「先跑一轮、再补一轮」，第二条的 execution 在返回时还没被创建。
+    await Promise.all([
+      sendRaw({ conversationId: conv.id, content: 'one' }),
+      sendRaw({ conversationId: conv.id, content: 'two' }),
     ]);
-    await waitForStatus(a.executionId, 'completed');
-    await waitForStatus(b.executionId, 'completed');
     await waitForConversationIdle(conv.id);
+
+    // 两条消息各自留下一条 execution（只是先后出现，不是同时)
+    const executions = team.listExecutions(conv.id, 100);
+    assert.equal(executions.length, 2, '两条消息应该各留下一条 execution');
+    assert.deepEqual(
+      executions.map((execution) => execution.triggerMessageSequence),
+      [1, 2],
+    );
+    assert.equal(new Set(executions.map((execution) => execution.memberId)).size, 1);
+    for (const execution of executions) {
+      assert.equal(execution.status, 'completed');
+    }
 
     const runtime = runtimeRow(conv.id, alice.id);
     assert.ok(runtime);
@@ -527,15 +588,16 @@ describe('wait-for 环检测（跨 delegation 树的死锁保护）', () => {
       memberIds: [alice.id, bob.id],
       defaultMemberId: alice.id,
     });
+    muteAllMembers(team, conv.id);
 
-    const aliceRun = await team.sendMessage({
+    const aliceRun = await sendMessage({
       conversationId: conv.id,
       content: 'A',
       targetMemberId: alice.id,
     });
     await waitForStatus(aliceRun.executionId, 'completed');
 
-    const bobRun = await team.sendMessage({
+    const bobRun = await sendMessage({
       conversationId: conv.id,
       content: 'B',
       targetMemberId: bob.id,
@@ -588,8 +650,9 @@ describe('wait-for 环检测（跨 delegation 树的死锁保护）', () => {
       memberIds: [alice.id, bob.id],
       defaultMemberId: alice.id,
     });
+    muteAllMembers(team, conv.id);
 
-    const parent = await team.sendMessage({
+    const parent = await sendMessage({
       conversationId: conv.id,
       content: 'parent',
       targetMemberId: alice.id,
@@ -646,7 +709,7 @@ describe('durable conversation_event 与 SSE 回放', () => {
     });
 
     try {
-      const sent = await team.sendMessage({ conversationId: conv.id, content: 'hello' });
+      const sent = await sendMessage({ conversationId: conv.id, content: 'hello' });
       await waitForStatus(sent.executionId, 'completed');
     } finally {
       unsubscribe();
@@ -691,7 +754,7 @@ describe('durable conversation_event 与 SSE 回放', () => {
       defaultMemberId: bob.id,
     });
 
-    const first = await team.sendMessage({ conversationId: conv.id, content: 'one' });
+    const first = await sendMessage({ conversationId: conv.id, content: 'one' });
     await waitForStatus(first.executionId, 'completed');
 
     const all = team.listEventsSince(conv.id, 0);
@@ -699,7 +762,7 @@ describe('durable conversation_event 与 SSE 回放', () => {
     const highWater = all[all.length - 1].sequence;
     assert.ok(highWater !== null);
 
-    const second = await team.sendMessage({ conversationId: conv.id, content: 'two' });
+    const second = await sendMessage({ conversationId: conv.id, content: 'two' });
     await waitForStatus(second.executionId, 'completed');
 
     const incremental = team.listEventsSince(conv.id, highWater);
@@ -722,7 +785,7 @@ describe('durable conversation_event 与 SSE 回放', () => {
       defaultMemberId: bob.id,
     });
 
-    const first = await team.sendMessage({ conversationId: conv.id, content: 'history' });
+    const first = await sendMessage({ conversationId: conv.id, content: 'history' });
     await waitForStatus(first.executionId, 'completed');
 
     const history = team.listEventsSince(conv.id, 0);
@@ -735,7 +798,7 @@ describe('durable conversation_event 与 SSE 回放', () => {
 
     try {
       // 订阅建立后立刻产生的新事件必须被推送到
-      const second = await team.sendMessage({ conversationId: conv.id, content: 'live' });
+      const second = await sendMessage({ conversationId: conv.id, content: 'live' });
       await waitForStatus(second.executionId, 'completed');
     } finally {
       unsubscribe();
@@ -762,7 +825,7 @@ describe('durable conversation_event 与 SSE 回放', () => {
       defaultMemberId: bob.id,
     });
 
-    const sent = await team.sendMessage({ conversationId: conv.id, content: 'rebuild' });
+    const sent = await sendMessage({ conversationId: conv.id, content: 'rebuild' });
     await waitForStatus(sent.executionId, 'completed');
 
     const replayed: string[] = [];
@@ -784,7 +847,7 @@ describe('durable conversation_event 与 SSE 回放', () => {
     });
 
     for (const text of ['a', 'b', 'c', 'd', 'e', 'f']) {
-      const sent = await team.sendMessage({ conversationId: conv.id, content: text });
+      const sent = await sendMessage({ conversationId: conv.id, content: text });
       await waitForStatus(sent.executionId, 'completed');
     }
 
@@ -895,7 +958,7 @@ describe('retryExecution', () => {
     stub.failWith = 'transient';
     let failedId = '';
     try {
-      const failed = await team.sendMessage({ conversationId: conv.id, content: 'try' });
+      const failed = await sendMessage({ conversationId: conv.id, content: 'try' });
       failedId = failed.executionId;
       await waitForStatus(failedId, 'failed');
     } finally {
@@ -921,7 +984,7 @@ describe('retryExecution', () => {
       release = resolve;
     });
     try {
-      const running = await team.sendMessage({ conversationId: conv.id, content: 'again' });
+      const running = await sendMessage({ conversationId: conv.id, content: 'again' });
       assert.throws(() => team.retryExecution(running.executionId), /仍在进行中/);
       release();
       await waitForStatus(running.executionId, 'completed');

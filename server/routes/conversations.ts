@@ -21,6 +21,10 @@ const addMemberSchema = z.object({
   memberId: z.string().min(1),
 });
 
+const setMemberStateSchema = z.object({
+  muted: z.boolean(),
+});
+
 export function conversationsRouter(team: TeamService) {
   const router = Router();
 
@@ -106,6 +110,41 @@ export function conversationsRouter(team: TeamService) {
   router.delete('/:id/members/:memberId', (req, res) => {
     try {
       res.json({ conversation: team.removeMember(req.params.id, req.params.memberId) });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  /**
+   * 房间里每个 Member 的房间状态（读游标 / 唤醒状态 / 是否静音）。
+   *
+   * UI 用它在 header 上把成员显示成「团队成员」而不是下拉选项：
+   * Alice ●idle / Bob ●working / Iris 🔇muted。
+   */
+  router.get('/:id/state', (req, res) => {
+    try {
+      res.json({ states: team.listConversationState(req.params.id) });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  /**
+   * 改某个 Member 在房间里的状态。当前只有 `muted` 一个可变字段。
+   *
+   * 静音的语义是「dispatcher 不唤醒它」——@ 也唤不醒。成员仍然看得见历史，
+   * 只是不再被拉进讨论。
+   */
+  router.patch('/:id/members/:memberId/state', (req, res) => {
+    const parsed = setMemberStateSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: 'muted 必须是 boolean' });
+      return;
+    }
+    try {
+      res.json({
+        state: team.setMemberMuted(req.params.id, req.params.memberId, parsed.data.muted),
+      });
     } catch (error) {
       sendError(res, error);
     }
