@@ -1,5 +1,11 @@
-import { useState } from 'react';
-import { api, type Member } from '../../lib/api';
+import { useEffect, useState } from 'react';
+import { api, type Member, type MemberCapabilities } from '../../lib/api';
+
+const CAPABILITY_SECTIONS: Array<{ key: keyof MemberCapabilities; label: string }> = [
+  { key: 'skills', label: 'Skills（来源）' },
+  { key: 'knowledge', label: 'Knowledge（知识源）' },
+  { key: 'tools', label: 'Tools（工具）' },
+];
 
 interface MemberEditorProps {
   member: Member;
@@ -12,11 +18,15 @@ interface MemberEditorProps {
  *
  * 字段和数据库一一对应，不做二次抽象：
  *
- *   name / handle / role / description / style / systemPrompt / model / toolProfile
+ *   name / handle / role / description / style / systemPrompt / model
  *
  * 这些字段最后会拼进 system prompt（见 TeamService.buildMemberSystemPrompt），
  * 所以它们是**人格定义**，不是元数据装饰。`model` 支持留空 = 显式回落
  * COPILOT_MODEL，所以提交时要用 null 而不是空串。
+ *
+ * 「能用什么」不在这里编辑，而是单独显示：它属于
+ * `/api/capabilities/members/:id`。把能力和身份混在一个表单里，会让「改个名字」
+ * 和「给它开 bash」变成同一个保存动作。
  */
 export function MemberEditor({ member, onSaved, onCancel }: MemberEditorProps) {
   const [name, setName] = useState(member.name);
@@ -26,11 +36,27 @@ export function MemberEditor({ member, onSaved, onCancel }: MemberEditorProps) {
   const [style, setStyle] = useState(member.style);
   const [systemPrompt, setSystemPrompt] = useState(member.systemPrompt);
   const [model, setModel] = useState(member.model ?? '');
-  const [toolProfile, setToolProfile] = useState<Member['toolProfile']>(member.toolProfile);
+  const [capabilities, setCapabilities] = useState<MemberCapabilities | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const canSave = name.trim().length > 0 && role.trim().length > 0 && !busy;
+
+  // 能力是只读视图：它由模板 / 运维决定，不跟着这个表单一起保存。
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .getMemberCapabilities(member.id)
+      .then((result) => {
+        if (!cancelled) setCapabilities(result.capabilities);
+      })
+      .catch(() => {
+        if (!cancelled) setCapabilities(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [member.id]);
 
   async function save() {
     if (!canSave) return;
@@ -47,7 +73,6 @@ export function MemberEditor({ member, onSaved, onCancel }: MemberEditorProps) {
         systemPrompt,
         // 空 = 显式回落默认模型（后端按 !== undefined 判断，不会被 ?? 吃掉）
         model: model.trim() || null,
-        toolProfile,
       });
       onSaved(result.member);
     } catch (e) {
@@ -139,29 +164,30 @@ export function MemberEditor({ member, onSaved, onCancel }: MemberEditorProps) {
       </label>
 
       <div className="field">
-        <span>Tool Profile</span>
-        <div className="radio-row">
-          <label className="radio">
-            <input
-              type="radio"
-              name="toolProfile"
-              checked={toolProfile === 'safe'}
-              onChange={() => setToolProfile('safe')}
-            />
-            Safe
-          </label>
-          <label className="radio">
-            <input
-              type="radio"
-              name="toolProfile"
-              checked={toolProfile === 'coding'}
-              onChange={() => setToolProfile('coding')}
-            />
-            Coding
-          </label>
-        </div>
+        <span>Capabilities（只读）</span>
+        {capabilities ? (
+          <ul className="capability-list">
+            {CAPABILITY_SECTIONS.map((section) => (
+              <li key={section.key}>
+                <strong>{section.label}</strong>
+                <ul>
+                  {capabilities[section.key].length === 0 && <li className="muted">(none)</li>}
+                  {capabilities[section.key].map((binding) => (
+                    <li key={`${binding.providerId}#${binding.selector ?? ''}`}>
+                      <code>{binding.providerId}</code>
+                      {binding.selector ? <span> · {binding.selector}</span> : null}
+                    </li>
+                  ))}
+                </ul>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="sidebar-hint">读取中…</p>
+        )}
         <p className="sidebar-hint">
-          Coding 会开放 bash / edit / grep / web_fetch —— 没有 sandbox 时能触达宿主机边界。
+          能力组成决定这个 Member 能用哪些 skill 来源、知识源和工具。它由模板或运维配置，
+          不在这个表单里修改；上面存的是 Provider ID，所以换掉后端实现时这里不变。
         </p>
       </div>
 

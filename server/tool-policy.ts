@@ -1,5 +1,4 @@
-import { BuiltInTools, ToolSet } from '@github/copilot-sdk';
-import type { ToolProfile } from './domain.js';
+import type { RuntimeTool, ToolDecision, ToolExecutionContext } from './capabilities/types.js';
 
 /**
  * 工具授权层。
@@ -10,152 +9,94 @@ import type { ToolProfile } from './domain.js';
  *   2. 每一次工具调用**放不放行**（hooks.onPreToolUse）—— 「它这次能不能用」
  *
  * 只做第 1 步不够。`skipPermission: true` 的含义是「这个 app-owned 工具不必弹
- * 权限提示」，也就是**无条件执行**；它是省一次交互，不是一次授权。
- * `toolProfile` 同理：那是成员自己声明想要什么能力，不是「允许它做任何事」。
- * 所以真正的判据必须在每次调用时重新算一遍，而不是在装配 session 时算完就完。
+ * 权限提示」，也就是**无条件执行**；它是省一次交互，不是一次授权。所以真正的
+ * 判据必须在每次调用时重新算一遍，而不是在装配 session 时算完就完。
  *
- * 工具的**性质**差别极大，这是这一层存在的理由：
+ * ── 这一层不再认识任何工具名 ──────────────────────────────────────────
  *
- *   remember_member   只往自己的记忆文件里追加一行
- *   message_member    给另一个 Member 发一条消息
- *   bash              在宿主机上执行任意命令
+ * 判据只有三个，全部来自 RuntimeTool 的声明：
  *
- * 把它们统一当成「成员自己说要用」的能力，等于把宿主机交给了一个
- * 由对话内容驱动的东西。
+ *   requiresHostAccess  + 部署开关   —— 会触达宿主机的工具要部署层放行
+ *   risk === 'privileged'            —— 高风险动作必须走独立决策，这里一律拒绝
+ *   authorize()                      —— Provider 自己的逐次判定（路径白名单等）
  *
- * ── 判定顺序 ────────────────────────────────────────────────────────
+ * `if (toolName === 'bash')` 这种写法之所以必须消失：它让「新增一个工具」变成
+ * 「改授权层」——于是第三方 / 新 Provider 提供的工具永远无法真正插件化，而且
+ * 每加一个工具都要重新审一遍这个文件。现在新增工具只需要在 Provider 里声明
+ * 它的 risk，授权层不动。
  *
- *   app-owned custom tool  → 允许（它们的副作用由各自的业务校验兜住）
- *   SDK isolated built-in  → 允许（SDK 契约保证只在 session 边界内活动）
- *   宿主工具               → 需要 coding profile **且**宿主工具已显式启用
- *   其它一切               → 拒绝
+ * 声明与放行的关系也随之变了：以前是「一份白名单同时喂两边」，现在是
+ * 「可用集合 = 解析出来的工具集合」，声明与放行天然同源 —— 引擎看得见的东西
+ * 就是解析器交出去的东西。
  *
- * 最后一条是默认拒绝。引擎新增一个工具、或某个 skill 让模型想调一个我们没
- * 显式承认过的名字时，必须在授权层被拦下，而不是默默执行。
+ * ── 默认拒绝 ─────────────────────────────────────────────────────────
+ *
+ * 走到 `check()` 的每个工具都已经在 `RuntimeCapabilities.toolIndex` 里（未注册
+ * 的直接在适配器里被拒）。所以这里的「默认」是把**未被任何 Provider 声明过的
+ * 名字**挡在外面：引擎新增一个 built-in、或某份 skill 让模型想调一个我们没承认
+ * 过的名字时，必须在授权层被拦下，而不是默默执行。
  */
-
-/** 应用自己注册的 custom tool。声明与放行共用这一份清单。 */
-export const CUSTOM_TOOLS = [
-  'ask_member',
-  'message_member',
-  'remember_member',
-  'search_team_knowledge',
-  'search_personal_knowledge',
-  'open_knowledge_document',
-] as const;
-
-/**
- * 会触达宿主机的 built-in。
- *
- * 它们的工作目录是 conversation workspace，但 runtime 仍然是宿主机上的进程 ——
- * 没有沙箱时 `bash` 能走到 workspace 之外。所以这一组不是「能力」，是**部署前提**。
- */
-export const HOST_TOOLS = ['bash', 'edit', 'grep', 'web_fetch'] as const;
-
-const ISOLATED_BUILTINS = new Set<string>(BuiltInTools.Isolated);
-const CUSTOM_TOOL_SET = new Set<string>(CUSTOM_TOOLS);
-const HOST_TOOL_SET = new Set<string>(HOST_TOOLS);
-
-export interface ToolCallRequest {
-  memberId: string;
-  toolProfile: ToolProfile;
-  executionId: string;
-  conversationId: string;
-  /** 引擎报上来的工具名。 */
-  toolName: string;
-  /** 引擎报上来的原始参数，供更细的策略（路径白名单等）使用。 */
-  toolArgs: unknown;
-}
-
-export interface ToolDecision {
-  allowed: boolean;
-  /** 允许或拒绝的理由。拒绝时必须写清楚「为什么」，它会出现在日志里。 */
-  reason: string;
+export interface ToolPolicyOptions {
+  /**
+   * 是否允许会触达宿主机的工具落地。
+   *
+   * 由部署决定，而不是由 Member 的能力声明决定：一个 Member 绑定了
+   * `runtime.host-coding-tools` 只代表「它想要」，不该等于它获得了宿主机的执行权。
+   */
+  allowHostTools: boolean;
 }
 
 export interface ToolPolicy {
-  /** 向引擎声明这个 profile 下可用的工具。 */
-  availableTools(profile: ToolProfile): ToolSet;
-  /** 每一次工具调用的授权判定。 */
-  check(request: ToolCallRequest): ToolDecision;
-  /**
-   * 成员声明了 coding，但宿主工具没有启用 —— 调用方据此在日志 / 健康检查里
-   * 说明「它要的能力没给」。不这样做的话，界面上写着 coding，实际跑起来
-   * 一个 bash 都没有，只能靠翻日志猜。
-   */
-  hostToolsWithheld(profile: ToolProfile): boolean;
-}
+  check(
+    tool: RuntimeTool,
+    context: ToolExecutionContext,
+    args: Record<string, unknown>,
+  ): Promise<ToolDecision> | ToolDecision;
 
-export interface ToolPolicyOptions {
   /**
-   * 是否允许宿主机工具落地。
+   * 这个已解析出来的工具是不是「声明了却被部署收走」。
    *
-   * 由部署决定，而不是由 Member 的配置决定：一个成员把 toolProfile 改成 coding，
-   * 不该等于它获得了宿主机的执行权。
+   * 放在 policy 上而不是让调用方自己拼 `requiresHostAccess && !allowHostTools`：
+   * 那两处一旦分开写就会漂移，而漂移的表现是「日志说没给、实际给了」。
    */
-  allowHostTools: boolean;
+  hostToolWithheld(tool: RuntimeTool): boolean;
 }
 
 export class DefaultToolPolicy implements ToolPolicy {
   constructor(private readonly options: ToolPolicyOptions) {}
 
-  availableTools(profile: ToolProfile): ToolSet {
-    const tools = new ToolSet().addBuiltIn(BuiltInTools.Isolated);
-
-    for (const name of CUSTOM_TOOLS) tools.addCustom(name);
-
-    if (!this.hostToolsAllowed(profile)) return tools;
-
-    for (const name of HOST_TOOLS) tools.addBuiltIn(name);
-    return tools;
-  }
-
-  check(request: ToolCallRequest): ToolDecision {
-    if (CUSTOM_TOOL_SET.has(request.toolName)) {
-      return allow('app-owned tool');
+  async check(
+    tool: RuntimeTool,
+    context: ToolExecutionContext,
+    args: Record<string, unknown>,
+  ): Promise<ToolDecision> {
+    if (tool.requiresHostAccess && !this.options.allowHostTools) {
+      return deny(
+        `${tool.name} 会触达宿主机，而宿主工具当前未启用（HOST_CODING_TOOLS != true）`,
+      );
     }
 
-    if (ISOLATED_BUILTINS.has(request.toolName)) {
-      // SDK 契约：这一组只在 session 边界内活动，不会泄漏宿主能力。
-      return allow('isolated built-in');
+    if (tool.risk === 'privileged') {
+      return deny('privileged Tool 必须经过独立 Policy 决策，授权层不直接放行');
     }
 
-    if (HOST_TOOL_SET.has(request.toolName)) {
-      if (request.toolProfile !== 'coding') {
-        return deny(
-          `${request.toolName} 只对 coding profile 开放，当前 profile 是 ${request.toolProfile}`,
-        );
-      }
-      if (!this.options.allowHostTools) {
-        return deny(
-          `${request.toolName} 会触达宿主机，而宿主工具当前未启用（HOST_CODING_TOOLS != true）`,
-        );
-      }
-      return allow('host tool，profile 与部署均已放行');
+    if (tool.authorize) {
+      const decision = await tool.authorize(context, args);
+      if (!decision.allowed) return decision;
     }
 
-    return deny(`未为该工具定义策略（${request.toolName}），授权层默认拒绝`);
+    return { allowed: true, reason: `provider=${tool.providerId}, risk=${tool.risk}` };
   }
 
   /**
-   * 两道门都开才给：成员自己声明 coding，且部署显式启用宿主工具。
+   * 某个已解析出来的宿主工具，是不是「声明了却被部署收走」。
    *
-   * 这两个判断是 `availableTools` 与 `check` 的**同一个**判据 —— 分开写两份
-   * 就会出现「声明了却调不动」或者反过来的漂移。
+   * 调用方据此在日志里说明「它要的能力没给」。不说出来的话，成员配置上写着
+   * 有宿主工具、实际跑起来一个都没有，只能靠翻执行日志猜。
    */
-  private hostToolsAllowed(profile: ToolProfile): boolean {
-    return profile === 'coding' && this.options.allowHostTools;
+  hostToolWithheld(tool: RuntimeTool): boolean {
+    return tool.requiresHostAccess === true && !this.options.allowHostTools;
   }
-
-  hostToolsWithheld(profile: ToolProfile): boolean {
-    // 只描述「声明了 coding 但没给到」这一种落差；safe profile 本来就不该有，
-    // 那不是被收走，是从来没打算给。
-    return profile === 'coding' && !this.options.allowHostTools;
-  }
-}
-
-function allow(reason: string): ToolDecision {
-  return { allowed: true, reason };
 }
 
 function deny(reason: string): ToolDecision {

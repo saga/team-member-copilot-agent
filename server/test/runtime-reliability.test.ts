@@ -27,12 +27,11 @@ process.env.COPILOT_WARMUP = 'false';
 const { config } = await import('../config.js');
 const { db } = await import('../db.js');
 const { MemberService } = await import('../member-service.js');
-const { KnowledgeService } = await import('../knowledge-service.js');
 const { TeamService } = await import('../team-service.js');
 const { ContextAssembler } = await import('../context-assembler.js');
 const { RecoveryService } = await import('../recovery-service.js');
 const { ConversationMemberService } = await import('../conversation-member-service.js');
-const { singleExecutionId, muteAllMembers } = await import('./support.js');
+const { singleExecutionId, muteAllMembers, createTestStack } = await import('./support.js');
 const { migrate, getUserVersion, SCHEMA_VERSION } = await import(
   '../db-migrations.js'
 );
@@ -484,8 +483,7 @@ describe('schema 就位（PRAGMA user_version）', () => {
 
 const stub = new StubCopilot();
 const memberService = new MemberService(db);
-const knowledgeService = new KnowledgeService(db);
-const team = new TeamService(db, memberService, stub as unknown as CopilotService, knowledgeService);
+const { team } = createTestStack(db, memberService, stub as unknown as CopilotService);
 
 const alice = team.createMember({ name: 'Alice', role: 'Analyst' });
 const bob = team.createMember({ name: 'Bob', role: 'Reviewer' });

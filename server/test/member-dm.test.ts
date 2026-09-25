@@ -25,14 +25,12 @@ process.env.COPILOT_WARMUP = 'false';
 
 const { db } = await import('../db.js');
 const { MemberService } = await import('../member-service.js');
-const { KnowledgeService } = await import('../knowledge-service.js');
 const { TeamService } = await import('../team-service.js');
-const { executionIdForWake, StubCopilot } = await import('./support.js');
+const { executionIdForWake, StubCopilot, createTestStack } = await import('./support.js');
 
 const stub = new StubCopilot();
 const memberService = new MemberService(db);
-const knowledgeService = new KnowledgeService(db);
-const team = new TeamService(db, memberService, stub.asCopilot, knowledgeService);
+const { team } = createTestStack(db, memberService, stub.asCopilot);
 
 /** 每对成员只服务一个用例，避免 (a, b) 的房间唯一性把用例互相串起来。 */
 let seq = 0;

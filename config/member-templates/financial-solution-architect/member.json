@@ -6,9 +6,22 @@
   "description": "负责金融服务领域的端到端解决方案设计、架构评审、技术选型、系统边界定义，以及 AI Agent、数据、集成、安全、运营和治理方面的架构分析。",
   "style": "结构化、务实、证据优先、主动挑战假设、避免过度设计。优先给出可以落地的架构和修改步骤。",
   "model": null,
-  "toolProfile": "safe",
   "systemPromptFile": "SYSTEM_PROMPT.md",
   "memoryFile": "MEMORY.md",
-  "teamKnowledgeBaseKeys": ["financial-core", "architecture-standards"],
+  "capabilities": {
+    "skills": [
+      { "providerId": "team.filesystem-skills" },
+      { "providerId": "member.filesystem-skills" }
+    ],
+    "knowledge": [
+      { "providerId": "local.filesystem-knowledge", "selector": "financial-core" },
+      { "providerId": "local.filesystem-knowledge", "selector": "architecture-standards" },
+      { "providerId": "local.filesystem-knowledge", "selector": "$personal" }
+    ],
+    "tools": [
+      { "providerId": "team.core-tools" },
+      { "providerId": "knowledge.tools" }
+    ]
+  },
   "enabled": true
 }

@@ -20,7 +20,10 @@ import {
   type UpdateMemberInput,
 } from './member-service.js';
 import type { CopilotService } from './copilot.js';
-import type { KnowledgeService } from './knowledge-service.js';
+import { defaultMemberCapabilities } from './capabilities/defaults.js';
+import type { CapabilityResolver } from './capabilities/resolver.js';
+import type { CapabilityService } from './capabilities/service.js';
+import type { ResolvedKnowledgeBinding, RuntimeCapabilities } from './capabilities/types.js';
 import type {
   Conversation,
   ConversationEvent,
@@ -34,10 +37,10 @@ import type {
   ExecutionRecord,
   ExecutionStatus,
   Member,
+  MemberCapabilities,
   MemberRuntime,
   PendingWake,
   StoredConversationEvent,
-  ToolProfile,
   TurnMode,
   WakeReason,
 } from './domain.js';
@@ -123,6 +126,12 @@ interface RuntimeRow {
   last_used_at: string | null;
 }
 
+/**
+ * 这里的 member 行类型是**刻意重复声明**的，不复用 member-service 的那一份：
+ * 两份查询取的不是同一组数据（这里只取构成 Conversation.members 需要的列），
+ * 共用一个类型等于让「列表页要显示的字段」和「会话里要显示的字段」互相牵制。
+ * 代价是给 member 加列时两处都要看一眼。
+ */
 interface MemberRow {
   id: string;
   handle: string;
@@ -132,7 +141,6 @@ interface MemberRow {
   style: string;
   system_prompt: string;
   model: string | null;
-  tool_profile: ToolProfile;
   status: 'active' | 'archived';
   seed_key: string | null;
   created_at: string;
@@ -300,7 +308,16 @@ export class TeamService {
     private readonly db: DatabaseSync,
     private readonly members: MemberService,
     private readonly copilot: CopilotService,
-    private readonly knowledge: KnowledgeService,
+    /** Member 的能力组成的读写。 */
+    private readonly capabilities: CapabilityService,
+    /**
+     * 能力引用 → 这一轮实际生效的能力。
+     *
+     * 它是执行路径上唯一的解析入口。这里不保留任何「直接去读 config.teamSkillRoot
+     * / 直接调某个 Knowledge 实现」的旁路 —— 有了旁路，`capabilityManifestHash`
+     * 就不再反映这一轮真的用了什么。
+     */
+    private readonly capabilityResolver: CapabilityResolver,
   ) {
     this.contextAssembler = new ContextAssembler(db);
     this.states = new ConversationMemberService(db, (conversationId, change) => {
@@ -338,10 +355,30 @@ export class TeamService {
 
   createMember(input: CreateMemberInput): Member {
     const member = this.members.create(input);
-    // Personal KB 与 Member 同生：资料目录、检索 ACL、prompt 里的 KB 清单
-    // 都假设它存在。漏掉这步的症状是「新建的人搜不了自己的资料」。
-    this.knowledge.ensurePersonalKnowledgeBase(member.id, member.name);
+    // 手工建出来的人也要有一组能跑起来的默认能力：skill 来源、个人资料库、
+    // 协作与检索工具。缺了它的症状是「新同事像是不会用工具」。
+    this.capabilities.replace(member.id, defaultMemberCapabilities());
     return member;
+  }
+
+  // --------------------------------------------------------------- 能力
+
+  getMemberCapabilities(memberId: string): MemberCapabilities {
+    this.members.get(memberId);
+    return this.capabilities.get(memberId);
+  }
+
+  /**
+   * 全量替换某个 Member 的能力组成。
+   *
+   * 先校验再落库：一个拼错的 Provider ID 必须在这里就失败，而不是等到下一轮
+   * turn 才发现「这个 Member 少了检索能力」—— 那时错误会表现为一个奇怪的回答，
+   * 而不是一条错误。
+   */
+  updateMemberCapabilities(memberId: string, capabilities: MemberCapabilities): MemberCapabilities {
+    this.members.get(memberId);
+    this.capabilityResolver.validate(capabilities);
+    return this.capabilities.replace(memberId, capabilities);
   }
 
   updateMember(id: string, input: UpdateMemberInput): Member {
@@ -1633,10 +1670,18 @@ export class TeamService {
     let partial: string | null = null;
 
     try {
-      const systemPrompt = this.buildMemberSystemPrompt(input.conversation, input.member);
-      // 快照写在这里而不是建 execution 时：system prompt 是到这里才拼出来的，
-      // 而 systemPromptHash 是快照的核心。
-      this.recordConfigSnapshot(executionId, input.member, systemPrompt);
+      // 能力解析必须在拼 system prompt 之前：prompt 里的资料源清单就是解析结果
+      // （Provider 说这个 Member 能看哪些源），两者共用一次解析，模型被明确告知
+      // 的源与它实际搜得到的源因此永远一致。
+      const runtimeCapabilities = await this.resolveCapabilities(input.member, executionId, input.conversation.id);
+      const systemPrompt = this.buildMemberSystemPrompt(
+        input.conversation,
+        input.member,
+        runtimeCapabilities.knowledge,
+      );
+      // 快照写在这里而不是建 execution 时：system prompt 与能力组成都是到这里
+      // 才定下来的，而它们的指纹就是快照的核心。
+      this.recordConfigSnapshot(executionId, input.member, systemPrompt, runtimeCapabilities.manifestHash);
 
       const result = await this.copilot.runMemberTurn({
         runtime,
@@ -1646,6 +1691,7 @@ export class TeamService {
         sourceMemberId: input.sourceMemberId,
         executionId,
         conversationId: input.conversation.id,
+        capabilities: runtimeCapabilities,
         onDelta: (delta) => {
           streamed += delta;
           this.emit(input.conversation.id, {
@@ -1804,12 +1850,28 @@ export class TeamService {
   }
 
   /**
-   * Member 的**稳定身份**。房间上下文（参与者、未读消息、要不要发言）不在这里，
-   * 而是每轮由 ContextAssembler 动态拼进 user prompt。
+   * 把 Member 的能力引用解析成这一轮真正生效的能力。
    *
-   * 分开的理由：身份要跨 conversation 稳定，把房间历史写进 persona 会让同一个
-   * Member 在不同房间里表现出不同「人格」。
+   * 执行路径上**唯一**的解析入口。任何地方重新去读 `config.teamSkillRoot`、或
+   * 直接调某个 Knowledge 实现，都会让 `manifestHash` 不再描述这一轮的真实组成 ——
+   * 而那正是事后回答「这轮到底用了哪个能力实现」的唯一依据。
    */
+  private async resolveCapabilities(
+    member: Member,
+    executionId: string,
+    conversationId: string,
+  ): Promise<RuntimeCapabilities> {
+    return this.capabilityResolver.resolve(
+      {
+        memberId: member.id,
+        conversationId,
+        executionId,
+        userId: config.localUserId,
+      },
+      this.capabilities.get(member.id),
+    );
+  }
+
   /**
    * 记录这一轮开跑时的配置，供事后对账。
    *
@@ -1820,14 +1882,17 @@ export class TeamService {
    * 16000 字符（见 MemberService.readMemory）。两者刻意不同：快照回答的是
    * 「当时是哪一份记忆」，不是「当时塞进去了哪些字节」。
    */
-  private buildConfigSnapshot(member: Member, systemPrompt: string): ExecutionConfigSnapshot {
+  private buildConfigSnapshot(
+    member: Member,
+    systemPrompt: string,
+    capabilityManifestHash: string,
+  ): ExecutionConfigSnapshot {
     return {
       memberRevision: member.updatedAt,
       model: member.model ?? config.defaultModel,
-      toolProfile: member.toolProfile,
       systemPromptHash: hashText(systemPrompt),
       memoryHash: this.members.getMemory(member.id).version,
-      skillManifestHash: this.members.skillManifestHash(member.id),
+      capabilityManifestHash,
       hostToolsEnabled: config.allowHostCodingTools,
     };
   }
@@ -1843,10 +1908,11 @@ export class TeamService {
     executionId: string,
     member: Member,
     systemPrompt: string,
+    capabilityManifestHash: string,
   ): void {
     try {
       this.updateExecution(executionId, {
-        configSnapshot: this.buildConfigSnapshot(member, systemPrompt),
+        configSnapshot: this.buildConfigSnapshot(member, systemPrompt, capabilityManifestHash),
       });
     } catch (error) {
       // eslint-disable-next-line no-console
@@ -1857,7 +1923,23 @@ export class TeamService {
     }
   }
 
-  private buildMemberSystemPrompt(conversation: Conversation, member: Member): string {
+  /**
+   * Member 的**稳定身份**。房间上下文（参与者、未读消息、要不要发言）不在这里，
+   * 而是每轮由 ContextAssembler 动态拼进 user prompt。
+   *
+   * 分开的理由：身份要跨 conversation 稳定，把房间历史写进 persona 会让同一个
+   * Member 在不同房间里表现出不同「人格」。
+   *
+   * 知识源清单来自**解析结果**（Provider 说这个 Member 能看哪些源），不是另一次
+   * 独立查询：清单与检索范围出自同一个解析，所以模型被明确告知的源和它实际搜得到
+   * 的源永远一致。清单里只有「有哪些源、各管什么」，正文一律按需检索 ——
+   * 资料量一大，全量进 prompt 只会把它变成垃圾场。
+   */
+  private buildMemberSystemPrompt(
+    conversation: Conversation,
+    member: Member,
+    knowledge: ResolvedKnowledgeBinding[],
+  ): string {
     const otherMembers = conversation.members
       .filter((item) => item.id !== member.id)
       .map((item) => `- ${item.name} (@${item.handle}, ${item.role}, id=${item.id})`)
@@ -1865,14 +1947,16 @@ export class TeamService {
 
     const memory = this.members.readMemory(member.id);
 
-    // KB 只进「有哪些库、各管什么」，不进正文 —— 资料按需检索，否则文档量
-    // 一大就会把 prompt 变成垃圾场。清单与检索 ACL 出自同一个 listForMember()，
-    // 所以模型被明确告知的库和它实际搜得到的库永远一致。
-    const profile = this.knowledge.listForMember(member.id);
-    const describeBases = (bases: typeof profile.teamKnowledgeBases): string =>
-      bases.length
-        ? bases.map((kb) => `- ${kb.name} (${kb.key}): ${kb.description || '(no description)'}`).join('\n')
+    const describeSources = (scope: 'team' | 'personal'): string => {
+      const sources = knowledge
+        .flatMap((item) => item.sources)
+        .filter((source) => (scope === 'personal' ? source.scope === 'personal' : source.scope !== 'personal'));
+      return sources.length
+        ? sources
+            .map((source) => `- ${source.name} (${source.id}): ${source.description || '(no description)'}`)
+            .join('\n')
         : '(none)';
+    };
 
     return [
       `You are ${member.name}.`,
@@ -1909,10 +1993,10 @@ export class TeamService {
       'Knowledge Base policy:',
       '',
       'Team Knowledge Bases (enterprise standards, policies, definitions):',
-      describeBases(profile.teamKnowledgeBases),
+      describeSources('team'),
       '',
       'Personal Knowledge Base (your own specialist reference material):',
-      describeBases(profile.personalKnowledgeBases),
+      describeSources('personal'),
       '',
       'Rules:',
       '1. For company-specific claims, prefer Team Knowledge Base over generic model knowledge.',
@@ -1924,7 +2008,7 @@ export class TeamService {
       '7. If authoritative Team Knowledge is missing or contradictory, say so explicitly.',
       '',
       'Retrieval:',
-      'Use search_team_knowledge / search_personal_knowledge to find material;',
+      'Use search_knowledge to find material across the sources listed above;',
       'use open_knowledge_document when a snippet is not enough.',
       '',
       'Long-term memory:',
@@ -2275,7 +2359,6 @@ export class TeamService {
         style: member.style,
         systemPrompt: member.system_prompt,
         model: member.model,
-        toolProfile: member.tool_profile,
         status: member.status,
         seedKey: member.seed_key,
         createdAt: member.created_at,

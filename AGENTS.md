@@ -44,6 +44,7 @@
 | 生产构建 | `npm run build` → `dist/` + `dist-server/` |
 | 本地数据 | `.data/`（sqlite + member home + workspace + copilot session state） |
 | 默认团队 | `config/member-templates/<dir>/`（provisioning baseline） |
+| 能力层 | `server/capabilities/`：Member 只引用 Provider ID + selector，实现可换 |
 
 命令：
 
@@ -83,6 +84,15 @@ user_version 相等  → 什么都不做
 - Member 的身份判据是 `seed_key`，**不是** `handle` / `name` —— 后两个是用户随时会改的显示属性。
 - 业务内容（角色定义、system prompt、初始记忆）只放 `config/member-templates/`。
   `server/*.ts` 只负责「怎么加载 Member」，不负责「谁是 Architect」。
+- **能力引用只写 Provider ID**（`member_capability_binding`），不写实现。
+  「换 KB 后端」= 注册一个新 Provider（或替换同 ID 的实现），不是改调用方。
+- **`CopilotService` 不认识任何具体 Provider**。它只接受一份解析好的
+  `RuntimeCapabilities`；`TeamService` 里也不允许出现直接读 `config.teamSkillRoot`
+  或直接调某个 Knowledge 实现的路径 —— 有了旁路，`capabilityManifestHash`
+  就不再反映这一轮真的用了什么。
+- **工具授权不看工具名**。新工具只需要在 Provider 里声明 `risk` /
+  `requiresHostAccess`，`tool-policy.ts` 不动。出现 `if (toolName === '...')`
+  就是回退。
 
 ## 6. 代码纪律
 

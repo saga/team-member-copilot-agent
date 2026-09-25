@@ -1,8 +1,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
+import type { MemberCapabilities } from './domain.js';
 import type { MemberService } from './member-service.js';
-import type { KnowledgeService } from './knowledge-service.js';
+import type { CapabilityResolver } from './capabilities/resolver.js';
+import type { CapabilityService } from './capabilities/service.js';
 
 /**
  * Member template provisioning。
@@ -12,21 +14,34 @@ import type { KnowledgeService } from './knowledge-service.js';
  *
  *   磁盘上的这份模板，对应的 Member 是否已经存在？
  *
- * 具体是谁、写什么 system prompt、初始记忆是什么，全部在模板目录里。这样以后加一个
- * 「合规评审」或者改掉架构师的措辞都不需要动 TypeScript —— 而那正是把三个角色写进
- * `MemberService` 或 migration 里会立刻丢掉的性质。
+ * 具体是谁、写什么 system prompt、初始记忆是什么、引用哪些能力 Provider，全部在
+ * 模板目录里。这样以后加一个「合规评审」或者改掉架构师的措辞、给它换一个知识
+ * 后端，都不需要动 TypeScript —— 而那正是把三个角色写进 `MemberService` 或
+ * migration 里会立刻丢掉的性质。
  *
  * 边界要分清：
  *
  *   config/member-templates/   provisioning baseline（第一次出现时是什么样）
  *   SQLite member              当前真实配置
+ *   member_capability_binding  当前能力组成
  *   <member home>/memory/      当前长期记忆
- *   <member home>/skills/      当前能力
  *
  * 所以**已存在就跳过，且不覆盖**。模板改了一版也不会自动升级已经建好的 Member：
  * 那会把用户手工改过的人设静默换掉。「恢复成模板」是一个需要显式触发的独立功能，
  * 不是启动副作用。
+ *
+ * ── 为什么这里不再 import 任何 Knowledge 实现 ─────────────────────────
+ *
+ * 模板说的是「引用哪个 Provider + 哪个 selector」，不是「让 KnowledgeService
+ * 去 ensure 一个 personal KB、再按 key 查 id 绑上去」。后者会让模板事实上知道
+ * 「我们的后端是 SQLite + 文件系统」—— 换成 Snowflake 就要改 provisioning。
  */
+
+const capabilityBindingSchema = z.object({
+  providerId: z.string().min(1).max(200),
+  /** Provider 自己解释的选择子（knowledge 常用；skill / tool 通常不写）。 */
+  selector: z.string().max(300).optional(),
+});
 
 const memberTemplateSchema = z.object({
   /** provisioning identity。唯一、稳定、不由用户修改。 */
@@ -43,19 +58,21 @@ const memberTemplateSchema = z.object({
    * 逐模板的文件修改。
    */
   model: z.string().max(100).nullable().default(null),
-  toolProfile: z.enum(['safe', 'coding']).default('safe'),
   systemPromptFile: z.string().min(1).default('SYSTEM_PROMPT.md'),
   memoryFile: z.string().min(1).default('MEMORY.md'),
   /**
-   * 创建时绑定的 team KB key。只在 Member 第一次出现时生效一次：绑定的前提是
-   * KB 行已经存在（磁盘扫描或 API 先建），缺的 key 静默跳过 —— 资料没就位不该
-   * 拦住 Member 落地，但也不能反过来「按模板把用户解绑的 KB 重新绑回去」，
-   * 所以这只发生在创建那一刻，之后绑定完全归 API 管。
+   * 能力组成。刻意**不设默认值**：一份模板必须自己说清楚它引用哪些 Provider。
+   * 有默认值的话，「新角色忘了写 tools」会静默拿到一组它并不需要的工具，而
+   * 这种错误在运行期表现为「模型偶尔调了一个奇怪的东西」。
+   *
+   * 三类的 providerId 在 seeding 时对注册表校验：写错一个就启动失败，而不是
+   * 等到第一个 turn 才发现「这个 Member 少了检索能力」。
    */
-  teamKnowledgeBaseKeys: z
-    .array(z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/))
-    .max(50)
-    .default([]),
+  capabilities: z.object({
+    skills: z.array(capabilityBindingSchema).max(50),
+    knowledge: z.array(capabilityBindingSchema).max(50),
+    tools: z.array(capabilityBindingSchema).max(50),
+  }),
   /** 关掉一个模板不会删掉已建出来的 Member，只是不再 provision 它。 */
   enabled: z.boolean().default(true),
 });
@@ -93,11 +110,10 @@ function readTemplateFile(root: string, relativePath: string): string {
   return fs.readFileSync(resolved, 'utf8');
 }
 
-function loadTemplate(root: string, directory: string): {
-  template: MemberTemplate;
-  systemPrompt: string;
-  memory: string;
-} {
+function loadTemplate(
+  root: string,
+  directory: string,
+): { template: MemberTemplate; systemPrompt: string; memory: string } {
   const templateRoot = path.join(root, directory);
   const manifestPath = path.join(templateRoot, 'member.json');
 
@@ -138,11 +154,15 @@ function loadTemplate(root: string, directory: string): {
  * 配置错误**直接抛**，不静默跳过：模板目录里出现一个坏掉的目录，正确行为是让人
  * 在启动日志里立刻看到它，而不是「默认团队少了两个人但服务照常起来了」。
  * 目录本身不存在是另一回事 —— 那说明这份部署不需要模板，返回空即可。
+ *
+ * 校验顺序是「先验能力、再建人、最后写绑定」：反过来的话，一个拼错的 providerId
+ * 会在库里留下一个没有能力的 Member（而它看起来是个正常人）。
  */
 export function seedMemberTemplates(
   memberService: MemberService,
   rootDirectory: string,
-  knowledge?: KnowledgeService,
+  capabilities: CapabilityService,
+  resolver: CapabilityResolver,
 ): SeedResult {
   if (!fs.existsSync(rootDirectory)) {
     return { created: [], skipped: [] };
@@ -177,6 +197,9 @@ export function seedMemberTemplates(
       continue;
     }
 
+    const templateCapabilities: MemberCapabilities = template.capabilities;
+    resolver.validate(templateCapabilities);
+
     const member = memberService.create(
       {
         name: template.name,
@@ -186,22 +209,11 @@ export function seedMemberTemplates(
         style: template.style,
         systemPrompt,
         model: template.model ?? undefined,
-        toolProfile: template.toolProfile,
       },
       { seedKey: template.key, initialMemory: memory },
     );
 
-    if (knowledge) {
-      knowledge.ensurePersonalKnowledgeBase(member.id, member.name);
-
-      const kbIds = template.teamKnowledgeBaseKeys
-        .map((key) => knowledge.findByKey('team', key))
-        .filter((kb): kb is NonNullable<typeof kb> => kb !== null)
-        .map((kb) => kb.id);
-      if (kbIds.length > 0) {
-        knowledge.setTeamKnowledgeBases(member.id, kbIds);
-      }
-    }
+    capabilities.replace(member.id, templateCapabilities);
 
     created.push(template.key);
   }

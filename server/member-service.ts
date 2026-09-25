@@ -6,7 +6,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import { config } from './config.js';
 import { hashText } from './content-hash.js';
 import { now } from './db.js';
-import type { Member, ToolProfile } from './domain.js';
+import type { Member } from './domain.js';
 
 interface MemberRow {
   id: string;
@@ -17,7 +17,6 @@ interface MemberRow {
   style: string;
   system_prompt: string;
   model: string | null;
-  tool_profile: ToolProfile;
   status: 'active' | 'archived';
   seed_key: string | null;
   created_at: string;
@@ -32,7 +31,6 @@ export interface CreateMemberInput {
   style?: string;
   systemPrompt?: string;
   model?: string;
-  toolProfile?: ToolProfile;
 }
 
 /**
@@ -55,7 +53,6 @@ export interface UpdateMemberInput {
   style?: string;
   systemPrompt?: string;
   model?: string | null;
-  toolProfile?: ToolProfile;
   status?: 'active' | 'archived';
 }
 
@@ -69,7 +66,6 @@ function mapRow(row: MemberRow): Member {
     style: row.style,
     systemPrompt: row.system_prompt,
     model: row.model,
-    toolProfile: row.tool_profile,
     status: row.status,
     seedKey: row.seed_key,
     createdAt: row.created_at,
@@ -274,13 +270,12 @@ export class MemberService {
           style,
           system_prompt,
           model,
-          tool_profile,
           status,
           seed_key,
           created_at,
           updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
         `,
       )
       .run(
@@ -292,7 +287,6 @@ export class MemberService {
         input.style?.trim() ?? '',
         input.systemPrompt?.trim() ?? '',
         input.model?.trim() || null,
-        input.toolProfile ?? 'safe',
         options.seedKey ?? null,
         createdAt,
         createdAt,
@@ -321,7 +315,6 @@ export class MemberService {
       style: input.style ?? current.style,
       systemPrompt: input.systemPrompt ?? current.systemPrompt,
       model: input.model === undefined ? current.model : input.model?.trim() || null,
-      toolProfile: input.toolProfile ?? current.toolProfile,
       status: input.status ?? current.status,
       updatedAt: now(),
     };
@@ -338,7 +331,6 @@ export class MemberService {
           style = ?,
           system_prompt = ?,
           model = ?,
-          tool_profile = ?,
           status = ?,
           updated_at = ?
         WHERE id = ?
@@ -352,7 +344,6 @@ export class MemberService {
         next.style,
         next.systemPrompt,
         next.model,
-        next.toolProfile,
         next.status,
         next.updatedAt,
         id,
@@ -571,20 +562,6 @@ export class MemberService {
       throw Object.assign(new Error(`Skill 不存在：${safe}`), { status: 404 });
     }
     fs.rmSync(dir, { recursive: true, force: true });
-  }
-
-  /**
-   * 已安装 skill 清单的指纹（名字 + 各自 SKILL.md 的 mtime）。
-   *
-   * 只用来判断「和上一轮相比，能力集合变了吗」—— 所以名字与 mtime 就够了，
-   * 不需要把每个 skill 的内容都读出来 hash 一遍。
-   */
-  skillManifestHash(memberId: string): string {
-    return hashText(
-      this.listSkills(memberId)
-        .map((skill) => `${skill.name}@${skill.updatedAt}`)
-        .join('\n'),
-    );
   }
 
   private describeSkill(memberId: string, name: string): MemberSkill {

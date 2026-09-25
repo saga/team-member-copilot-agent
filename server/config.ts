@@ -22,15 +22,16 @@ export const config = {
   dbPath: path.join(dataDir, 'team-member.db'),
   memberHomeRoot: path.join(dataDir, 'members'),
   /**
-   * 团队统一 Skill 目录。Copilot session 会同时加载它和 Member 的个人 skills
-   * 目录（SDK 支持多个 skillDirectories）。放「所有 Member 都该会的程序化
-   * 方法论」，每个 Member 的专长留在各自的 <memberHome>/<id>/skills/ 里。
+   * 团队统一 Skill 目录。它是 `team.filesystem-skills` 这个 Provider 的根目录，
+   * 绑定它的 Member 都会加载这些 skill。每个 Member 的专长留在各自的
+   * <memberHome>/<id>/skills/（`member.filesystem-skills`）。
    */
   teamSkillRoot: path.join(dataDir, 'team', 'skills'),
   /**
    * 团队 KB 的资料根目录：<teamKnowledgeRoot>/<kbKey>/...。
-   * 启动时会扫描子目录，目录即 KB（key = 目录名），文件落盘即可被检索；
-   * API 写入的文档也落在同一棵树上。Member 个人 KB 在 <memberHomeRoot>/<id>/knowledge/。
+   * 它是 `local.filesystem-knowledge` 这个 Provider 的存储：启动时会扫描子目录，
+   * 目录即 KB（key = 目录名），文件落盘即可被检索；API 写入的文档也落在同一棵树上。
+   * Member 个人 KB 在 <memberHomeRoot>/<id>/knowledge/。
    */
   teamKnowledgeRoot: path.join(dataDir, 'team', 'knowledge'),
   workspaceRoot: path.join(dataDir, 'workspaces'),
@@ -76,10 +77,10 @@ export const config = {
   /**
    * 是否允许 Member 使用会触达宿主机的 built-in（bash / edit / grep / web_fetch）。
    *
-   * 默认关闭，且**不随 toolProfile 打开**：成员把自己标成 coding 只是声明想要
-   * 什么，不该等于拿到了宿主机的执行权。打开它等于承认「当前 runtime 是可信的
-   * 单租户环境」；多租户必须等沙箱运行时（K8s / Kata / Firecracker）就位后，
-   * 由运行时策略而不是这个开关来给工具。
+   * 默认关闭，且**不随能力绑定打开**：给 Member 绑定 `runtime.host-coding-tools`
+   * 只是声明想要什么，拿到这个 Provider 不等于拿到了宿主机的执行权。打开它等于
+   * 承认「当前 runtime 是可信的单租户环境」；多租户必须等沙箱运行时（K8s / Kata /
+   * Firecracker）就位后，由运行时策略而不是这个开关来给工具。
    */
   allowHostCodingTools: env('HOST_CODING_TOOLS', 'false') === 'true',
   /**

@@ -504,7 +504,6 @@ export function TeamChat() {
       role: input.role,
       description: '',
       style: 'clear and concise',
-      toolProfile: 'safe',
     });
     setMembers((current) => [...current, result.member]);
     setShowNewMember(false);

@@ -35,7 +35,6 @@ export interface Member {
   style: string;
   systemPrompt: string;
   model: string | null;
-  toolProfile: 'safe' | 'coding';
   status: 'active' | 'archived';
   /**
    * 非空表示这个 Member 由 `config/member-templates` 里的某份模板 provision。
@@ -45,6 +44,24 @@ export interface Member {
    * 服务端也刻意不允许通过 create / update 设置它。
    */
   seedKey: string | null;
+}
+
+/**
+ * Member 对某个能力 Provider 的一次引用。
+ *
+ * 存的是 Provider ID（稳定契约）+ selector，不是实现 —— 所以换掉本地资料库的
+ * 实现时这里不变。`selector` 的含义由 Provider 定义（knowledge 用 KB key 或
+ * `$personal`；skill / tool 通常为空）。
+ */
+export interface CapabilityBinding {
+  providerId: string;
+  selector?: string;
+}
+
+export interface MemberCapabilities {
+  skills: CapabilityBinding[];
+  knowledge: CapabilityBinding[];
+  tools: CapabilityBinding[];
 }
 
 export interface Conversation {
@@ -116,10 +133,10 @@ export type ExecutionStatus =
 export interface ExecutionConfigSnapshot {
   memberRevision: string;
   model: string;
-  toolProfile: 'safe' | 'coding';
   systemPromptHash: string;
   memoryHash: string;
-  skillManifestHash: string;
+  /** 这一轮实际生效的能力组成（Provider ID + 版本 + 工具集）的 sha256。 */
+  capabilityManifestHash: string;
   hostToolsEnabled: boolean;
 }
 
@@ -276,7 +293,6 @@ export const api = {
     style?: string;
     systemPrompt?: string;
     model?: string;
-    toolProfile?: 'safe' | 'coding';
   }): Promise<{ member: Member }> {
     return fetch(`${API_BASE}/api/members`, {
       method: 'POST',
@@ -299,7 +315,6 @@ export const api = {
       style?: string;
       systemPrompt?: string;
       model?: string | null;
-      toolProfile?: 'safe' | 'coding';
       status?: 'active' | 'archived';
     },
   ): Promise<{ member: Member }> {
@@ -308,6 +323,30 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(input),
     }).then(json<{ member: Member }>);
+  },
+
+  /**
+   * Member 的能力组成。
+   *
+   * 和 `/api/members/:id/skills` 是两件事：那个回答「磁盘上装了哪些 skill」
+   * （内容投放），这个回答「启用了哪些能力来源」。界面上必须分开显示 ——
+   * 否则会出现「装了一个 skill 却不知道谁在用它」。
+   */
+  getMemberCapabilities(id: string): Promise<{ capabilities: MemberCapabilities }> {
+    return fetch(`${API_BASE}/api/capabilities/members/${encodeURIComponent(id)}`).then(
+      json<{ capabilities: MemberCapabilities }>,
+    );
+  },
+
+  updateMemberCapabilities(
+    id: string,
+    input: MemberCapabilities,
+  ): Promise<{ capabilities: MemberCapabilities }> {
+    return fetch(`${API_BASE}/api/capabilities/members/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    }).then(json<{ capabilities: MemberCapabilities }>);
   },
 
   /**

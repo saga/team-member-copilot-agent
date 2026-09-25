@@ -15,17 +15,45 @@ User
         ├── Coder Member ─────── Runtime ── Copilot Session
         └── Reviewer Member ──── Runtime ── Copilot Session
                                         │
-        ├── Skills
-        ├── Memory
-        ├── Workspace
-        └── ask_member
+                    ┌───────────────────┴───────────────────┐
+                    │              Capabilities             │
+                    │  SkillProvider  KnowledgeProvider  ToolProvider
+                    └───────────────────────────────────────┘
 ```
+
+Member 的「能用什么」是一组**能力引用**，不是代码里的清单：
+
+```
+Member
+│
+├── Persona（name / role / style / system prompt / model）
+├── Memory（长期记忆，全文进 prompt）
+│
+└── Capabilities（member_capability_binding）
+    │
+    ├── Skill Providers
+    │   ├── team.filesystem-skills      团队共用的程序化方法论
+    │   └── member.filesystem-skills    这个 Member 自己的专长
+    │
+    ├── Knowledge Providers
+    │   └── local.filesystem-knowledge  本地文件系统 + FTS（selector = KB key / $personal）
+    │
+    └── Tool Providers
+        ├── team.core-tools             ask_member / message_member / remember_member
+        ├── knowledge.tools             search_knowledge / open_knowledge_document
+        └── runtime.host-coding-tools   bash / edit / grep / web_fetch（需部署放行）
+```
+
+Provider ID 是稳定契约，实现可以替换：把 `local.filesystem-knowledge` 换成企业搜索，
+Member 的 binding 一行都不用改。**CopilotService 不认识任何具体 Provider** ——
+它只接受一份解析好的 `RuntimeCapabilities`。
 
 ## Core model
 
 | 概念 | 含义 |
 |------|------|
-| **Member** | 业务上的长期 AI 同事。持久身份 + role + style + system prompt + model + skills + long-term memory。跨 conversation 稳定。 |
+| **Member** | 业务上的长期 AI 同事。持久身份 + role + style + system prompt + model + 能力组成 + long-term memory。跨 conversation 稳定。 |
+| **Capability** | Member 引用哪些 Skill / Knowledge / Tool Provider（`member_capability_binding`）。它是「能用什么」的唯一答案。 |
 | **Conversation** | 聊天/协作空间。`direct`（一个 Member）/ `group`（多个 Member）/ `work`（独立工作会话）。 |
 | **MemberRuntime** | 某 Member 在某 Conversation 中的运行实例。一个 runtime 拥有一个稳定的 Copilot Session 和一个独立 workspace。 |
 | **CopilotSession** | Runtime 的执行引擎状态。**内部实现细节，不是业务对象。** |
@@ -104,41 +132,58 @@ Member       = 应用层业务身份（跨 Conversation 稳定）
 
 服务端使用 Copilot SDK `mode: "empty"`，由应用显式控制：
 
-- tools（`ToolSet` allow-list：`BuiltInTools.Isolated` + 自定义工具）
+- tools（由能力解析结果推导：`ToolSet` = isolated built-ins + 各 Tool Provider 声明的工具）
 - workspace（`.data/workspaces/<conversation-id>/<member-id>/`）
-- skills（`.data/members/<member-id>/skills/`）
+- skills（`skillDirectories` = 各 Skill Provider 解析出来的目录）
 - Member 身份（`systemMessage` append）
 - delegation（`ask_member`）
 - memory（`.data/members/<member-id>/memory/MEMORY.md`）
 
-### 工具授权：声明与放行
+### 能力解析：一条单向链路
+
+```
+MemberCapabilities（binding 列表）
+        ↓  CapabilityResolver.resolve(context, capabilities)
+RuntimeCapabilities { skills, knowledge, tools, toolIndex, manifestHash }
+        ↓  CopilotCapabilityAdapter.build(...)
+Copilot SDK session 配置（tools / availableTools / onPreToolUse）
+```
+
+链路只有这一条：`TeamService.executeMemberTurn()` 里出现 `resolveCapabilities()` 之后，
+引擎拿到的就只有解析结果。任何地方重新去读 `config.teamSkillRoot`、或直接调某个
+Knowledge 实现，都会让 `manifestHash` 不再反映这一轮真的用了什么 —— 而那正是事后
+回答「这一轮到底用了哪个能力实现」的唯一依据。
+
+解析本身与引擎无关：换掉最后一层（Copilot → DeepAgents / OpenCode / Claude Agent SDK）
+只需要重写 `server/capabilities/copilot-adapter.ts`。
+
+### 工具授权：只看声明的性质，不看工具名
 
 「引擎看得见什么」和「这一次调用放不放行」是两件事，很容易各自漂移成两套判据 ——
 模型看得见一个它其实用不了的工具，或者更糟：看不见却在某条路径上被放行。
-两者都收敛到同一个 `ToolPolicy` 实例（`server/tool-policy.ts`）：
+两者都出自**同一份解析结果**（`RuntimeCapabilities`）：
 
 ```
-availableTools(profile)  →  ToolSet       声明给引擎（它有什么）
-hooks.onPreToolUse       →  allow | deny  每次调用重新判一遍（这次能不能用）
+availableTools                         声明给引擎（它有什么）
+hooks.onPreToolUse → ToolPolicy.check  每次调用重新判一遍（这次能不能用）
 ```
 
-`check()` 的判定顺序：
+`DefaultToolPolicy.check()` 的判据只有三个，全部来自 `RuntimeTool` 的声明：
 
-| 工具 | 判定 |
+| 判据 | 判定 |
 |------|------|
-| `ask_member` / `message_member` / `remember_member` | 放行 —— 副作用由各自的业务校验兜住 |
-| `BuiltInTools.Isolated` | 放行 —— SDK 契约保证只在 session 边界内活动 |
-| `bash` / `edit` / `grep` / `web_fetch` | `profile === 'coding'` **且** `HOST_CODING_TOOLS=true` 才放行 |
-| 其它一切 | 拒绝 |
+| `requiresHostAccess` 且 `HOST_CODING_TOOLS=false` | 拒绝 |
+| `risk === 'privileged'` | 拒绝（必须经过独立 Policy 决策） |
+| `authorize()` 返回拒绝 | 拒绝 |
+| 不在 `toolIndex` 里的任何名字 | 拒绝（默认拒绝） |
 
-最后一条是默认拒绝：引擎新增一个 built-in、或者某个 skill 让模型想调一个没承认过的名字时，
-必须在授权层被拦下。`skipPermission: true` 的含义只是「app-owned 工具不必弹权限提示」，
-它是省一次交互，不是一次授权；`toolProfile` 同理 —— 成员声明想要什么，不等于允许它做任何事。
+**没有 `if (toolName === 'bash')`。** 这是这一层最关键的性质：新增一个工具只需要在
+Provider 里声明它的 `risk` / `requiresHostAccess`，授权层不动。硬编码工具名的写法会让
+每加一个工具都要重新审一遍授权层，第三方 Provider 也就永远无法真正插件化。
 
-一轮 turn 用的是**开始那一刻**的 `toolProfile`（冻结在 `RuntimeExecutionContext` 里）：
-中途有人把 profile 从 `safe` 改成 `coding`，不该让正在跑的这一轮突然多出宿主工具。
-hook 认不出 `sessionId` 属于哪个 execution 时也拒绝而不是放行 —— 那说明这个 session
-不是本进程在跑的一轮 turn，既不知道是谁在用、也不知道属于哪个房间。
+`skipPermission: true` 的含义只是「app-owned 工具不必弹权限提示」，它是省一次交互，
+不是一次授权。一轮 turn 用的是**开始那一刻**解析出来的能力：中途有人改了 Member 的
+绑定，不该让正在跑的这一轮突然多出（或少掉）一个工具。
 
 放行时返回的是**明确的 `allow`**，不是空对象。空对象是「没有意见」，引擎会接着走它
 自己的权限流程，而这个服务里没有可以点「同意」的人 —— 那个请求会一直挂在 pending 上，
@@ -150,13 +195,14 @@ hook 认不出 `sessionId` 属于哪个 execution 时也拒绝而不是放行 �
 等一个不会来的答案是纯粹的损失。注意这**不是**默认放行 —— 一个装出来的放宽会让权限层
 变成比策略层更弱的一条旁路，那正是策略层想避免的事。
 
-| profile | 声明给引擎的工具 |
+| 能力绑定 | 声明给引擎的工具 |
 |---------|------------------|
-| `safe`（默认） | SDK isolated built-ins + `ask_member` + `message_member` + `remember_member` |
-| `coding` | 同上；且仅在 `HOST_CODING_TOOLS=true` 时再加 `bash` / `edit` / `grep` / `web_fetch` |
+| `team.core-tools` + `knowledge.tools` | SDK isolated built-ins + `ask_member` + `message_member` + `remember_member` + `search_knowledge` + `open_knowledge_document` |
+| 再加 `runtime.host-coding-tools` | 同上；且仅在 `HOST_CODING_TOOLS=true` 时再加 `bash` / `edit` / `grep` / `web_fetch` |
 
-> `coding` 在 `HOST_CODING_TOOLS=true` 且没有 sandbox 时，`bash` 可以触达宿主机边界，
-> 不要直接用于多租户生产环境。
+> 绑定 `runtime.host-coding-tools` 只是**声明想要**。没有 `HOST_CODING_TOOLS=true` 时，
+> 这些工具既不声明给引擎也不放行；`HOST_CODING_TOOLS=true` 且没有 sandbox 时，
+> `bash` 可以触达宿主机边界，不要直接用于多租户生产环境。
 
 ## Runtime reliability
 
@@ -174,7 +220,7 @@ hook 认不出 `sessionId` 属于哪个 execution 时也拒绝而不是放行 �
 | 网络重试会写出重复消息 | `clientRequestId` 落到唯一索引上，重试命中已有那条并回 `deduplicated: true`（序号不会被重复分配） |
 | 两个人同时改同一份记忆 | `MEMORY.md` 的 `version` = 全文 sha256，PUT 带 `expectedVersion`，不匹配 `409` 且不写盘 |
 | 上下文无限增长会撑爆 prompt | `ContextAssembler` 按条数 + 字符数双重上限，**从最新往前取**，并在 transcript 前显式说明省略了多少条 |
-| 事后看不出「这一轮用的是哪份配置」 | `execution.config_snapshot` 存指纹（memberRevision / model / toolProfile / 各种 hash），不存全文 |
+| 事后看不出「这一轮用的是哪份配置」 | `execution.config_snapshot` 存指纹（memberRevision / model / 各种 hash，含 `capabilityManifestHash`），不存全文 |
 | 状态变化没有消息可看，前端只能靠猜 | `conversation_member_state.updated` 落 `conversation_event` 再广播，前端按 `updatedAt` 合并 |
 
 ### 1. 崩溃恢复：宁可漏跑，不可重跑
@@ -334,21 +380,24 @@ temp → `fsync` → `rename` 交错。**写盘是原子的**：同目录内 `re
 前端（`MemberMemory.tsx`）收到 `409` 时不重试：重新拉一次最新内容作为新基线，
 按钮文案变成 `Save anyway`，让「覆盖别人的修改」成为一次显式操作。
 
-`skillManifestHash` 用同一个 `hashText()`（`server/content-hash.ts`）——
-memory version / memoryHash / systemPromptHash 必须是**同一个实现**，
+memory version / memoryHash / systemPromptHash / capabilityManifestHash 必须是同一个实现，
 各写各的会让两个本该相等的指纹永远不相等。
 
 ### 9. 一轮 turn 用了哪份配置
 
-配置会漂移：有人在 Member 还跑着的时候改了 system prompt、换了 model、动了 skills。
+配置会漂移：有人在 Member 还跑着的时候改了 system prompt、换了 model、动了能力绑定。
 事后只能看到结果，看不出「当时喂进去的是什么」—— 配置快照回答的就是这个。
 
 ```ts
 ExecutionConfigSnapshot {
-  memberRevision, model, toolProfile,
-  systemPromptHash, memoryHash, skillManifestHash, hostToolsEnabled
+  memberRevision, model,
+  systemPromptHash, memoryHash, capabilityManifestHash, hostToolsEnabled
 }
 ```
+
+`capabilityManifestHash` 覆盖 skill / knowledge / tool 三层的组成与版本。只记 skill 清单
+是不够的：9 月 25 日和 9 月 30 日可以是同一份 system prompt、同一份记忆，但一次用本地
+KB、一次用企业搜索 —— 那是两种不同的能力实现，而快照必须能区分它们。
 
 只存指纹不存全文：全文能从 member 行 + 磁盘重算，存两份必然有一份过期。
 `memoryHash` 是**整份记忆文件**的指纹，不是「注入了 tail 16000 字符」的指纹 ——
@@ -392,37 +441,43 @@ ExecutionConfigSnapshot {
 ```
 config/member-templates/
 ├── financial-solution-architect/
-│   ├── member.json          # profile（key/handle/name/role/style/toolProfile）
+│   ├── member.json          # profile（key/handle/name/role/style/model/capabilities）
 │   ├── SYSTEM_PROMPT.md     # 稳定行为与人格
 │   └── MEMORY.md            # 初始长期记忆
 ├── financial-senior-engineer/
 └── financial-security-reviewer/
 ```
 
-| Member | Handle | Role | Tool Profile |
+| Member | Handle | Role | 能力上的差别 |
 |--------|--------|------|--------------|
-| Senior Solution Architect | `@architect` | Senior Financial Services Solution Architect | `safe` |
-| Senior Software Engineer | `@engineer` | Senior Financial Services Software Engineer | `coding` |
-| Security Reviewer | `@security` | Financial Services Security & Architecture Reviewer | `safe` |
+| Senior Solution Architect | `@architect` | Senior Financial Services Solution Architect | `financial-core` + `architecture-standards` |
+| Senior Software Engineer | `@engineer` | Senior Financial Services Software Engineer | `financial-core` + `architecture-standards` + **`runtime.host-coding-tools`** |
+| Security Reviewer | `@security` | Financial Services Security & Architecture Reviewer | `financial-core` + `security-controls` |
 
-只有 Engineer 默认拿 `coding`：架构师和 Security Reviewer 不该因为「自己是这个角色」
-就获得宿主机代码执行能力。等 sandbox 接进来，再把这两个拆成更细的只读工具。
+三个角色共用同一组 skill / tool Provider（`team.filesystem-skills`、`member.filesystem-skills`、
+`local.filesystem-knowledge`、`team.core-tools`、`knowledge.tools`），差别只在 knowledge 的
+selector 和 Engineer 额外绑定了宿主工具 Provider。
+
+只有 Engineer 默认绑定 `runtime.host-coding-tools`：架构师和 Security Reviewer 不该因为
+「自己是这个角色」就获得宿主机代码执行能力。而且绑定本身不等于放行 —— 没有
+`HOST_CODING_TOOLS=true` 时，这一组工具既不声明给引擎也不被授权层放行。
 
 ### 模板不是 source of truth
 
 ```
 config/member-templates/     provisioning baseline —— 这个 Member 第一次出现时是什么样
-SQLite member                当前真实配置
+SQLite member                当前真实配置（人格字段）
+member_capability_binding    当前能力组成
 <member home>/memory/        当前长期记忆
-<member home>/skills/        当前能力
 ```
 
 启动时执行一次 provisioning：
 
 ```
-扫描目录 → 解析 member.json → 校验 → 按 seedKey 查 member 表
-                                        ├── 已存在 → 跳过（不覆盖）
-                                        └── 不存在 → 创建 + 写入初始 memory
+扫描目录 → 解析 member.json → 校验 Provider ID → 按 seedKey 查 member 表
+                                                ├── 已存在 → 跳过（不覆盖）
+                                                └── 不存在 → 创建 + 写入初始 memory
+                                                             + 写入能力绑定
 ```
 
 四条**不会**发生的事，是这套设计真正的约束：
@@ -454,12 +509,23 @@ MEMBER_TEMPLATES_DIR=/etc/team-member/templates
 SEED_DEFAULT_MEMBERS=false    # 代码带着模板，但不要自动建人
 ```
 
-配置错误（重复的 key、`systemPromptFile` 指向模板目录之外、`member.json` 非法）
-**直接让启动失败**，不静默跳过 —— 否则症状是「默认团队少两个人但服务照常起来了」。
+配置错误（重复的 key、`systemPromptFile` 指向模板目录之外、`member.json` 非法、
+引用了未注册的 Provider）**直接让启动失败**，不静默跳过 ——
+否则症状是「默认团队少两个人但服务照常起来了」。
 
-模板的 `member.json` 还可以带 `teamKnowledgeBaseKeys`：Member 第一次被创建时，
-按 key 绑定已存在的 team Knowledge Base（缺的 key 静默跳过 —— 资料没就位不拦人）。
-绑定只发生在创建那一刻，之后完全归 Knowledge API 管，重启不会把用户解绑的 KB 绑回去。
+模板的 `member.json` 用 `capabilities` 声明能力组成，它**只描述引用，不描述实现**：
+
+```json
+"capabilities": {
+  "skills":    [{ "providerId": "team.filesystem-skills" }],
+  "knowledge": [{ "providerId": "local.filesystem-knowledge", "selector": "financial-core" }],
+  "tools":     [{ "providerId": "team.core-tools" }]
+}
+```
+
+所以模板不知道自己被哪个后端服务：把 `local.filesystem-knowledge` 的实现换成企业搜索，
+这三份模板一个字都不用改。绑定只发生在创建那一刻，之后完全归
+`PUT /api/capabilities/members/:id` 管 —— 重启不会把用户解绑的能力绑回去。
 
 ## Knowledge Base
 
@@ -471,21 +537,27 @@ KB       = What    大量事实资料，按需检索，永不全量进 prompt
 Memory   = 这个 Member 学到的动态事实，小而常变，全文进 prompt
 ```
 
+KB 由 `local.filesystem-knowledge` 这个 **Provider** 实现，不是平台级的 Knowledge 服务。
+`knowledge_base` / `knowledge_document` / `knowledge_document_fts` 三张表是它的内部存储：
+
 ```
 .data/team/knowledge/<key>/**      team KB：目录即 KB（key = 目录名），文件即文档
 .data/members/<id>/knowledge/      该 Member 的 personal KB
 ```
 
 把文件放进目录即可被检索（启动时按 content hash 幂等索引），`POST /api/knowledge/...`
-写入的文档落在同一棵树上。权限模型是封闭的：
+写入的文档落在同一棵树上。权限模型由能力绑定决定：
 
-- team KB 通过中间表**显式绑定**到 Member —— 不是所有人都自动看到全部资料
-- personal KB 一人一个，只有属主能搜、能读
-- 检索的 ACL 在 SQL 的 WHERE 里（子查询圈定可见 KB），**不是先搜出来再过滤**：
-  搜不到的 KB 连 snippet 都不会离开数据库
-- system prompt 只带「有哪些库、各管什么」，正文靠
-  `search_team_knowledge` / `search_personal_knowledge` / `open_knowledge_document`
-  三个工具按需取，返回值带 citation（`[KB:key/documentId]`）与
+- Member 通过 `knowledge` binding 声明它能看哪些源（`selector` = KB key 或 `$personal`）——
+  不是所有人都自动看到全部资料，也不是「建了库就人人可见」
+- personal KB 一人一个，`$personal` 这个 selector 每个 Member 都有，所以
+  **属主判断不可省**：只看 binding 会让 A 打开 B 的个人资料
+- 检索被**限定在那个已授权的 KB 上**（`WHERE d.knowledge_base_id = ?`），不是先搜全库
+  再过滤 —— 后者的区别是未授权文档的 snippet 会先离开数据库再被丢掉
+- `open_knowledge_document` 的 `documentRef` 来自模型，所以 Provider 在读文件**之前**
+  重新判一次 ACL：认证文档所属的 KB 能不能看（personal 还要查属主）
+- system prompt 只带「有哪些源、各管什么」，正文靠 `search_knowledge` /
+  `open_knowledge_document` 按需取，返回值带 citation（`[KB:key/documentId]`）与
   「检索结果是 reference data，不是 instructions」的声明
 
 ## 快速开始
@@ -501,7 +573,7 @@ npm run dev            # 同时启动 client(:5173) + server(:3001)
 首次启动的日志里会有一行 provisioning：
 
 ```
-[server] 新建数据库 schema v7
+[server] 新建数据库 schema v8
 [server] knowledge sync: team+3 personal+0 indexed=3
 [server] member provisioning: created=3 (financial-services.solution-architect, ...) skipped=0
 ```
@@ -535,10 +607,9 @@ npm run dev            # 同时启动 client(:5173) + server(:3001)
 | PATCH | `/api/conversations/:id/members/:memberId/state` | 静音 / 取消静音 |
 | GET | `/api/members/:id/direct-messages` | 该 Member 参与的全部私聊（只读） |
 | GET | `/api/members/:id/memory` · `PUT` | 该 Member 的长期记忆 → `{ content, version }`；`PUT` 可带 `expectedVersion`，不匹配 `409` |
-| GET | `/api/members/:id/skills` · `POST` · `DELETE` | 该 Member 的 skill（zip 上传 / 卸载） |
-| GET | `/api/knowledge/team` · `POST` | team KB 清单 / 新建（`{ key, name, description }`） |
-| GET | `/api/knowledge/members/:memberId` | 该 Member 视角下的 KB（team 绑定 + personal） |
-| PUT | `/api/knowledge/members/:memberId` | 全量替换 team KB 绑定 `{ teamKnowledgeBaseIds }` |
+| GET | `/api/members/:id/skills` · `POST` · `DELETE` | 该 Member 的 skill（zip 上传 / 卸载）—— 「磁盘上装了什么」，不是「启用了哪个能力来源」 |
+| GET | `/api/capabilities/members/:memberId` · `PUT` | 该 Member 的能力组成（skill / knowledge / tool 的 Provider 引用）。**「能用什么」的唯一写入口** |
+| GET | `/api/knowledge/team` · `POST` | team KB 清单 / 新建（`{ key, name, description }`）—— `local.filesystem-knowledge` 的管理面 |
 | POST | `/api/knowledge/bases/:kbId/documents` | 写文档（落盘 + FTS 索引） |
 | POST | `/api/internal/members/:id/direct-messages` | **以 `:id` 的身份**发私聊 —— Internal API，见下 |
 | GET | `/api/executions/:id` | 单条 execution |
@@ -552,7 +623,7 @@ npm run dev            # 同时启动 client(:5173) + server(:3001)
 | 边界 | 前缀 | `:id` 的含义 | 调用方 |
 |------|------|--------------|--------|
 | Human API | `/api/conversations`、`/api/members`（读） | 我在看谁 | 浏览器里的用户 |
-| Admin API | `/api/members`（写）、memory、skills | 我在改谁 | 管理员 |
+| Admin API | `/api/members`（写）、memory、skills、capabilities、knowledge | 我在改谁 | 管理员 |
 | Internal API | `/api/internal` | **我代表谁** | 另一个 runtime |
 
 `POST /api/internal/members/:id/direct-messages` 里的 `:id` 是调用方自己填的 ——
@@ -628,10 +699,24 @@ Content-Type: application/json
   "description": "负责研究资料分析、事实核查和研究总结",
   "style": "严谨、简洁、引用证据",
   "systemPrompt": "优先区分事实、推论和不确定性。",
-  "model": "gpt-5",
-  "toolProfile": "safe"
+  "model": "gpt-5"
 }
 ```
+
+新建的 Member 自动获得默认能力组成（团队 skill、个人 skill、个人资料库、协作与检索
+工具）。要调整它（比如给它开宿主工具），走能力接口：
+
+```json
+PUT /api/capabilities/members/researcher-id
+{
+  "skills":    [{ "providerId": "team.filesystem-skills" }],
+  "knowledge": [{ "providerId": "local.filesystem-knowledge", "selector": "$personal" }],
+  "tools":     [{ "providerId": "team.core-tools" }, { "providerId": "knowledge.tools" }]
+}
+```
+
+Provider ID 拼错会直接 `400`（写之前先对注册表校验），而不是等到下一轮 turn 才发现
+「这个人少了检索能力」。
 
 Direct Chat：
 
@@ -676,14 +761,19 @@ Group Chat：
 
 ```
 .data/
-├── team-member.db                     # member / conversation / conversation_member /
-│                                      # conversation_message / member_runtime / execution /
-│                                      # conversation_event
+├── team-member.db                     # member / member_capability_binding / conversation /
+│                                      # conversation_member / conversation_message /
+│                                      # member_runtime / execution / conversation_event /
+│                                      # knowledge_base / knowledge_document(+fts)
 ├── members/
 │   └── <member-id>/
 │       ├── SOUL.md                    # role / description / style / system prompt
 │       ├── memory/MEMORY.md           # 长期记忆（remember_member 写入）
-│       └── skills/                    # skillDirectories
+│       ├── skills/                    # member.filesystem-skills 的根目录
+│       └── knowledge/                 # 该 Member 的 personal KB（$personal）
+├── team/
+│   ├── skills/                        # team.filesystem-skills 的根目录
+│   └── knowledge/<kb-key>/**          # team KB 的正文
 ├── workspaces/
 │   └── <conversation-id>/
 │       └── <member-id>/AGENTS.md      # 每个 runtime 独立 workspace
@@ -762,15 +852,27 @@ server/                       # Express + Copilot SDK 后端
   config.ts                   # 环境变量
   db.ts                       # node:sqlite 打开 + 确保形状
   db-migrations.ts            # 唯一一份 SCHEMA_SQL + 形状检查（无迁移链）
-  domain.ts                   # Member / Conversation / Runtime / Execution 类型
+  domain.ts                   # Member / Capability / Conversation / Runtime / Execution 类型
   content-hash.ts             # hashText() —— memory version / 各种 snapshot hash 的唯一实现
-  copilot.ts                  # MemberRuntime → CopilotSession 执行引擎 + custom tools
-  tool-policy.ts              # 工具声明与放行（同一个实例回答两个问题）
+  copilot.ts                  # MemberRuntime → CopilotSession 执行引擎（不认识任何 Provider）
+  tool-policy.ts              # 工具授权：只看 RuntimeTool 声明的 risk / requiresHostAccess
   context-assembler.ts        # 增量上下文（message_sequence checkpoint）
   recovery-service.ts         # 启动恢复（保守策略，不自动重跑 running）
   member-service.ts           # 长期 Member 身份 + member home + seedKey
-  member-template-seeder.ts   # 模板 provisioning（不含任何业务内容）
-  knowledge-service.ts        # Knowledge Base：ACL 在 SQL 里 + FTS5 检索 + 磁盘同步
+  member-template-seeder.ts   # 模板 provisioning（不含任何业务内容，也不认识任何后端）
+  capabilities/               # 能力层：Member 引用哪些 Provider
+    types.ts                  #   SkillProvider / KnowledgeProvider / ToolProvider 契约
+    registry.ts               #   Provider 注册表（重复注册 / 未注册都直接抛）
+    service.ts                #   member_capability_binding 读写 + hasKnowledgeBinding（ACL 判据）
+    resolver.ts               #   binding → RuntimeCapabilities（含 manifestHash）
+    defaults.ts               #   新建 Member 的默认能力组成
+    copilot-adapter.ts        #   RuntimeCapabilities → SDK session 配置（唯一认识 SDK 的地方）
+    providers/
+      filesystem-skill.ts     #     team / member 两级 skill 目录
+      filesystem-knowledge.ts #     本地 KB：FTS5 检索 + 磁盘同步 + ACL（原 knowledge-service.ts）
+      core-tools.ts           #     ask_member / message_member / remember_member
+      knowledge-tools.ts      #     search_knowledge / open_knowledge_document
+      host-tools.ts           #     bash / edit / grep / web_fetch（需部署放行）
   conversation-member-service.ts  # 房间内成员状态（读游标 / pending wake / wake_status）
   member-turn-scheduler.ts    # 同一 Member 的 turn 串行化 + 唤醒合并
   team-service.ts             # 核心编排：Conversation / Execution / Delegation / 单写者 / durable event
@@ -782,13 +884,15 @@ server/                       # Express + Copilot SDK 后端
   routes/
     health.ts
     members.ts
+    capabilities.ts             # 能力组成（skill / knowledge / tool 的 Provider 引用）
     conversations.ts
     executions.ts               # 单条 / 列表 / retry / cancel
     internal.ts                 # 以 Member 身份说话（token 门禁）
-    knowledge.ts                # KB 清单 / 绑定 / 写文档
+    knowledge.ts                # local.filesystem-knowledge 的管理面（建库 / 写文档）
   test/
     schemas.test.ts
-    tool-policy.test.ts            # 声明了什么 / 放行什么 / 两者不允许漂移
+    capabilities.test.ts           # Provider 隔离 / 未知 Provider / 同名冲突 / manifest hash / open 二次 ACL
+    tool-policy.test.ts            # 只看 risk 与部署许可，不看工具名 / 声明与放行不允许漂移
     internal-api.test.ts           # 路径归属 + token 门禁
     team-service.test.ts           # delegation cycle / depth / runtime 隔离 / kind 形状约束
     member-dm.test.ts              # Member ↔ Member 私聊房间唯一性 + 自动对谈抑制
@@ -796,8 +900,8 @@ server/                       # Express + Copilot SDK 后端
     runtime-reliability.test.ts    # schema 形状 / 序号 / 增量上下文 / durable event / 恢复 / 死锁
     runtime-correctness.test.ts    # resume 分类 / 超时 abort / 工具授权接线 / cancel 状态机 / retry
     data-integrity.test.ts         # replyTo 校验 / 消息幂等 / 记忆乐观并发 / 上下文上限 / 配置快照 / state 事件 / mention 精确匹配
-    member-template-seeder.test.ts # provisioning 幂等 / 不覆盖已改 Member / 归档不复活 / 穿越与重复 key
-    knowledge-service.test.ts      # ACL 在 SQL 里 / personal 隔离 / 路径与 FTS 注入 / 索引幂等 / 磁盘同步
+    member-template-seeder.test.ts # provisioning 幂等 / 不覆盖已改 Member / 归档不复活 / 穿越与重复 key / 能力绑定
+    knowledge-provider.test.ts     # 检索范围限定在授权的 KB / personal 隔离 / 路径与 FTS 注入 / 索引幂等 / 磁盘同步
 ```
 
 ## 环境变量
@@ -815,20 +919,24 @@ server/                       # Express + Copilot SDK 后端
 | `GROUP_AUTO_WAKE_ROUNDS` | `2` | 无 `@mention` 的 member 发言最多连着唤醒几轮 |
 | `MAX_CONTEXT_MESSAGES` | `100` | 注入 prompt 的 shared message 条数上限（从最新往前取，至少 1 条） |
 | `MAX_CONTEXT_CHARS` | `60000` | 注入 prompt 的字符数上限（含每条 32 字符的固定开销），与条数上限同时生效 |
-| `HOST_CODING_TOOLS` | `false` | 是否允许 `bash` / `edit` / `grep` / `web_fetch`。**不随 `toolProfile` 打开** |
+| `HOST_CODING_TOOLS` | `false` | 是否允许 `bash` / `edit` / `grep` / `web_fetch`。**不随能力绑定打开** |
 | `INTERNAL_API_TOKEN` | 空 | Internal API 门禁；空 = 不校验（仅限本机单用户） |
 | `MEMBER_TEMPLATES_DIR` | `config/member-templates` | 默认 Member 模板目录（provisioning baseline） |
 | `SEED_DEFAULT_MEMBERS` | `true` | 启动时执行 Member provisioning；关闭 = 代码带着模板但不自动建人 |
 
 `HOST_CODING_TOOLS` 默认关闭，原因是这几个工具的工作目录虽然是 conversation workspace，
-runtime 仍然是宿主机上的进程 —— 没有沙箱时 `bash` 能走到 workspace 之外。成员把
-`toolProfile` 标成 `coding` 只是**声明想要什么**，不等于拿到了宿主机的执行权；
-判定要看两道门：`profile === 'coding'` **且** 部署显式启用了宿主工具。打开它等于承认
+runtime 仍然是宿主机上的进程 —— 没有沙箱时 `bash` 能走到 workspace 之外。给 Member 绑定
+`runtime.host-coding-tools` 只是**声明想要什么**，不等于拿到了宿主机的执行权；判定在
+`DefaultToolPolicy.check()` 里看 `requiresHostAccess` + 这个开关。打开它等于承认
 「当前 runtime 是可信的单租户环境」；多租户必须等沙箱运行时（K8s / Kata / Firecracker）
 就位后，由运行时策略而不是这个开关来给工具。
 
-三个 custom tool（`ask_member` / `message_member` / `remember_member`）和 SDK 的
-`BuiltInTools.Isolated` 集合始终可用；没定义过策略的工具一律拒绝。
+工具授权**不看工具名**：`ask_member` / `message_member` / `remember_member` /
+`search_knowledge` / `open_knowledge_document` 由各自的 Provider 声明，SDK 的
+`BuiltInTools.Isolated` 恒可用；没被任何 Provider 声明过的名字一律拒绝。
+
+> Admin 边界（`/api/capabilities`、`/api/knowledge`、`/api/members` 的写入口）目前与 Human
+> API 同源同权限，只靠部署位置隔离。多用户部署前必须给它们加上真正的管理员认证。
 
 ## 前提
 

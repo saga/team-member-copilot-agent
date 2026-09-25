@@ -29,9 +29,8 @@ process.env.COPILOT_WARMUP = 'false';
 
 const { db } = await import('../db.js');
 const { MemberService } = await import('../member-service.js');
-const { KnowledgeService } = await import('../knowledge-service.js');
 const { TeamService } = await import('../team-service.js');
-const { executionIdForWake, muteAllMembers, StubCopilot } = await import('./support.js');
+const { executionIdForWake, muteAllMembers, StubCopilot, createTestStack } = await import('./support.js');
 
 const ALICE_PROMPT = 'ALICE_PERSONA_SENTINEL';
 const BOB_PROMPT = 'BOB_PERSONA_SENTINEL';
@@ -52,8 +51,7 @@ interface ExecutionRow {
 
 const stub = new StubCopilot();
 const memberService = new MemberService(db);
-const knowledgeService = new KnowledgeService(db);
-const team = new TeamService(db, memberService, stub.asCopilot, knowledgeService);
+const { team } = createTestStack(db, memberService, stub.asCopilot);
 
 function executionRow(id: string): ExecutionRow {
   const row = db.prepare(`SELECT * FROM execution WHERE id = ?`).get(id) as unknown as

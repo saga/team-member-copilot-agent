@@ -20,7 +20,7 @@ import type { DatabaseSync } from 'node:sqlite';
  *
  * 程序不认识任何别的编号 —— 没有升级代码，认出来也无从下手。
  */
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
 
 /**
  * 当前 schema 的完整定义，按最终形状写。
@@ -39,8 +39,6 @@ CREATE TABLE member (
   style TEXT NOT NULL DEFAULT '',
   system_prompt TEXT NOT NULL DEFAULT '',
   model TEXT,
-  tool_profile TEXT NOT NULL DEFAULT 'safe'
-    CHECK (tool_profile IN ('safe', 'coding')),
   status TEXT NOT NULL DEFAULT 'active'
     CHECK (status IN ('active', 'archived')),
   -- 这个 Member 由哪份 member template provision 出来；手工创建的为 NULL。
@@ -56,6 +54,40 @@ CREATE TABLE member (
 CREATE UNIQUE INDEX idx_member_seed_key
   ON member(seed_key)
   WHERE seed_key IS NOT NULL;
+
+-- ─────────────────────────────────────────────── Member Capabilities ──────
+--
+-- Member 的「能力组成」：它引用哪些 Skill / Knowledge / Tool Provider。
+--
+-- 这里存的是 Provider ID（稳定契约）+ selector（Provider 自己解释的选择子），
+-- 不是实现。所以「本地 SQLite 资料库」换成「企业搜索服务」时，Member 这一行
+-- 不用动 —— 换的是注册表里那个 ID 背后的实现。
+--
+-- 表形状刻意的三合一（一张表 + capability_type）而不是三张表：三类能力在存储
+-- 这一层的形状完全一样，拆开只会让「列出这个 Member 的全部能力」变成三次查询
+-- 加一次手工合并。
+--
+-- selector 用 '' 而不是 NULL：它参与主键，而 SQLite 把 NULL 视为互不相等 ——
+-- 用 NULL 会让同一个 (member, type, provider) 能插进无限多行。
+
+CREATE TABLE member_capability_binding (
+  member_id TEXT NOT NULL,
+  capability_type TEXT NOT NULL
+    CHECK (capability_type IN ('skill', 'knowledge', 'tool')),
+  provider_id TEXT NOT NULL,
+  selector TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (member_id, capability_type, provider_id, selector),
+  FOREIGN KEY (member_id)
+    REFERENCES member(id)
+    ON DELETE CASCADE
+);
+
+CREATE INDEX idx_member_capability_provider
+  ON member_capability_binding(capability_type, provider_id);
+
+CREATE INDEX idx_member_capability_member
+  ON member_capability_binding(member_id);
 
 CREATE TABLE conversation (
   id TEXT PRIMARY KEY,
@@ -270,10 +302,13 @@ CREATE INDEX idx_execution_status
 --   KB      = What（大量事实资料，按需检索，永不全量进 prompt）
 --   Memory  = Member 自己学到的动态事实
 --
--- 权限模型在表形状里就是封闭的：team KB 通过 member_team_knowledge_base 显式
--- 绑定到 Member（不是所有人都自动看到全部资料），personal KB 一人一个且
--- member_id 即属主。两条 CHECK 把 scope 和属主绑死，不存在「team KB 却有
--- 属主」这种中间态。
+-- 这一组表是 **local.filesystem-knowledge 这个 Provider 的内部存储**，不是平台
+-- 级的 Knowledge 模型：正文在磁盘上（<teamKnowledgeRoot>/<key> 与
+-- <memberHomeRoot>/<id>/knowledge），这里只放元数据与 FTS 索引。
+--
+-- 因此「谁能看哪个库」不在这里表达 —— 那是 member_capability_binding 的事
+-- （knowledge + provider_id + selector）。这里只表达「有哪些库、哪个 Member 拥有
+-- 它」，两条 CHECK 把 scope 和属主绑死，不存在「team KB 却有属主」这种中间态。
 
 CREATE TABLE knowledge_base (
   id TEXT PRIMARY KEY,
@@ -293,19 +328,6 @@ CREATE TABLE knowledge_base (
   UNIQUE (scope, key),
   FOREIGN KEY (member_id)
     REFERENCES member(id)
-    ON DELETE CASCADE
-);
-
-CREATE TABLE member_team_knowledge_base (
-  member_id TEXT NOT NULL,
-  knowledge_base_id TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  PRIMARY KEY (member_id, knowledge_base_id),
-  FOREIGN KEY (member_id)
-    REFERENCES member(id)
-    ON DELETE CASCADE,
-  FOREIGN KEY (knowledge_base_id)
-    REFERENCES knowledge_base(id)
     ON DELETE CASCADE
 );
 
@@ -330,9 +352,6 @@ CREATE VIRTUAL TABLE knowledge_document_fts
 
 CREATE INDEX idx_knowledge_document_kb
   ON knowledge_document(knowledge_base_id);
-
-CREATE INDEX idx_member_team_knowledge_base_member
-  ON member_team_knowledge_base(member_id);
 `;
 
 export function getUserVersion(db: DatabaseSync): number {

@@ -102,6 +102,32 @@ main {
   margin: 4px 0;
 }
 
+/* Member 能力组成（只读）。三层结构：分区 → Provider 列表 → 一行一个绑定。 */
+.capability-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  font-size: 12px;
+}
+
+.capability-list > li + li {
+  margin-top: 6px;
+}
+
+.capability-list ul {
+  list-style: none;
+  padding: 0 0 0 10px;
+  margin: 2px 0 0;
+}
+
+.capability-list code {
+  font-size: 11px;
+}
+
+.capability-list .muted {
+  color: #999;
+}
+
 .member-row,
 .conversation-row {
   width: 100%;

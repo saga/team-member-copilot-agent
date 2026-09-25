@@ -5,11 +5,20 @@ import fs from 'node:fs';
 import { config } from './config.js';
 import { db } from './db.js';
 import { MemberService } from './member-service.js';
-import { KnowledgeService } from './knowledge-service.js';
 import { CopilotService } from './copilot.js';
 import { TeamService } from './team-service.js';
+import { CapabilityRegistry } from './capabilities/registry.js';
+import { CapabilityService } from './capabilities/service.js';
+import { CapabilityResolver } from './capabilities/resolver.js';
+import { FilesystemSkillProvider } from './capabilities/providers/filesystem-skill.js';
+import { LocalFilesystemKnowledgeProvider } from './capabilities/providers/filesystem-knowledge.js';
+import { CoreTeamToolProvider } from './capabilities/providers/core-tools.js';
+import { KnowledgeToolProvider } from './capabilities/providers/knowledge-tools.js';
+import { HostCodingToolProvider } from './capabilities/providers/host-tools.js';
+import { DefaultToolPolicy } from './tool-policy.js';
 import { healthRouter } from './routes/health.js';
 import { membersRouter } from './routes/members.js';
+import { capabilitiesRouter } from './routes/capabilities.js';
 import { knowledgeRouter } from './routes/knowledge.js';
 import { internalRouter } from './routes/internal.js';
 import { conversationsRouter } from './routes/conversations.js';
@@ -19,26 +28,63 @@ import { errorHandler } from './middleware/errorHandler.js';
 /**
  * 依赖装配集中在这里，index.ts 和 route 都不再各自 new service()。
  *
- * CopilotService 需要回调 TeamService，TeamService 又需要 CopilotService，
- * 所以先用延迟求值的箭头函数打破循环，再补上真正的实例。
+ * 顺序是**单向**的，照着读就是数据流：
+ *
+ *   db → memberService → capabilityService → provider registry → resolver
+ *      → copilotService → teamService
+ *
+ * 只有 CoreTeamToolProvider 需要反向调 TeamService（它执行的是业务编排），
+ * 用惰性箭头函数打断 —— 调用发生在真正执行工具的那一刻，那时 TeamService
+ * 早就构造完了。
+ *
+ * CopilotService 之所以排在最后能被 teamService 依赖、又不反过来依赖它：
+ * 引擎不认识任何具体 Provider，它只接受一份解析好的 RuntimeCapabilities。
  */
 let teamService!: TeamService;
 
-const knowledgeService = new KnowledgeService(db);
+const memberService = new MemberService(db);
+const capabilityService = new CapabilityService(db);
 
-const copilotService = new CopilotService(
-  {
+const localKnowledgeProvider = new LocalFilesystemKnowledgeProvider(db, capabilityService);
+
+const registry = new CapabilityRegistry();
+
+registry.registerSkillProvider(
+  new FilesystemSkillProvider('team.filesystem-skills', config.teamSkillRoot),
+);
+registry.registerSkillProvider(
+  new FilesystemSkillProvider('member.filesystem-skills', (context) =>
+    memberService.skillsPath(context.memberId),
+  ),
+);
+
+registry.registerKnowledgeProvider(localKnowledgeProvider);
+
+registry.registerToolProvider(
+  new CoreTeamToolProvider({
     delegateMember: (input) => teamService.delegateMember(input),
     rememberMember: (input) => teamService.rememberMember(input),
     messageMember: (input) => teamService.messageMember(input),
-  },
-  { knowledge: knowledgeService },
+  }),
+);
+registry.registerToolProvider(new KnowledgeToolProvider());
+registry.registerToolProvider(new HostCodingToolProvider());
+
+const capabilityResolver = new CapabilityResolver(registry);
+
+const copilotService = new CopilotService({
+  toolPolicy: new DefaultToolPolicy({ allowHostTools: config.allowHostCodingTools }),
+});
+
+teamService = new TeamService(
+  db,
+  memberService,
+  copilotService,
+  capabilityService,
+  capabilityResolver,
 );
 
-const memberService = new MemberService(db);
-teamService = new TeamService(db, memberService, copilotService, knowledgeService);
-
-// Team Skill / Team KB 的目录是「放进去就生效」的磁盘约定，必须先存在。
+// Skill / KB 的目录是「放进去就生效」的磁盘约定，必须先存在。
 // KB 行本身由启动时的 syncFromDisk 按 directory 建，这里只兜目录。
 fs.mkdirSync(config.teamSkillRoot, { recursive: true });
 fs.mkdirSync(config.teamKnowledgeRoot, { recursive: true });
@@ -50,7 +96,8 @@ app.use(express.json({ limit: '1mb' }));
 
 app.use('/api/health', healthRouter);
 app.use('/api/members', membersRouter(teamService));
-app.use('/api/knowledge', knowledgeRouter(knowledgeService));
+app.use('/api/capabilities', capabilitiesRouter(teamService));
+app.use('/api/knowledge', knowledgeRouter(localKnowledgeProvider));
 app.use('/api/conversations', conversationsRouter(teamService));
 app.use('/api/executions', executionsRouter(teamService));
 // 以某个 Member 的身份说话 —— 独立的命名空间 + token 门禁，见 middleware/apiScope.ts
@@ -77,4 +124,12 @@ if (fs.existsSync(DIST_DIR)) {
   });
 }
 
-export { copilotService, memberService, knowledgeService, teamService };
+export {
+  copilotService,
+  memberService,
+  capabilityService,
+  capabilityResolver,
+  localKnowledgeProvider,
+  registry,
+  teamService,
+};

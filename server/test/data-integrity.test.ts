@@ -30,10 +30,8 @@ process.env.COPILOT_WARMUP = 'false';
 const { config } = await import('../config.js');
 const { db } = await import('../db.js');
 const { MemberService } = await import('../member-service.js');
-const { KnowledgeService } = await import('../knowledge-service.js');
-const { TeamService } = await import('../team-service.js');
 const { resolveMentions } = await import('../group-dispatcher.js');
-const { singleExecutionId, muteAllMembers } = await import('./support.js');
+const { singleExecutionId, muteAllMembers, createTestStack } = await import('./support.js');
 
 after(() => {
   db.close();
@@ -59,8 +57,8 @@ class StubCopilot {
 
 const stub = new StubCopilot();
 const memberService = new MemberService(db);
-const knowledgeService = new KnowledgeService(db);
-const team = new TeamService(db, memberService, stub as unknown as CopilotService, knowledgeService);
+// 与 app.ts 相同的装配（Copilot 换成 stub），见 support.ts 的 createTestStack。
+const { team } = createTestStack(db, memberService, stub as unknown as CopilotService);
 
 function makeMember(name: string, handle: string): Member {
   return memberService.create({ name, handle, role: 'Analyst', style: 'concise' });
@@ -480,12 +478,12 @@ describe('execution 记录当时用的配置', () => {
     const firstSnapshot = first.configSnapshot;
     assert.ok(firstSnapshot, '跑完一轮必须留下配置快照');
     assert.equal(firstSnapshot.memberRevision, team.getMember(alice.id).updatedAt);
-    assert.equal(firstSnapshot.toolProfile, 'safe');
     assert.equal(firstSnapshot.model, config.defaultModel);
     assert.equal(firstSnapshot.hostToolsEnabled, config.allowHostCodingTools);
-    assert.equal(firstSnapshot.systemPromptHash.length, 64);
-    assert.equal(firstSnapshot.memoryHash.length, 64);
-    assert.equal(firstSnapshot.skillManifestHash.length, 64);
+    assert.match(firstSnapshot.systemPromptHash, /^[\da-f]{64}$/);
+    assert.match(firstSnapshot.memoryHash, /^[\da-f]{64}$/);
+    // 能力组成的指纹：这一轮到底用了哪个 skill / knowledge / tool 实现
+    assert.match(firstSnapshot.capabilityManifestHash, /^[\da-f]{64}$/);
 
     // 换人格 + 加记忆，然后 retry 同一条 execution
     team.updateMember(alice.id, {

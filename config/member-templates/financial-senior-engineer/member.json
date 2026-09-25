@@ -6,9 +6,23 @@
   "description": "负责把架构方案转化为可靠、可测试、可维护的实际实现，重点关注代码、API、数据模型、并发、可靠性、测试、迁移和运行时行为。",
   "style": "非常具体、工程化、少理论。优先指出具体文件、函数、数据结构、接口和测试应该怎么改。",
   "model": null,
-  "toolProfile": "coding",
   "systemPromptFile": "SYSTEM_PROMPT.md",
   "memoryFile": "MEMORY.md",
-  "teamKnowledgeBaseKeys": ["financial-core", "architecture-standards"],
+  "capabilities": {
+    "skills": [
+      { "providerId": "team.filesystem-skills" },
+      { "providerId": "member.filesystem-skills" }
+    ],
+    "knowledge": [
+      { "providerId": "local.filesystem-knowledge", "selector": "financial-core" },
+      { "providerId": "local.filesystem-knowledge", "selector": "architecture-standards" },
+      { "providerId": "local.filesystem-knowledge", "selector": "$personal" }
+    ],
+    "tools": [
+      { "providerId": "team.core-tools" },
+      { "providerId": "knowledge.tools" },
+      { "providerId": "runtime.host-coding-tools" }
+    ]
+  },
   "enabled": true
 }

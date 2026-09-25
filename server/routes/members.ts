@@ -11,7 +11,6 @@ const createMemberSchema = z.object({
   style: z.string().max(2000).optional(),
   systemPrompt: z.string().max(12000).optional(),
   model: z.string().trim().min(1).max(100).optional(),
-  toolProfile: z.enum(['safe', 'coding']).optional(),
 });
 
 /**
@@ -23,6 +22,9 @@ const createMemberSchema = z.object({
  * 2. `handle` 可以改（create 时省略则由 name 推导）。
  *
  * 所有字段都是 optional：省略 = 不改。
+ *
+ * 「能用什么」不在这里 —— 那是 `/api/capabilities/members/:id` 的事。把能力
+ * 混进身份编辑，会让「改个名字」和「给它开 shell 权限」变成同一个请求。
  */
 const updateMemberSchema = z.object({
   name: z.string().trim().min(1).max(100).optional(),
@@ -32,7 +34,6 @@ const updateMemberSchema = z.object({
   style: z.string().max(2000).optional(),
   systemPrompt: z.string().max(12000).optional(),
   model: z.string().trim().max(100).nullable().optional(),
-  toolProfile: z.enum(['safe', 'coding']).optional(),
   status: z.enum(['active', 'archived']).optional(),
 });
 

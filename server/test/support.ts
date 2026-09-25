@@ -1,9 +1,81 @@
 import assert from 'node:assert/strict';
 import type { DatabaseSync } from 'node:sqlite';
+import { config } from '../config.js';
 import type { CopilotService, RunMemberTurnInput } from '../copilot.js';
 import type { WakePlan } from '../group-dispatcher.js';
-import type { TeamService } from '../team-service.js';
+import { TeamService } from '../team-service.js';
+import type { CapabilityContext } from '../capabilities/types.js';
+import { CapabilityRegistry } from '../capabilities/registry.js';
+import { CapabilityResolver } from '../capabilities/resolver.js';
+import { CapabilityService } from '../capabilities/service.js';
+import { FilesystemSkillProvider } from '../capabilities/providers/filesystem-skill.js';
+import { LocalFilesystemKnowledgeProvider } from '../capabilities/providers/filesystem-knowledge.js';
+import { CoreTeamToolProvider } from '../capabilities/providers/core-tools.js';
+import { KnowledgeToolProvider } from '../capabilities/providers/knowledge-tools.js';
+import { HostCodingToolProvider } from '../capabilities/providers/host-tools.js';
+import type { MemberService } from '../member-service.js';
 import { NO_REPLY_SENTINEL } from '../member-decision.js';
+
+/**
+ * 测试用的能力装配。
+ *
+ * 形状与 `server/app.ts` 一致（同一个顺序、同一组 Provider），所以用例里跑的是
+ * 真实链路，而不是一份「测试专用」的简化装配 —— 后者会让人在 app.ts 里漏接一个
+ * Provider 而测试全绿。
+ *
+ * 与 app.ts 的差别只有两点，都是测试需要：
+ *   - CopilotService 是 stub（不拉起真实 CLI 进程）
+ *   - 不注册 routes
+ */
+export interface TestStack {
+  team: TeamService;
+  capabilities: CapabilityService;
+  knowledge: LocalFilesystemKnowledgeProvider;
+  registry: CapabilityRegistry;
+  resolver: CapabilityResolver;
+}
+
+export function createTestStack(
+  db: DatabaseSync,
+  members: MemberService,
+  copilot: CopilotService,
+): TestStack {
+  const capabilities = new CapabilityService(db);
+  const knowledge = new LocalFilesystemKnowledgeProvider(db, capabilities);
+
+  const registry = new CapabilityRegistry();
+  registry.registerSkillProvider(
+    new FilesystemSkillProvider('team.filesystem-skills', config.teamSkillRoot),
+  );
+  registry.registerSkillProvider(
+    new FilesystemSkillProvider('member.filesystem-skills', (context) =>
+      members.skillsPath(context.memberId),
+    ),
+  );
+  registry.registerKnowledgeProvider(knowledge);
+
+  // 与 app.ts 同样的反向依赖：工具执行的是业务编排，装配时用惰性闭包打断循环。
+  let team!: TeamService;
+  registry.registerToolProvider(
+    new CoreTeamToolProvider({
+      delegateMember: (input) => team.delegateMember(input),
+      rememberMember: (input) => team.rememberMember(input),
+      messageMember: (input) => team.messageMember(input),
+    }),
+  );
+  registry.registerToolProvider(new KnowledgeToolProvider());
+  registry.registerToolProvider(new HostCodingToolProvider());
+
+  const resolver = new CapabilityResolver(registry);
+  team = new TeamService(db, members, copilot, capabilities, resolver);
+
+  return { team, capabilities, knowledge, registry, resolver };
+}
+
+/** 直接调 Provider 时用的最小上下文。 */
+export function capabilityContext(memberId: string): CapabilityContext {
+  return { memberId, conversationId: 'test-conversation', executionId: 'test-execution', userId: 'test-user' };
+}
 
 /**
  * 测试共享助手。放在 support.ts 而不是 *.test.ts，避免被 `npm test` 的

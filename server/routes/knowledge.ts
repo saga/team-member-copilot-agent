@@ -1,17 +1,21 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import type { KnowledgeService } from '../knowledge-service.js';
+import type { LocalFilesystemKnowledgeProvider } from '../capabilities/providers/filesystem-knowledge.js';
 import { sendError } from '../middleware/errorHandler.js';
+
+/**
+ * `local.filesystem-knowledge` 这个 Provider 的管理面。
+ *
+ * 它回答的是「本地后端里有哪些库、库里有什么文档」，**不包括**「哪个 Member 能看
+ * 哪个库」—— 绑定关系归 `/api/capabilities/members/:id`。分开的理由很具体：
+ * 绑定是能力声明（换后端也成立），而「建库、写文档」是本地实现专有的运维动作。
+ * 混在一个命名空间里，会让人以为换掉后端之后这套接口还会存在。
+ */
 
 const createBaseSchema = z.object({
   key: z.string().trim().min(1).max(200),
   name: z.string().trim().min(1).max(200),
   description: z.string().max(2000).optional(),
-});
-
-const bindSchema = z.object({
-  /** 全量替换：数组里有什么就绑什么，空数组 = 解绑全部。 */
-  teamKnowledgeBaseIds: z.array(z.string().min(1)).max(100),
 });
 
 const documentSchema = z.object({
@@ -21,7 +25,7 @@ const documentSchema = z.object({
   sourceUri: z.string().url().nullable().optional(),
 });
 
-export function knowledgeRouter(knowledge: KnowledgeService) {
+export function knowledgeRouter(knowledge: LocalFilesystemKnowledgeProvider) {
   const router = Router();
 
   router.get('/team', (_req, res) => {
@@ -36,32 +40,6 @@ export function knowledgeRouter(knowledge: KnowledgeService) {
     }
     try {
       res.status(201).json({ knowledgeBase: knowledge.createTeamKnowledgeBase(parsed.data) });
-    } catch (error) {
-      sendError(res, error);
-    }
-  });
-
-  router.get('/members/:memberId', (req, res) => {
-    try {
-      res.json(knowledge.listForMember(req.params.memberId));
-    } catch (error) {
-      sendError(res, error);
-    }
-  });
-
-  router.put('/members/:memberId', (req, res) => {
-    const parsed = bindSchema.safeParse(req.body ?? {});
-    if (!parsed.success) {
-      res.status(400).json({ error: parsed.error.issues.map((i) => i.message).join('; ') });
-      return;
-    }
-    try {
-      res.json({
-        teamKnowledgeBases: knowledge.setTeamKnowledgeBases(
-          req.params.memberId,
-          parsed.data.teamKnowledgeBaseIds,
-        ),
-      });
     } catch (error) {
       sendError(res, error);
     }

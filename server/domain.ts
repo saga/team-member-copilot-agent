@@ -11,53 +11,35 @@
 
 export type MemberStatus = 'active' | 'archived';
 
-export type ToolProfile = 'safe' | 'coding';
+// --------------------------------------------------------------- Capability
 
-// ------------------------------------------------------------- Knowledge Base
-
-export type KnowledgeBaseScope = 'team' | 'personal';
-
-export interface KnowledgeBase {
-  id: string;
-  scope: KnowledgeBaseScope;
-  /** 稳定的目录名 / 引用名。team KB 全局唯一；personal KB 固定为 member-<memberId>。 */
-  key: string;
-  name: string;
-  description: string;
-  /** personal KB 的属主；team KB 为 null。 */
-  memberId: string | null;
-  createdAt: string;
-  updatedAt: string;
+/**
+ * Member 对某个能力 Provider 的一次引用。
+ *
+ * 这里存的是 **Provider ID（稳定契约）+ selector**，不是实现。所以
+ * 「本地 SQLite 资料库」换成「企业搜索服务」时，Member 这一行不用动 ——
+ * 换的是注册表里那个 ID 背后的实现。
+ *
+ * `selector` 的含义由 Provider 自己定义：
+ *   skill / tool      通常为空（Provider 决定给哪些）
+ *   knowledge         资料源选择子，本地实现是 KB key 或 `$personal`
+ */
+export interface CapabilityBinding {
+  providerId: string;
+  selector?: string;
 }
 
-export interface KnowledgeDocument {
-  id: string;
-  knowledgeBaseId: string;
-  title: string;
-  /** 相对 KB 根目录的路径，也是 (kb, path) 唯一键。 */
-  relativePath: string;
-  /** 全文 sha256 —— 磁盘同步靠它跳过没变过的文件。 */
-  contentHash: string;
-  sourceUri: string | null;
-  updatedAt: string;
-}
-
-export interface KnowledgeSearchHit {
-  documentId: string;
-  knowledgeBaseId: string;
-  knowledgeBaseName: string;
-  scope: KnowledgeBaseScope;
-  title: string;
-  snippet: string;
-  /** 稳定的引用标记，格式 [KB:<key>/<documentId>]。 */
-  citation: string;
-  sourceUri: string | null;
-}
-
-/** 某 Member 视角下能看到的 KB。检索 ACL 与 prompt 里的清单共用这一个查询。 */
-export interface MemberKnowledgeProfile {
-  teamKnowledgeBases: KnowledgeBase[];
-  personalKnowledgeBases: KnowledgeBase[];
+/**
+ * Member 的能力组成（skill / knowledge / tool 三类引用）。
+ *
+ * 它取代了早期的 `toolProfile: 'safe' | 'coding'`：那个字段把「能用什么」压成
+ * 一个二值开关，于是一组工具的增减、一个知识库的绑定都只能靠改代码。能力是
+ * 一组显式引用，不是一个档位。
+ */
+export interface MemberCapabilities {
+  skills: CapabilityBinding[];
+  knowledge: CapabilityBinding[];
+  tools: CapabilityBinding[];
 }
 
 export interface Member {
@@ -69,7 +51,6 @@ export interface Member {
   style: string;
   systemPrompt: string;
   model: string | null;
-  toolProfile: ToolProfile;
   status: MemberStatus;
   /**
    * 非空表示这个 Member 最初由 member template provision。
@@ -174,24 +155,27 @@ export type ExecutionStatus =
 /**
  * 一轮 execution 开跑那一刻，这个 Member 的配置快照。
  *
- * 为什么需要它：Member 的配置（system prompt / memory / skills / model /
- * toolProfile）是**会变的**，而 execution 是「当时真的这样跑过一轮」的记录。
- * 没有快照，事后只能看到两条 execution 行为不同，看不到它们的输入不同 ——
- * 尤其是 retry：同一份 prompt 在今天重跑，用的已经是另一个人格、另一份记忆。
+ * 为什么需要它：Member 的配置（system prompt / memory / 能力组成 / model）是
+ * **会变的**，而 execution 是「当时真的这样跑过一轮」的记录。没有快照，事后只能
+ * 看到两条 execution 行为不同，看不到它们的输入不同 —— 尤其是 retry：同一份
+ * prompt 在今天重跑，用的已经是另一个人格、另一份记忆、另一组能力。
  *
  * `memberRevision` 用 `member.updated_at`：它是这个 Member 身份字段的写序号，
  * 换过任何一个人格字段都会变。
+ *
+ * `capabilityManifestHash` 覆盖 skill / knowledge / tool 三层的组成与版本。
+ * 单独记 skill 清单是不够的 —— 9 月 25 日和 9 月 30 日可以是同一份 system
+ * prompt、同一份记忆，但一次用本地 KB、一次用企业搜索，那是两种不同的能力实现。
  */
 export interface ExecutionConfigSnapshot {
   memberRevision: string;
   model: string;
-  toolProfile: ToolProfile;
   /** system prompt 全文的 sha256（不存全文：它可以从 member + memory 重算）。 */
   systemPromptHash: string;
   /** 长期记忆内容的 sha256。Agent 在 turn 里写记忆会让它变化。 */
   memoryHash: string;
-  /** 已安装 skill 清单的 sha256（名字 + 各自 SKILL.md 的 mtime）。 */
-  skillManifestHash: string;
+  /** 这一轮实际生效的能力组成（Provider ID + 版本 + 工具集）的 sha256。 */
+  capabilityManifestHash: string;
   /** 部署层是否放行宿主工具。它决定 availableTools 的真实形状。 */
   hostToolsEnabled: boolean;
 }
