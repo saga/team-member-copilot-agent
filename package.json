@@ -1,0 +1,42 @@
+{
+  "name": "team-member-copilot-agent",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Copilot SDK + Vite + TypeScript + Express 基础框架（参考 ai-interview-questions 的前后端同源结构）",
+  "scripts": {
+    "dev": "concurrently -n client,server -c green,blue \"vite\" \"tsx watch server/index.ts\"",
+    "dev:client": "vite",
+    "dev:server": "tsx watch server/index.ts",
+    "build": "tsc -b && vite build && npm run build:server",
+    "build:server": "tsc -p server/tsconfig.json",
+    "start": "node dist-server/index.js",
+    "preview": "vite preview",
+    "typecheck": "tsc -p tsconfig.app.json --noEmit && tsc -p tsconfig.node.json --noEmit && tsc -p server/tsconfig.json --noEmit",
+    "test": "node --import tsx --test server/test/*.test.ts"
+  },
+  "dependencies": {
+    "@github/copilot-sdk": "1.0.14",
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.0",
+    "express": "^5.2.1",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "zod": "^4.5.4"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.2.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.5",
+    "@vitejs/plugin-react": "^6.1.0",
+    "concurrently": "^9.0.1",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.2"
+  },
+  "engines": {
+    "node": ">=22.13"
+  }
+}
