@@ -27,6 +27,10 @@ export interface Conversation {
   kind: 'direct' | 'group' | 'work';
   defaultMemberId: string | null;
   createdBy: string;
+  /** 会话内单调递增的 event 游标，等于 SSE 的 Last-Event-ID。 */
+  eventSequence: number;
+  /** 会话内单调递增的 message 游标。 */
+  messageSequence: number;
   createdAt: string;
   updatedAt: string;
   members: Member[];
@@ -35,6 +39,7 @@ export interface Conversation {
 export interface ConversationMessage {
   id: string;
   conversationId: string;
+  messageSequence: number;
   senderType: 'user' | 'member' | 'system';
   senderId: string;
   targetMemberId: string | null;
@@ -44,6 +49,17 @@ export interface ConversationMessage {
   createdAt: string;
 }
 
+export type ExecutionStatus =
+  | 'queued'
+  | 'running'
+  /** 正在等另一个 Member 的 runtime 完成（ask_member 进行中）。 */
+  | 'waiting_for_member'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  /** 进程重启时还停在 running / waiting_for_member，未自动重跑。 */
+  | 'interrupted';
+
 export interface ExecutionRecord {
   id: string;
   conversationId: string;
@@ -52,10 +68,15 @@ export interface ExecutionRecord {
   parentExecutionId: string | null;
   delegationPath: string[];
   kind: 'interactive' | 'member_delegate' | 'member_work';
-  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+  status: ExecutionStatus;
   prompt: string;
   response: string | null;
   error: string | null;
+  waitingForRuntimeId: string | null;
+  retryOfExecutionId: string | null;
+  startedAt: string | null;
+  endedAt: string | null;
+  createdAt: string;
 }
 
 export interface Health {
@@ -173,8 +194,15 @@ export const api = {
     ).then(json<{ conversation: Conversation }>);
   },
 
-  /** 会话级 SSE：message.created / message.delta / execution.updated / delegation.* */
-  eventsUrl(conversationId: string): string {
-    return `${API_BASE}/api/conversations/${encodeURIComponent(conversationId)}/events`;
+  /**
+   * 会话级 SSE：message.created / message.delta / execution.updated / delegation.*
+   *
+   * 服务端会给 durable 事件带 `id: <sequence>`，浏览器断线重连时自动回传
+   * Last-Event-ID，服务端据此补发断线期间的事件 —— 前端不需要自己记录水位。
+   * `since` 只在首次连接（或想强制从头拉）时用。
+   */
+  eventsUrl(conversationId: string, since?: number): string {
+    const base = `${API_BASE}/api/conversations/${encodeURIComponent(conversationId)}/events`;
+    return since && since > 0 ? `${base}?since=${since}` : base;
   },
 };

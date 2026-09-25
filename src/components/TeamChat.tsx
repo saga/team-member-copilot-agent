@@ -6,6 +6,7 @@ import {
   type DelegationEvent,
   type DeltaEvent,
   type ExecutionRecord,
+  type ExecutionStatus,
   type Member,
 } from '../lib/api';
 
@@ -23,6 +24,19 @@ interface DelegationLog {
   status: 'running' | 'done' | 'error';
 }
 
+/** 还在推进中的 execution 状态；到了其它状态就说明这条 execution 已经收尾。 */
+const ACTIVE_STATUSES: ExecutionStatus[] = ['queued', 'running', 'waiting_for_member'];
+
+const STATUS_LABEL: Record<ExecutionStatus, string> = {
+  queued: '排队中',
+  running: '执行中',
+  waiting_for_member: '等待其他 Member',
+  completed: '完成',
+  failed: '失败',
+  cancelled: '已取消',
+  interrupted: '已中断',
+};
+
 function parseEvent<T>(event: MessageEvent): T | null {
   try {
     return JSON.parse(event.data) as T;
@@ -38,6 +52,8 @@ export function TeamChat() {
   const [messages, setMessages] = useState<ConversationMessage[]>([]);
   const [streaming, setStreaming] = useState<Record<string, StreamState>>({});
   const [delegations, setDelegations] = useState<DelegationLog[]>([]);
+  /** executionId → 最近一次 execution.updated，用来渲染 runtime 实时状态。 */
+  const [executions, setExecutions] = useState<Record<string, ExecutionRecord>>({});
   const [targetMemberId, setTargetMemberId] = useState('');
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
@@ -68,6 +84,22 @@ export function TeamChat() {
     return memberById.get(id)?.name ?? `${id.slice(0, 8)}…`;
   }
 
+  /**
+   * 每个 Member 当前最活跃的那条 execution。
+   * 一个 Member 可能同时挂着几条（被多次委派），只展示最新的一条即可。
+   */
+  const activeExecutions = useMemo(() => {
+    const byMember = new Map<string, ExecutionRecord>();
+    for (const execution of Object.values(executions)) {
+      if (!ACTIVE_STATUSES.includes(execution.status)) continue;
+      const current = byMember.get(execution.memberId);
+      if (!current || current.createdAt <= execution.createdAt) {
+        byMember.set(execution.memberId, execution);
+      }
+    }
+    return [...byMember.values()].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }, [executions]);
+
   async function refresh() {
     const [membersResult, conversationsResult] = await Promise.all([
       api.listMembers(),
@@ -90,6 +122,7 @@ export function TeamChat() {
       setMessages([]);
       setStreaming({});
       setDelegations([]);
+      setExecutions({});
       return;
     }
 
@@ -99,6 +132,7 @@ export function TeamChat() {
     setMessages([]);
     setStreaming({});
     setDelegations([]);
+    setExecutions({});
     setError(null);
     setTargetMemberId(conversation?.defaultMemberId ?? conversation?.members[0]?.id ?? '');
 
@@ -119,6 +153,12 @@ export function TeamChat() {
       .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)));
 
     const source = new EventSource(api.eventsUrl(activeId));
+
+    // 服务端在每次连接（含自动重连）建立后都会发一条 connected，
+    // 说明断线期间的事件已经按 Last-Event-ID 补发完毕，可以清掉旧的错误提示。
+    source.addEventListener('connected', () => {
+      setError(null);
+    });
 
     source.addEventListener('message.created', (event) => {
       const message = parseEvent<ConversationMessage>(event as MessageEvent);
@@ -154,8 +194,15 @@ export function TeamChat() {
     source.addEventListener('execution.updated', (event) => {
       const data = parseEvent<ExecutionRecord>(event as MessageEvent);
       if (!data) return;
+
+      setExecutions((current) => ({ ...current, [data.id]: data }));
+
       if (data.status === 'failed' && data.error) setError(data.error);
-      if (data.status === 'failed' || data.status === 'cancelled') {
+      if (data.status === 'interrupted') {
+        setError('有 execution 因服务重启而中断，未被自动重跑（避免重复执行）。');
+      }
+      // 终态：清掉流式占位，避免残留一个永远转圈的半截回复
+      if (!ACTIVE_STATUSES.includes(data.status)) {
         setStreaming((current) => {
           const next = { ...current };
           delete next[data.id];
@@ -202,12 +249,12 @@ export function TeamChat() {
     };
   }, [conversationId]);
 
-  // 新消息 / 新增量到达时贴底
+  // 新消息 / 新增量 / runtime 状态变化时贴底
   useEffect(() => {
     const node = scrollRef.current;
     if (!node) return;
     node.scrollTo({ top: node.scrollHeight });
-  }, [messages, streaming, delegations]);
+  }, [messages, streaming, delegations, executions]);
 
   async function createDirect(member: Member) {
     const existing = conversations.find(
@@ -393,6 +440,17 @@ export function TeamChat() {
                 ))}
               </select>
             </header>
+
+            {activeExecutions.length > 0 && (
+              <div className="runtime-strip">
+                {activeExecutions.map((execution) => (
+                  <span key={execution.id} className={`runtime-chip ${execution.status}`}>
+                    <span className="runtime-dot" />
+                    {memberLabel(execution.memberId)} · {STATUS_LABEL[execution.status]}
+                  </span>
+                ))}
+              </div>
+            )}
 
             <div className="conversation-messages" ref={scrollRef}>
               {messages.length === 0 && (

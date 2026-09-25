@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import type { TeamService } from '../team-service.js';
+import type { StoredConversationEvent } from '../domain.js';
 import { sendError } from '../middleware/errorHandler.js';
 
 const createConversationSchema = z.object({
@@ -104,6 +105,10 @@ export function conversationsRouter(team: TeamService) {
    *                      execution.updated
    * 一次请求只对应一个 execution，但一个 execution 可能触发多次 delegation，
    * 只有「会话级」的通道才能把整棵执行树推给前端。
+   *
+   * 可靠性：事件先落 conversation_event 再广播，SSE 帧带 `id: <sequence>`。
+   * 浏览器断线重连时会自动带上 Last-Event-ID，服务端据此把断线期间的事件补发，
+   * 所以刷新页面 / 切网络不会丢消息。也可以用 `?since=` 手动指定水位。
    */
   router.get('/:id/events', (req, res) => {
     const conversationId = req.params.id;
@@ -116,22 +121,31 @@ export function conversationsRouter(team: TeamService) {
       return;
     }
 
+    const since = parseSince(req.headers['last-event-id'], req.query.since);
+
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache, no-transform',
       Connection: 'keep-alive',
       'X-Accel-Buffering': 'no',
     });
+    res.socket?.setNoDelay(true);
+    // 断线后浏览器 3s 重连，比默认值激进一点，移动端体验更好
+    res.write('retry: 3000\n\n');
+    res.write(`event: connected\ndata: ${JSON.stringify({ conversationId, since })}\n\n`);
 
-    const send = (event: string, data: unknown) => {
-      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    const send = (event: StoredConversationEvent) => {
+      // message.delta 没有 sequence（token 级事件不落库），因此不带 id 帧，
+      // 浏览器不会推进 Last-Event-ID —— 它丢了也不用补，durable 的
+      // message.created 会带完整内容收敛。
+      const frame: string[] = [];
+      if (event.sequence !== null) frame.push(`id: ${event.sequence}`);
+      frame.push(`event: ${event.type}`);
+      frame.push(`data: ${JSON.stringify(event.data)}`);
+      res.write(`${frame.join('\n')}\n\n`);
     };
 
-    send('connected', { conversationId });
-
-    const unsubscribe = team.subscribe(conversationId, (event) => {
-      send(event.type, event.data);
-    });
+    const unsubscribe = team.replayAndSubscribe(conversationId, since, send);
 
     const heartbeat = setInterval(() => {
       res.write(': ping\n\n');
@@ -145,4 +159,17 @@ export function conversationsRouter(team: TeamService) {
   });
 
   return router;
+}
+
+/**
+ * Last-Event-ID 头优先于 `?since=`。
+ *
+ * 自动重连时浏览器会带上 Last-Event-ID，它比 URL 里的 `?since=` 新（后者是
+ * 首次连接时写死的），所以必须让 header 赢，否则每次重连都会重复回放一段。
+ * 非法值一律当作从头回放（0）。
+ */
+function parseSince(header: unknown, query: unknown): number {
+  const raw = header ?? query;
+  const value = Number(Array.isArray(raw) ? raw[0] : raw);
+  return Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0;
 }

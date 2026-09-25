@@ -98,7 +98,7 @@ async function waitForStatus(id: string, status: string): Promise<void> {
   assert.fail(`execution ${id} 未在预期时间内变成 ${status}（当前 ${executionRow(id).status}）`);
 }
 
-/** 等到该 conversation 没有 queued / running 的 execution，避免断言时还有异步写入。 */
+/** 等到该 conversation 没有 queued / running / waiting_for_member 的 execution，避免断言时还有异步写入。 */
 async function waitForConversationIdle(conversationId: string): Promise<void> {
   for (let attempt = 0; attempt < 300; attempt += 1) {
     const row = db
@@ -107,7 +107,7 @@ async function waitForConversationIdle(conversationId: string): Promise<void> {
         SELECT COUNT(*) AS n
         FROM execution
         WHERE conversation_id = ?
-          AND status IN ('queued', 'running')
+          AND status IN ('queued', 'running', 'waiting_for_member')
         `,
       )
       .get(conversationId) as unknown as { n: number };
