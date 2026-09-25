@@ -14,9 +14,12 @@ import type { DatabaseSync } from 'node:sqlite';
  *         execution.waiting_for_runtime_id / retry_of_execution_id
  *         execution.status 增加 waiting_for_member / interrupted
  *         conversation_event（durable event + SSE replay）
+ *   3 — Team discussion：
+ *         conversation_member_state（Member 在房间里的读游标 + 唤醒状态）
+ *         execution.decision / trigger_message_sequence
  */
 
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 /**
  * v1 schema。生产路径不会再创建它，保留的原因有两个：
@@ -333,6 +336,51 @@ CREATE INDEX IF NOT EXISTS idx_conversation_event_replay
   ON conversation_event(conversation_id, sequence);
 `;
 
+/**
+ * v3 新增部分，被全新库和 v2→v3 迁移共用。
+ *
+ * 这里刻意只用 `CREATE TABLE` / `ALTER TABLE ADD COLUMN`：给 execution 加列不需要
+ * 重建表，而重建表要处理 parent_execution_id / retry_of_execution_id 两个自引用外键，
+ * 风险远大于收益。（加 CHECK 约束才必须重建，这次没有。）
+ */
+export const V3_ADDITIONS_SQL = `
+CREATE TABLE IF NOT EXISTS conversation_member_state (
+  conversation_id TEXT NOT NULL,
+  member_id TEXT NOT NULL,
+  -- 这个 Member 已经读到房间的哪个位置
+  last_seen_message_sequence INTEGER NOT NULL DEFAULT 0,
+  -- 这个 Member 最后一次发言的序号
+  last_replied_message_sequence INTEGER NOT NULL DEFAULT 0,
+  wake_status TEXT NOT NULL DEFAULT 'idle'
+    CHECK (wake_status IN ('idle', 'queued', 'running', 'cooldown')),
+  -- durable 的「有个唤醒信号还没处理完」标记，重启后靠它重新派 wake
+  pending_wake INTEGER NOT NULL DEFAULT 0,
+  muted INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (conversation_id, member_id),
+  FOREIGN KEY (conversation_id)
+    REFERENCES conversation(id)
+    ON DELETE CASCADE,
+  FOREIGN KEY (member_id)
+    REFERENCES member(id)
+    ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_conversation_member_state_wake
+  ON conversation_member_state(conversation_id, wake_status);
+
+ALTER TABLE execution ADD COLUMN decision TEXT;
+
+ALTER TABLE execution ADD COLUMN trigger_message_sequence INTEGER;
+
+-- 为什么唤醒这个 Member（direct / mention / open_discussion / follow_up）。
+-- 落库是为了重启恢复时能忠实重放同一轮，而不是猜一个。
+ALTER TABLE execution ADD COLUMN wake_reason TEXT;
+`;
+
+/** v3 schema，全新库直接建这个。 */
+export const V3_SCHEMA_SQL = `${V2_SCHEMA_SQL}\n${V3_ADDITIONS_SQL}`;
+
 export function getUserVersion(db: DatabaseSync): number {
   const row = db.prepare('PRAGMA user_version').get() as unknown as
     | { user_version: number }
@@ -363,6 +411,15 @@ export function applySchemaV2(db: DatabaseSync): void {
   db.exec(V2_SCHEMA_SQL);
 }
 
+export function applySchemaV3(db: DatabaseSync): void {
+  db.exec(V3_SCHEMA_SQL);
+}
+
+function hasColumn(db: DatabaseSync, table: string, column: string): boolean {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as unknown as Array<{ name: string }>;
+  return rows.some((row) => row.name === column);
+}
+
 export interface MigrationResult {
   from: number;
   to: number;
@@ -387,9 +444,9 @@ export function migrate(db: DatabaseSync): MigrationResult {
       version = 1;
       setUserVersion(db, 1);
     } else {
-      applySchemaV2(db);
+      applySchemaV3(db);
       setUserVersion(db, SCHEMA_VERSION);
-      return { from: 0, to: SCHEMA_VERSION, applied: ['create-schema-v2'], fresh: true };
+      return { from: 0, to: SCHEMA_VERSION, applied: ['create-schema-v3'], fresh: true };
     }
   }
 
@@ -406,6 +463,13 @@ export function migrate(db: DatabaseSync): MigrationResult {
     applied.push('v1-to-v2');
     version = 2;
     setUserVersion(db, 2);
+  }
+
+  if (version < 3) {
+    migrateV2ToV3(db);
+    applied.push('v2-to-v3');
+    version = 3;
+    setUserVersion(db, 3);
   }
 
   return { from, to: version, applied, fresh: false };
@@ -595,6 +659,100 @@ function migrateV1ToV2(db: DatabaseSync): void {
       CREATE INDEX IF NOT EXISTS idx_conversation_event_replay
         ON conversation_event(conversation_id, sequence);
     `);
+
+    const violations = db.prepare('PRAGMA foreign_key_check').all();
+    if (violations.length > 0) {
+      throw new Error(
+        `迁移后外键校验失败（${violations.length} 条），已回滚：${JSON.stringify(violations.slice(0, 5))}`,
+      );
+    }
+
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  } finally {
+    db.exec('PRAGMA foreign_keys = ON');
+  }
+}
+
+/**
+ * v2 → v3：加 conversation_member_state + execution.decision / trigger_message_sequence。
+ *
+ * 不需要重建表（只加列、只加表），所以比 v1→v2 简单得多。
+ */
+function migrateV2ToV3(db: DatabaseSync): void {
+  const updatedAt = new Date().toISOString();
+
+  db.exec('PRAGMA foreign_keys = OFF');
+  db.exec('BEGIN');
+  try {
+    // ALTER 不幂等，用 table_info 兜一层，避免「迁移跑到一半被中断后重跑」时炸掉
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS conversation_member_state (
+        conversation_id TEXT NOT NULL,
+        member_id TEXT NOT NULL,
+        last_seen_message_sequence INTEGER NOT NULL DEFAULT 0,
+        last_replied_message_sequence INTEGER NOT NULL DEFAULT 0,
+        wake_status TEXT NOT NULL DEFAULT 'idle'
+          CHECK (wake_status IN ('idle', 'queued', 'running', 'cooldown')),
+        pending_wake INTEGER NOT NULL DEFAULT 0,
+        muted INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (conversation_id, member_id),
+        FOREIGN KEY (conversation_id)
+          REFERENCES conversation(id)
+          ON DELETE CASCADE,
+        FOREIGN KEY (member_id)
+          REFERENCES member(id)
+          ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_conversation_member_state_wake
+        ON conversation_member_state(conversation_id, wake_status);
+    `);
+
+    if (!hasColumn(db, 'execution', 'decision')) {
+      db.exec(`ALTER TABLE execution ADD COLUMN decision TEXT;`);
+    }
+    if (!hasColumn(db, 'execution', 'trigger_message_sequence')) {
+      db.exec(`ALTER TABLE execution ADD COLUMN trigger_message_sequence INTEGER;`);
+    }
+    if (!hasColumn(db, 'execution', 'wake_reason')) {
+      db.exec(`ALTER TABLE execution ADD COLUMN wake_reason TEXT;`);
+    }
+
+    // 给现有 roster 里的每个 (conversation, member) 补一行状态。
+    //
+    // last_seen 直接推到该 conversation 的当前 message_sequence，而不是 0：
+    // 否则升级后第一次收到新消息时，每个 Member 的「未读」都是整个历史，
+    // 会被一次性灌进 prompt。（和 v1→v2 推 last_context_message_sequence 同一个理由。）
+    db.prepare(
+      `
+      INSERT OR IGNORE INTO conversation_member_state (
+        conversation_id,
+        member_id,
+        last_seen_message_sequence,
+        last_replied_message_sequence,
+        wake_status,
+        pending_wake,
+        muted,
+        updated_at
+      )
+      SELECT
+        cm.conversation_id,
+        cm.member_id,
+        COALESCE(c.message_sequence, 0),
+        0,
+        'idle',
+        0,
+        0,
+        ?
+      FROM conversation_member cm
+      JOIN conversation c
+        ON c.id = cm.conversation_id
+      `,
+    ).run(updatedAt);
 
     const violations = db.prepare('PRAGMA foreign_key_check').all();
     if (violations.length > 0) {

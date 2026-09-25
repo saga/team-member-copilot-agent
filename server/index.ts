@@ -19,7 +19,7 @@ let server: Server | null = null;
  * 启动顺序很重要：
  *   1. schema 迁移（db.ts 在 import 时已完成）
  *   2. 崩溃恢复 —— 必须在开始接请求之前，否则客户端会看到一个正在被改写的中途状态
- *   3. 重新提交 queued 的 root execution（fire-and-forget）
+ *   3. 重新提交 queued 的 root execution / 重新派发丢失的唤醒（fire-and-forget）
  *   4. listen
  */
 async function bootstrap(): Promise<void> {
@@ -38,12 +38,20 @@ async function bootstrap(): Promise<void> {
         `orphanChildren=${report.interruptedOrphanChildren} ` +
         `runtimesReset=${report.runtimesReset} ` +
         `activeCleared=${report.activeExecutionCleared} ` +
-        `requeue=${report.requeuedExecutionIds.length}`,
+        `requeue=${report.requeuedExecutionIds.length} ` +
+        `lostWakes=${report.lostWakes.length}`,
     );
 
     // 这些 execution 从来没开始跑过（进程在真正执行前就挂了），重跑是安全的。
     for (const executionId of report.requeuedExecutionIds) {
       void teamService.resumeQueuedExecution(executionId);
+    }
+
+    // 同理：wake_status 还是 queued 的唤醒也从来没开始跑过。
+    // 顺序上放在 execution 之后 —— 先让已存在的 execution 跑起来，
+    // 再补那些连 execution 都还没创建的唤醒。
+    for (const wake of report.lostWakes) {
+      teamService.redispatchWake(wake);
     }
   }
 

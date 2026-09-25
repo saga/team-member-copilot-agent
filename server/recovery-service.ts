@@ -28,6 +28,16 @@ export interface RecoveryReport {
   requeuedExecutionIds: string[];
   runtimesReset: number;
   activeExecutionCleared: number;
+  /**
+   * 排队中被进程带走、需要重新派发的唤醒（conversation_member_state）。
+   *
+   * 和 `queued` 的 root execution 同一条规则：**还没开始跑**的可以安全重派。
+   * 已经开始跑的唤醒（wake_status = 'running'）不重派 —— 它对应的 execution
+   * 已经被标成 interrupted，重派会让副作用跑第二遍。
+   */
+  lostWakes: Array<{ conversationId: string; memberId: string }>;
+  /** 被复位成 idle 的唤醒状态行数。 */
+  wakesReset: number;
 }
 
 const INTERRUPTED_REASON = '进程重启，execution 在运行中被中断（未自动重跑）';
@@ -42,6 +52,8 @@ export class RecoveryService {
       requeuedExecutionIds: [],
       runtimesReset: 0,
       activeExecutionCleared: 0,
+      lostWakes: [],
+      wakesReset: 0,
     };
 
     const timestamp = now();
@@ -116,6 +128,40 @@ export class RecoveryService {
         )
         .run();
       report.runtimesReset = Number(reset.changes);
+
+      // 4. 房间唤醒状态。
+      //
+      //    先挑出「排队中还没开始跑」的唤醒（可以安全重派），再统一复位 ——
+      //    顺序不能反，复位会把 pending_wake 清掉。
+      const lostWakes = this.db
+        .prepare(
+          `
+          SELECT conversation_id, member_id
+          FROM conversation_member_state
+          WHERE pending_wake = 1
+            AND wake_status = 'queued'
+          `,
+        )
+        .all() as unknown as Array<{ conversation_id: string; member_id: string }>;
+      report.lostWakes = lostWakes.map((row) => ({
+        conversationId: row.conversation_id,
+        memberId: row.member_id,
+      }));
+
+      const wakesReset = this.db
+        .prepare(
+          `
+          UPDATE conversation_member_state
+          SET
+            wake_status = 'idle',
+            pending_wake = 0,
+            updated_at = ?
+          WHERE wake_status <> 'idle'
+             OR pending_wake = 1
+          `,
+        )
+        .run(timestamp);
+      report.wakesReset = Number(wakesReset.changes);
 
       this.db.exec('COMMIT');
     } catch (error) {

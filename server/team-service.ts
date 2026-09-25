@@ -5,6 +5,10 @@ import type { DatabaseSync } from 'node:sqlite';
 import { config } from './config.js';
 import { now } from './db.js';
 import { ContextAssembler } from './context-assembler.js';
+import { ConversationMemberService } from './conversation-member-service.js';
+import { GroupDispatcher, type DispatchPlan, type WakePlan } from './group-dispatcher.js';
+import { MemberTurnScheduler, type PendingWake } from './member-turn-scheduler.js';
+import { NO_REPLY_SENTINEL, parseMemberTurnOutcome } from './member-decision.js';
 import {
   MemberService,
   type CreateMemberInput,
@@ -16,7 +20,9 @@ import type {
   ConversationEvent,
   ConversationEventType,
   ConversationKind,
+  ConversationMemberState,
   ConversationMessage,
+  ExecutionDecision,
   ExecutionKind,
   ExecutionRecord,
   ExecutionStatus,
@@ -24,6 +30,8 @@ import type {
   MemberRuntime,
   StoredConversationEvent,
   ToolProfile,
+  TurnMode,
+  WakeReason,
 } from './domain.js';
 
 /**
@@ -85,6 +93,9 @@ interface ExecutionRow {
   error: string | null;
   waiting_for_runtime_id: string | null;
   retry_of_execution_id: string | null;
+  decision: ExecutionDecision | null;
+  trigger_message_sequence: number | null;
+  wake_reason: string | null;
   started_at: string | null;
   ended_at: string | null;
   created_at: string;
@@ -131,6 +142,26 @@ export interface CreateConversationInput {
   kind?: 'direct' | 'group' | 'work';
   memberIds: string[];
   defaultMemberId?: string;
+}
+
+/**
+ * 发一条消息的结果。
+ *
+ * 刻意**没有**单个 `executionId`：group 房间的一条消息可以唤醒多个 Member，
+ * 各自产生一条 execution，一个字段表达不了。谁被唤醒了由 `wakes` 给出；
+ * 每条 execution 的进展通过 SSE 的 `execution.updated` 到达。
+ */
+export interface SendMessageResult {
+  message: ConversationMessage;
+  /** 这条消息唤醒的 Member（各自会产生一条 execution）。 */
+  wakes: WakePlan[];
+  /**
+   * 消息里 @ 了但不属于这个房间的名字。
+   *
+   * 这种情况下**不广播给全员** —— 用户明确想找某个人，把消息派给所有人是
+   * 更糟的误解。调用方应当据此提示用户。
+   */
+  unresolvedMentions: string[];
 }
 
 /**
@@ -235,6 +266,15 @@ export class TeamService {
    */
   private readonly cancelRequests = new Set<string>();
   private readonly contextAssembler: ContextAssembler;
+  /**
+   * Member 在房间里的读游标 / 唤醒状态。
+   * 和 MemberRuntime 是两件事，见 conversation-member-service.ts。
+   */
+  private readonly states: ConversationMemberService;
+  /** 一条消息该唤醒谁 —— 确定性规则，不是 LLM routing。 */
+  private readonly dispatcher: GroupDispatcher;
+  /** 「消息到了」和「Agent 开始跑」之间的那一层：串行 + 合并。 */
+  private readonly scheduler: MemberTurnScheduler;
 
   constructor(
     private readonly db: DatabaseSync,
@@ -242,6 +282,21 @@ export class TeamService {
     private readonly copilot: CopilotService,
   ) {
     this.contextAssembler = new ContextAssembler(db);
+    this.states = new ConversationMemberService(db);
+    this.dispatcher = new GroupDispatcher(db, this.states, config.groupAutoWakeRounds);
+    this.scheduler = new MemberTurnScheduler(
+      this.states,
+      (wake) => this.runWake(wake),
+      (wake, error) => {
+        // 一轮唤醒失败已经被 runTurn 记进 execution 并广播了，这里只是别让它
+        // 变成 unhandled rejection，也不要让调度器的循环静默吞掉。
+        // eslint-disable-next-line no-console
+        console.error(
+          `[team] wake ${wake.memberId} 失败:`,
+          error instanceof Error ? error.message : error,
+        );
+      },
+    );
   }
 
   // ---------------------------------------------------------------- Member
@@ -349,6 +404,8 @@ export class TeamService {
     );
     for (const memberId of memberIds) {
       insertMember.run(id, memberId, createdAt);
+      // 新房间没有历史，房间读游标从 0 开始
+      this.states.ensure(id, memberId, 0);
     }
 
     return this.getConversation(id);
@@ -379,6 +436,10 @@ export class TeamService {
         `,
       )
       .run(conversationId, memberId, now());
+
+    // 加入已有 group 的新成员：房间游标直接推到当前水位。
+    // 从 0 开始的话，它第一次被唤醒时「未读」是整个历史。
+    this.states.ensure(conversationId, memberId, conversation.messageSequence);
 
     this.touchConversation(conversationId);
     return this.getConversation(conversationId);
@@ -422,6 +483,9 @@ export class TeamService {
       )
       .run(memberId, now(), conversationId);
 
+    // 房间状态跟着 roster 一起走：人走了，它的读游标 / 唤醒状态也不该留下
+    this.states.remove(conversationId, memberId);
+
     return this.getConversation(conversationId);
   }
 
@@ -452,79 +516,207 @@ export class TeamService {
     return rows.reverse().map(mapMessage);
   }
 
+  /**
+   * 发一条消息。
+   *
+   * 这个函数**只负责落库 + 派发唤醒**，不再承担「挑一个 Member 然后跑它」：
+   *
+   *   sendMessage()  →  insert user message  →  dispatcher.plan()  →  scheduler.enqueue()
+   *
+   * 一条消息可能唤醒多个 Member（group 的共享讨论），各自产生一条 execution，
+   * 所以返回值里没有单个 executionId —— 那是「一个房间只有一个收件人」时代的形状。
+   * 谁被唤醒了由 `wakes` 给出；每条 execution 通过 SSE 的 execution.updated 到达。
+   */
   async sendMessage(input: {
     conversationId: string;
     content: string;
     targetMemberId?: string;
     replyToMessageId?: string;
-  }): Promise<{ message: ConversationMessage; executionId: string }> {
+  }): Promise<SendMessageResult> {
     const conversation = this.getConversation(input.conversationId);
-    const target = this.resolveTargetMember(conversation, input.targetMemberId);
-
-    const messageId = randomUUID();
-    const executionId = randomUUID();
-    const createdAt = now();
     const content = input.content.trim();
-    const messageSequence = this.nextMessageSequence(conversation.id);
+    if (!content) throw badRequest('消息内容不能为空');
+
+    // 显式指定收件人时先校验：一条没人收的消息不该落库
+    if (input.targetMemberId) this.requireActiveMember(conversation, input.targetMemberId);
 
     const message: ConversationMessage = {
-      id: messageId,
-      conversationId: input.conversationId,
-      messageSequence,
+      id: randomUUID(),
+      conversationId: conversation.id,
+      messageSequence: this.nextMessageSequence(conversation.id),
       senderType: 'user',
       senderId: config.localUserId,
-      targetMemberId: target.id,
+      targetMemberId: input.targetMemberId ?? null,
       replyToMessageId: input.replyToMessageId ?? null,
       content,
-      executionId,
-      createdAt,
+      // 一条消息可以唤醒多个 Member，外键装不下「触发它的 execution」
+      executionId: null,
+      createdAt: now(),
     };
 
     this.insertMessage(message);
+    this.touchConversation(conversation.id);
+    this.emit(conversation.id, { type: 'message.created', data: message });
+
+    const plan = this.dispatcher.plan({ conversation, message });
+    for (const wake of plan.wakes) {
+      this.scheduler.enqueue({
+        conversationId: conversation.id,
+        memberId: wake.memberId,
+        reason: wake.reason,
+        triggerSequence: wake.triggerSequence,
+      });
+    }
+
+    return {
+      message,
+      wakes: plan.wakes,
+      unresolvedMentions: plan.unresolvedMentions,
+    };
+  }
+
+  /**
+   * 某个 Member 发言之后，把它这条消息再派发一次 —— 别人可能该被唤醒。
+   *
+   * 这就是 Team discussion 的闭环：
+   *
+   *   message → wake → Member 判断 → reply / skip → new message → 其它 Member wake
+   *
+   * 必须带 `authorMemberId`：否则 Member 一发言就把自己再唤醒一次。
+   */
+  private dispatchMessage(input: {
+    conversation: Conversation;
+    message: ConversationMessage;
+    authorMemberId?: string;
+  }): DispatchPlan {
+    const plan = this.dispatcher.plan(input);
+
+    for (const wake of plan.wakes) {
+      this.scheduler.enqueue({
+        conversationId: input.conversation.id,
+        memberId: wake.memberId,
+        reason: wake.reason,
+        triggerSequence: wake.triggerSequence,
+      });
+    }
+
+    return plan;
+  }
+
+  // ---------------------------------------------------- Conversation state
+
+  /** 房间里每个 Member 的读游标 / 唤醒状态 / 未读数。 */
+  listConversationState(conversationId: string): ConversationMemberState[] {
+    const conversation = this.getConversation(conversationId);
+    // 归档的成员也保留状态（历史事实），但 ensure 只对 roster 里的人做
+    for (const member of conversation.members) this.states.ensure(conversationId, member.id);
+    return this.states.list(conversationId);
+  }
+
+  /** 静音 / 解除静音。静音的 Member 不会被 dispatcher 唤醒（@ 也唤不醒）。 */
+  setMemberMuted(conversationId: string, memberId: string, muted: boolean): ConversationMemberState {
+    const conversation = this.getConversation(conversationId);
+    this.requireConversationMember(conversation, memberId);
+    this.states.ensure(conversationId, memberId);
+    this.states.setMuted(conversationId, memberId, muted);
+    return this.states.get(conversationId, memberId);
+  }
+
+  /**
+   * 真正跑一次唤醒。
+   *
+   * execution 在这里创建（而不是在 sendMessage 里）：scheduler 已经保证了
+   * 同一个 (conversation, member) 同时只有一个 wake 在跑，所以「一轮 = 一条
+   * execution」，不会出现「一条消息唤醒两次、留下一条永远 queued 的 execution」。
+   */
+  private async runWake(wake: PendingWake): Promise<void> {
+    const conversation = this.getConversation(wake.conversationId);
+    const member = this.requireActiveMember(conversation, wake.memberId);
+
+    const trigger = this.findMessageBySequence(wake.conversationId, wake.triggerSequence);
 
     const execution: ExecutionRecord = {
-      id: executionId,
+      id: randomUUID(),
       conversationId: conversation.id,
-      memberId: target.id,
+      memberId: member.id,
       runtimeId: null,
       parentExecutionId: null,
-      delegationPath: [target.id],
+      delegationPath: [member.id],
       kind: conversation.kind === 'work' ? 'member_work' : 'interactive',
       status: 'queued',
-      prompt: content,
+      prompt: trigger?.content ?? '',
       response: null,
       error: null,
       waitingForRuntimeId: null,
       retryOfExecutionId: null,
+      decision: null,
+      triggerMessageSequence: wake.triggerSequence,
+      wakeReason: wake.reason,
       startedAt: null,
       endedAt: null,
-      createdAt,
+      createdAt: now(),
     };
     this.insertExecution(execution);
-
-    this.touchConversation(conversation.id);
-    this.emit(conversation.id, { type: 'message.created', data: message });
     this.emitExecution(execution);
 
-    // 异步执行，不阻塞 202 响应；状态全部通过 SSE + execution 表对外暴露。
-    void this.executeMemberTurn({
+    await this.executeMemberTurn({
       conversation,
-      member: target,
+      member,
       execution,
-      prompt: content,
-    }).catch((error: unknown) => {
-      // executeMemberTurn 内部已经把 execution 标记为终态并广播，
-      // 这里只是防止 fire-and-forget 变成 unhandled rejection。
-      // 取消是预期路径，不该刷 error 日志。
-      if (error instanceof ExecutionCancelledError) return;
-      // eslint-disable-next-line no-console
-      console.error(
-        '[team] interactive execution failed:',
-        error instanceof Error ? error.message : error,
-      );
+      prompt: trigger?.content ?? '',
+      triggerMessageSequence: wake.triggerSequence,
+      turnMode: conversation.kind === 'group' ? 'discussion' : 'direct',
+      wakeReason: wake.reason,
     });
+  }
 
-    return { message, executionId };
+  /**
+   * 重启恢复用：重新派发一个被进程带走的唤醒。
+   *
+   * 触发消息的序号也要一起带上 —— 恢复出来的这一轮必须看到当时那条消息，
+   * 否则它会在一个空上下文里做「要不要发言」的判断。
+   */
+  redispatchWake(input: { conversationId: string; memberId: string }): void {
+    const conversation = this.getConversation(input.conversationId);
+    const member = this.requireConversationMember(conversation, input.memberId);
+    if (member.status !== 'active') return;
+
+    const state = this.states.get(input.conversationId, input.memberId);
+    const triggerSequence = this.latestMessageSequence(input.conversationId);
+    if (triggerSequence <= state.lastSeenMessageSequence) return;
+
+    this.scheduler.enqueue({
+      conversationId: input.conversationId,
+      memberId: input.memberId,
+      // 唤醒原因没落库在这个路径上（wake 还没走到建 execution 那一步），
+      // 用最宽松的 open_discussion：允许 skip，不会强行逼出一条消息。
+      reason: 'open_discussion',
+      triggerSequence,
+    });
+  }
+
+  private latestMessageSequence(conversationId: string): number {
+    const row = this.db
+      .prepare(`SELECT message_sequence FROM conversation WHERE id = ?`)
+      .get(conversationId) as unknown as { message_sequence: number } | undefined;
+    return row?.message_sequence ?? 0;
+  }
+
+  private findMessageBySequence(
+    conversationId: string,
+    sequence: number,
+  ): ConversationMessage | null {
+    const row = this.db
+      .prepare(
+        `
+        SELECT *
+        FROM conversation_message
+        WHERE conversation_id = ?
+          AND message_sequence = ?
+        `,
+      )
+      .get(conversationId, sequence) as unknown as MessageRow | undefined;
+    return row ? mapMessage(row) : null;
   }
 
   // ----------------------------------------------------------- Delegation
@@ -655,6 +847,10 @@ export class TeamService {
           .filter(Boolean)
           .join('\n'),
         sourceMemberId: fromMember.id,
+        // delegation 没有触发消息，也没有房间讨论语义：它是一道明确的任务。
+        triggerMessageSequence: null,
+        turnMode: 'delegation',
+        wakeReason: null,
       });
 
       this.emit(conversation.id, {
@@ -829,6 +1025,11 @@ export class TeamService {
       error: null,
       waitingForRuntimeId: null,
       retryOfExecutionId: original.id,
+      decision: null,
+      // 触发消息与唤醒原因原样带过来：retry 是「把同一轮再跑一次」，
+      // 不是「当成一条新消息」。这样它仍然能看到当时的房间上下文。
+      triggerMessageSequence: original.triggerMessageSequence,
+      wakeReason: original.wakeReason,
       startedAt: null,
       endedAt: null,
       createdAt: now(),
@@ -841,6 +1042,9 @@ export class TeamService {
       member,
       execution: retry,
       prompt: retry.prompt,
+      triggerMessageSequence: retry.triggerMessageSequence,
+      turnMode: this.turnModeFor(conversation, retry),
+      wakeReason: retry.wakeReason,
     }).catch((error: unknown) => {
       // eslint-disable-next-line no-console
       console.error(
@@ -850,6 +1054,17 @@ export class TeamService {
     });
 
     return { executionId: retry.id };
+  }
+
+  /**
+   * 从落库的 execution 反推这一轮该怎么跑。
+   *
+   * retry 和重启恢复都不该「猜」一个 turnMode：delegation 与房间讨论的
+   * prompt 差别很大，猜错会让恢复出来的一轮行为莫名其妙。
+   */
+  private turnModeFor(conversation: Conversation, execution: ExecutionRecord): TurnMode {
+    if (execution.kind === 'member_delegate') return 'delegation';
+    return conversation.kind === 'group' ? 'discussion' : 'direct';
   }
 
   /**
@@ -881,6 +1096,9 @@ export class TeamService {
         member,
         execution,
         prompt: execution.prompt,
+        triggerMessageSequence: execution.triggerMessageSequence,
+        turnMode: this.turnModeFor(conversation, execution),
+        wakeReason: execution.wakeReason,
       });
     } catch (error) {
       // executeMemberTurn 已经把 execution 置为 failed 并广播过，这里只是收口。
@@ -1011,6 +1229,9 @@ export class TeamService {
     execution: ExecutionRecord;
     prompt: string;
     sourceMemberId?: string;
+    triggerMessageSequence: number | null;
+    turnMode: TurnMode;
+    wakeReason: WakeReason | null;
   }): Promise<string> {
     const runtime = this.ensureRuntime(input.conversation, input.member);
     // 整个 turn（含 DB 写入）都在 runtime 锁内，保证单写者。
@@ -1023,6 +1244,9 @@ export class TeamService {
     execution: ExecutionRecord;
     prompt: string;
     sourceMemberId?: string;
+    triggerMessageSequence: number | null;
+    turnMode: TurnMode;
+    wakeReason: WakeReason | null;
     runtime: MemberRuntime;
   }): Promise<string> {
     const runtime = input.runtime;
@@ -1063,7 +1287,11 @@ export class TeamService {
     // Copilot session 自己已经记着这个 Member 的历史，整段重放会重复。
     const context = this.contextAssembler.assemble({
       runtime,
-      currentExecutionId: executionId,
+      conversation: input.conversation,
+      member: input.member,
+      turnMode: input.turnMode,
+      triggerMessageSequence: input.triggerMessageSequence,
+      wakeReason: input.wakeReason,
       currentPrompt: input.prompt,
     });
 
@@ -1103,13 +1331,7 @@ export class TeamService {
         throw new ExecutionCancelledError();
       }
 
-      const message = this.insertMemberMessage({
-        conversationId: input.conversation.id,
-        memberId: input.member.id,
-        content: result,
-        executionId,
-        replyToMessageId: null,
-      });
+      const outcome = parseMemberTurnOutcome(result);
 
       // checkpoint 只在成功后才推进；失败时保持不变，下一轮重新注入，
       // 宁可重复也不要丢上下文。
@@ -1119,9 +1341,47 @@ export class TeamService {
         lastContextMessageSequence: context.consumedThroughSequence,
         lastUsedAt: now(),
       });
+
+      if (outcome.decision === 'skip') {
+        // skip 是一条**成功**的 execution，只是没有产出 message。
+        // 它仍然推进房间读游标（这个 Member 确实读过这些消息了），
+        // 但不推进 session checkpoint —— 它的 Copilot session 从没读过，
+        // 下一轮确实需要重新看到。
+        this.states.markSeen(
+          input.conversation.id,
+          input.member.id,
+          context.consumedThroughSequence,
+        );
+        this.updateExecution(executionId, {
+          status: 'completed',
+          decision: 'skip',
+          response: null,
+          endedAt: now(),
+        });
+        this.emitExecution(this.getExecution(executionId));
+        // 没有新消息 → 不需要再派发唤醒，循环自然终止
+        return '';
+      }
+
+      const message = this.insertMemberMessage({
+        conversationId: input.conversation.id,
+        memberId: input.member.id,
+        content: outcome.content,
+        executionId,
+        replyToMessageId: null,
+      });
+
+      this.states.markSeen(
+        input.conversation.id,
+        input.member.id,
+        context.consumedThroughSequence,
+      );
+      this.states.markReplied(input.conversation.id, input.member.id, message.messageSequence);
+
       this.updateExecution(executionId, {
         status: 'completed',
-        response: result,
+        decision: 'reply',
+        response: outcome.content,
         endedAt: now(),
       });
 
@@ -1129,7 +1389,15 @@ export class TeamService {
       this.emitExecution(this.getExecution(executionId));
       this.touchConversation(input.conversation.id);
 
-      return result;
+      // Team discussion 的闭环：这条新消息可能该唤醒别人。
+      // 必须带 authorMemberId，否则这个 Member 会被自己的消息再唤醒一次。
+      this.dispatchMessage({
+        conversation: input.conversation,
+        message,
+        authorMemberId: input.member.id,
+      });
+
+      return outcome.content;
     } catch (error) {
       const cancelled =
         error instanceof ExecutionCancelledError || this.cancelRequests.has(executionId);
@@ -1195,6 +1463,13 @@ export class TeamService {
     return false;
   }
 
+  /**
+   * Member 的**稳定身份**。房间上下文（参与者、未读消息、要不要发言）不在这里，
+   * 而是每轮由 ContextAssembler 动态拼进 user prompt。
+   *
+   * 分开的理由：身份要跨 conversation 稳定，把房间历史写进 persona 会让同一个
+   * Member 在不同房间里表现出不同「人格」。
+   */
   private buildMemberSystemPrompt(conversation: Conversation, member: Member): string {
     const otherMembers = conversation.members
       .filter((item) => item.id !== member.id)
@@ -1218,17 +1493,22 @@ export class TeamService {
       'execute privileged operations, approve actions,',
       'or bypass application policy.',
       '',
-      `Current conversation: ${conversation.id}`,
-      `Conversation title: ${conversation.title}`,
+      `Current room: ${conversation.title} (${conversation.kind})`,
       '',
-      'Other Team Members:',
+      'Other Team Members in this room:',
       otherMembers || '(none)',
       '',
+      'How this room works:',
+      'You are one participant among several, not the assistant of the whole room.',
+      'Mention another Member with @handle when you want a specific person to respond.',
+      'In a group room you may be woken without being addressed; if you have nothing',
+      `useful and non-duplicative to add, reply with exactly ${NO_REPLY_SENTINEL} instead of a message.`,
+      '',
       'Delegation:',
-      'Use ask_member when another Member is better suited to a subtask.',
+      'Use ask_member when another Member is better suited to a specific subtask.',
+      'ask_member is a blocking RPC: you will wait for that Member to finish, so keep',
+      'delegated tasks focused. It is not how you talk in the room — for that, just reply.',
       'Do not directly simulate another Member.',
-      'ask_member is synchronous: you will block until that Member finishes,',
-      'so keep delegated tasks focused.',
       '',
       'Long-term memory:',
       memory || '(no stored memory yet)',
@@ -1378,22 +1658,9 @@ export class TeamService {
     return message;
   }
 
-  private resolveTargetMember(conversation: Conversation, targetMemberId?: string): Member {
-    if (targetMemberId) return this.requireActiveMember(conversation, targetMemberId);
-    if (conversation.defaultMemberId) {
-      return this.requireActiveMember(conversation, conversation.defaultMemberId);
-    }
-
-    const active = conversation.members.filter((member) => member.status === 'active');
-    if (active.length === 1) return active[0];
-    if (active.length === 0) {
-      throw badRequest('conversation 里没有可用的 Member（都归档了？）');
-    }
-
-    throw badRequest('group conversation 必须指定 targetMemberId');
-  }
-
-  /** roster 里能找到就行（含已归档）—— 用于查历史、校验父 execution 归属。 */
+  /**
+   * roster 里能找到就行（含已归档）—— 用于查历史、校验父 execution 归属。
+   */
   private requireConversationMember(conversation: Conversation, memberId: string): Member {
     const member = conversation.members.find((item) => item.id === memberId);
     if (!member) {
@@ -1479,11 +1746,14 @@ export class TeamService {
           error,
           waiting_for_runtime_id,
           retry_of_execution_id,
+          decision,
+          trigger_message_sequence,
+          wake_reason,
           started_at,
           ended_at,
           created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `,
       )
       .run(
@@ -1500,6 +1770,9 @@ export class TeamService {
         execution.error,
         execution.waitingForRuntimeId,
         execution.retryOfExecutionId,
+        execution.decision,
+        execution.triggerMessageSequence,
+        execution.wakeReason,
         execution.startedAt,
         execution.endedAt,
         execution.createdAt,
@@ -1526,6 +1799,7 @@ export class TeamService {
       response: string | null;
       error: string | null;
       waitingForRuntimeId: string | null;
+      decision: ExecutionDecision | null;
       startedAt: string | null;
       endedAt: string | null;
     }>,
@@ -1541,6 +1815,7 @@ export class TeamService {
           response = ?,
           error = ?,
           waiting_for_runtime_id = ?,
+          decision = ?,
           started_at = ?,
           ended_at = ?
         WHERE id = ?
@@ -1554,6 +1829,7 @@ export class TeamService {
         patch.waitingForRuntimeId !== undefined
           ? patch.waitingForRuntimeId
           : current.waitingForRuntimeId,
+        patch.decision !== undefined ? patch.decision : current.decision,
         patch.startedAt !== undefined ? patch.startedAt : current.startedAt,
         patch.endedAt !== undefined ? patch.endedAt : current.endedAt,
         id,
@@ -1767,6 +2043,9 @@ function mapExecution(row: ExecutionRow): ExecutionRecord {
     error: row.error,
     waitingForRuntimeId: row.waiting_for_runtime_id,
     retryOfExecutionId: row.retry_of_execution_id,
+    decision: row.decision ?? null,
+    triggerMessageSequence: row.trigger_message_sequence ?? null,
+    wakeReason: (row.wake_reason as WakeReason | null) ?? null,
     startedAt: row.started_at,
     endedAt: row.ended_at,
     createdAt: row.created_at,
