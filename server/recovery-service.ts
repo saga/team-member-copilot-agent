@@ -1,5 +1,7 @@
 import type { DatabaseSync } from 'node:sqlite';
+import { ConversationMemberService } from './conversation-member-service.js';
 import { now } from './db.js';
+import type { PendingWake } from './domain.js';
 
 /**
  * 启动恢复。
@@ -34,8 +36,11 @@ export interface RecoveryReport {
    * 和 `queued` 的 root execution 同一条规则：**还没开始跑**的可以安全重派。
    * 已经开始跑的唤醒（wake_status = 'running'）不重派 —— 它对应的 execution
    * 已经被标成 interrupted，重派会让副作用跑第二遍。
+   *
+   * 带上 triggerSequence / reason：恢复出来必须是**当时那一轮**，
+   * 不能拿房间当前水位 + 最宽松的 reason 猜一个。
    */
-  lostWakes: Array<{ conversationId: string; memberId: string }>;
+  lostWakes: PendingWake[];
   /** 被复位成 idle 的唤醒状态行数。 */
   wakesReset: number;
 }
@@ -43,7 +48,10 @@ export interface RecoveryReport {
 const INTERRUPTED_REASON = '进程重启，execution 在运行中被中断（未自动重跑）';
 
 export class RecoveryService {
-  constructor(private readonly db: DatabaseSync) {}
+  constructor(
+    private readonly db: DatabaseSync,
+    private readonly states: ConversationMemberService,
+  ) {}
 
   recover(): RecoveryReport {
     const report: RecoveryReport = {
@@ -133,35 +141,12 @@ export class RecoveryService {
       //
       //    先挑出「排队中还没开始跑」的唤醒（可以安全重派），再统一复位 ——
       //    顺序不能反，复位会把 pending_wake 清掉。
-      const lostWakes = this.db
-        .prepare(
-          `
-          SELECT conversation_id, member_id
-          FROM conversation_member_state
-          WHERE pending_wake = 1
-            AND wake_status = 'queued'
-          `,
-        )
-        .all() as unknown as Array<{ conversation_id: string; member_id: string }>;
-      report.lostWakes = lostWakes.map((row) => ({
-        conversationId: row.conversation_id,
-        memberId: row.member_id,
-      }));
-
-      const wakesReset = this.db
-        .prepare(
-          `
-          UPDATE conversation_member_state
-          SET
-            wake_status = 'idle',
-            pending_wake = 0,
-            updated_at = ?
-          WHERE wake_status <> 'idle'
-             OR pending_wake = 1
-          `,
-        )
-        .run(timestamp);
-      report.wakesReset = Number(wakesReset.changes);
+      //
+      //    这两步走 ConversationMemberService 而不是在这里再写一份 SQL：
+      //    「什么算 lost wake」只该有一个定义，否则恢复逻辑和调度器会各自漂移。
+      //    两边都是同步语句，会加入当前这个事务。
+      report.lostWakes = this.states.findLostWakes();
+      report.wakesReset = this.states.resetWakeStatuses();
 
       this.db.exec('COMMIT');
     } catch (error) {

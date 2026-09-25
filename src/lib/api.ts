@@ -96,17 +96,19 @@ export interface ExecutionRecord {
 }
 
 /**
- * 一条消息唤醒了哪个 Member、为什么。
- *
- * 确定性规则的产物（见 server/group-dispatcher.ts），不是 LLM routing：
+ * 为什么唤醒这个 Member。确定性规则的产物（见 server/group-dispatcher.ts），
+ * 不是 LLM routing：
  *   direct          1:1 房间，或请求里显式指定了 targetMemberId
  *   mention         消息里 @ 了它
  *   open_discussion 用户没 @ 任何人，让房间成员自行判断要不要发言
  *   follow_up       另一个 Member 发言后顺带被唤醒（受 autoWakeRounds 限制）
  */
+export type WakeReason = 'direct' | 'mention' | 'open_discussion' | 'follow_up';
+
+/** 一条消息唤醒了哪个 Member、为什么。 */
 export interface WakePlan {
   memberId: string;
-  reason: 'direct' | 'mention' | 'open_discussion' | 'follow_up';
+  reason: WakeReason;
   triggerSequence: number;
 }
 
@@ -136,6 +138,14 @@ export interface ConversationMemberState {
   lastRepliedMessageSequence: number;
   wakeStatus: 'idle' | 'queued' | 'running' | 'cooldown';
   pendingWake: boolean;
+  /**
+   * 排队中那次唤醒是被哪条消息、以什么原因触发的；没有排队时为 null。
+   *
+   * 它和 pendingWake 同生共死：只显示「有个唤醒在排队」而不知道它为什么排队，
+   * 排查起来只能靠猜。
+   */
+  pendingWakeTriggerSequence: number | null;
+  pendingWakeReason: WakeReason | null;
   muted: boolean;
   updatedAt: string;
 }

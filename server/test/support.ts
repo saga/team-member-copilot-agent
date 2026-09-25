@@ -101,6 +101,13 @@ export interface StubTurn {
 export class StubCopilot {
   mode: 'reply' | 'skip' = 'reply';
   readonly turns: StubTurn[] = [];
+  /**
+   * 挂住 turn，用来把一个 execution 稳定地钉在 running 上。
+   *
+   * 测试「同一轮还在跑的时候又来了唤醒」必须靠它：不等住第一轮，第二轮永远
+   * 落在「已经跑完」之后，走的是另一条路径。
+   */
+  hold: Promise<void> | null = null;
 
   async runMemberTurn(input: RunMemberTurnInput): Promise<string> {
     this.turns.push({
@@ -109,12 +116,14 @@ export class StubCopilot {
       systemPrompt: input.systemPrompt,
       prompt: input.prompt,
     });
+    if (this.hold) await this.hold;
     return this.mode === 'skip' ? NO_REPLY_SENTINEL : `reply from ${input.member.name}`;
   }
 
   reset(): void {
     this.turns.length = 0;
     this.mode = 'reply';
+    this.hold = null;
   }
 
   turnFor(executionId: string): StubTurn {

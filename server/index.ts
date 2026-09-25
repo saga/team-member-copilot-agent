@@ -5,6 +5,7 @@ import { app, copilotService, teamService } from './app.js';
 import { config } from './config.js';
 import { db, migration } from './db.js';
 import { RecoveryService } from './recovery-service.js';
+import { ConversationMemberService } from './conversation-member-service.js';
 
 // 与 app.ts 用同一个基准，避免两处 DIST_DIR 指向不同目录
 const DIST_DIR = path.resolve(process.cwd(), 'dist');
@@ -31,7 +32,7 @@ async function bootstrap(): Promise<void> {
   );
 
   if (config.recoverOnStartup) {
-    const report = new RecoveryService(db).recover();
+    const report = new RecoveryService(db, new ConversationMemberService(db)).recover();
     // eslint-disable-next-line no-console
     console.log(
       `[server] recovery: interrupted=${report.interrupted} ` +

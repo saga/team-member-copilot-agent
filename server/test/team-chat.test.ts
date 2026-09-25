@@ -253,6 +253,98 @@ describe('NO_REPLY 是一条成功的 execution', () => {
   });
 });
 
+describe('同一轮还在跑时到达的唤醒', () => {
+  interface WakeStateRow {
+    pending_wake: number;
+    pending_wake_trigger_sequence: number | null;
+    pending_wake_reason: string | null;
+  }
+
+  function wakeState(conversationId: string, memberId: string): WakeStateRow {
+    const row = db
+      .prepare(
+        `
+        SELECT pending_wake, pending_wake_trigger_sequence, pending_wake_reason
+        FROM conversation_member_state
+        WHERE conversation_id = ? AND member_id = ?
+        `,
+      )
+      .get(conversationId, memberId) as unknown as WakeStateRow | undefined;
+    assert.ok(row, 'conversation_member_state 行应该存在');
+    return row;
+  }
+
+  it('合并时 reason 与 trigger 必须来自同一条消息，不能拼出一个不存在的事件', async () => {
+    const group = team.createConversation({
+      kind: 'group',
+      title: 'Coalescing Room',
+      memberIds: [alice.id, bob.id],
+    });
+
+    // 按住引擎，让 Alice 的第一轮停在 running —— 后面两条唤醒才会落进 pending
+    // 并发生合并，而不是各自开一轮。
+    let release!: () => void;
+    stub.hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    try {
+      // #1 显式点名 → direct。它进引擎（被按住）。
+      const first = await team.sendMessage({
+        conversationId: group.id,
+        content: '先看下风险',
+        targetMemberId: alice.id,
+      });
+      const firstExecutionId = executionIdForWake(db, group.id, first.wakes[0]);
+      await waitForStatus(firstExecutionId, 'running');
+
+      // #2 @alice → mention。入队，等第一轮结束再跑。
+      await team.sendMessage({ conversationId: group.id, content: '@alice 再看下依赖' });
+
+      // #3 无 mention 的广播 → open_discussion（更弱）。它不该把 mention 顶掉。
+      await team.sendMessage({ conversationId: group.id, content: '大家也一起看下' });
+
+      // 关键断言：留下的是 mention 与它自己那条消息。
+      // 早先的实现分别取「更明确的 reason」和「更大的 sequence」，
+      // 会拼出 mention @3 —— 而 #3 并没有点名 Alice。
+      assert.deepEqual(
+        { ...wakeState(group.id, alice.id) },
+        { pending_wake: 1, pending_wake_trigger_sequence: 2, pending_wake_reason: 'mention' },
+      );
+    } finally {
+      release();
+      stub.hold = null;
+    }
+
+    await waitForConversationIdle(group.id);
+
+    // 补跑的那一轮也必须按 mention @2 走，而不是把两件事错配。
+    const aliceExecutions = (
+      db
+        .prepare(
+          `
+          SELECT trigger_message_sequence, wake_reason
+          FROM execution
+          WHERE conversation_id = ? AND member_id = ?
+          ORDER BY rowid
+          `,
+        )
+        .all(group.id, alice.id) as unknown as Array<{
+        trigger_message_sequence: number | null;
+        wake_reason: string | null;
+      }>
+    ).map((row) => ({ ...row }));
+
+    assert.deepEqual(aliceExecutions, [
+      { trigger_message_sequence: 1, wake_reason: 'direct' },
+      { trigger_message_sequence: 2, wake_reason: 'mention' },
+    ]);
+
+    // 合并之后 pending 被真正消费掉，不留幽灵标记
+    assert.equal(wakeState(group.id, alice.id).pending_wake, 0);
+  });
+});
+
 describe('Member 之间是隔离的', () => {
   /**
    * 在**同一个房间**里点名一个 Member 跑一轮，返回真正传给引擎的 system prompt。

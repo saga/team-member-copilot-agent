@@ -1,6 +1,6 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { now } from './db.js';
-import type { ConversationMemberState, WakeStatus } from './domain.js';
+import type { ConversationMemberState, PendingWake, WakeReason, WakeStatus } from './domain.js';
 
 interface StateRow {
   conversation_id: string;
@@ -9,6 +9,8 @@ interface StateRow {
   last_replied_message_sequence: number;
   wake_status: WakeStatus;
   pending_wake: number;
+  pending_wake_trigger_sequence: number | null;
+  pending_wake_reason: string | null;
   muted: number;
   updated_at: string;
 }
@@ -146,19 +148,105 @@ export class ConversationMemberService {
       .run(status, now(), conversationId, memberId);
   }
 
-  setPendingWake(conversationId: string, memberId: string, pending: boolean): void {
+  /**
+   * 记下 / 清掉「有个唤醒在排队」。
+   *
+   * `pending = true` 时必须带上触发消息与原因 —— 这两样会一起落库，恢复时按它们
+   * 原样重放（见 PendingWake 的注释）。`pending = false` 时一并清空，避免留下
+   * 一条「没有排队、却还记得上次为什么排队」的幽灵记录。
+   */
+  setPendingWake(
+    conversationId: string,
+    memberId: string,
+    pending: boolean,
+    wake?: { triggerSequence: number; reason: WakeReason },
+  ): void {
+    if (pending && !wake) {
+      // 这是调用方的编程错误，不是用户输入问题：能落库的 pending 必须可重放。
+      throw new Error('setPendingWake(true) 必须带上 triggerSequence 与 reason');
+    }
+
     this.db
       .prepare(
         `
         UPDATE conversation_member_state
         SET
           pending_wake = ?,
+          pending_wake_trigger_sequence = ?,
+          pending_wake_reason = ?,
           updated_at = ?
         WHERE conversation_id = ?
           AND member_id = ?
         `,
       )
-      .run(pending ? 1 : 0, now(), conversationId, memberId);
+      .run(
+        pending ? 1 : 0,
+        pending && wake ? wake.triggerSequence : null,
+        pending && wake ? wake.reason : null,
+        now(),
+        conversationId,
+        memberId,
+      );
+  }
+
+  /**
+   * 「排队」→「在跑」：这条唤醒已经进了引擎。
+   *
+   * 调用方必须在 **execution 落库之后、同一个事务里** 调它。这个状态翻转等价的
+   * 语义是「副作用可能已经发生过」，所以重启恢复不会再重派它。
+   *
+   * 反过来先清 pending 再建 execution 的话，进程死在中间会同时丢掉 wake 和
+   * execution —— 恢复时两边都看不见，这一轮凭空消失。
+   */
+  beginWake(conversationId: string, memberId: string): void {
+    this.db
+      .prepare(
+        `
+        UPDATE conversation_member_state
+        SET
+          pending_wake = 0,
+          pending_wake_trigger_sequence = NULL,
+          pending_wake_reason = NULL,
+          wake_status = 'running',
+          updated_at = ?
+        WHERE conversation_id = ?
+          AND member_id = ?
+        `,
+      )
+      .run(now(), conversationId, memberId);
+  }
+
+  /**
+   * 丢弃一条**从未开始跑**的唤醒（run 在建 execution 之前就失败了）。
+   *
+   * 带上 `expected` 是为了不误伤并发到达的那条新唤醒：只有持久化的那一条仍然
+   * 是失败者本人时才清。否则「成员被归档导致这一轮失败」会把紧随其后的新一轮
+   * 的 pending 标记一起抹掉。
+   */
+  abandonPendingWake(conversationId: string, memberId: string, expected: PendingWake): void {
+    this.db
+      .prepare(
+        `
+        UPDATE conversation_member_state
+        SET
+          pending_wake = 0,
+          pending_wake_trigger_sequence = NULL,
+          pending_wake_reason = NULL,
+          updated_at = ?
+        WHERE conversation_id = ?
+          AND member_id = ?
+          AND pending_wake = 1
+          AND pending_wake_trigger_sequence IS ?
+          AND pending_wake_reason IS ?
+        `,
+      )
+      .run(
+        now(),
+        conversationId,
+        memberId,
+        expected.triggerSequence,
+        expected.reason,
+      );
   }
 
   setMuted(conversationId: string, memberId: string, muted: boolean): void {
@@ -209,27 +297,47 @@ export class ConversationMemberService {
   }
 
   /**
-   * 重启恢复用：把「排队中被进程挂掉带走的」唤醒挑出来。
+   * 重启恢复用：把「排队中被进程挂掉带走的」唤醒挑出来，连同触发消息与原因。
    *
    * 和 execution 的恢复策略一致 —— `queued` 表示还没开始跑，可以安全重派；
    * `running` 表示已经进过引擎，不能自动重跑（副作用可能已经发生），
    * 只把状态清回 idle，交给 execution 那侧的 interrupted 处理。
+   *
+   * 元数据为 NULL 的行只可能来自 v3→v4 迁移的瞬间（极端罕见），这时退回
+   * triggerSequence = 0 + open_discussion：宁可重放成一次允许沉默的唤醒，
+   * 也不要把一条 unknown 的原因当成 mention 逼出一条消息。调用方看到
+   * triggerSequence = 0 会用房间当前水位兜底。
    */
-  findLostWakes(): Array<{ conversationId: string; memberId: string }> {
+  findLostWakes(): PendingWake[] {
     const rows = this.db
       .prepare(
         `
-        SELECT conversation_id, member_id
+        SELECT
+          conversation_id,
+          member_id,
+          pending_wake_trigger_sequence,
+          pending_wake_reason
         FROM conversation_member_state
         WHERE pending_wake = 1
           AND wake_status = 'queued'
         `,
       )
-      .all() as unknown as Array<{ conversation_id: string; member_id: string }>;
-    return rows.map((row) => ({ conversationId: row.conversation_id, memberId: row.member_id }));
+      .all() as unknown as Array<{
+      conversation_id: string;
+      member_id: string;
+      pending_wake_trigger_sequence: number | null;
+      pending_wake_reason: string | null;
+    }>;
+
+    return rows.map((row) => ({
+      conversationId: row.conversation_id,
+      memberId: row.member_id,
+      triggerSequence: row.pending_wake_trigger_sequence ?? 0,
+      reason: asWakeReason(row.pending_wake_reason),
+    }));
   }
 
-  /** 恢复时把所有非 idle 的唤醒状态清回 idle。 */
+  /** 恢复时把所有非 idle 的唤醒状态清回 idle，连同 pending 的元数据。 */
   resetWakeStatuses(): number {
     const result = this.db
       .prepare(
@@ -238,6 +346,8 @@ export class ConversationMemberService {
         SET
           wake_status = 'idle',
           pending_wake = 0,
+          pending_wake_trigger_sequence = NULL,
+          pending_wake_reason = NULL,
           updated_at = ?
         WHERE wake_status <> 'idle'
            OR pending_wake = 1
@@ -248,6 +358,19 @@ export class ConversationMemberService {
   }
 }
 
+/**
+ * 把落库的 reason 收窄回联合类型。
+ *
+ * 数据库里是自由 TEXT（加 CHECK 要重建表，见 db-migrations 的 v4 注释），所以
+ * 读回来必须过这一层：认不出来的一律按最宽松的 open_discussion 处理。
+ * RecoveryService 也用它，两处读同一列不能有两套判据。
+ */
+export function asWakeReason(value: string | null): WakeReason {
+  return value === 'direct' || value === 'mention' || value === 'follow_up'
+    ? value
+    : 'open_discussion';
+}
+
 function mapState(row: StateRow): ConversationMemberState {
   return {
     conversationId: row.conversation_id,
@@ -256,6 +379,8 @@ function mapState(row: StateRow): ConversationMemberState {
     lastRepliedMessageSequence: row.last_replied_message_sequence,
     wakeStatus: row.wake_status,
     pendingWake: row.pending_wake === 1,
+    pendingWakeTriggerSequence: row.pending_wake_trigger_sequence,
+    pendingWakeReason: row.pending_wake_reason ? asWakeReason(row.pending_wake_reason) : null,
     muted: row.muted === 1,
     updatedAt: row.updated_at,
   };

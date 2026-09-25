@@ -17,9 +17,11 @@ import type { DatabaseSync } from 'node:sqlite';
  *   3 — Team discussion：
  *         conversation_member_state（Member 在房间里的读游标 + 唤醒状态）
  *         execution.decision / trigger_message_sequence
+ *   4 — Wake 可重放：
+ *         conversation_member_state.pending_wake_trigger_sequence / pending_wake_reason
  */
 
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 /**
  * v1 schema。生产路径不会再创建它，保留的原因有两个：
@@ -381,6 +383,28 @@ ALTER TABLE execution ADD COLUMN wake_reason TEXT;
 /** v3 schema，全新库直接建这个。 */
 export const V3_SCHEMA_SQL = `${V2_SCHEMA_SQL}\n${V3_ADDITIONS_SQL}`;
 
+/**
+ * v4 新增部分，被全新库和 v3→v4 迁移共用。
+ *
+ * 只加列，不重建表：conversation_member_state 被 conversation / member 两张表
+ * 引用，重建的收益（给 reason 加 CHECK）远小于风险。
+ */
+export const V4_ADDITIONS_SQL = `
+-- 排队中的这次唤醒是被哪条消息、以什么原因触发的，与 pending_wake 同生共死。
+--
+-- 不落库的话，重启恢复只能拿「房间当前最大序号」+ 最宽松的 reason 去猜：
+-- 一次 "@bob 看下风险"（reason=mention, trigger=17）会被重放成
+-- reason=open_discussion、trigger=23，对着完全另一条消息重新判断要不要发言。
+ALTER TABLE conversation_member_state ADD COLUMN pending_wake_trigger_sequence INTEGER;
+
+-- WakeReason 的取值由 domain.ts 定义。这里刻意不加 CHECK：SQLite 加 CHECK 只能
+-- 重建表，而取值集合在 TypeScript 侧已经是封闭联合，写入口只有 scheduler 一处。
+ALTER TABLE conversation_member_state ADD COLUMN pending_wake_reason TEXT;
+`;
+
+/** v4 schema，全新库直接建这个。 */
+export const V4_SCHEMA_SQL = `${V3_SCHEMA_SQL}\n${V4_ADDITIONS_SQL}`;
+
 export function getUserVersion(db: DatabaseSync): number {
   const row = db.prepare('PRAGMA user_version').get() as unknown as
     | { user_version: number }
@@ -415,6 +439,10 @@ export function applySchemaV3(db: DatabaseSync): void {
   db.exec(V3_SCHEMA_SQL);
 }
 
+export function applySchemaV4(db: DatabaseSync): void {
+  db.exec(V4_SCHEMA_SQL);
+}
+
 function hasColumn(db: DatabaseSync, table: string, column: string): boolean {
   const rows = db.prepare(`PRAGMA table_info(${table})`).all() as unknown as Array<{ name: string }>;
   return rows.some((row) => row.name === column);
@@ -444,9 +472,9 @@ export function migrate(db: DatabaseSync): MigrationResult {
       version = 1;
       setUserVersion(db, 1);
     } else {
-      applySchemaV3(db);
+      applySchemaV4(db);
       setUserVersion(db, SCHEMA_VERSION);
-      return { from: 0, to: SCHEMA_VERSION, applied: ['create-schema-v3'], fresh: true };
+      return { from: 0, to: SCHEMA_VERSION, applied: ['create-schema-v4'], fresh: true };
     }
   }
 
@@ -470,6 +498,13 @@ export function migrate(db: DatabaseSync): MigrationResult {
     applied.push('v2-to-v3');
     version = 3;
     setUserVersion(db, 3);
+  }
+
+  if (version < 4) {
+    migrateV3ToV4(db);
+    applied.push('v3-to-v4');
+    version = 4;
+    setUserVersion(db, 4);
   }
 
   return { from, to: version, applied, fresh: false };
@@ -753,6 +788,42 @@ function migrateV2ToV3(db: DatabaseSync): void {
         ON c.id = cm.conversation_id
       `,
     ).run(updatedAt);
+
+    const violations = db.prepare('PRAGMA foreign_key_check').all();
+    if (violations.length > 0) {
+      throw new Error(
+        `迁移后外键校验失败（${violations.length} 条），已回滚：${JSON.stringify(violations.slice(0, 5))}`,
+      );
+    }
+
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  } finally {
+    db.exec('PRAGMA foreign_keys = ON');
+  }
+}
+
+/**
+ * v3 → v4：给 conversation_member_state 补 pending wake 的元数据。
+ *
+ * 只加两列。已有行的值为 NULL —— 与 pending_wake = 0 语义一致（没在排队就没有
+ * 触发信息）；万一升级时正好有 pending_wake = 1 的行，恢复逻辑会退回宽松解释
+ * （见 conversation-member-service.findLostWakes）。
+ */
+function migrateV3ToV4(db: DatabaseSync): void {
+  db.exec('PRAGMA foreign_keys = OFF');
+  db.exec('BEGIN');
+  try {
+    if (!hasColumn(db, 'conversation_member_state', 'pending_wake_trigger_sequence')) {
+      db.exec(
+        `ALTER TABLE conversation_member_state ADD COLUMN pending_wake_trigger_sequence INTEGER;`,
+      );
+    }
+    if (!hasColumn(db, 'conversation_member_state', 'pending_wake_reason')) {
+      db.exec(`ALTER TABLE conversation_member_state ADD COLUMN pending_wake_reason TEXT;`);
+    }
 
     const violations = db.prepare('PRAGMA foreign_key_check').all();
     if (violations.length > 0) {

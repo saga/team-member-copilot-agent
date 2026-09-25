@@ -30,6 +30,7 @@ const { MemberService } = await import('../member-service.js');
 const { TeamService } = await import('../team-service.js');
 const { ContextAssembler } = await import('../context-assembler.js');
 const { RecoveryService } = await import('../recovery-service.js');
+const { ConversationMemberService } = await import('../conversation-member-service.js');
 const { singleExecutionId, muteAllMembers } = await import('./support.js');
 const { migrate, getUserVersion, SCHEMA_VERSION, V1_SCHEMA_SQL } = await import(
   '../db-migrations.js'
@@ -158,6 +159,12 @@ describe('schema migration（PRAGMA user_version）', () => {
       assert.ok(tableColumns(handle, 'execution').includes('waiting_for_runtime_id'));
       assert.ok(tableColumns(handle, 'execution').includes('retry_of_execution_id'));
       assert.ok(tableColumns(handle, 'conversation_event').includes('sequence'));
+      assert.ok(
+        tableColumns(handle, 'conversation_member_state').includes(
+          'pending_wake_trigger_sequence',
+        ),
+      );
+      assert.ok(tableColumns(handle, 'conversation_member_state').includes('pending_wake_reason'));
 
       // 新状态必须被 CHECK 接受
       handle.exec(`
@@ -206,7 +213,11 @@ describe('schema migration（PRAGMA user_version）', () => {
       // 断言的是「升到最新」而不是某个具体版本号：这条用例保护的是
       // 「老库能一路升上来」，加一版 schema 不该让它变红。
       assert.equal(result.to, SCHEMA_VERSION);
-      assert.deepEqual(result.applied, ['v1-to-v2', 'v2-to-v3'].slice(0, SCHEMA_VERSION - 1));
+      // 每一步迁移各一个名字：不写死清单，加一版 schema 不该让这条用例变红
+      assert.deepEqual(
+        result.applied,
+        Array.from({ length: SCHEMA_VERSION - 1 }, (_, index) => `v${index + 1}-to-v${index + 2}`),
+      );
 
       // 1) 消息序号按 (created_at, rowid) 回填成 1..N
       // 注意：node:sqlite 返回的是 null-prototype 对象，断言前要先摊平成普通对象
@@ -281,10 +292,18 @@ describe('schema migration（PRAGMA user_version）', () => {
       assert.ok(tableColumns(handle, 'conversation_member_state').includes('wake_status'));
       const state = handle
         .prepare(
-          `SELECT last_seen_message_sequence, muted FROM conversation_member_state
+          `SELECT last_seen_message_sequence, muted, pending_wake_trigger_sequence, pending_wake_reason
+           FROM conversation_member_state
            WHERE conversation_id = 'c1' AND member_id = 'm1'`,
         )
-        .get() as unknown as { last_seen_message_sequence: number; muted: number } | undefined;
+        .get() as unknown as
+        | {
+            last_seen_message_sequence: number;
+            muted: number;
+            pending_wake_trigger_sequence: number | null;
+            pending_wake_reason: string | null;
+          }
+        | undefined;
       assert.ok(state, '已有 roster 必须补上房间状态行');
       assert.equal(state.last_seen_message_sequence, 2);
       assert.equal(state.muted, 0);
@@ -293,6 +312,16 @@ describe('schema migration（PRAGMA user_version）', () => {
       assert.ok(tableColumns(handle, 'execution').includes('decision'));
       assert.ok(tableColumns(handle, 'execution').includes('trigger_message_sequence'));
       assert.ok(tableColumns(handle, 'execution').includes('wake_reason'));
+
+      // 9) v4：排队唤醒的元数据列，历史行默认 NULL（= 没有排队，语义一致）
+      assert.ok(
+        tableColumns(handle, 'conversation_member_state').includes(
+          'pending_wake_trigger_sequence',
+        ),
+      );
+      assert.ok(tableColumns(handle, 'conversation_member_state').includes('pending_wake_reason'));
+      assert.equal(state.pending_wake_trigger_sequence, null);
+      assert.equal(state.pending_wake_reason, null);
     } finally {
       handle.close();
     }
@@ -904,7 +933,7 @@ describe('RecoveryService', () => {
              ('e-done',    'c2', 'm', 'r-idle',    NULL,     '["m"]',     'interactive',     'completed',          'p', NULL,         '5');
     `);
 
-    const report = new RecoveryService(handle).recover();
+    const report = new RecoveryService(handle, new ConversationMemberService(handle)).recover();
 
     assert.equal(report.interrupted, 2, 'running + waiting_for_member');
     assert.equal(report.interruptedOrphanChildren, 1);
@@ -937,12 +966,172 @@ describe('RecoveryService', () => {
     assert.equal(runtime.active_execution_id, null);
 
     // 幂等：再跑一次不会重复处理
-    const second = new RecoveryService(handle).recover();
+    const second = new RecoveryService(handle, new ConversationMemberService(handle)).recover();
     assert.equal(second.interrupted, 0);
     assert.equal(second.interruptedOrphanChildren, 0);
     assert.deepEqual(second.requeuedExecutionIds, ['e-qroot']);
 
     handle.close();
+  });
+
+  it('被进程带走的排队唤醒：连同触发消息与原因一起重派，不是猜一个', () => {
+    const handle = new DatabaseSync(path.join(dataDir, 'recovery-wakes.db'));
+    handle.exec('PRAGMA foreign_keys = ON;');
+    migrate(handle);
+
+    handle.exec(`
+      INSERT INTO member (id, handle, name, role, created_at, updated_at)
+      VALUES ('m1', 'alice', 'Alice', 'Analyst', 't', 't'),
+             ('m2', 'bob', 'Bob', 'Engineer', 't', 't');
+
+      INSERT INTO conversation (id, title, kind, created_by, message_sequence, created_at, updated_at)
+      VALUES ('c', 'Room', 'group', 'u', 23, 't', 't');
+
+      INSERT INTO conversation_member (conversation_id, member_id, joined_at)
+      VALUES ('c', 'm1', 't'), ('c', 'm2', 't');
+    `);
+
+    // Alice：排队中被进程带走 —— 触发消息是 17，原因是 mention。
+    // 房间现在已经走到 23；旧实现会拿 23 + open_discussion 重放，等于换了一轮。
+    //
+    // pending_wake 与 wake_status 是两次写（调度器分开调，因为「正在跑」时不该
+    // 把状态压回 queued），这里手动复现「刚入队就被进程带走」那一刻。
+    const states = new ConversationMemberService(handle);
+    states.ensure('c', 'm1', 0);
+    states.setPendingWake('c', 'm1', true, { triggerSequence: 17, reason: 'mention' });
+    states.setWakeStatus('c', 'm1', 'queued');
+
+    // Bob：已经进过引擎（wake_status = running），不能被重派
+    handle.prepare(
+      `
+      INSERT INTO conversation_member_state (
+        conversation_id, member_id, last_seen_message_sequence,
+        last_replied_message_sequence, wake_status, pending_wake,
+        pending_wake_trigger_sequence, pending_wake_reason, muted, updated_at
+      )
+      VALUES ('c', 'm2', 0, 0, 'running', 1, 9, 'direct', 0, 't')
+      `,
+    ).run();
+
+    const report = new RecoveryService(handle, new ConversationMemberService(handle)).recover();
+
+    assert.deepEqual(
+      report.lostWakes.map((wake) => ({ ...wake })),
+      [{ conversationId: 'c', memberId: 'm1', reason: 'mention', triggerSequence: 17 }],
+      '只有「排队中」的那条可重派，且必须带上原来的 trigger + reason',
+    );
+
+    // 复位把 pending 与元数据一起清掉，不留幽灵记录
+    const rows = (
+      handle
+        .prepare(
+          `
+          SELECT member_id, wake_status, pending_wake, pending_wake_trigger_sequence, pending_wake_reason
+          FROM conversation_member_state
+          ORDER BY member_id
+          `,
+        )
+        .all() as unknown as Array<{
+        member_id: string;
+        wake_status: string;
+        pending_wake: number;
+        pending_wake_trigger_sequence: number | null;
+        pending_wake_reason: string | null;
+      }>
+    ).map((row) => ({ ...row }));
+
+    assert.deepEqual(rows, [
+      {
+        member_id: 'm1',
+        wake_status: 'idle',
+        pending_wake: 0,
+        pending_wake_trigger_sequence: null,
+        pending_wake_reason: null,
+      },
+      {
+        member_id: 'm2',
+        wake_status: 'idle',
+        pending_wake: 0,
+        pending_wake_trigger_sequence: null,
+        pending_wake_reason: null,
+      },
+    ]);
+
+    handle.close();
+  });
+});
+
+describe('redispatchWake：恢复出来的是同一轮', () => {
+  it('用落库的 trigger + reason 重放，而不是拿房间当前水位猜一个', async () => {
+    const room = team.createConversation({
+      kind: 'group',
+      title: 'Crash Room',
+      memberIds: [alice.id, bob.id],
+    });
+    muteAllMembers(team, room.id);
+
+    // 只点名 Bob。Alice 从头到尾没被唤醒，读游标停在 0。
+    const first = await sendMessage({
+      conversationId: room.id,
+      content: 'Bob 先看这个',
+      targetMemberId: bob.id,
+    });
+    await waitForStatus(first.executionId, 'completed');
+    await waitForConversationIdle(room.id);
+
+    // 再堆一条，把房间水位推高 —— 这样「原样重放」和「猜一个」会明显不同
+    const second = await sendMessage({
+      conversationId: room.id,
+      content: 'Bob 再补一条',
+      targetMemberId: bob.id,
+    });
+    await waitForStatus(second.executionId, 'completed');
+    await waitForConversationIdle(room.id);
+
+    const watermark = team.getConversation(room.id).messageSequence;
+    assert.ok(watermark > 1, '前置条件：房间水位应该已经超过第 1 条');
+
+    // 模拟「Alice 的唤醒在排队时进程被 kill」。
+    //
+    // 这个状态没法通过公开 API 造出来（正常路径下一入队就立刻开跑），所以直接
+    // 把 durable 那几个字段写成崩溃那一刻的样子 —— 这正是 RecoveryService
+    // 重启后看到的东西。
+    const states = new ConversationMemberService(db);
+    states.setPendingWake(room.id, alice.id, true, { triggerSequence: 1, reason: 'mention' });
+    states.setWakeStatus(room.id, alice.id, 'queued');
+
+    const lost = states.findLostWakes();
+    assert.deepEqual(
+      lost.filter((wake) => wake.memberId === alice.id).map((wake) => ({ ...wake })),
+      [{ conversationId: room.id, memberId: alice.id, reason: 'mention', triggerSequence: 1 }],
+    );
+
+    for (const wake of lost) team.redispatchWake(wake);
+    await waitForConversationIdle(room.id);
+
+    const aliceRuns = (
+      db
+        .prepare(
+          `
+          SELECT trigger_message_sequence, wake_reason
+          FROM execution
+          WHERE conversation_id = ? AND member_id = ?
+          ORDER BY rowid
+          `,
+        )
+        .all(room.id, alice.id) as unknown as Array<{
+        trigger_message_sequence: number | null;
+        wake_reason: string | null;
+      }>
+    ).map((row) => ({ ...row }));
+
+    assert.deepEqual(
+      aliceRuns,
+      [{ trigger_message_sequence: 1, wake_reason: 'mention' }],
+      // 旧实现会产出 { trigger_message_sequence: watermark, wake_reason: 'open_discussion' }：
+      // 对着另一条消息、以另一个理由重新判断要不要发言。
+      '重放出来的必须是当时那一轮',
+    );
   });
 });
 

@@ -172,9 +172,31 @@ export interface ConversationMemberState {
    * 进程在排队期间挂掉时，RecoveryService 靠它把 wake 重新派出去。
    */
   pendingWake: boolean;
+  /**
+   * 排队中那次唤醒是被哪条消息、以什么原因触发的。没有排队时为 null。
+   *
+   * 和 `pendingWake` 一起落库是**必须的**：只记住「有人被唤醒过」，恢复时就只能
+   * 拿房间当前水位 + 最宽松的 reason 去猜，重放出来的是另一轮 —— 一次显式
+   * @mention 会被降级成「顺带看看」，而且对着的是另一条消息。
+   */
+  pendingWakeTriggerSequence: number | null;
+  pendingWakeReason: WakeReason | null;
   /** 静音：dispatcher 不会唤醒它（@ 也唤不醒）。 */
   muted: boolean;
   updatedAt: string;
+}
+
+/**
+ * 一次还没被处理完的唤醒：谁、在哪个房间、因为哪条消息、为什么。
+ *
+ * 它是 scheduler 的入队单位，也是落库的重放单位 —— 两个用途共用同一个形状，
+ * 这样「恢复出来的那一轮」与「当时那一轮」在结构上不可能不一致。
+ */
+export interface PendingWake {
+  conversationId: string;
+  memberId: string;
+  reason: WakeReason;
+  triggerSequence: number;
 }
 
 export interface MemberRuntime {

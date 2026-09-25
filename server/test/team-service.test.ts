@@ -37,9 +37,12 @@ interface RunTurnInput {
 
 class StubCopilot {
   readonly turns: RunTurnInput[] = [];
+  /** 挂住 turn，把一个 execution 稳定地钉在 running 上。 */
+  hold: Promise<void> | null = null;
 
   async runMemberTurn(input: RunTurnInput): Promise<string> {
     this.turns.push(input);
+    if (this.hold) await this.hold;
     return `stub reply from ${input.member.id}`;
   }
 }
@@ -64,6 +67,7 @@ interface RuntimeRow {
   copilot_session_id: string;
   workspace_path: string;
   status: string;
+  last_context_message_sequence: number;
 }
 
 const stub = new StubCopilot();
@@ -342,6 +346,131 @@ describe('Conversation / Runtime 边界', () => {
       all.slice(-2).map((message) => message.id),
     );
     assert.equal(recent[0].createdAt <= recent[1].createdAt, true, '必须按时间正序返回');
+  });
+});
+
+describe('Member 生命周期边界', () => {
+  /**
+   * 把 `fn` 包在「引擎被按住」的窗口里执行。
+   *
+   * 归档 / 移出必须等手上的活收尾，所以断言前得先造出「真的有活在跑」这个状态，
+   * 而不是靠 sleep 撞运气。
+   */
+  async function whileBusy(fn: () => Promise<void>): Promise<void> {
+    let release!: () => void;
+    stub.hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    try {
+      await fn();
+    } finally {
+      release();
+      stub.hold = null;
+    }
+  }
+
+  it('还有 execution 在跑时不能归档，跑完就可以', async () => {
+    const conversation = team.createConversation({ kind: 'direct', memberIds: [archivist.id] });
+
+    await whileBusy(async () => {
+      const { executionId } = await sendMessage({
+        conversationId: conversation.id,
+        content: '先别停',
+      });
+      await waitForStatus(executionId, 'running');
+
+      assert.throws(
+        () => team.updateMember(archivist.id, { status: 'archived' }),
+        /不能归档/,
+        '归档会把正在跑的 execution 悬空（消息在、execution 在、执行体却没了）',
+      );
+      // 归档被拒绝后 Member 仍然是可用的
+      assert.equal(team.getMember(archivist.id).status, 'active');
+    });
+
+    await waitForConversationIdle(conversation.id);
+    assert.equal(team.updateMember(archivist.id, { status: 'archived' }).status, 'archived');
+    // 还原，后面的用例还要用它
+    team.updateMember(archivist.id, { status: 'active' });
+  });
+
+  it('排队中的唤醒同样算「有活」，不能归档也不能移出', async () => {
+    const group = team.createConversation({
+      kind: 'group',
+      memberIds: [archivist.id, reviewer.id],
+    });
+    muteAllMembers(team, group.id);
+
+    await whileBusy(async () => {
+      const first = await sendMessage({
+        conversationId: group.id,
+        content: '第一轮',
+        targetMemberId: archivist.id,
+      });
+      await waitForStatus(first.executionId, 'running');
+
+      // 第二轮落进 pending，还没开跑 —— 用 sendRaw：这一轮此刻还没有 execution，
+      // 这正是要断言的状态。
+      await sendRaw({
+        conversationId: group.id,
+        content: '第二轮',
+        targetMemberId: archivist.id,
+      });
+
+      const state = team
+        .listConversationState(group.id)
+        .find((item) => item.memberId === archivist.id);
+      assert.equal(state?.pendingWake, true, '前置条件：应该有一条排队的唤醒');
+
+      assert.throws(() => team.updateMember(archivist.id, { status: 'archived' }), /不能归档/);
+      assert.throws(() => team.removeMember(group.id, archivist.id), /不能移出/);
+    });
+
+    await waitForConversationIdle(group.id);
+  });
+
+  it('移出再重新加入拿到全新的 Copilot session，不从旧上下文续写', async () => {
+    const group = team.createConversation({
+      kind: 'group',
+      memberIds: [coder.id, reviewer.id, analyst.id],
+    });
+    muteAllMembers(team, group.id);
+
+    // 先让 analyst 在房间里跑一轮，把 runtime 用起来
+    const first = await sendMessage({
+      conversationId: group.id,
+      content: '记录一下',
+      targetMemberId: analyst.id,
+    });
+    await waitForStatus(first.executionId, 'completed');
+    await waitForConversationIdle(group.id);
+
+    const before = runtimeRow(group.id, analyst.id);
+    assert.ok(before, '跑过一轮后 runtime 应该存在');
+
+    team.removeMember(group.id, analyst.id);
+    const afterRemove = runtimeRow(group.id, analyst.id);
+    assert.ok(afterRemove, 'runtime 槽位保留（execution.runtime_id 还在引用它）');
+    assert.notEqual(
+      afterRemove.copilot_session_id,
+      before.copilot_session_id,
+      '移出即断代：旧 session 里记着它在这张桌子上的全部历史',
+    );
+
+    const rejoined = team.addMember(group.id, analyst.id);
+    const watermark = rejoined.messageSequence;
+    const afterAdd = runtimeRow(group.id, analyst.id);
+    assert.equal(
+      afterAdd?.last_context_message_sequence,
+      watermark,
+      '上下文水位要对齐到重新加入时的房间位置，否则第一轮会把离开期间的消息全灌进去',
+    );
+    assert.equal(
+      team
+        .listConversationState(group.id)
+        .find((item) => item.memberId === analyst.id)?.lastSeenMessageSequence,
+      watermark,
+    );
   });
 });
 

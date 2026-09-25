@@ -7,7 +7,7 @@ import { now } from './db.js';
 import { ContextAssembler } from './context-assembler.js';
 import { ConversationMemberService } from './conversation-member-service.js';
 import { GroupDispatcher, type DispatchPlan, type WakePlan } from './group-dispatcher.js';
-import { MemberTurnScheduler, type PendingWake } from './member-turn-scheduler.js';
+import { MemberTurnScheduler } from './member-turn-scheduler.js';
 import { NO_REPLY_SENTINEL, parseMemberTurnOutcome } from './member-decision.js';
 import { badRequest, conflict, notFound } from './http-error.js';
 import { MemberConversationService, isMemberDm, type MemberDirectMessage } from './member-conversation-service.js';
@@ -31,6 +31,7 @@ import type {
   ExecutionStatus,
   Member,
   MemberRuntime,
+  PendingWake,
   StoredConversationEvent,
   ToolProfile,
   TurnMode,
@@ -284,7 +285,7 @@ export class TeamService {
     this.memberConversations = new MemberConversationService(db, this);
     this.scheduler = new MemberTurnScheduler(
       this.states,
-      (wake) => this.runWake(wake),
+      (wake, markStarted) => this.runWake(wake, markStarted),
       (wake, error) => {
         // 一轮唤醒失败已经被 runTurn 记进 execution 并广播了，这里只是别让它
         // 变成 unhandled rejection，也不要让调度器的循环静默吞掉。
@@ -312,6 +313,11 @@ export class TeamService {
   }
 
   updateMember(id: string, input: UpdateMemberInput): Member {
+    // 归档意味着「不再接活」，所以它必须等手上的活干完再落地。不然会留下
+    // 「消息有、wake 有、execution 没有」的洞 —— 见 assertMemberNotBusy。
+    if (input.status === 'archived' && this.members.get(id).status !== 'archived') {
+      this.assertMemberNotBusy(id, '归档');
+    }
     return this.members.update(id, input);
   }
 
@@ -438,6 +444,10 @@ export class TeamService {
     // 加入已有 group 的新成员：房间游标直接推到当前水位。
     // 从 0 开始的话，它第一次被唤醒时「未读」是整个历史。
     this.states.ensure(conversationId, memberId, conversation.messageSequence);
+    // runtime 的上下文水位同样要对齐。被移出后重新加入的成员会命中「已有 runtime」
+    // 这条分支（它的 session 在移出时已经退休），水位如果还停在离开时的位置，
+    // 第一轮就会把离开期间的全部消息塞进 prompt。
+    this.alignRuntimeCheckpoint(conversationId, memberId, conversation.messageSequence);
 
     this.touchConversation(conversationId);
     return this.getConversation(conversationId);
@@ -450,6 +460,11 @@ export class TeamService {
         `${conversation.kind} conversation 的成员是固定的，只有 group 允许增减成员`,
       );
     }
+
+    // 移出前必须没有在飞的活。否则 scheduler 手里的那条 queued wake 会在
+    // runWake 里撞上 requireActiveMember / requireConversationMember 抛错，
+    // 于是「消息留着、execution 没有」。
+    this.assertMemberNotBusy(memberId, '移出 Team', conversationId);
 
     // 移出后 roster 仍要满足 kind 的形状约束（group 至少两个成员），
     // 否则会造出一个不合法的 group。
@@ -483,6 +498,8 @@ export class TeamService {
 
     // 房间状态跟着 roster 一起走：人走了，它的读游标 / 唤醒状态也不该留下
     this.states.remove(conversationId, memberId);
+    // 引擎侧也要断代
+    this.retireRuntime(conversationId, memberId);
 
     return this.getConversation(conversationId);
   }
@@ -733,8 +750,13 @@ export class TeamService {
    * execution 在这里创建（而不是在 sendMessage 里）：scheduler 已经保证了
    * 同一个 (conversation, member) 同时只有一个 wake 在跑，所以「一轮 = 一条
    * execution」，不会出现「一条消息唤醒两次、留下一条永远 queued 的 execution」。
+   *
+   * `markStarted` 由 scheduler 传入：它必须在 execution 落库之后调用一次，
+   * 表示这条 wake 已不可安全重放。scheduler 用它区分「跑失败了」和
+   * 「连跑都没跑起来」——后者要把 durable 的 pending 标记清掉，否则每次重启
+   * 都会重派一条注定失败的唤醒。
    */
-  private async runWake(wake: PendingWake): Promise<void> {
+  private async runWake(wake: PendingWake, markStarted: () => void): Promise<void> {
     const conversation = this.getConversation(wake.conversationId);
     const member = this.requireActiveMember(conversation, wake.memberId);
 
@@ -761,7 +783,17 @@ export class TeamService {
       endedAt: null,
       createdAt: now(),
     };
-    this.insertExecution(execution);
+
+    // execution 落库与「这条 wake 已经进过引擎」必须在同一个事务里。
+    //
+    // 拆开的话，进程死在两句之间的那一刻会同时丢掉两边：execution 不存在，
+    // pending 却还亮着 —— 恢复时 requeue 找不到 execution，重派又因为
+    // 「已经进过引擎」不成立而再建一条…… 状态机就分叉了。
+    this.transaction(() => {
+      this.insertExecution(execution);
+      this.states.beginWake(wake.conversationId, wake.memberId);
+    });
+    markStarted();
     this.emitExecution(execution);
 
     await this.executeMemberTurn({
@@ -778,24 +810,30 @@ export class TeamService {
   /**
    * 重启恢复用：重新派发一个被进程带走的唤醒。
    *
-   * 触发消息的序号也要一起带上 —— 恢复出来的这一轮必须看到当时那条消息，
-   * 否则它会在一个空上下文里做「要不要发言」的判断。
+   * 触发消息与原因原样带过来 —— 它们和这次唤醒一起落库，就是为了让恢复出来的
+   * 是**同一轮**。以前这里用「房间当前最大序号 + open_discussion」猜：一次
+   * `@bob 看下风险`（mention @17）会被重放成对着第 23 条消息的顺带唤醒。
    */
-  redispatchWake(input: { conversationId: string; memberId: string }): void {
-    const conversation = this.getConversation(input.conversationId);
-    const member = this.requireConversationMember(conversation, input.memberId);
+  redispatchWake(wake: PendingWake): void {
+    const conversation = this.getConversation(wake.conversationId);
+    const member = this.requireConversationMember(conversation, wake.memberId);
     if (member.status !== 'active') return;
 
-    const state = this.states.get(input.conversationId, input.memberId);
-    const triggerSequence = this.latestMessageSequence(input.conversationId);
+    const state = this.states.get(wake.conversationId, wake.memberId);
+
+    // 触发消息必须还在。丢弃了它就不能拿当前水位糊弄过去 —— 那会换一条消息重跑。
+    // 只有确实查不到（房间被手工清理过）时才退回当前水位，并把原因降成
+    // open_discussion：对着一条不是原地唤醒它的话，不该逼它必须回答。
+    const trigger = this.findMessageBySequence(wake.conversationId, wake.triggerSequence);
+    const triggerSequence = trigger ? wake.triggerSequence : this.latestMessageSequence(wake.conversationId);
+    const reason: WakeReason = trigger ? wake.reason : 'open_discussion';
+
     if (triggerSequence <= state.lastSeenMessageSequence) return;
 
     this.scheduler.enqueue({
-      conversationId: input.conversationId,
-      memberId: input.memberId,
-      // 唤醒原因没落库在这个路径上（wake 还没走到建 execution 那一步），
-      // 用最宽松的 open_discussion：允许 skip，不会强行逼出一条消息。
-      reason: 'open_discussion',
+      conversationId: wake.conversationId,
+      memberId: wake.memberId,
+      reason,
       triggerSequence,
     });
   }
@@ -1671,6 +1709,16 @@ export class TeamService {
    * Runtime = 某 Member 在某 Conversation 中的运行实例。
    * 同一 (conversation, member) 永远复用同一个 Copilot session，
    * 换 conversation 就换一个 runtime，上下文天然隔离。
+   *
+   * 新建时的上下文水位取自该 Member 的房间读游标，而不是 0。
+   * 这两条分支都要对：
+   *
+   *   全新房间的第一轮   读游标 = 0  → 水位 0，本轮消息照常注入
+   *   中途加入 / 重新加入 读游标 = 加入时的房间水位 → 不灌整个历史
+   *
+   * 取 0 会把「它进来之前这个房间说过的每一句话」当成它漏读的上下文塞进
+   * prompt；取「当前水位」又会把触发消息本身排除在外，让讨论模式的一轮
+   * 在空房间里做「要不要发言」的判断。读游标恰好是这两者之间唯一正确的点。
    */
   private ensureRuntime(conversation: Conversation, member: Member): MemberRuntime {
     const existing = this.findRuntime(conversation.id, member.id);
@@ -1679,6 +1727,7 @@ export class TeamService {
     const id = randomUUID();
     const copilotSessionId = `member-${member.id}-${randomUUID()}`;
     const workspacePath = path.join(config.workspaceRoot, conversation.id, member.id);
+    const initialCheckpoint = this.states.get(conversation.id, member.id).lastSeenMessageSequence;
 
     fs.mkdirSync(workspacePath, { recursive: true });
     fs.writeFileSync(
@@ -1711,10 +1760,10 @@ export class TeamService {
           last_context_message_sequence,
           last_used_at
         )
-        VALUES (?, ?, ?, ?, ?, 'idle', NULL, 0, NULL)
+        VALUES (?, ?, ?, ?, ?, 'idle', NULL, ?, NULL)
         `,
       )
-      .run(id, conversation.id, member.id, copilotSessionId, workspacePath);
+      .run(id, conversation.id, member.id, copilotSessionId, workspacePath, initialCheckpoint);
 
     const row = this.db
       .prepare(
@@ -1829,6 +1878,129 @@ export class TeamService {
       throw badRequest(`Member ${member.name} 已归档，不能作为新的执行目标`);
     }
     return member;
+  }
+
+  /**
+   * 「这个 Member 手上有没有还没收尾的活」——归档 / 移出前的闸门。
+   *
+   * 不做这个检查的话，一条已经排队的 wake 会在 operator 归档之后才开始处理，
+   * 在 runWake 里撞上 requireActiveMember 抛错。结果是「消息留着、wake 有过、
+   * execution 没有」：审计链上出现一段无法解释的空洞，而操作者以为自己只是
+   * 移走了一个人。
+   *
+   * 三个来源都要看，缺一不可：
+   *
+   *   execution                    queued / running / waiting_for_member
+   *   conversation_member_state    pending_wake 或非 idle 的 wake_status
+   *   scheduler 内存态             已入队但还没落库到 state 行的那一瞬
+   *
+   * 第一版刻意选「拒绝操作」而不是「边跑边踢」：中断一个正在写文件的 Agent
+   * 需要取消传播（连同它的 delegation 子树），那是另一件事。
+   */
+  private assertMemberNotBusy(memberId: string, action: string, conversationId?: string): void {
+    const scope = conversationId ? ' AND conversation_id = ?' : '';
+    const args = conversationId ? [memberId, conversationId] : [memberId];
+
+    const active = this.db
+      .prepare(
+        `
+        SELECT COUNT(*) AS n
+        FROM execution
+        WHERE member_id = ?
+          AND status IN ('queued', 'running', 'waiting_for_member')${scope}
+        `,
+      )
+      .get(...args) as unknown as { n: number };
+
+    const pending = this.db
+      .prepare(
+        `
+        SELECT COUNT(*) AS n
+        FROM conversation_member_state
+        WHERE member_id = ?
+          AND (pending_wake = 1 OR wake_status <> 'idle')${scope}
+        `,
+      )
+      .get(...args) as unknown as { n: number };
+
+    const queued = conversationId
+      ? this.scheduler.isBusy(conversationId, memberId)
+      : this.scheduler.hasWork(memberId);
+
+    if (active.n === 0 && pending.n === 0 && !queued) return;
+
+    throw conflict(
+      `Member 还有未完成的工作（${[
+        active.n > 0 ? `${active.n} 条未结束的 execution` : '',
+        pending.n > 0 || queued ? '待处理的唤醒' : '',
+      ]
+        .filter(Boolean)
+        .join('、')}），不能${action}。请等它跑完，或先取消对应的 execution。`,
+    );
+  }
+
+  /**
+   * 退休某个 (conversation, member) 的运行时：下一个 turn 起用全新的 Copilot session。
+   *
+   * 为什么不直接删 member_runtime 行：execution.runtime_id 引用它（**没有**
+   * ON DELETE 子句，删了会踩外键），而且「runtime 槽位」与「引擎 session」本来就是
+   * 两件事 —— 槽位属于 (conversation, member) 这个关系，session 属于其中一段连续
+   * 的任职。换掉 sessionId 就等于「上一次任职的上下文不再继承」，历史 execution
+   * 的 runtime 链接也仍然有效。
+   *
+   * `last_context_message_sequence` 不在这里动：归零会让新 session 的第一轮被灌进
+   * 整个房间历史。真正的对齐发生在重新加入时（见 alignRuntimeCheckpoint）。
+   *
+   * 工作区目录保留 —— 那是这个 Member 在这个房间里的产出，不是引擎状态。
+   * 旧 session 的数据留在 copilot base directory 里，但它已经没有任何引用，
+   * 不会被 resumeSession 找回。
+   */
+  private retireRuntime(conversationId: string, memberId: string): void {
+    this.db
+      .prepare(
+        `
+        UPDATE member_runtime
+        SET
+          copilot_session_id = ?,
+          active_execution_id = NULL,
+          status = 'idle',
+          last_used_at = ?
+        WHERE conversation_id = ?
+          AND member_id = ?
+        `,
+      )
+      .run(
+        `member-${memberId}-${randomUUID()}`,
+        now(),
+        conversationId,
+        memberId,
+      );
+  }
+
+  /**
+   * 把 runtime 的上下文水位对齐到某个序号。
+   *
+   * 加入房间时用：新加入（或被移出后重新加入）的成员不应该被灌进整个房间历史。
+   * runtime 尚不存在时什么都不做 —— 它创建时会自己取房间状态里的读游标作为初值，
+   * 那正好就是「加入时的水位」。
+   */
+  private alignRuntimeCheckpoint(
+    conversationId: string,
+    memberId: string,
+    sequence: number,
+  ): void {
+    this.db
+      .prepare(
+        `
+        UPDATE member_runtime
+        SET
+          last_context_message_sequence = ?,
+          last_used_at = ?
+        WHERE conversation_id = ?
+          AND member_id = ?
+        `,
+      )
+      .run(sequence, now(), conversationId, memberId);
   }
 
   private hydrateConversation(row: ConversationRow): Conversation {
@@ -2160,6 +2332,25 @@ export class TeamService {
   private async waitForRuntimeIdle(runtimeId: string): Promise<void> {
     const current = this.runtimeLocks.get(runtimeId);
     if (current) await current.catch(() => {});
+  }
+
+  /**
+   * 把若干次写收成一个原子块。
+   *
+   * `fn` 必须是**同步**的：node:sqlite 是同步 API，一旦里面出现 await，事务就会
+   * 跨过事件循环边界，别的请求能挤进同一个连接上的 BEGIN/COMMIT 之间 ——
+   * 那不是事务，是陷阱。所以这里对返回值不做 Promise 处理。
+   */
+  private transaction<T>(fn: () => T): T {
+    this.db.exec('BEGIN');
+    try {
+      const result = fn();
+      this.db.exec('COMMIT');
+      return result;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
 }
 
