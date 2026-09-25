@@ -32,7 +32,7 @@ const { db } = await import('../db.js');
 const { MemberService } = await import('../member-service.js');
 const { TeamService } = await import('../team-service.js');
 const { NO_REPLY_SENTINEL } = await import('../member-decision.js');
-const { executionIdForWake } = await import('./support.js');
+const { executionIdForWake, muteAllMembers } = await import('./support.js');
 
 const ALICE_PROMPT = 'ALICE_PERSONA_SENTINEL';
 const BOB_PROMPT = 'BOB_PERSONA_SENTINEL';
@@ -145,6 +145,8 @@ async function waitForConversationIdle(conversationId: string): Promise<void> {
 let alice: Member;
 let bob: Member;
 let iris: Member;
+/** 隔离类用例共用的房间：**同一个人房间里**才谈得上「谁拿到谁的记忆」。 */
+let roomId: string;
 
 before(() => {
   alice = team.createMember({
@@ -162,6 +164,16 @@ before(() => {
     systemPrompt: BOB_PROMPT,
   });
   iris = team.createMember({ name: 'Iris', role: 'Reviewer' });
+
+  const room = team.createConversation({
+    kind: 'group',
+    title: 'Shared Room',
+    memberIds: [alice.id, bob.id, iris.id],
+  });
+  // 静音全体：每一轮都由用例显式点名（targetMemberId 不走静音判断），
+  // 免得 open_discussion / follow_up 的连锁唤醒把「谁跑了几轮」变随机。
+  muteAllMembers(team, room.id);
+  roomId = room.id;
 });
 
 afterEach(() => {
@@ -283,18 +295,29 @@ describe('NO_REPLY 是一条成功的 execution', () => {
 });
 
 describe('Member 之间是隔离的', () => {
-  /** 单独跑一轮，返回真正传给引擎的 system prompt。 */
-  async function runSolo(member: Member): Promise<string> {
-    const conversation = team.createConversation({ kind: 'direct', memberIds: [member.id] });
-    const result = await team.sendMessage({ conversationId: conversation.id, content: '介绍一下你自己' });
-    const executionId = executionIdForWake(db, conversation.id, result.wakes[0]);
+  /**
+   * 在**同一个房间**里点名一个 Member 跑一轮，返回真正传给引擎的 system prompt。
+   *
+   * 刻意不用「每人一个 direct 房间」：那样房间里只有它自己，「按 member 取身份 /
+   * 记忆」和「按房间第一个人取」结果完全相同，断言区分不出隔离有没有做对。
+   */
+  async function runInRoom(member: Member): Promise<string> {
+    const result = await team.sendMessage({
+      conversationId: roomId,
+      content: '介绍一下你自己',
+      targetMemberId: member.id,
+    });
+    assert.equal(result.wakes.length, 1, '显式点名应该恰好唤醒一个人');
+
+    const executionId = executionIdForWake(db, roomId, result.wakes[0]);
     await waitForStatus(executionId, 'completed');
+    await waitForConversationIdle(roomId);
     return stub.turnFor(executionId).systemPrompt;
   }
 
-  it('personality 隔离：每个 Member 拿到的是自己的身份，不是房间的', async () => {
-    const alicePrompt = await runSolo(alice);
-    const bobPrompt = await runSolo(bob);
+  it('personality 隔离：同一个房间里，每人拿到的是自己的身份', async () => {
+    const alicePrompt = await runInRoom(alice);
+    const bobPrompt = await runInRoom(bob);
 
     assert.match(alicePrompt, /You are Alice\./);
     assert.match(alicePrompt, new RegExp(ALICE_PROMPT));
@@ -305,12 +328,12 @@ describe('Member 之间是隔离的', () => {
     assert.doesNotMatch(bobPrompt, new RegExp(ALICE_PROMPT));
   });
 
-  it('memory 隔离：Alice 的 prompt 里有自己的记忆，没有 Bob 的', async () => {
+  it('memory 隔离：各人 prompt 里只有自己的长期记忆', async () => {
     team.replaceMemberMemory(alice.id, `# Long-term Memory\n\n- ${ALICE_MEMORY}\n`);
     team.replaceMemberMemory(bob.id, `# Long-term Memory\n\n- ${BOB_MEMORY}\n`);
 
-    const alicePrompt = await runSolo(alice);
-    const bobPrompt = await runSolo(bob);
+    const alicePrompt = await runInRoom(alice);
+    const bobPrompt = await runInRoom(bob);
 
     assert.match(alicePrompt, new RegExp(ALICE_MEMORY));
     assert.doesNotMatch(alicePrompt, new RegExp(BOB_MEMORY));
