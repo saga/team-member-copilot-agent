@@ -4,6 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { CopilotClient, CopilotSession } from '@github/copilot-sdk';
+// type-only：被完全擦除，不参与运行时模块初始化顺序（这个文件要先把 DATA_DIR 设好）
+import type { ToolPolicy } from '../tool-policy.js';
 
 /**
  * Runtime correctness 测试（Commit 1 + Commit 2）。
@@ -24,6 +26,7 @@ const { db } = await import('../db.js');
 const { MemberService } = await import('../member-service.js');
 const { TeamService } = await import('../team-service.js');
 const { CopilotService, isSessionNotFound, isTurnTimeout } = await import('../copilot.js');
+const { DefaultToolPolicy } = await import('../tool-policy.js');
 const { singleExecutionId, muteAllMembers } = await import('./support.js');
 
 after(() => {
@@ -129,6 +132,14 @@ function createFakeClient(config: {
   resume?: (sessionId: string) => Promise<CopilotSession>;
   create?: () => Promise<CopilotSession>;
   metadata?: (sessionId: string) => Promise<unknown>;
+  /**
+   * 记下真正交给引擎的那份 sessionConfig。
+   *
+   * 「工具声明」和「工具授权」都有两条腿：策略算出结论，CopilotService 把它
+   * 交给引擎。只测策略等于只测了一半 —— 少接一根线（比如 hooks 忘了传），
+   * 策略再正确也不会生效，而且没有任何断言会红。
+   */
+  onConfig?: (config: unknown) => void;
 }): FakeClient {
   const calls = { resume: 0, create: 0, metadata: 0 };
 
@@ -137,13 +148,15 @@ function createFakeClient(config: {
     async stop() {
       return [];
     },
-    async resumeSession(sessionId: string) {
+    async resumeSession(sessionId: string, sessionConfig?: unknown) {
       calls.resume += 1;
+      config.onConfig?.(sessionConfig);
       if (!config.resume) throw new Error('test: resume not configured');
       return config.resume(sessionId);
     },
-    async createSession() {
+    async createSession(sessionConfig?: unknown) {
       calls.create += 1;
+      config.onConfig?.(sessionConfig);
       if (!config.create) throw new Error('test: create not configured');
       return config.create();
     },
@@ -156,7 +169,10 @@ function createFakeClient(config: {
   return { client: client as unknown as CopilotClient, calls };
 }
 
-function turnInput(overrides: { onDelta?: (delta: string) => void } = {}) {
+function turnInput(
+  overrides: { onDelta?: (delta: string) => void; toolProfile?: 'safe' | 'coding' } = {},
+) {
+  const { toolProfile, ...rest } = overrides;
   return {
     runtime: {
       id: 'runtime-1',
@@ -178,7 +194,7 @@ function turnInput(overrides: { onDelta?: (delta: string) => void } = {}) {
       style: '',
       systemPrompt: '',
       model: null,
-      toolProfile: 'safe' as const,
+      toolProfile: toolProfile ?? ('safe' as const),
       status: 'active' as const,
       createdAt: 't',
       updatedAt: 't',
@@ -187,7 +203,7 @@ function turnInput(overrides: { onDelta?: (delta: string) => void } = {}) {
     prompt: 'hello',
     executionId: 'exec-1',
     conversationId: 'conv-1',
-    ...overrides,
+    ...rest,
   };
 }
 
@@ -349,6 +365,247 @@ describe('sendAndWait 超时 → abort', () => {
 
     release();
     await turn;
+  });
+});
+
+// ═══════════════════════════════════════════ 2.5 工具授权接到引擎上
+
+/**
+ * 工具授权层有两条腿：
+ *
+ *   策略算出结论        tool-policy.test.ts 覆盖
+ *   结论交给引擎        ← 这个 block
+ *
+ * 第二条腿很容易漏：策略写得再对，`hooks` 忘了传、`availableTools` 忘了解包，
+ * 引擎那边就是「什么都没管」，而且不会有任何断言变红 —— 因为默认行为是不拦。
+ */
+
+interface CapturedSessionConfig {
+  availableTools?: { toArray(): string[] } | string[];
+  hooks?: {
+    onPreToolUse?: (input: {
+      sessionId: string;
+      toolName: string;
+      toolArgs: unknown;
+    }) => unknown;
+  };
+  onPermissionRequest?: (request: { kind: string }, invocation: { sessionId: string }) => unknown;
+}
+
+function declaredTools(config: CapturedSessionConfig | undefined): string[] {
+  const tools = config?.availableTools;
+  if (!tools) return [];
+  return Array.isArray(tools) ? tools : tools.toArray();
+}
+
+/** 跑一轮完整 turn，并在 turn 进行中执行 `during`（此时 execution 上下文才存在）。 */
+async function runTurnCapturing(
+  options: {
+    toolProfile?: 'safe' | 'coding';
+    toolPolicy?: ToolPolicy;
+    /**
+     * 第二个参数是这一轮的 input，由本函数创建后才交给引擎 —— 用例的闭包里
+     * 拿不到它（那时还在 TDZ），所以从这里传进去。
+     */
+    during?: (
+      config: CapturedSessionConfig,
+      input: ReturnType<typeof turnInput>,
+    ) => void | Promise<void>;
+  } = {},
+) {
+  let captured: CapturedSessionConfig | undefined;
+  const input = turnInput({ toolProfile: options.toolProfile });
+
+  const fakeSession = createFakeSession({
+    onSendAndWait: async () => {
+      if (options.during && captured) await options.during(captured, input);
+      return { data: { content: 'ok' } };
+    },
+  });
+  const fake = createFakeClient({
+    resume: async () => fakeSession.session,
+    onConfig: (config) => {
+      captured = config as CapturedSessionConfig;
+    },
+  });
+
+  const copilot = new CopilotService(
+    {} as never,
+    {
+      createClient: () => fake.client,
+      ...(options.toolPolicy ? { toolPolicy: options.toolPolicy } : {}),
+    },
+  );
+
+  await copilot.runMemberTurn(input);
+  assert.ok(captured, '引擎没有拿到 sessionConfig');
+  return { config: captured, input };
+}
+
+describe('工具授权层真的接到了引擎上', () => {
+  it('三个 custom tool 都声明给了引擎（漏一个 = 这个能力不存在）', async () => {
+    const { config } = await runTurnCapturing();
+    const declared = new Set(declaredTools(config));
+
+    for (const name of ['ask_member', 'message_member', 'remember_member']) {
+      assert.ok(declared.has(`custom:${name}`), `引擎没拿到 ${name} 的声明`);
+    }
+  });
+
+  it('safe profile：宿主工具既不声明也不放行', async () => {
+    const decisions: Array<Record<string, unknown>> = [];
+
+    const { config } = await runTurnCapturing({
+      toolProfile: 'safe',
+      toolPolicy: new DefaultToolPolicy({ allowHostTools: true }),
+      during: async (captured) => {
+        for (const name of ['bash', 'edit', 'grep', 'web_fetch']) {
+          decisions.push(
+            (await captured.hooks?.onPreToolUse?.({
+              sessionId: 'sess-1',
+              toolName: name,
+              toolArgs: {},
+            })) as Record<string, unknown>,
+          );
+        }
+      },
+    });
+
+    const declared = declaredTools(config);
+    for (const name of ['bash', 'edit', 'grep', 'web_fetch']) {
+      assert.ok(!declared.includes(`builtin:${name}`), `${name} 不该被声明给 safe profile`);
+    }
+    assert.equal(decisions.length, 4);
+    for (const decision of decisions) {
+      assert.equal(decision.permissionDecision, 'deny');
+    }
+  });
+
+  it('宿主工具已启用 + coding profile：声明里有了，hook 也真的放行', async () => {
+    let decision: Record<string, unknown> | undefined;
+
+    const { config } = await runTurnCapturing({
+      toolProfile: 'coding',
+      toolPolicy: new DefaultToolPolicy({ allowHostTools: true }),
+      during: async (captured) => {
+        decision = (await captured.hooks?.onPreToolUse?.({
+          sessionId: 'sess-1',
+          toolName: 'bash',
+          toolArgs: { command: 'ls' },
+        })) as Record<string, unknown>;
+      },
+    });
+
+    assert.ok(declaredTools(config).includes('builtin:bash'));
+    assert.equal(decision?.permissionDecision, 'allow');
+  });
+
+  it('放行必须返回明确的 allow，不能返回空对象', async () => {
+    // 空对象是「没有意见」：引擎会接着走它自己的权限流程，而这个服务里没有
+    // 可以点「同意」的人 —— 请求会挂在 pending 上直到 execution 超时。
+    const decisions: Array<Record<string, unknown>> = [];
+
+    await runTurnCapturing({
+      during: async (captured) => {
+        for (const name of ['ask_member', 'message_member', 'remember_member', 'skill']) {
+          decisions.push(
+            (await captured.hooks?.onPreToolUse?.({
+              sessionId: 'sess-1',
+              toolName: name,
+              toolArgs: {},
+            })) as Record<string, unknown>,
+          );
+        }
+      },
+    });
+
+    for (const decision of decisions) {
+      assert.equal(
+        decision.permissionDecision,
+        'allow',
+        '授权结果必须显式表态，留空会把决策权交回给一个不存在的用户',
+      );
+    }
+  });
+
+  it('不是工具调用引起的权限请求：拒绝，而不是挂在 pending 上等一个不会来的答案', async () => {
+    let result: Record<string, unknown> | undefined;
+
+    const { config } = await runTurnCapturing({
+      during: async (captured) => {
+        result = (await captured.onPermissionRequest?.({ kind: 'url' }, { sessionId: 'sess-1' })) as
+          | Record<string, unknown>
+          | undefined;
+      },
+    });
+
+    assert.ok(config.onPermissionRequest, '没有接 onPermissionRequest，请求会一直 pending');
+    assert.equal(result?.kind, 'user-not-available');
+  });
+
+  it('钩子认不出这个 session 时拒绝，而不是放行', async () => {
+    // resume 出来的旧 session 被别处驱动、或者 sub-agent 的 session，都会走到这支。
+    // 我们既不知道是谁在用、也不知道属于哪个房间，没有任何理由替它背书。
+    let decision: Record<string, unknown> | undefined;
+
+    await runTurnCapturing({
+      during: async (captured) => {
+        decision = (await captured.hooks?.onPreToolUse?.({
+          sessionId: 'some-other-session',
+          toolName: 'ask_member',
+          toolArgs: {},
+        })) as Record<string, unknown>;
+      },
+    });
+
+    assert.equal(decision?.permissionDecision, 'deny');
+  });
+
+  it('一轮 turn 用开始那一刻的 profile —— 中途改 Member 不改变已经在跑的这一轮', async () => {
+    let decision: Record<string, unknown> | undefined;
+
+    // 先按 safe 起一轮，在 turn 进行中把 Member 改成 coding。
+    await runTurnCapturing({
+      toolProfile: 'safe',
+      toolPolicy: new DefaultToolPolicy({ allowHostTools: true }),
+      during: async (captured, input) => {
+        input.member.toolProfile = 'coding';
+        decision = (await captured.hooks?.onPreToolUse?.({
+          sessionId: 'sess-1',
+          toolName: 'bash',
+          toolArgs: {},
+        })) as Record<string, unknown>;
+      },
+    });
+
+    assert.equal(
+      decision?.permissionDecision,
+      'deny',
+      '正在跑的这一轮突然多出了宿主工具 —— profile 必须在 turn 开始时冻结',
+    );
+  });
+
+  it('三个 custom tool 即使没有 execution 上下文也不会被策略拦下（它们的边界在业务里）', async () => {
+    // 这条是上面那条的反面：认不出 session 才拒绝，认得出就必须让 custom tool 过。
+    const decisions: Array<Record<string, unknown>> = [];
+
+    await runTurnCapturing({
+      during: async (captured) => {
+        for (const name of ['ask_member', 'message_member', 'remember_member']) {
+          decisions.push(
+            (await captured.hooks?.onPreToolUse?.({
+              sessionId: 'sess-1',
+              toolName: name,
+              toolArgs: {},
+            })) as Record<string, unknown>,
+          );
+        }
+      },
+    });
+
+    for (const decision of decisions) {
+      assert.equal(decision.permissionDecision, 'allow');
+    }
   });
 });
 

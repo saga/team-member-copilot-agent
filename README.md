@@ -109,18 +109,56 @@ Member       = 应用层业务身份（跨 Conversation 稳定）
 - delegation（`ask_member`）
 - memory（`.data/members/<member-id>/memory/MEMORY.md`）
 
-`toolProfile` 决定工具面：
+### 工具授权：声明与放行
 
-| profile | 可用工具 |
-|---------|----------|
-| `safe`（默认） | SDK isolated built-ins + `ask_member` + `remember_member` |
-| `coding` | `safe` 再加 `bash` / `edit` / `grep` / `web_fetch` |
+「引擎看得见什么」和「这一次调用放不放行」是两件事，很容易各自漂移成两套判据 ——
+模型看得见一个它其实用不了的工具，或者更糟：看不见却在某条路径上被放行。
+两者都收敛到同一个 `ToolPolicy` 实例（`server/tool-policy.ts`）：
 
-> `coding` 没有 sandbox 时 `bash` 可以触达宿主机边界，不要直接用于多租户生产环境。
+```
+availableTools(profile)  →  ToolSet       声明给引擎（它有什么）
+hooks.onPreToolUse       →  allow | deny  每次调用重新判一遍（这次能不能用）
+```
+
+`check()` 的判定顺序：
+
+| 工具 | 判定 |
+|------|------|
+| `ask_member` / `message_member` / `remember_member` | 放行 —— 副作用由各自的业务校验兜住 |
+| `BuiltInTools.Isolated` | 放行 —— SDK 契约保证只在 session 边界内活动 |
+| `bash` / `edit` / `grep` / `web_fetch` | `profile === 'coding'` **且** `HOST_CODING_TOOLS=true` 才放行 |
+| 其它一切 | 拒绝 |
+
+最后一条是默认拒绝：引擎新增一个 built-in、或者某个 skill 让模型想调一个没承认过的名字时，
+必须在授权层被拦下。`skipPermission: true` 的含义只是「app-owned 工具不必弹权限提示」，
+它是省一次交互，不是一次授权；`toolProfile` 同理 —— 成员声明想要什么，不等于允许它做任何事。
+
+一轮 turn 用的是**开始那一刻**的 `toolProfile`（冻结在 `RuntimeExecutionContext` 里）：
+中途有人把 profile 从 `safe` 改成 `coding`，不该让正在跑的这一轮突然多出宿主工具。
+hook 认不出 `sessionId` 属于哪个 execution 时也拒绝而不是放行 —— 那说明这个 session
+不是本进程在跑的一轮 turn，既不知道是谁在用、也不知道属于哪个房间。
+
+放行时返回的是**明确的 `allow`**，不是空对象。空对象是「没有意见」，引擎会接着走它
+自己的权限流程，而这个服务里没有可以点「同意」的人 —— 那个请求会一直挂在 pending 上，
+直到 `EXECUTION_TIMEOUT_MS` 把一轮正常的工作判成超时。`allow` / `deny` 两边都写出来，
+授权就只有 `onPreToolUse` 这一个决策点。
+
+不是由工具调用引起的权限请求（`url` / `mcp` / 扩展管理……）由 `onPermissionRequest`
+回答 `user-not-available`：这个服务里没有终端、没有确认框、没有第二个进程在看着，
+等一个不会来的答案是纯粹的损失。注意这**不是**默认放行 —— 一个装出来的放宽会让权限层
+变成比策略层更弱的一条旁路，那正是策略层想避免的事。
+
+| profile | 声明给引擎的工具 |
+|---------|------------------|
+| `safe`（默认） | SDK isolated built-ins + `ask_member` + `message_member` + `remember_member` |
+| `coding` | 同上；且仅在 `HOST_CODING_TOOLS=true` 时再加 `bash` / `edit` / `grep` / `web_fetch` |
+
+> `coding` 在 `HOST_CODING_TOOLS=true` 且没有 sandbox 时，`bash` 可以触达宿主机边界，
+> 不要直接用于多租户生产环境。
 
 ## Runtime reliability
 
-「能跑的 Team Agent Demo」和「可靠的 Team Runtime」之间差的是下面六件事。当前实现把它们都收在 `server/` 里，没有引入 K8s sandbox、LLM router、policy service 或 scheduler。
+「能跑的 Team Agent Demo」和「可靠的 Team Runtime」之间差的是下面几件事。当前实现把它们都收在 `server/` 里，没有引入 K8s sandbox、LLM router、policy service 或 scheduler。
 
 | 问题 | 做法 |
 |------|------|
@@ -130,6 +168,7 @@ Member       = 应用层业务身份（跨 Conversation 稳定）
 | 会话上下文和 Copilot session history 重复 | `ContextAssembler` 只注入 `message_sequence > last_context_message_sequence` 的新消息 |
 | 并发 delegation 会死锁 | `delegation_path` 防同树环 + wait-for 图防跨树互相等待 |
 | DB 说失败 / 已取消，引擎还在跑 | `resumeSession` 错误分类收窄 + 超时 `abort()` + `activeSessions` 句柄，让 cancel 能真的落地 |
+| 排队中的唤醒经不起重启 | 唤醒的**触发消息序号与原因一起落库**，恢复时原样重派，而不是拿当前水位猜一个 |
 
 ### 1. 崩溃恢复：宁可漏跑，不可重跑
 
@@ -208,6 +247,41 @@ abort 之后还要等一次 `session.idle` 才算「停稳」。注意这里**�
 
 `activeSessions: Map<executionId, CopilotSession>`（turn 入口 set，`finally` delete）是 `cancel` 能落地的前提 —— 没有这个句柄，`POST /executions/:id/cancel` 只能写个假的 `cancelled`。
 
+### 6. 唤醒是一个可重放的单位
+
+scheduler 的入队单位**就是**落库的重放单位：
+
+```ts
+interface PendingWake {
+  conversationId: string;
+  memberId: string;
+  reason: WakeReason;      // direct | mention | open_discussion | follow_up
+  triggerSequence: number; // 是哪条消息唤起的
+}
+```
+
+两者共用同一个形状，是为了让「恢复出来的那一轮」和「当时那一轮」在结构上不可能不一致。
+只存一个 `pending_wake` 布尔位时，恢复只能拿当前水位 + 一个猜的原因去重建 —— 结果是
+`@bob 看一下风险`（mention @17）被重放成对着第 23 条消息的顺带唤醒。
+
+三处细节：
+
+- **「排队 → 在跑」是一个原子翻转。** `beginWake()`（清 pending）和 `insertExecution()`
+  必须在同一个事务里。反过来先清 pending 再建 execution 有一个窗口：进程死在中间，
+  唤醒和 execution 会同时消失。
+- **合并要整条保留，不能字段级拼装。** `mergeWake()` 若分别取「更明确的 reason」和
+  「更大的 triggerSequence」，会拼出一个从未发生的事件（`mention` + 第 11 条消息，
+  而第 11 条并没有点名）。正确做法是更明确的 reason 胜出**连同它自己的 trigger**，
+  同级取更新的。被丢掉的那条消息不会消失：`ContextAssembler` 注入的是 checkpoint
+  以来的全部消息。
+- **区分「跑失败了」与「连跑都没跑起来」。** 后者要清掉 durable 标记，否则每次重启
+  都会重派一条注定失败的唤醒。scheduler 通过 `run(wake, markStarted)` 回调拿到这个区分。
+
+归档 / 移出 Member 前有三道闸门（未结束的 execution、`pending_wake`/`wake_status`、
+scheduler 内存队列），任一条命中就 `409 Conflict` —— 不做「边跑边踢」。移出时
+`member_runtime` 行**换 sessionId 而不是删除**（`execution.runtime_id` 引用它且没有
+`ON DELETE`），重新加入自然拿到一个全新的 Copilot session，不会 resume 上一段任职的历史。
+
 ## 快速开始
 
 ```bash
@@ -241,9 +315,40 @@ npm run dev            # 同时启动 client(:5173) + server(:3001)
 | DELETE | `/api/conversations/:id/members/:memberId` | 移出 Member（仅 `group`） |
 | GET | `/api/conversations/:id/events?since=` | 会话级 SSE（支持 `Last-Event-ID` 回放） |
 | GET | `/api/conversations/:id/executions?limit=` | 该会话的 execution，按 `createdAt` 正序（默认 200，夹在 1..1000） |
+| GET | `/api/conversations/:id/state` | 房间里每个 Member 的读游标 / 唤醒状态 / 静音 |
+| PATCH | `/api/conversations/:id/members/:memberId/state` | 静音 / 取消静音 |
+| GET | `/api/members/:id/direct-messages` | 该 Member 参与的全部私聊（只读） |
+| GET | `/api/members/:id/memory` · `PUT` | 该 Member 的长期记忆全文 |
+| GET | `/api/members/:id/skills` · `POST` · `DELETE` | 该 Member 的 skill（zip 上传 / 卸载） |
+| POST | `/api/internal/members/:id/direct-messages` | **以 `:id` 的身份**发私聊 —— Internal API，见下 |
 | GET | `/api/executions/:id` | 单条 execution |
 | POST | `/api/executions/:id/retry` | `202 { executionId, execution }` —— 新建一条并指回原记录 |
 | POST | `/api/executions/:id/cancel` | 等引擎真的停下来才返回最终状态 |
+
+### API 边界：谁在调用
+
+同一个 `:id` 在不同路径下的含义不一样，混在一起就会出问题：
+
+| 边界 | 前缀 | `:id` 的含义 | 调用方 |
+|------|------|--------------|--------|
+| Human API | `/api/conversations`、`/api/members`（读） | 我在看谁 | 浏览器里的用户 |
+| Admin API | `/api/members`（写）、memory、skills | 我在改谁 | 管理员 |
+| Internal API | `/api/internal` | **我代表谁** | 另一个 runtime |
+
+`POST /api/internal/members/:id/direct-messages` 里的 `:id` 是调用方自己填的 ——
+它长在 `/api/members` 下时，任何能访问这个服务的人都能填别人的 id，效果就是
+「替 Alice 发消息」。身份会从一个**校验过的输入**退化成一个**请求参数**。
+
+所以这一组单独挂在 `/api/internal` 下 —— 路径本身也是契约：看到它就知道调用方
+不是浏览器，而是另一个 runtime。整组走 `requireInternalToken`：
+
+```
+INTERNAL_API_TOKEN 为空    放行（单机原型）。启动日志写「Internal API 未设防」
+INTERNAL_API_TOKEN 已配置  要求 Authorization: Bearer <token> 或 X-Internal-Token: <token>
+```
+
+Member 自己的三个工具（`message_member` / `ask_member` / `remember_member`）和这条
+HTTP 路径是**同一个能力面**，只是一个从引擎里调、一个从外面调，两边的授权判据一致。
 
 ### Execution API
 
@@ -358,12 +463,15 @@ Group Chat：
 |---------|------|
 | 1 | 初版六张表（旧代码用 `CREATE TABLE IF NOT EXISTS` 建出来的，没写 `user_version`） |
 | 2 | `conversation.event_sequence` / `message_sequence`、`conversation_message.message_sequence`、`member_runtime.active_execution_id` / `last_context_message_sequence`、`execution.waiting_for_runtime_id` / `retry_of_execution_id`、`execution.status` 增加 `waiting_for_member` / `interrupted`、`conversation_event` |
+| 3 | `conversation_member_state`（Member 在房间里的读游标 + 唤醒状态）、`execution.decision` / `trigger_message_sequence` |
+| 4 | `conversation_member_state.pending_wake_trigger_sequence` / `pending_wake_reason`（唤醒的重放单位） |
 
 约定：
 
 - `user_version = 0` 且已存在 `member` 表 → 当作 v1（老库），不重建。
-- `user_version = 0` 且库是空的 → 直接建 v2。
+- `user_version = 0` 且库是空的 → 直接建最新版。
 - `user_version > SCHEMA_VERSION` → 拒绝启动，避免新数据被老代码写坏。
+- 加列一律走 `ADD COLUMN`，不重建表 —— 这几张表被 6 张表 FK 引用，SQLite 改不了它们。
 - `execution` 要改 `status` 的 CHECK 约束，而 SQLite 不支持 `ALTER CHECK`，所以按官方 12 步流程重建表；重建期间 `PRAGMA foreign_keys = OFF` 必须放在 `BEGIN` **之前**（该 PRAGMA 在事务内无效），提交前跑 `PRAGMA foreign_key_check`。
 - 升级时会同步计数器与水位线：`conversation.message_sequence` 追上历史最大值（否则下一条消息撞 UNIQUE），`member_runtime.last_context_message_sequence` 推到当前最大序号（否则升级后立刻重复注入一次全量上下文）。
 
@@ -392,26 +500,36 @@ src/                          # Vite + React 前端
 server/                       # Express + Copilot SDK 后端
   config.ts                   # 环境变量
   db.ts                       # node:sqlite 打开 + 迁移
-  db-migrations.ts            # PRAGMA user_version 迁移（v1 → v2）
+  db-migrations.ts            # PRAGMA user_version 迁移（v1 → v4）
   domain.ts                   # Member / Conversation / Runtime / Execution 类型
   copilot.ts                  # MemberRuntime → CopilotSession 执行引擎 + custom tools
+  tool-policy.ts              # 工具声明与放行（同一个实例回答两个问题）
   context-assembler.ts        # 增量上下文（message_sequence checkpoint）
   recovery-service.ts         # 启动恢复（保守策略，不自动重跑 running）
   member-service.ts           # 长期 Member 身份 + member home
+  conversation-member-service.ts  # 房间内成员状态（读游标 / pending wake / wake_status）
+  member-turn-scheduler.ts    # 同一 Member 的 turn 串行化 + 唤醒合并
   team-service.ts             # 核心编排：Conversation / Execution / Delegation / 单写者 / durable event
-  app.ts                      # 依赖装配
+  app.ts                      # 依赖装配 + 路由挂载
   index.ts                    # 迁移 → 恢复 → listen + 优雅退出
-  middleware/errorHandler.ts
+  middleware/
+    errorHandler.ts
+    apiScope.ts               # Internal API 门禁（三类调用方的边界）
   routes/
     health.ts
     members.ts
     conversations.ts
     executions.ts               # 单条 / 列表 / retry / cancel
+    internal.ts                 # 以 Member 身份说话（token 门禁）
   test/
     schemas.test.ts
+    tool-policy.test.ts            # 声明了什么 / 放行什么 / 两者不允许漂移
+    internal-api.test.ts           # 路径归属 + token 门禁
     team-service.test.ts           # delegation cycle / depth / runtime 隔离 / kind 形状约束
+    member-dm.test.ts              # Member ↔ Member 私聊房间唯一性 + 自动对谈抑制
+    member-skills.test.ts          # skill 安装 / 卸载 / zip 校验
     runtime-reliability.test.ts    # 迁移 / 序号 / 增量上下文 / durable event / 恢复 / 死锁
-    runtime-correctness.test.ts    # resume 分类 / 超时 abort / 归档语义 / cancel 状态机 / retry
+    runtime-correctness.test.ts    # resume 分类 / 超时 abort / 工具授权接线 / cancel 状态机 / retry
 ```
 
 ## 环境变量
@@ -426,6 +544,19 @@ server/                       # Express + Copilot SDK 后端
 | `MAX_DELEGATION_DEPTH` | `4` | `delegation_path` 最大长度 |
 | `EXECUTION_TIMEOUT_MS` | `600000` | 单次 turn 上限（SDK 默认 60s 对带工具的真实任务太短） |
 | `RECOVER_ON_STARTUP` | `true` | 启动时跑 `RecoveryService`（单进程独占 DB 才安全） |
+| `GROUP_AUTO_WAKE_ROUNDS` | `2` | 无 `@mention` 的 member 发言最多连着唤醒几轮 |
+| `HOST_CODING_TOOLS` | `false` | 是否允许 `bash` / `edit` / `grep` / `web_fetch`。**不随 `toolProfile` 打开** |
+| `INTERNAL_API_TOKEN` | 空 | Internal API 门禁；空 = 不校验（仅限本机单用户） |
+
+`HOST_CODING_TOOLS` 默认关闭，原因是这几个工具的工作目录虽然是 conversation workspace，
+runtime 仍然是宿主机上的进程 —— 没有沙箱时 `bash` 能走到 workspace 之外。成员把
+`toolProfile` 标成 `coding` 只是**声明想要什么**，不等于拿到了宿主机的执行权；
+判定要看两道门：`profile === 'coding'` **且** 部署显式启用了宿主工具。打开它等于承认
+「当前 runtime 是可信的单租户环境」；多租户必须等沙箱运行时（K8s / Kata / Firecracker）
+就位后，由运行时策略而不是这个开关来给工具。
+
+三个 custom tool（`ask_member` / `message_member` / `remember_member`）和 SDK 的
+`BuiltInTools.Isolated` 集合始终可用；没定义过策略的工具一律拒绝。
 
 ## 前提
 

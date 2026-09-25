@@ -1,14 +1,28 @@
 import {
-  BuiltInTools,
   CopilotClient,
   defineTool,
-  ToolSet,
   type CopilotSession,
+  type SessionConfigBase,
+  type SessionHooks,
   type ToolInvocation,
 } from '@github/copilot-sdk';
 import { z } from 'zod';
 import { config } from './config.js';
 import type { Member, MemberRuntime } from './domain.js';
+import { DefaultToolPolicy, type ToolPolicy } from './tool-policy.js';
+
+/**
+ * SDK 顶层没有导出 `PreToolUseHookInput` / `PreToolUseHookOutput`（它们在
+ * dist/types.d.ts 里声明但未 re-export），所以从 `SessionHooks` 派生。
+ */
+type PreToolUseHook = NonNullable<SessionHooks['onPreToolUse']>;
+type PreToolUseInput = Parameters<PreToolUseHook>[0];
+type PreToolUseOutput = Exclude<Awaited<ReturnType<PreToolUseHook>>, void>;
+
+type PermissionHook = NonNullable<SessionConfigBase['onPermissionRequest']>;
+type PermissionRequest = Parameters<PermissionHook>[0];
+type PermissionInvocation = Parameters<PermissionHook>[1];
+type PermissionResult = Awaited<ReturnType<PermissionHook>>;
 
 /**
  * Runtime 执行引擎。这一层不再管理任何「业务 session」：
@@ -37,6 +51,14 @@ export interface RuntimeExecutionContext {
   executionId: string;
   conversationId: string;
   memberId: string;
+  /**
+   * 这一轮生效的 tool profile。
+   *
+   * 冻结在这里而不是在 hook 里现查 Member：一轮 turn 用的是**开始那一刻**的
+   * 身份。中途有人把 profile 从 safe 改成 coding，不该让正在跑的这一轮
+   * 突然多出宿主工具。
+   */
+  toolProfile: Member['toolProfile'];
 }
 
 /** 反向依赖注入：CopilotService 需要调 TeamService，但不能直接 import 它。 */
@@ -91,6 +113,11 @@ export interface CopilotServiceOptions {
    * 生产环境不传，走默认的 `new CopilotClient({ mode: 'empty', ... })`。
    */
   createClient?: () => CopilotClient;
+  /**
+   * 工具授权层。不传则用默认实现（策略由 config.allowHostCodingTools 决定）。
+   * 可替换是为了让测试能直接验证「某次调用被拒」而不必真的跑引擎。
+   */
+  toolPolicy?: ToolPolicy;
 }
 
 /**
@@ -155,11 +182,16 @@ export class CopilotService {
    * 的假取消。
    */
   private readonly activeSessions = new Map<string, CopilotSession>();
+  /** 工具授权层。声明与放行都由它回答，见 tool-policy.ts。 */
+  private readonly toolPolicy: ToolPolicy;
 
   constructor(
     private readonly host: CopilotHost,
     private readonly options: CopilotServiceOptions = {},
-  ) {}
+  ) {
+    this.toolPolicy =
+      options.toolPolicy ?? new DefaultToolPolicy({ allowHostTools: config.allowHostCodingTools });
+  }
 
   async getClient(): Promise<CopilotClient> {
     if (this.client) return this.client;
@@ -221,7 +253,17 @@ export class CopilotService {
   async runMemberTurn(input: RunMemberTurnInput): Promise<string> {
     return this.withLock(input.runtime.id, async () => {
       const client = await this.getClient();
-      const availableTools = this.buildAvailableTools(input.member.toolProfile);
+      const availableTools = this.toolPolicy.availableTools(input.member.toolProfile);
+
+      if (this.toolPolicy.hostToolsWithheld(input.member.toolProfile)) {
+        // 界面 / API 上都写着 coding，实际一个宿主工具都没给。不说出来的话，
+        // 只能靠「它怎么什么都不做」去猜。
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[copilot] Member ${input.member.name} 声明了 coding，但宿主工具未启用` +
+            `（HOST_CODING_TOOLS != true），本次不提供 bash/edit/grep/web_fetch`,
+        );
+      }
 
       const sessionConfig = {
         sessionId: input.runtime.copilotSessionId,
@@ -239,7 +281,15 @@ export class CopilotService {
           this.createRememberMemberTool(),
           this.createMessageMemberTool(),
         ],
+        // availableTools 只决定「模型看得见什么」；真正的授权在下面的 hook 里
+        // 每次调用重新判一遍。两者共用 ToolPolicy，所以不会各自漂移。
         availableTools,
+        hooks: {
+          onPreToolUse: (hookInput: PreToolUseInput) => this.checkToolUse(hookInput),
+        },
+        // 不是由工具调用引起的权限请求（url / mcp / 扩展管理……），见 answerPermissionRequest。
+        onPermissionRequest: (request: PermissionRequest, invocation: PermissionInvocation) =>
+          this.answerPermissionRequest(request, invocation),
         // SDK 默认 false。不打开的话 assistant.message_delta 根本不会发，
         // 前端的实时增量就永远是空的。
         streaming: true,
@@ -257,6 +307,7 @@ export class CopilotService {
         executionId: input.executionId,
         conversationId: input.conversationId,
         memberId: input.member.id,
+        toolProfile: input.member.toolProfile,
       });
       this.activeSessions.set(input.executionId, session);
 
@@ -493,25 +544,73 @@ export class CopilotService {
   }
 
   /**
-   * safe:
-   *   只允许 Copilot SDK 的 isolated built-ins + Team tools。
+   * 每一次 tool call 的授权判定 —— 这块系统里**唯一**的授权判定。
    *
-   * coding:
-   *   在 safe 基础上开放 bash/edit/grep/web_fetch。
+   * 拿不到 execution 上下文就**拒绝**而不是放行：那说明这个 session 不是本进程
+   * 在跑的一轮 turn（比如 resume 出来的旧 session 被别处驱动了，或者 sub-agent
+   * 自己的 session），我们既不知道是谁在用、也不知道它属于哪个房间，没有任何
+   * 理由替它背书。
    *
-   * coding profile 不应该直接用于多租户生产环境：没有 sandbox 时
-   * bash 可以触达宿主机边界。
+   * 放行时必须返回明确的 `allow`，不能返回 `{}`。空对象是「没有意见」，引擎会
+   * 接着走它自己的权限流程 —— 而这个服务里没有可以点「同意」的人，那个请求会
+   * 一直挂在 pending 上，直到 `EXECUTION_TIMEOUT_MS` 把一轮正常的工作判成超时。
+   * `allow` / `deny` 两边都写出来，授权就只有这一个决策点。
    */
-  private buildAvailableTools(profile: Member['toolProfile']): ToolSet {
-    const tools = new ToolSet().addCustom('ask_member').addCustom('remember_member');
-
-    tools.addBuiltIn(BuiltInTools.Isolated);
-
-    if (profile === 'coding') {
-      tools.addBuiltIn('bash').addBuiltIn('edit').addBuiltIn('grep').addBuiltIn('web_fetch');
+  private checkToolUse(hookInput: PreToolUseInput): PreToolUseOutput {
+    const context = this.executionContexts.get(hookInput.sessionId);
+    if (!context) {
+      return this.deny(hookInput.toolName, '找不到当前 execution 上下文，授权层无法判定');
     }
 
-    return tools;
+    const decision = this.toolPolicy.check({
+      memberId: context.memberId,
+      toolProfile: context.toolProfile,
+      executionId: context.executionId,
+      conversationId: context.conversationId,
+      toolName: hookInput.toolName,
+      toolArgs: hookInput.toolArgs,
+    });
+
+    if (decision.allowed) {
+      return { permissionDecision: 'allow', permissionDecisionReason: decision.reason };
+    }
+
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[copilot] 拒绝工具调用 ${hookInput.toolName}（member=${context.memberId} ` +
+        `execution=${context.executionId}）：${decision.reason}`,
+    );
+    return this.deny(hookInput.toolName, decision.reason);
+  }
+
+  /**
+   * 处理**不是由工具调用引起**的权限请求：url、mcp、memory、扩展管理等等。
+   *
+   * 工具调用那一路已经被 `onPreToolUse` 收口了；走到这里的是另一类问题：
+   * 引擎想问一句「我可以吗」。而这个服务里没有人可以问 —— 没有终端、没有确认框、
+   * 没有第二个进程在看着。把它挂在 pending 上等一个永远不会来的答案，只会把一轮
+   * 正常的工作拖到超时才失败。
+   *
+   * 所以直接给出「没有用户可确认」。注意这**不是**默认放行：一个装出来的放宽
+   * 会让权限层变成比策略层更弱的一条旁路，那正是策略层想避免的事。
+   */
+  private answerPermissionRequest(
+    request: PermissionRequest,
+    invocation: PermissionInvocation,
+  ): PermissionResult {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[copilot] 权限请求 ${request.kind} 被拒（session=${invocation.sessionId}）：` +
+        '本服务没有可征得同意的用户',
+    );
+    return { kind: 'user-not-available' };
+  }
+
+  private deny(toolName: string, reason: string): PreToolUseOutput {
+    return {
+      permissionDecision: 'deny',
+      permissionDecisionReason: `工具 ${toolName} 未被授权：${reason}`,
+    };
   }
 
   private async withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {

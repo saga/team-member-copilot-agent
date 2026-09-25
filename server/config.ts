@@ -46,4 +46,20 @@ export const config = {
    * @mention 才能唤醒别人（mention 永远有效）。见 group-dispatcher.ts。
    */
   groupAutoWakeRounds: intEnv('GROUP_AUTO_WAKE_ROUNDS', 2),
+  /**
+   * 是否允许 Member 使用会触达宿主机的 built-in（bash / edit / grep / web_fetch）。
+   *
+   * 默认关闭，且**不随 toolProfile 打开**：成员把自己标成 coding 只是声明想要
+   * 什么，不该等于拿到了宿主机的执行权。打开它等于承认「当前 runtime 是可信的
+   * 单租户环境」；多租户必须等沙箱运行时（K8s / Kata / Firecracker）就位后，
+   * 由运行时策略而不是这个开关来给工具。
+   */
+  allowHostCodingTools: env('HOST_CODING_TOOLS', 'false') === 'true',
+  /**
+   * Internal Member runtime API 的共享 token。
+   *
+   * 空 = 不做门禁（localhost 单用户原型）。真正的部署必须配置它，或者把这组
+   * 路由挡在内网 / API gateway 后面 —— 启动日志会提醒。
+   */
+  internalApiToken: env('INTERNAL_API_TOKEN', ''),
 };

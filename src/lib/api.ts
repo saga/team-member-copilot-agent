@@ -326,6 +326,9 @@ export const api = {
   /**
    * 以这个 Member 的身份给另一个 Member 发一条私聊消息。
    *
+   * 走 Internal API：`memberId` 在这里是「我代表谁」，不是「我在看谁」，
+   * 服务端会按 INTERNAL_API_TOKEN 校验（未配置则只在单机原型下放行）。
+   *
    * 202：消息已落库、对方已入队，对方的回复通过那个房间的 SSE 推。
    * 房间不存在时会自动建立 —— 调用方不需要「先开房间再发消息」两段式。
    */
@@ -333,7 +336,7 @@ export const api = {
     memberId: string,
     input: { toMemberId: string; content: string },
   ): Promise<SendMessageResult & { conversation: Conversation; peer: Member }> {
-    return fetch(`${API_BASE}/api/members/${encodeURIComponent(memberId)}/direct-messages`, {
+    return fetch(`${API_BASE}/api/internal/members/${encodeURIComponent(memberId)}/direct-messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(input),

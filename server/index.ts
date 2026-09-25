@@ -6,6 +6,7 @@ import { config } from './config.js';
 import { db, migration } from './db.js';
 import { RecoveryService } from './recovery-service.js';
 import { ConversationMemberService } from './conversation-member-service.js';
+import { describeApiBoundary } from './middleware/apiScope.js';
 
 // 与 app.ts 用同一个基准，避免两处 DIST_DIR 指向不同目录
 const DIST_DIR = path.resolve(process.cwd(), 'dist');
@@ -59,6 +60,9 @@ async function bootstrap(): Promise<void> {
   server = app.listen(config.port, () => {
     // eslint-disable-next-line no-console
     console.log(`[server] listening on http://localhost:${config.port}`);
+    // 边界只在日志里说出来才存在：没配 token 时得让人知道这个服务只该待在本机。
+    // eslint-disable-next-line no-console
+    console.log(`[server] ${describeApiBoundary()}`);
     if (config.warmup) {
       void copilotService.warmup().then((result) => {
         if (result.ok) {
