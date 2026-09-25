@@ -1,20 +1,85 @@
 const API_BASE = import.meta.env.VITE_API_BASE || '';
 
-async function json<T>(res: Response): Promise<T> {
-  if (!res.ok) {
-    const text = await res.text().catch(() => res.statusText);
-    throw new Error(`HTTP ${res.status}: ${text}`);
+async function json<T>(response: Response): Promise<T> {
+  if (!response.ok) {
+    const text = await response.text().catch(() => response.statusText);
+    throw new Error(`HTTP ${response.status}: ${text}`);
   }
-  return res.json() as Promise<T>;
+  return response.json() as Promise<T>;
+}
+
+export interface Member {
+  id: string;
+  handle: string;
+  name: string;
+  role: string;
+  description: string;
+  style: string;
+  systemPrompt: string;
+  model: string | null;
+  toolProfile: 'safe' | 'coding';
+  status: 'active' | 'archived';
+}
+
+export interface Conversation {
+  id: string;
+  title: string;
+  kind: 'direct' | 'group' | 'work';
+  defaultMemberId: string | null;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+  members: Member[];
+}
+
+export interface ConversationMessage {
+  id: string;
+  conversationId: string;
+  senderType: 'user' | 'member' | 'system';
+  senderId: string;
+  targetMemberId: string | null;
+  replyToMessageId: string | null;
+  content: string;
+  executionId: string | null;
+  createdAt: string;
+}
+
+export interface ExecutionRecord {
+  id: string;
+  conversationId: string;
+  memberId: string;
+  runtimeId: string | null;
+  parentExecutionId: string | null;
+  delegationPath: string[];
+  kind: 'interactive' | 'member_delegate' | 'member_work';
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+  prompt: string;
+  response: string | null;
+  error: string | null;
 }
 
 export interface Health {
   status: string;
-  uptime: number;
   timestamp: string;
   /** idle = client 尚未建连的懒加载态，不是故障 */
   copilot: 'connected' | 'idle' | 'error';
   copilotError?: string;
+}
+
+export interface DelegationEvent {
+  executionId: string;
+  parentExecutionId?: string;
+  fromMemberId?: string;
+  targetMemberId?: string;
+  task?: string;
+  reason?: string | null;
+  error?: string;
+}
+
+export interface DeltaEvent {
+  executionId: string;
+  memberId: string;
+  delta: string;
 }
 
 export const api = {
@@ -22,91 +87,94 @@ export const api = {
     return fetch(`${API_BASE}/api/health`).then(json<Health>);
   },
 
-  createSession(model?: string): Promise<{ sessionId: string }> {
-    return fetch(`${API_BASE}/api/sessions`, {
+  listMembers(): Promise<{ members: Member[] }> {
+    return fetch(`${API_BASE}/api/members`).then(json<{ members: Member[] }>);
+  },
+
+  createMember(input: {
+    name: string;
+    handle?: string;
+    role: string;
+    description?: string;
+    style?: string;
+    systemPrompt?: string;
+    model?: string;
+    toolProfile?: 'safe' | 'coding';
+  }): Promise<{ member: Member }> {
+    return fetch(`${API_BASE}/api/members`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(model ? { model } : {}),
-    }).then(json<{ sessionId: string }>);
+      body: JSON.stringify(input),
+    }).then(json<{ member: Member }>);
   },
 
-  listSessions(): Promise<{ sessions: string[] }> {
-    return fetch(`${API_BASE}/api/sessions`).then(json<{ sessions: string[] }>);
+  listConversations(): Promise<{ conversations: Conversation[] }> {
+    return fetch(`${API_BASE}/api/conversations`).then(
+      json<{ conversations: Conversation[] }>,
+    );
   },
 
-  destroySession(id: string): Promise<unknown> {
-    return fetch(`${API_BASE}/api/sessions/${encodeURIComponent(id)}`, {
-      method: 'DELETE',
-    }).then(json<unknown>);
-  },
-
-  /** 非流式：一问一答 */
-  chat(sessionId: string, prompt: string, model?: string): Promise<{ content: string }> {
-    return fetch(`${API_BASE}/api/sessions/${encodeURIComponent(sessionId)}/chat`, {
+  createConversation(input: {
+    title?: string;
+    kind?: 'direct' | 'group' | 'work';
+    memberIds: string[];
+    defaultMemberId?: string;
+  }): Promise<{ conversation: Conversation }> {
+    return fetch(`${API_BASE}/api/conversations`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt, streaming: false, model }),
-    }).then(json<{ content: string }>);
+      body: JSON.stringify(input),
+    }).then(json<{ conversation: Conversation }>);
   },
 
-  /**
-   * 流式：SSE，回调 onDelta 增量更新。
-   * 后端事件：delta {delta} / message {content} / done / error
-   */
-  chatStream(
-    sessionId: string,
-    prompt: string,
-    callbacks: {
-      onDelta: (d: string) => void;
-      onDone?: () => void;
-      onError?: (e: Error) => void;
-    },
-    model?: string,
-  ): void {
-    fetch(`${API_BASE}/api/sessions/${encodeURIComponent(sessionId)}/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
-      body: JSON.stringify({ prompt, streaming: true, model }),
-    })
-      .then(async (res) => {
-        if (!res.ok || !res.body) {
-          const text = await res.text().catch(() => res.statusText);
-          throw new Error(`HTTP ${res.status}: ${text}`);
-        }
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let buf = '';
+  listMessages(conversationId: string): Promise<{ messages: ConversationMessage[] }> {
+    return fetch(
+      `${API_BASE}/api/conversations/${encodeURIComponent(conversationId)}/messages`,
+    ).then(json<{ messages: ConversationMessage[] }>);
+  },
 
-        const dispatch = (raw: string) => {
-          const frames = raw.split('\n\n');
-          for (const frame of frames.slice(0, -1)) {
-            const eventMatch = frame.match(/^event:\s*(.+)$/m);
-            const dataMatch = frame.match(/^data:\s*(.+)$/m);
-            if (!eventMatch || !dataMatch) continue;
-            const event = eventMatch[1].trim();
-            let data: { delta?: string; content?: string; error?: string };
-            try {
-              data = JSON.parse(dataMatch[1]);
-            } catch {
-              continue;
-            }
-            if (event === 'delta' && data.delta) callbacks.onDelta(data.delta);
-            if (event === 'message' && data.content) callbacks.onDelta(data.content);
-            if (event === 'done') callbacks.onDone?.();
-            if (event === 'error') callbacks.onError?.(new Error(data.error ?? 'stream error'));
-          }
-          return frames[frames.length - 1];
-        };
+  sendMessage(
+    conversationId: string,
+    input: { content: string; targetMemberId?: string; replyToMessageId?: string },
+  ): Promise<{ message: ConversationMessage; executionId: string }> {
+    return fetch(
+      `${API_BASE}/api/conversations/${encodeURIComponent(conversationId)}/messages`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(input),
+      },
+    ).then(json<{ message: ConversationMessage; executionId: string }>);
+  },
 
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buf += decoder.decode(value, { stream: true });
-          buf = dispatch(buf);
-        }
-        dispatch(buf + '\n\n');
-        callbacks.onDone?.();
-      })
-      .catch((e: unknown) => callbacks.onError?.(e instanceof Error ? e : new Error(String(e))));
+  addMemberToConversation(
+    conversationId: string,
+    memberId: string,
+  ): Promise<{ conversation: Conversation }> {
+    return fetch(
+      `${API_BASE}/api/conversations/${encodeURIComponent(conversationId)}/members`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ memberId }),
+      },
+    ).then(json<{ conversation: Conversation }>);
+  },
+
+  removeMemberFromConversation(
+    conversationId: string,
+    memberId: string,
+  ): Promise<{ conversation: Conversation }> {
+    return fetch(
+      `${API_BASE}/api/conversations/${encodeURIComponent(
+        conversationId,
+      )}/members/${encodeURIComponent(memberId)}`,
+      { method: 'DELETE' },
+    ).then(json<{ conversation: Conversation }>);
+  },
+
+  /** 会话级 SSE：message.created / message.delta / execution.updated / delegation.* */
+  eventsUrl(conversationId: string): string {
+    return `${API_BASE}/api/conversations/${encodeURIComponent(conversationId)}/events`;
   },
 };

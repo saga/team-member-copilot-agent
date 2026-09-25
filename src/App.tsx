@@ -1,16 +1,18 @@
 import { HealthBadge } from './components/HealthBadge';
-import { Chat } from './components/Chat';
+import { TeamChat } from './components/TeamChat';
 
 export default function App() {
   return (
     <div className="app">
-      <header>
-        <h1>Team Member Copilot Agent</h1>
-        <p className="sub">React (Vite) → Express API → @github/copilot-sdk</p>
+      <header className="app-header">
+        <div>
+          <h1>Team Member Copilot Agent</h1>
+          <p className="sub">Member → Conversation → Member Runtime → Copilot Session</p>
+        </div>
         <HealthBadge />
       </header>
       <main>
-        <Chat />
+        <TeamChat />
       </main>
     </div>
   );

@@ -1,0 +1,493 @@
+import { after, before, describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import type { CopilotService } from '../copilot.js';
+
+/**
+ * 业务控制测试。这里刻意不碰真实的 Copilot runtime：
+ * 用临时 DATA_DIR + stub Copilot，验证 Member / Conversation / Execution /
+ * delegation 这四层关系是否真的成立。
+ *
+ * 重点不是 AI 行为，而是 delegation 的「业务正确性」：
+ *   A → B            OK
+ *   A → B → C        OK
+ *   A → B → A        reject（cycle）
+ *   A → B → C → D → E reject（depth）
+ */
+
+const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tmca-test-'));
+// 必须在 import config.ts 之前设好，否则 db 会落到仓库的 .data/
+process.env.DATA_DIR = dataDir;
+process.env.MAX_DELEGATION_DEPTH = '4';
+process.env.COPILOT_WARMUP = 'false';
+
+const { config } = await import('../config.js');
+const { db } = await import('../db.js');
+const { MemberService } = await import('../member-service.js');
+const { TeamService } = await import('../team-service.js');
+
+interface RunTurnInput {
+  runtime: { id: string; copilotSessionId: string; workspacePath: string };
+  member: { id: string };
+  prompt: string;
+}
+
+class StubCopilot {
+  readonly turns: RunTurnInput[] = [];
+
+  async runMemberTurn(input: RunTurnInput): Promise<string> {
+    this.turns.push(input);
+    return `stub reply from ${input.member.id}`;
+  }
+}
+
+interface ExecutionRow {
+  id: string;
+  conversation_id: string;
+  member_id: string;
+  runtime_id: string | null;
+  parent_execution_id: string | null;
+  delegation_path: string;
+  kind: string;
+  status: string;
+  response: string | null;
+  error: string | null;
+}
+
+interface RuntimeRow {
+  id: string;
+  conversation_id: string;
+  member_id: string;
+  copilot_session_id: string;
+  workspace_path: string;
+  status: string;
+}
+
+const stub = new StubCopilot();
+const memberService = new MemberService(db);
+const team = new TeamService(db, memberService, stub as unknown as CopilotService);
+
+function executionRow(id: string): ExecutionRow {
+  const row = db.prepare(`SELECT * FROM execution WHERE id = ?`).get(id) as unknown as
+    | ExecutionRow
+    | undefined;
+  assert.ok(row, `execution ${id} 不存在`);
+  return row;
+}
+
+function runtimeRow(conversationId: string, memberId: string): RuntimeRow | undefined {
+  return db
+    .prepare(
+      `SELECT * FROM member_runtime WHERE conversation_id = ? AND member_id = ?`,
+    )
+    .get(conversationId, memberId) as unknown as RuntimeRow | undefined;
+}
+
+function executionCount(): number {
+  const row = db.prepare(`SELECT COUNT(*) AS n FROM execution`).get() as unknown as { n: number };
+  return row.n;
+}
+
+async function waitForStatus(id: string, status: string): Promise<void> {
+  for (let attempt = 0; attempt < 300; attempt += 1) {
+    if (executionRow(id).status === status) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.fail(`execution ${id} 未在预期时间内变成 ${status}（当前 ${executionRow(id).status}）`);
+}
+
+/** 等到该 conversation 没有 queued / running 的 execution，避免断言时还有异步写入。 */
+async function waitForConversationIdle(conversationId: string): Promise<void> {
+  for (let attempt = 0; attempt < 300; attempt += 1) {
+    const row = db
+      .prepare(
+        `
+        SELECT COUNT(*) AS n
+        FROM execution
+        WHERE conversation_id = ?
+          AND status IN ('queued', 'running')
+        `,
+      )
+      .get(conversationId) as unknown as { n: number };
+    if (row.n === 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.fail(`conversation ${conversationId} 仍有未完成的 execution`);
+}
+
+let researcher: { id: string; name: string };
+let coder: { id: string; name: string };
+let reviewer: { id: string; name: string };
+let analyst: { id: string; name: string };
+let archivist: { id: string; name: string };
+let teamConversationId: string;
+
+before(() => {
+  researcher = team.createMember({ name: 'Researcher', role: 'Research Analyst' });
+  coder = team.createMember({
+    name: 'Coder',
+    role: 'Software Engineer',
+    toolProfile: 'coding',
+  });
+  reviewer = team.createMember({ name: 'Reviewer', role: 'Reviewer' });
+  analyst = team.createMember({ name: 'Analyst', role: 'Data Analyst' });
+  archivist = team.createMember({ name: 'Archivist', role: 'Knowledge Manager' });
+
+  const conversation = team.createConversation({
+    kind: 'group',
+    title: 'Investment Review Team',
+    memberIds: [researcher.id, coder.id, reviewer.id, analyst.id, archivist.id],
+    defaultMemberId: researcher.id,
+  });
+  teamConversationId = conversation.id;
+});
+
+after(() => {
+  db.close();
+  fs.rmSync(dataDir, { recursive: true, force: true });
+});
+
+describe('Member 是跨 conversation 的长期身份', () => {
+  it('member home 落在 .data/members/<id> 下，与 conversation 无关', () => {
+    const home = memberService.homePath(researcher.id);
+    assert.equal(home, path.join(config.memberHomeRoot, researcher.id));
+    assert.ok(fs.existsSync(path.join(home, 'SOUL.md')));
+    assert.ok(fs.existsSync(path.join(home, 'memory', 'MEMORY.md')));
+    assert.ok(fs.existsSync(path.join(home, 'skills')));
+  });
+
+  it('handle 冲突时自动加后缀', () => {
+    const first = team.createMember({ name: 'Duplicate', role: 'Twin' });
+    const second = team.createMember({ name: 'Duplicate', role: 'Twin' });
+    assert.notEqual(first.handle, second.handle);
+  });
+
+  it('remember_member 写入 Member 自己的长期记忆', async () => {
+    const result = await team.rememberMember({
+      memberId: researcher.id,
+      content: '用户偏好先看风险再看收益。',
+    });
+    assert.match(result, /长期记忆/);
+    assert.match(memberService.readMemory(researcher.id), /先看风险再看收益/);
+  });
+});
+
+describe('Conversation / Runtime 边界', () => {
+  it('同一个 Member 在不同 Conversation 拥有不同 Runtime', async () => {
+    const other = team.createConversation({
+      kind: 'direct',
+      memberIds: [researcher.id],
+      defaultMemberId: researcher.id,
+    });
+
+    // Runtime 是懒创建的：先各跑一轮，runtime 才落库
+    const inTeam = await team.sendMessage({
+      conversationId: teamConversationId,
+      content: '团队会话里的一轮',
+      targetMemberId: researcher.id,
+    });
+    const inSolo = await team.sendMessage({
+      conversationId: other.id,
+      content: '单独会话里的一轮',
+    });
+    await waitForStatus(inTeam.executionId, 'completed');
+    await waitForStatus(inSolo.executionId, 'completed');
+
+    const runtimeA = runtimeRow(teamConversationId, researcher.id);
+    const runtimeB = runtimeRow(other.id, researcher.id);
+
+    assert.ok(runtimeA);
+    assert.ok(runtimeB);
+    assert.notEqual(runtimeA.id, runtimeB.id);
+    assert.notEqual(runtimeA.copilot_session_id, runtimeB.copilot_session_id);
+    assert.notEqual(runtimeA.workspace_path, runtimeB.workspace_path);
+    assert.ok(fs.existsSync(path.join(runtimeB.workspace_path, 'AGENTS.md')));
+
+    // Member identity 是跨 conversation 的：home 不随 conversation 变化
+    assert.equal(
+      memberService.homePath(researcher.id),
+      path.join(config.memberHomeRoot, researcher.id),
+    );
+  });
+
+  it('conversation 至少保留一个 Member', () => {
+    const solo = team.createConversation({
+      kind: 'direct',
+      memberIds: [coder.id],
+      defaultMemberId: coder.id,
+    });
+    assert.throws(() => team.removeMember(solo.id, coder.id), /至少保留一个/);
+  });
+
+  it('group conversation 未指定 targetMemberId 且无默认成员时报 400', () => {
+    const group = team.createConversation({
+      kind: 'group',
+      memberIds: [coder.id, reviewer.id],
+    });
+    try {
+      team.createConversation({
+        kind: 'group',
+        memberIds: [coder.id, reviewer.id],
+        defaultMemberId: 'not-in-conversation',
+      });
+      assert.fail('应该拒绝不属于 conversation 的 defaultMemberId');
+    } catch (error) {
+      assert.ok(error instanceof Error);
+    }
+    assert.equal(group.defaultMemberId, null);
+  });
+
+  it('listMessages 返回最近 N 条且按时间正序', async () => {
+    const conversation = team.createConversation({
+      kind: 'direct',
+      memberIds: [reviewer.id],
+      defaultMemberId: reviewer.id,
+    });
+
+    let lastExecutionId = '';
+    for (const text of ['first', 'second', 'third']) {
+      const result = await team.sendMessage({ conversationId: conversation.id, content: text });
+      lastExecutionId = result.executionId;
+    }
+    await waitForStatus(lastExecutionId, 'completed');
+    await waitForConversationIdle(conversation.id);
+
+    const all = team.listMessages(conversation.id, 500);
+    assert.ok(all.length > 2, '前置条件：消息数应大于 2');
+
+    const recent = team.listMessages(conversation.id, 2);
+    assert.equal(recent.length, 2);
+    // 关键契约：取的是「尾部」而不是「头部」
+    assert.deepEqual(
+      recent.map((message) => message.id),
+      all.slice(-2).map((message) => message.id),
+    );
+    assert.equal(recent[0].createdAt <= recent[1].createdAt, true, '必须按时间正序返回');
+  });
+});
+
+describe('Execution 审计链', () => {
+  it('interactive execution 记录 runtime 与 delegationPath 起点', async () => {
+    const { executionId } = await team.sendMessage({
+      conversationId: teamConversationId,
+      content: '分析一下这个投资研究报告的主要风险',
+    });
+    await waitForStatus(executionId, 'completed');
+
+    const row = executionRow(executionId);
+    assert.equal(row.kind, 'interactive');
+    assert.equal(row.member_id, researcher.id);
+    assert.equal(row.parent_execution_id, null);
+    assert.deepEqual(JSON.parse(row.delegation_path), [researcher.id]);
+    assert.ok(row.runtime_id, 'interactive execution 必须绑定 runtime');
+    assert.equal(row.status, 'completed');
+    assert.match(row.response ?? '', /stub reply/);
+  });
+});
+
+describe('delegation 业务控制', () => {
+  it('A → B 成功，并留下 parent + delegationPath', async () => {
+    const { executionId } = await team.sendMessage({
+      conversationId: teamConversationId,
+      content: '先研究这个问题',
+      targetMemberId: researcher.id,
+    });
+    await waitForStatus(executionId, 'completed');
+
+    const result = await team.delegateMember({
+      conversationId: teamConversationId,
+      fromMemberId: researcher.id,
+      parentExecutionId: executionId,
+      targetMemberId: coder.id,
+      task: '根据结论写一个验证脚本',
+    });
+    assert.match(result, /stub reply/);
+
+    const child = db
+      .prepare(`SELECT * FROM execution WHERE parent_execution_id = ?`)
+      .get(executionId) as unknown as ExecutionRow;
+
+    assert.equal(child.member_id, coder.id);
+    assert.equal(child.kind, 'member_delegate');
+    assert.equal(child.status, 'completed');
+    assert.deepEqual(JSON.parse(child.delegation_path), [researcher.id, coder.id]);
+
+    // 子 execution 用的是 Coder 在这个 conversation 里的独立 runtime
+    assert.equal(child.runtime_id, runtimeRow(teamConversationId, coder.id)?.id);
+  });
+
+  it('A → B → A 被拒绝（cycle）', async () => {
+    const { executionId } = await team.sendMessage({
+      conversationId: teamConversationId,
+      content: 'cycle 测试起点',
+      targetMemberId: researcher.id,
+    });
+    await waitForStatus(executionId, 'completed');
+
+    const before = executionCount();
+    await assert.rejects(
+      () =>
+        team.delegateMember({
+          conversationId: teamConversationId,
+          fromMemberId: researcher.id,
+          parentExecutionId: executionId,
+          targetMemberId: researcher.id,
+          task: 'recursive request',
+        }),
+      /cycle/i,
+    );
+    assert.equal(executionCount(), before, '被拒绝的 delegation 不应该写入 execution');
+  });
+
+  it('A → B → C → A 被拒绝（cycle 跨层级）', async () => {
+    const { executionId } = await team.sendMessage({
+      conversationId: teamConversationId,
+      content: '多层 cycle 测试起点',
+      targetMemberId: researcher.id,
+    });
+    await waitForStatus(executionId, 'completed');
+
+    // researcher → coder
+    const second = await team.delegateMember({
+      conversationId: teamConversationId,
+      fromMemberId: researcher.id,
+      parentExecutionId: executionId,
+      targetMemberId: coder.id,
+      task: 'delegate to coder',
+    });
+    assert.match(second, /stub reply/);
+
+    const coderExecution = db
+      .prepare(`SELECT * FROM execution WHERE parent_execution_id = ?`)
+      .get(executionId) as unknown as ExecutionRow;
+
+    // coder → reviewer
+    await team.delegateMember({
+      conversationId: teamConversationId,
+      fromMemberId: coder.id,
+      parentExecutionId: coderExecution.id,
+      targetMemberId: reviewer.id,
+      task: 'delegate to reviewer',
+    });
+    const reviewerExecution = db
+      .prepare(`SELECT * FROM execution WHERE parent_execution_id = ?`)
+      .get(coderExecution.id) as unknown as ExecutionRow;
+    assert.deepEqual(JSON.parse(reviewerExecution.delegation_path), [
+      researcher.id,
+      coder.id,
+      reviewer.id,
+    ]);
+
+    // reviewer → researcher 应该被 cycle 拦住
+    await assert.rejects(
+      () =>
+        team.delegateMember({
+          conversationId: teamConversationId,
+          fromMemberId: reviewer.id,
+          parentExecutionId: reviewerExecution.id,
+          targetMemberId: researcher.id,
+          task: 'back to the start',
+        }),
+      /cycle/i,
+    );
+  });
+
+  it('超过 maxDelegationDepth 被拒绝（depth）', async () => {
+    const { executionId } = await team.sendMessage({
+      conversationId: teamConversationId,
+      content: 'depth 测试起点',
+      targetMemberId: researcher.id,
+    });
+    await waitForStatus(executionId, 'completed');
+
+    let parentId = executionId;
+    const chain = [
+      { from: researcher.id, to: coder.id },
+      { from: coder.id, to: reviewer.id },
+      { from: reviewer.id, to: analyst.id },
+    ];
+
+    for (const step of chain) {
+      await team.delegateMember({
+        conversationId: teamConversationId,
+        fromMemberId: step.from,
+        parentExecutionId: parentId,
+        targetMemberId: step.to,
+        task: `delegate ${step.from} → ${step.to}`,
+      });
+      const child = db
+        .prepare(`SELECT * FROM execution WHERE parent_execution_id = ?`)
+        .get(parentId) as unknown as ExecutionRow;
+      parentId = child.id;
+    }
+
+    // 到这里 delegationPath 长度 = maxDelegationDepth (4)
+    const deepest = executionRow(parentId);
+    assert.equal(JSON.parse(deepest.delegation_path).length, config.maxDelegationDepth);
+
+    // 再往下探一层：目标是全新 Member（不是 cycle），必须被 depth 拦住
+    await assert.rejects(
+      () =>
+        team.delegateMember({
+          conversationId: teamConversationId,
+          fromMemberId: analyst.id,
+          parentExecutionId: parentId,
+          targetMemberId: archivist.id,
+          task: 'one level too deep',
+        }),
+      /depth/i,
+    );
+  });
+
+  it('parent execution 不属于当前 Member 时被拒绝', async () => {
+    const { executionId } = await team.sendMessage({
+      conversationId: teamConversationId,
+      content: 'parent 归属测试',
+      targetMemberId: researcher.id,
+    });
+    await waitForStatus(executionId, 'completed');
+
+    await assert.rejects(
+      () =>
+        team.delegateMember({
+          conversationId: teamConversationId,
+          fromMemberId: coder.id,
+          parentExecutionId: executionId,
+          targetMemberId: reviewer.id,
+          task: 'spoofed parent',
+        }),
+      /parent execution/,
+    );
+  });
+
+  it('delegation 全过程通过 SSE 事件对外暴露', async () => {
+    const { executionId } = await team.sendMessage({
+      conversationId: teamConversationId,
+      content: 'SSE 事件测试',
+      targetMemberId: researcher.id,
+    });
+    await waitForStatus(executionId, 'completed');
+
+    const seen: string[] = [];
+    const unsubscribe = team.subscribe(teamConversationId, (event) => seen.push(event.type));
+
+    try {
+      await team.delegateMember({
+        conversationId: teamConversationId,
+        fromMemberId: researcher.id,
+        parentExecutionId: executionId,
+        targetMemberId: coder.id,
+        task: 'emit events',
+      });
+    } finally {
+      unsubscribe();
+    }
+
+    assert.ok(seen.includes('delegation.started'), `缺少 delegation.started：${seen.join(',')}`);
+    assert.ok(seen.includes('delegation.finished'), `缺少 delegation.finished：${seen.join(',')}`);
+    assert.ok(seen.includes('message.created'), `缺少 message.created：${seen.join(',')}`);
+    assert.ok(seen.includes('execution.updated'), `缺少 execution.updated：${seen.join(',')}`);
+  });
+});

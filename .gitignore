@@ -10,6 +10,9 @@
 .env
 !.env.example
 
+# Local runtime data (sqlite db / member homes / workspaces / copilot session state)
+/.data/
+
 # Logs
 npm-debug.log*
 yarn-debug.log*
