@@ -29,7 +29,6 @@ process.env.COPILOT_WARMUP = 'false';
 
 const { db } = await import('../db.js');
 const { MemberService } = await import('../member-service.js');
-const { TeamService } = await import('../team-service.js');
 const { executionIdForWake, muteAllMembers, StubCopilot, createTestStack } = await import('./support.js');
 
 const ALICE_PROMPT = 'ALICE_PERSONA_SENTINEL';
@@ -280,6 +279,13 @@ describe('同一轮还在跑时到达的唤醒', () => {
       title: 'Coalescing Room',
       memberIds: [alice.id, bob.id],
     });
+
+    // 静音 Bob：这个用例考的是 Alice 的 pending 合并，而 Bob 是同一房间里另一个
+    // 会自动被唤醒的 Member —— 他的回复会再反过来 follow_up 唤醒 Alice。那一轮
+    // 到底有没有发生取决于两人 turn 的交替顺序（Alice 的 checkpoint 是否已经越过
+    // Bob 那条消息），于是「Alice 恰好两条 execution」这个断言会随微任务顺序飘。
+    // 断言时序之外的东西只能靠把无关的自动唤醒关掉，而不是把断言放宽。
+    team.setMemberMuted(group.id, bob.id, true);
 
     // 按住引擎，让 Alice 的第一轮停在 running —— 后面两条唤醒才会落进 pending
     // 并发生合并，而不是各自开一轮。

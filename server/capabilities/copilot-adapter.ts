@@ -45,6 +45,12 @@ export class CopilotCapabilityAdapter {
     const tools: Tool<unknown>[] = [];
 
     for (const tool of capabilities.tools) {
+      // 部署收走的宿主工具**连声明都不给**：模型看到一个自己永远调不动的工具
+      // 只会反复尝试，把一轮 turn 浪费在被拒的调用上。声明与放行同源 ——
+      // 这里和 check() 用同一个判据（policy.hostToolWithheld），不会一边说
+      // 「不给」一边又给了。
+      if (this.policy.hostToolWithheld(tool)) continue;
+
       if (tool.kind === 'builtin') {
         availableTools.addBuiltIn(tool.name);
         continue;

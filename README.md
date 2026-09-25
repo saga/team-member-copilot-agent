@@ -545,6 +545,12 @@ KB 由 `local.filesystem-knowledge` 这个 **Provider** 实现，不是平台级
 .data/members/<id>/knowledge/      该 Member 的 personal KB
 ```
 
+什么算「一份可索引的资料」只在一处定义（`providers/knowledge-document-limits.ts`），
+扫目录与 API 写入共用同一个判据：扩展名白名单（`.md` `.markdown` `.mdx` `.txt`
+`.json` `.yaml` `.yml`）+ 单份不超过 1 MB。两边共用是刻意的 —— 一边接受、一边
+拒绝是「文件系统与索引不一致」最常见的形态。被跳过的文件会在启动日志里留下
+原因（`格式不对` / `超过上限`），而不是悄悄消失。
+
 把文件放进目录即可被检索（启动时按 content hash 幂等索引），`POST /api/knowledge/...`
 写入的文档落在同一棵树上。权限模型由能力绑定决定：
 
@@ -870,6 +876,7 @@ server/                       # Express + Copilot SDK 后端
     providers/
       filesystem-skill.ts     #     team / member 两级 skill 目录
       filesystem-knowledge.ts #     本地 KB：FTS5 检索 + 磁盘同步 + ACL（原 knowledge-service.ts）
+      knowledge-document-limits.ts  # 什么算「一份可索引的资料」（扫目录与 API 写入共用）
       core-tools.ts           #     ask_member / message_member / remember_member
       knowledge-tools.ts      #     search_knowledge / open_knowledge_document
       host-tools.ts           #     bash / edit / grep / web_fetch（需部署放行）
@@ -899,9 +906,13 @@ server/                       # Express + Copilot SDK 后端
     member-skills.test.ts          # skill 安装 / 卸载 / zip 校验
     runtime-reliability.test.ts    # schema 形状 / 序号 / 增量上下文 / durable event / 恢复 / 死锁
     runtime-correctness.test.ts    # resume 分类 / 超时 abort / 工具授权接线 / cancel 状态机 / retry
+    team-chat.test.ts              # 产品行为：direct / group / @mention / NO_REPLY / persona 与 memory 隔离
     data-integrity.test.ts         # replyTo 校验 / 消息幂等 / 记忆乐观并发 / 上下文上限 / 配置快照 / state 事件 / mention 精确匹配
     member-template-seeder.test.ts # provisioning 幂等 / 不覆盖已改 Member / 归档不复活 / 穿越与重复 key / 能力绑定
     knowledge-provider.test.ts     # 检索范围限定在授权的 KB / personal 隔离 / 路径与 FTS 注入 / 索引幂等 / 磁盘同步
+
+scripts/
+  mutation-check.py           # 变异验证：把跨层不变量改回错误写法，确认断言真的变红（AGENTS.md §7）
 ```
 
 ## 环境变量

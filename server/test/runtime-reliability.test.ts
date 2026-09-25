@@ -27,7 +27,6 @@ process.env.COPILOT_WARMUP = 'false';
 const { config } = await import('../config.js');
 const { db } = await import('../db.js');
 const { MemberService } = await import('../member-service.js');
-const { TeamService } = await import('../team-service.js');
 const { ContextAssembler } = await import('../context-assembler.js');
 const { RecoveryService } = await import('../recovery-service.js');
 const { ConversationMemberService } = await import('../conversation-member-service.js');
@@ -225,7 +224,7 @@ describe('schema 就位（PRAGMA user_version）', () => {
         'member_runtime',
         'execution',
         'knowledge_base',
-        'member_team_knowledge_base',
+        'member_capability_binding',
         'knowledge_document',
         'knowledge_document_fts',
       ];
@@ -241,7 +240,6 @@ describe('schema 就位（PRAGMA user_version）', () => {
             'style',
             'system_prompt',
             'model',
-            'tool_profile',
             'status',
             'seed_key',
             'created_at',
@@ -335,7 +333,13 @@ describe('schema 就位（PRAGMA user_version）', () => {
           'created_at',
           'updated_at',
         ],
-        member_team_knowledge_base: ['member_id', 'knowledge_base_id', 'created_at'],
+        member_capability_binding: [
+          'member_id',
+          'capability_type',
+          'provider_id',
+          'selector',
+          'created_at',
+        ],
         knowledge_document: [
           'id',
           'knowledge_base_id',
@@ -364,8 +368,9 @@ describe('schema 就位（PRAGMA user_version）', () => {
         'idx_execution_parent',
         'idx_execution_status',
         'idx_knowledge_document_kb',
+        'idx_member_capability_member',
+        'idx_member_capability_provider',
         'idx_member_seed_key',
-        'idx_member_team_knowledge_base_member',
         'idx_message_client_request',
         'idx_message_conversation_created',
         'idx_message_conversation_sequence',

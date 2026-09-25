@@ -93,6 +93,11 @@ user_version 相等  → 什么都不做
 - **工具授权不看工具名**。新工具只需要在 Provider 里声明 `risk` /
   `requiresHostAccess`，`tool-policy.ts` 不动。出现 `if (toolName === '...')`
   就是回退。
+- **「部署开关」不能由 Member 的能力声明替代**。绑定 `runtime.host-coding-tools`
+  只是「想要」；放行与否由 `DefaultToolPolicy` 看部署开关决定，两个判据各写各的。
+- **「什么算一份可索引的资料」只写一处**。磁盘扫目录与 API 写文档共用
+  `capabilities/providers/knowledge-document-limits.ts`；一边接受、一边拒绝是
+  这类不一致最常见的形态。
 
 ## 6. 代码纪律
 
@@ -113,5 +118,9 @@ user_version 相等  → 什么都不做
 3. `npm run build` 全绿
 4. README / `.env.example` 里被这个改动影响的部分已经同步（新增的写上，删掉的删掉）
 5. 改了别人的契约（HTTP 形状、环境变量、schema）时，调用方与文档一起改，不留过渡期
+
+跨层不变量（schema 形状、ACL 判据、授权判据、幂等键、manifest 指纹）还要跑一次
+**变异验证**：`python3 scripts/mutation-check.py` 把实现改回错误写法，确认对应断言
+真的变红。没有区分度的断言要改断言，不是删断言。
 
 跑服务验证时用真实 HTTP + 真实 SQLite，不要只跑单测就宣布完成。

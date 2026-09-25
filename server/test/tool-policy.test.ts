@@ -1,13 +1,8 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { BuiltInTools } from '@github/copilot-sdk';
-import type { ToolProfile } from '../domain.js';
-import {
-  CUSTOM_TOOLS,
-  DefaultToolPolicy,
-  HOST_TOOLS,
-  type ToolCallRequest,
-} from '../tool-policy.js';
+import { DefaultToolPolicy } from '../tool-policy.js';
+import { HOST_BUILTIN_NAMES } from '../capabilities/providers/host-tools.js';
+import type { RuntimeTool, ToolExecutionContext, ToolRisk } from '../capabilities/types.js';
 
 /**
  * 工具授权层。
@@ -16,173 +11,207 @@ import {
  * 给引擎的 availableTools 说了一套，hook 里又按另一套判，结果就是模型看得见
  * 一个它其实用不了的工具（或者更糟：看不见却在某个路径上被放行）。
  *
- * 用例分两组，分别盯这两个问题：
- *   1. 成员**看得见**什么 —— 三个 custom tool 一个都不能漏
- *   2. 每一次调用**放不放行** —— 默认拒绝，宿主工具要两道门都开
+ * ── 这一组用例真正在锁的东西 ──────────────────────────────────────────
  *
- * 最后一条用例把它们钉在一起：声明出来的东西不允许被自己的 hook 拒掉。
+ * 判据只有三个，全部来自 RuntimeTool 的声明：`requiresHostAccess` + 部署开关、
+ * `risk === 'privileged'`、`authorize()`。**没有一条看工具名**。
+ *
+ * 「不看名字」这件事没法靠「bash 被拒了」来证明 —— 旧实现里 `if (name === 'bash')`
+ * 同样会让那条断言通过。所以下面反复用同一个手法：**造一个名字从未出现过的工具**，
+ * 用同样的声明走一遍，看结论是否与 `bash` 一致。反过来也造一个叫 `bash` 但声明
+ * 是个普通读工具的家伙，它必须被放行。名字一旦参与判定，这两条立刻会红。
  */
 
 function policy(allowHostTools: boolean): DefaultToolPolicy {
   return new DefaultToolPolicy({ allowHostTools });
 }
 
-function request(overrides: Partial<ToolCallRequest> = {}): ToolCallRequest {
+const ALLOW_HOST = true;
+const WITHHOLD_HOST = false;
+
+function tool(overrides: Partial<RuntimeTool> = {}): RuntimeTool {
   return {
-    memberId: 'm1',
-    toolProfile: 'safe',
-    executionId: 'e1',
-    conversationId: 'c1',
-    toolName: 'ask_member',
-    toolArgs: {},
+    providerId: 'test.provider',
+    kind: 'custom',
+    name: 'ask_member',
+    description: 'test tool',
+    risk: 'coordination',
     ...overrides,
   };
 }
 
-/** `toArray()` 是源限定前缀格式：`builtin:bash` / `custom:ask_member`。 */
-function declaredFor(profile: ToolProfile, allowHostTools: boolean): Set<string> {
-  return new Set(policy(allowHostTools).availableTools(profile).toArray());
+function context(toolName: string): ToolExecutionContext {
+  return {
+    memberId: 'm1',
+    conversationId: 'c1',
+    executionId: 'e1',
+    userId: 'u1',
+    toolName,
+  };
 }
 
-const ALLOW_HOST = true;
-const WITHHOLD_HOST = false;
+async function decide(
+  layer: DefaultToolPolicy,
+  subject: RuntimeTool,
+  args: Record<string, unknown> = {},
+) {
+  return layer.check(subject, context(subject.name), args);
+}
 
-describe('availableTools：成员看得见什么', () => {
-  it('safe profile 下三个 custom tool 都在，宿主工具一个都不在', () => {
-    const declared = declaredFor('safe', WITHHOLD_HOST);
+/** 一组声明相同、只有名字不同的宿主工具（其中一个名字是真的）。 */
+function hostTools(): RuntimeTool[] {
+  return [
+    ...HOST_BUILTIN_NAMES.map((name) =>
+      tool({
+        providerId: 'runtime.host-coding-tools',
+        kind: 'builtin',
+        name,
+        risk: 'host-execution',
+        requiresHostAccess: true,
+      }),
+    ),
+    tool({
+      providerId: 'someone.else',
+      kind: 'builtin',
+      name: 'a_tool_invented_after_this_test_was_written',
+      risk: 'host-execution',
+      requiresHostAccess: true,
+    }),
+  ];
+}
 
-    for (const name of CUSTOM_TOOLS) {
-      assert.ok(
-        declared.has(`custom:${name}`),
-        `成员看不到 ${name} —— 工具注册了却没有声明，等于这个能力不存在`,
-      );
-    }
+describe('check：判据来自声明，不来自名字', () => {
+  it('普通工具放行，理由里写得出 provider 与 risk', async () => {
+    const decision = await decide(policy(WITHHOLD_HOST), tool());
 
-    for (const name of HOST_TOOLS) {
-      assert.ok(!declared.has(`builtin:${name}`), `safe profile 不该看到 ${name}`);
-    }
+    assert.equal(decision.allowed, true);
+    assert.match(decision.reason, /provider=test\.provider/);
+    assert.match(decision.reason, /risk=coordination/);
   });
 
-  it('SDK 的 isolated 集合原样声明（它们只在 session 边界内活动）', () => {
-    const declared = declaredFor('safe', WITHHOLD_HOST);
-
-    for (const name of BuiltInTools.Isolated) {
-      assert.ok(declared.has(`builtin:${name}`), `缺少 isolated built-in ${name}`);
-    }
-  });
-
-  it('声明了 coding 但宿主工具未启用：仍然不给宿主工具，且能被上层问出原因', () => {
+  it('read / self-write / coordination 都不需要额外开关', async () => {
     const layer = policy(WITHHOLD_HOST);
-    const declared = new Set(layer.availableTools('coding').toArray());
 
-    for (const name of HOST_TOOLS) {
-      assert.ok(
-        !declared.has(`builtin:${name}`),
-        `toolProfile=coding 不等于获得宿主机执行权，${name} 不该被声明`,
-      );
-    }
-
-    assert.equal(layer.hostToolsWithheld('coding'), true);
-    assert.equal(layer.hostToolsWithheld('safe'), false);
-  });
-
-  it('部署显式启用宿主工具后，coding profile 才拿得到', () => {
-    const declared = declaredFor('coding', ALLOW_HOST);
-
-    for (const name of HOST_TOOLS) {
-      assert.ok(declared.has(`builtin:${name}`), `已启用宿主工具，${name} 应被声明`);
+    for (const risk of ['read', 'self-write', 'coordination'] as ToolRisk[]) {
+      const decision = await decide(layer, tool({ risk }));
+      assert.equal(decision.allowed, true, `risk=${risk} 不该被拒：${decision.reason}`);
     }
   });
 
-  it('宿主工具启用也只给 coding —— safe profile 仍然拿不到', () => {
-    const declared = declaredFor('safe', ALLOW_HOST);
+  it('宿主工具：部署没放行就拒绝，理由指出是部署开关', async () => {
+    const layer = policy(WITHHOLD_HOST);
 
-    for (const name of HOST_TOOLS) {
-      assert.ok(!declared.has(`builtin:${name}`), `safe profile 不该看到 ${name}`);
+    for (const subject of hostTools()) {
+      const decision = await decide(layer, subject);
+      assert.equal(decision.allowed, false, `${subject.name} 不该被放行`);
+      assert.match(decision.reason, /HOST_CODING_TOOLS/);
     }
+  });
+
+  it('宿主工具：部署放行就放行 —— 名字是旧的还是新的都一样', async () => {
+    const layer = policy(ALLOW_HOST);
+
+    for (const subject of hostTools()) {
+      const decision = await decide(layer, subject);
+      assert.equal(decision.allowed, true, `${subject.name} 被拒了：${decision.reason}`);
+    }
+  });
+
+  it('名字叫 bash，但声明是个普通工具 → 放行', async () => {
+    // 这条专门打「按名字判」的写法：一个再也不能碰宿主机的 bash 就是一个工具名。
+    // 加上上面那条「新名字的宿主工具也走同一条路」，两头都堵死了。
+    const decision = await decide(
+      policy(WITHHOLD_HOST),
+      tool({ providerId: 'sandbox.simulated-shell', name: 'bash', risk: 'read' }),
+    );
+
+    assert.equal(decision.allowed, true, `被按名字拒了：${decision.reason}`);
+  });
+
+  it('privileged 一律拒绝 —— 部署全开、authorize 说可以也不行', async () => {
+    const layer = policy(ALLOW_HOST);
+    const subject = tool({
+      name: 'submit_trade',
+      risk: 'privileged',
+      authorize: () => ({ allowed: true, reason: '这一笔在额度内' }),
+    });
+
+    const decision = await decide(layer, subject);
+
+    assert.equal(decision.allowed, false);
+    assert.match(decision.reason, /privileged/);
+  });
+
+  it('privileged 也不需要部署开关就能拒绝（不依赖 HOST_CODING_TOOLS 恰好关着）', async () => {
+    const decision = await decide(policy(WITHHOLD_HOST), tool({ risk: 'privileged' }));
+    assert.equal(decision.allowed, false);
+    assert.match(decision.reason, /privileged/);
   });
 });
 
-describe('check：每一次调用放不放行', () => {
-  it('三个 custom tool 在 safe profile 下也放行（它们的边界由各自的业务校验兜住）', () => {
-    const layer = policy(WITHHOLD_HOST);
-
-    for (const name of CUSTOM_TOOLS) {
-      const decision = layer.check(request({ toolName: name, toolProfile: 'safe' }));
-      assert.equal(decision.allowed, true, `${name} 被拒了：${decision.reason}`);
-    }
-  });
-
-  it('isolated built-in 放行', () => {
-    const layer = policy(WITHHOLD_HOST);
-
-    for (const name of BuiltInTools.Isolated) {
-      assert.equal(layer.check(request({ toolName: name })).allowed, true, `${name} 被拒`);
-    }
-  });
-
-  it('宿主工具对非 coding profile 一律拒绝，理由说得出是 profile 的问题', () => {
+describe('check：authorize 是逐次判定，不是第二份白名单', () => {
+  it('authorize 说不行 → 拒绝，理由原样带出来', async () => {
     const layer = policy(ALLOW_HOST);
+    const subject = tool({
+      name: 'read_file',
+      risk: 'read',
+      authorize: (_context, args) =>
+        String(args.path ?? '').startsWith('/workspace/')
+          ? { allowed: true, reason: '在 workspace 内' }
+          : { allowed: false, reason: `路径不在 workspace 内：${String(args.path)}` },
+    });
 
-    for (const name of HOST_TOOLS) {
-      const decision = layer.check(request({ toolName: name, toolProfile: 'safe' }));
-      assert.equal(decision.allowed, false, `${name} 不该对 safe profile 放行`);
-      assert.match(decision.reason, /coding/);
-    }
+    const inside = await decide(layer, subject, { path: '/workspace/a.ts' });
+    assert.equal(inside.allowed, true);
+
+    const outside = await decide(layer, subject, { path: '/etc/shadow' });
+    assert.equal(outside.allowed, false);
+    assert.match(outside.reason, /不在 workspace 内/);
   });
 
-  it('coding profile 也要宿主工具已启用才放行', () => {
-    const withHost = policy(ALLOW_HOST);
-    const withoutHost = policy(WITHHOLD_HOST);
-    const coding = { toolProfile: 'coding' as const };
-
-    const denied = withoutHost.check(request({ toolName: 'bash', ...coding }));
-    assert.equal(denied.allowed, false);
-    assert.match(denied.reason, /HOST_CODING_TOOLS/);
-
-    assert.equal(withHost.check(request({ toolName: 'bash', ...coding })).allowed, true);
-  });
-
-  it('没定义过策略的工具默认拒绝', () => {
+  it('authorize 是 async 的也照常判（远端策略、查库都行）', async () => {
     const layer = policy(ALLOW_HOST);
+    const subject = tool({
+      risk: 'external-write',
+      authorize: async () => ({ allowed: false, reason: '远端策略拒绝' }),
+    });
 
-    // 引擎新增的 built-in、skill 带来的 MCP 工具，都会先落到这一支。
-    for (const name of ['mcp:github-list_issues', 'builtin:some_future_tool', 'custom:unknown']) {
-      const decision = layer.check(request({ toolName: name, toolProfile: 'coding' }));
-      assert.equal(decision.allowed, false, `${name} 应被默认拒绝`);
-      assert.match(decision.reason, /默认拒绝/);
-    }
+    const decision = await decide(layer, subject);
+    assert.equal(decision.allowed, false);
+    assert.match(decision.reason, /远端策略拒绝/);
+  });
+
+  it('没有 authorize 的工具不因为「少了这个字段」而被拒', async () => {
+    // authorize 是可选的。把它写成必填，会让「加一个简单工具」也要求写一份
+    // 逐次判定 —— 然后大家会写 `() => true`，等于多了一层没有内容的仪式。
+    const decision = await decide(policy(WITHHOLD_HOST), tool({ authorize: undefined }));
+    assert.equal(decision.allowed, true);
   });
 });
 
-describe('声明与放行不允许漂移', () => {
-  const profiles: ToolProfile[] = ['safe', 'coding'];
-  const deployments = [
-    ['宿主工具已启用', ALLOW_HOST],
-    ['宿主工具未启用', WITHHOLD_HOST],
-  ] as const;
+describe('hostToolWithheld 与 check 不允许漂移', () => {
+  it('对每个宿主工具，「被收走」与「check 拒绝」是同一个结论', async () => {
+    // 两处分开写就会漂移，而漂移的表现是日志里说「没给」、实际给了。
+    const layer = policy(WITHHOLD_HOST);
 
-  for (const profile of profiles) {
-    for (const [label, allowHostTools] of deployments) {
-      it(`${profile} / ${label}：声明出来的工具必须能被同一个 policy 放行`, () => {
-        const layer = policy(allowHostTools);
-        const declared = layer.availableTools(profile).toArray();
-
-        // 通配声明要展开成具体名字才能逐个判；这里只处理具体名字。
-        const concrete = declared.filter((item) => !item.endsWith(':*') && item !== '*');
-        assert.ok(concrete.length > 0);
-
-        for (const qualified of concrete) {
-          const name = qualified.slice(qualified.indexOf(':') + 1);
-          const decision = layer.check(request({ toolName: name, toolProfile: profile }));
-          assert.equal(
-            decision.allowed,
-            true,
-            `${qualified} 声明给了成员，却在授权层被拒（${decision.reason}）——` +
-              '模型会看得见一个用不了的工具',
-          );
-        }
-      });
+    for (const subject of hostTools()) {
+      assert.equal(layer.hostToolWithheld(subject), true);
+      assert.equal((await decide(layer, subject)).allowed, false);
     }
-  }
+  });
+
+  it('部署放行时两边同时翻面', async () => {
+    const layer = policy(ALLOW_HOST);
+
+    for (const subject of hostTools()) {
+      assert.equal(layer.hostToolWithheld(subject), false);
+      assert.equal((await decide(layer, subject)).allowed, true);
+    }
+  });
+
+  it('普通工具永远不会被「收走」', () => {
+    const layer = policy(WITHHOLD_HOST);
+    assert.equal(layer.hostToolWithheld(tool()), false);
+    assert.equal(layer.hostToolWithheld(tool({ requiresHostAccess: false })), false);
+  });
 });

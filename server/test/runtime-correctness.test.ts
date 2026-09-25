@@ -6,6 +6,7 @@ import path from 'node:path';
 import type { CopilotClient, CopilotSession } from '@github/copilot-sdk';
 // type-only：被完全擦除，不参与运行时模块初始化顺序（这个文件要先把 DATA_DIR 设好）
 import type { ToolPolicy } from '../tool-policy.js';
+import type { RuntimeCapabilities } from '../capabilities/types.js';
 
 /**
  * Runtime correctness 测试（Commit 1 + Commit 2）。
@@ -24,15 +25,92 @@ process.env.COPILOT_WARMUP = 'false';
 
 const { db } = await import('../db.js');
 const { MemberService } = await import('../member-service.js');
-const { KnowledgeService } = await import('../knowledge-service.js');
-const { TeamService } = await import('../team-service.js');
 const { CopilotService, isSessionNotFound, isTurnTimeout } = await import('../copilot.js');
 const { DefaultToolPolicy } = await import('../tool-policy.js');
-const { singleExecutionId, muteAllMembers } = await import('./support.js');
+const { defaultMemberCapabilities } = await import('../capabilities/defaults.js');
+const { createTestStack, capabilityContext, singleExecutionId, muteAllMembers } = await import(
+  './support.js'
+);
 
 after(() => {
   db.close();
   fs.rmSync(dataDir, { recursive: true, force: true });
+});
+
+// ═══════════════════════════════════════════ 0. 共享装配
+
+/**
+ * TeamService 侧用的 Copilot stub。
+ *
+ * 只记下这一轮，不跑引擎 —— 这一段的用例考的是 execution 状态机与 runtime
+ * 归属，不是引擎行为。`hold` 用来把一个 execution 稳定地钉在 running 上；
+ * `failWith` / `resolveOnCancel` 用来构造失败与「abort 后半截结果正常返回」。
+ */
+class StubCopilot {
+  readonly turns: Array<{ member: { id: string }; executionId: string; prompt: string }> = [];
+  failWith: string | null = null;
+  hold: Promise<void> | null = null;
+  /** 模拟「abort 让 sendAndWait 正常返回半截结果」而不是抛错。 */
+  resolveOnCancel = false;
+  private readonly cancelled = new Set<string>();
+
+  async runMemberTurn(input: {
+    member: { id: string };
+    executionId: string;
+    prompt: string;
+  }): Promise<string> {
+    this.turns.push(input);
+    if (this.hold) await this.hold;
+    if (this.cancelled.has(input.executionId)) {
+      if (this.resolveOnCancel) return 'partial output';
+      throw new Error('aborted by user');
+    }
+    if (this.failWith) throw new Error(this.failWith);
+    return `stub reply from ${input.member.id}`;
+  }
+
+  async cancelTurn(executionId: string) {
+    const found = this.turns.some((turn) => turn.executionId === executionId);
+    this.cancelled.add(executionId);
+    return { found, aborted: found, idle: found };
+  }
+}
+
+/**
+ * 全文件共用一套装配，形状与 `server/app.ts` 一致（见 support.ts）。
+ *
+ * 上半段的用例自己 new CopilotService（要替换 createClient / toolPolicy），
+ * 但能力解析走的是同一个 resolver。手写一份 `RuntimeCapabilities` 字面量会让
+ * 「hook 认得出哪些工具」这件事与解析器脱钩 —— `toolIndex` 只有解析器会建，
+ * 而授权判定的第一件事就是拿工具名去 `toolIndex` 里反查。
+ */
+const memberService = new MemberService(db);
+const stub = new StubCopilot();
+const stack = createTestStack(db, memberService, stub as never);
+const { team, resolver: capabilityResolver } = stack;
+
+const alice = team.createMember({ name: 'Alice', role: 'Analyst' });
+const bob = team.createMember({ name: 'Bob', role: 'Reviewer' });
+
+/** 默认能力（团队 skill + 个人 skill + 个人资料库 + 协作/检索工具，无宿主工具）。 */
+const defaultCapabilities = await capabilityResolver.resolve(
+  capabilityContext(alice.id),
+  defaultMemberCapabilities(),
+);
+
+/**
+ * 「绑定了宿主工具」的能力。
+ *
+ * 它只代表这个 Member **想要**宿主工具：能不能真的用还要部署层放行
+ * （`ToolPolicy.allowHostTools`）。两个开关是独立的，所以下面把「声明」与
+ * 「放行」分开断言 —— 只测其中一个会漏掉一半。
+ */
+const hostCapabilities = await capabilityResolver.resolve(capabilityContext(alice.id), {
+  ...defaultMemberCapabilities(),
+  tools: [
+    ...defaultMemberCapabilities().tools,
+    { providerId: 'runtime.host-coding-tools' },
+  ],
 });
 
 // ═══════════════════════════════════════════ 1. 错误分类（纯函数）
@@ -170,10 +248,20 @@ function createFakeClient(config: {
   return { client: client as unknown as CopilotClient, calls };
 }
 
+/**
+ * 一轮 turn 的输入。
+ *
+ * `capabilities` 这一项是这一轮真正生效的能力，默认给不带宿主工具的那份。
+ * 它由解析器产出（见文件头），所以 hook 里能反查到的工具集合就是引擎拿到
+ * 声明的那一份 —— 用例改的是「绑定」，不是在这个字面量里手改工具。
+ */
 function turnInput(
-  overrides: { onDelta?: (delta: string) => void; toolProfile?: 'safe' | 'coding' } = {},
+  overrides: {
+    onDelta?: (delta: string) => void;
+    capabilities?: RuntimeCapabilities;
+  } = {},
 ) {
-  const { toolProfile, ...rest } = overrides;
+  const { capabilities, ...rest } = overrides;
   return {
     runtime: {
       id: 'runtime-1',
@@ -195,7 +283,6 @@ function turnInput(
       style: '',
       systemPrompt: '',
       model: null,
-      toolProfile: toolProfile ?? ('safe' as const),
       status: 'active' as const,
       seedKey: null,
       createdAt: 't',
@@ -205,6 +292,7 @@ function turnInput(
     prompt: 'hello',
     executionId: 'exec-1',
     conversationId: 'conv-1',
+    capabilities: capabilities ?? defaultCapabilities,
     ...rest,
   };
 }
@@ -213,7 +301,7 @@ describe('resumeSession 的降级必须窄', () => {
   it('resume 成功 → 不建新 session', async () => {
     const fakeSession = createFakeSession({});
     const fake = createFakeClient({ resume: async () => fakeSession.session });
-    const copilot = new CopilotService({} as never, { knowledge: knowledgeService, createClient: () => fake.client });
+    const copilot = new CopilotService({ createClient: () => fake.client });
 
     const result = await copilot.runMemberTurn(turnInput());
 
@@ -233,7 +321,7 @@ describe('resumeSession 的降级必须窄', () => {
       // session 还在磁盘上 —— 说明这不是「session 不存在」
       metadata: async () => ({ sessionId: 'sess-1' }),
     });
-    const copilot = new CopilotService({} as never, { knowledge: knowledgeService, createClient: () => fake.client });
+    const copilot = new CopilotService({ createClient: () => fake.client });
 
     await assert.rejects(() => copilot.runMemberTurn(turnInput()), /No GitHub OAuth token/);
 
@@ -250,7 +338,7 @@ describe('resumeSession 的降级必须窄', () => {
       },
       create: async () => fresh.session,
     });
-    const copilot = new CopilotService({} as never, { knowledge: knowledgeService, createClient: () => fake.client });
+    const copilot = new CopilotService({ createClient: () => fake.client });
 
     const result = await copilot.runMemberTurn(turnInput());
 
@@ -269,7 +357,7 @@ describe('resumeSession 的降级必须窄', () => {
       metadata: async () => undefined, // 权威来源确认：真的没有了
       create: async () => fresh.session,
     });
-    const copilot = new CopilotService({} as never, { knowledge: knowledgeService, createClient: () => fake.client });
+    const copilot = new CopilotService({ createClient: () => fake.client });
 
     await copilot.runMemberTurn(turnInput());
     assert.equal(fake.calls.create, 1);
@@ -286,7 +374,7 @@ describe('resumeSession 的降级必须窄', () => {
       },
       create: async () => createFakeSession({}).session,
     });
-    const copilot = new CopilotService({} as never, { knowledge: knowledgeService, createClient: () => fake.client });
+    const copilot = new CopilotService({ createClient: () => fake.client });
 
     await assert.rejects(() => copilot.runMemberTurn(turnInput()), /connection lost mid-handshake/);
     assert.equal(fake.calls.create, 0, '无法确认就必须让原始错误抛出');
@@ -301,7 +389,7 @@ describe('sendAndWait 超时 → abort', () => {
       },
     });
     const fake = createFakeClient({ resume: async () => fakeSession.session });
-    const copilot = new CopilotService({} as never, { knowledge: knowledgeService, createClient: () => fake.client });
+    const copilot = new CopilotService({ createClient: () => fake.client });
 
     await assert.rejects(() => copilot.runMemberTurn(turnInput()), /Timeout after 600000ms/);
 
@@ -317,7 +405,7 @@ describe('sendAndWait 超时 → abort', () => {
       },
     });
     const fake = createFakeClient({ resume: async () => fakeSession.session });
-    const copilot = new CopilotService({} as never, { knowledge: knowledgeService, createClient: () => fake.client });
+    const copilot = new CopilotService({ createClient: () => fake.client });
 
     await assert.rejects(() => copilot.runMemberTurn(turnInput()), /No GitHub OAuth token/);
     assert.equal(fakeSession.calls.abort, 0, '普通失败不该 abort');
@@ -326,7 +414,7 @@ describe('sendAndWait 超时 → abort', () => {
   it('正常结束不 abort', async () => {
     const fakeSession = createFakeSession({});
     const fake = createFakeClient({ resume: async () => fakeSession.session });
-    const copilot = new CopilotService({} as never, { knowledge: knowledgeService, createClient: () => fake.client });
+    const copilot = new CopilotService({ createClient: () => fake.client });
 
     await copilot.runMemberTurn(turnInput());
     assert.equal(fakeSession.calls.abort, 0);
@@ -335,7 +423,7 @@ describe('sendAndWait 超时 → abort', () => {
   it('cancelTurn 找不到 execution 时如实返回 found=false', async () => {
     const fakeSession = createFakeSession({});
     const fake = createFakeClient({ resume: async () => fakeSession.session });
-    const copilot = new CopilotService({} as never, { knowledge: knowledgeService, createClient: () => fake.client });
+    const copilot = new CopilotService({ createClient: () => fake.client });
 
     assert.deepEqual(await copilot.cancelTurn('nope'), {
       found: false,
@@ -355,7 +443,7 @@ describe('sendAndWait 超时 → abort', () => {
       },
     });
     const holdingClient = createFakeClient({ resume: async () => holding.session });
-    const copilot2 = new CopilotService({} as never, { knowledge: knowledgeService, createClient: () => holdingClient.client });
+    const copilot2 = new CopilotService({ createClient: () => holdingClient.client });
 
     const turn = copilot2.runMemberTurn(turnInput());
     await new Promise((resolve) => setTimeout(resolve, 20));
@@ -400,10 +488,10 @@ function declaredTools(config: CapturedSessionConfig | undefined): string[] {
   return Array.isArray(tools) ? tools : tools.toArray();
 }
 
-/** 跑一轮完整 turn，并在 turn 进行中执行 `during`（此时 execution 上下文才存在）。 */
+/** 跑一轮完整 turn，并在 turn 进行中执行 `during`。 */
 async function runTurnCapturing(
   options: {
-    toolProfile?: 'safe' | 'coding';
+    capabilities?: RuntimeCapabilities;
     toolPolicy?: ToolPolicy;
     /**
      * 第二个参数是这一轮的 input，由本函数创建后才交给引擎 —— 用例的闭包里
@@ -416,7 +504,9 @@ async function runTurnCapturing(
   } = {},
 ) {
   let captured: CapturedSessionConfig | undefined;
-  const input = turnInput({ toolProfile: options.toolProfile });
+  const input = turnInput(
+    options.capabilities ? { capabilities: options.capabilities } : {},
+  );
 
   const fakeSession = createFakeSession({
     onSendAndWait: async () => {
@@ -431,14 +521,10 @@ async function runTurnCapturing(
     },
   });
 
-  const copilot = new CopilotService(
-    {} as never,
-    {
-      knowledge: knowledgeService,
-      createClient: () => fake.client,
-      ...(options.toolPolicy ? { toolPolicy: options.toolPolicy } : {}),
-    },
-  );
+  const copilot = new CopilotService({
+    createClient: () => fake.client,
+    ...(options.toolPolicy ? { toolPolicy: options.toolPolicy } : {}),
+  });
 
   await copilot.runMemberTurn(input);
   assert.ok(captured, '引擎没有拿到 sessionConfig');
@@ -455,11 +541,14 @@ describe('工具授权层真的接到了引擎上', () => {
     }
   });
 
-  it('safe profile：宿主工具既不声明也不放行', async () => {
+  it('没绑定宿主工具：既不声明也不放行', async () => {
+    // 部署层放开了（allowHostTools: true），但这一轮的能力里根本没有这条
+    // binding —— 于是宿主工具连声明都没有，授权层也无从放行。
+    // 「能不能用」先看能力解析结果，再看部署开关，两个都要过。
     const decisions: Array<Record<string, unknown>> = [];
 
     const { config } = await runTurnCapturing({
-      toolProfile: 'safe',
+      capabilities: defaultCapabilities,
       toolPolicy: new DefaultToolPolicy({ allowHostTools: true }),
       during: async (captured) => {
         for (const name of ['bash', 'edit', 'grep', 'web_fetch']) {
@@ -476,7 +565,7 @@ describe('工具授权层真的接到了引擎上', () => {
 
     const declared = declaredTools(config);
     for (const name of ['bash', 'edit', 'grep', 'web_fetch']) {
-      assert.ok(!declared.includes(`builtin:${name}`), `${name} 不该被声明给 safe profile`);
+      assert.ok(!declared.includes(`builtin:${name}`), `${name} 不该被声明给没绑定它的 Member`);
     }
     assert.equal(decisions.length, 4);
     for (const decision of decisions) {
@@ -484,11 +573,11 @@ describe('工具授权层真的接到了引擎上', () => {
     }
   });
 
-  it('宿主工具已启用 + coding profile：声明里有了，hook 也真的放行', async () => {
+  it('绑定了宿主工具 + 部署放行：声明里有了，hook 也真的放行', async () => {
     let decision: Record<string, unknown> | undefined;
 
     const { config } = await runTurnCapturing({
-      toolProfile: 'coding',
+      capabilities: hostCapabilities,
       toolPolicy: new DefaultToolPolicy({ allowHostTools: true }),
       during: async (captured) => {
         decision = (await captured.hooks?.onPreToolUse?.({
@@ -501,6 +590,31 @@ describe('工具授权层真的接到了引擎上', () => {
 
     assert.ok(declaredTools(config).includes('builtin:bash'));
     assert.equal(decision?.permissionDecision, 'allow');
+  });
+
+  it('绑定了宿主工具但部署没放行：声明里没有，hook 也拒绝', async () => {
+    // 这是上面那条的另一半，也是「部署开关 ≠ Member 能力声明」的判据。
+    // 少了这条，把部署开关接到 binding 上（或者干脆去掉判据）不会有断言变红：
+    // 一个 Member 只要自己声明就能拿到宿主机执行权。
+    let decision: Record<string, unknown> | undefined;
+
+    const { config } = await runTurnCapturing({
+      capabilities: hostCapabilities,
+      toolPolicy: new DefaultToolPolicy({ allowHostTools: false }),
+      during: async (captured) => {
+        decision = (await captured.hooks?.onPreToolUse?.({
+          sessionId: 'sess-1',
+          toolName: 'bash',
+          toolArgs: { command: 'ls' },
+        })) as Record<string, unknown>;
+      },
+    });
+
+    assert.ok(
+      !declaredTools(config).includes('builtin:bash'),
+      '部署没放行时不该把宿主工具声明给引擎',
+    );
+    assert.equal(decision?.permissionDecision, 'deny');
   });
 
   it('放行必须返回明确的 allow，不能返回空对象', async () => {
@@ -546,16 +660,18 @@ describe('工具授权层真的接到了引擎上', () => {
     assert.equal(result?.kind, 'user-not-available');
   });
 
-  it('钩子认不出这个 session 时拒绝，而不是放行', async () => {
-    // resume 出来的旧 session 被别处驱动、或者 sub-agent 的 session，都会走到这支。
-    // 我们既不知道是谁在用、也不知道属于哪个房间，没有任何理由替它背书。
+  it('声明之外的任何工具名一律拒绝（不是「不认识 session 就拒绝」）', async () => {
+    // 判据只有一条：这个名字有没有被某个 Provider 声明过（在 toolIndex 里）。
+    // 引擎自己的其它 built-in、MCP server 带进来的工具、拼错的名字，全部走这支。
+    // 放行一个来历不明的工具，等于授权层不存在 —— 所以这里刻意用一个真实存在
+    // 但从未声明过的形态（MCP 工具名）。
     let decision: Record<string, unknown> | undefined;
 
     await runTurnCapturing({
       during: async (captured) => {
         decision = (await captured.hooks?.onPreToolUse?.({
-          sessionId: 'some-other-session',
-          toolName: 'ask_member',
+          sessionId: 'sess-1',
+          toolName: 'mcp__filesystem__write_file',
           toolArgs: {},
         })) as Record<string, unknown>;
       },
@@ -564,15 +680,16 @@ describe('工具授权层真的接到了引擎上', () => {
     assert.equal(decision?.permissionDecision, 'deny');
   });
 
-  it('一轮 turn 用开始那一刻的 profile —— 中途改 Member 不改变已经在跑的这一轮', async () => {
+  it('一轮 turn 用开始那一刻的能力 —— 中途重新解析不改变已经在跑的这一轮', async () => {
     let decision: Record<string, unknown> | undefined;
 
-    // 先按 safe 起一轮，在 turn 进行中把 Member 改成 coding。
+    // 按「没有宿主工具」起一轮，在 turn 进行中把 input.capabilities 换成
+    // 「有宿主工具」的那份 —— 模拟解析在别处重算了一次。
     await runTurnCapturing({
-      toolProfile: 'safe',
+      capabilities: defaultCapabilities,
       toolPolicy: new DefaultToolPolicy({ allowHostTools: true }),
       during: async (captured, input) => {
-        input.member.toolProfile = 'coding';
+        input.capabilities = hostCapabilities;
         decision = (await captured.hooks?.onPreToolUse?.({
           sessionId: 'sess-1',
           toolName: 'bash',
@@ -584,12 +701,14 @@ describe('工具授权层真的接到了引擎上', () => {
     assert.equal(
       decision?.permissionDecision,
       'deny',
-      '正在跑的这一轮突然多出了宿主工具 —— profile 必须在 turn 开始时冻结',
+      '正在跑的这一轮突然多出了宿主工具 —— 能力必须在 turn 开始时冻结',
     );
   });
 
-  it('三个 custom tool 即使没有 execution 上下文也不会被策略拦下（它们的边界在业务里）', async () => {
-    // 这条是上面那条的反面：认不出 session 才拒绝，认得出就必须让 custom tool 过。
+  it('custom tool 只要被声明就必须放行（它的边界在业务里，不在授权层）', async () => {
+    // 上面那条的反面：声明过就必须过。授权层不做「这个 Member 该不该调
+    // ask_member」这种业务判断 —— 那是 TeamService 的事，混进来会让
+    // 「加一个工具」变成「改授权层」。
     const decisions: Array<Record<string, unknown>> = [];
 
     await runTurnCapturing({
@@ -614,38 +733,6 @@ describe('工具授权层真的接到了引擎上', () => {
 
 // ═══════════════════════════════════════════ 3/4. TeamService
 
-interface TurnInput {
-  member: { id: string };
-  executionId: string;
-  prompt: string;
-}
-
-class StubCopilot {
-  readonly turns: TurnInput[] = [];
-  failWith: string | null = null;
-  hold: Promise<void> | null = null;
-  /** 模拟「abort 让 sendAndWait 正常返回半截结果」而不是抛错。 */
-  resolveOnCancel = false;
-  private readonly cancelled = new Set<string>();
-
-  async runMemberTurn(input: TurnInput): Promise<string> {
-    this.turns.push(input);
-    if (this.hold) await this.hold;
-    if (this.cancelled.has(input.executionId)) {
-      if (this.resolveOnCancel) return 'partial output';
-      throw new Error('aborted by user');
-    }
-    if (this.failWith) throw new Error(this.failWith);
-    return `stub reply from ${input.member.id}`;
-  }
-
-  async cancelTurn(executionId: string) {
-    const found = this.turns.some((turn) => turn.executionId === executionId);
-    this.cancelled.add(executionId);
-    return { found, aborted: found, idle: found };
-  }
-}
-
 function executionRow(id: string) {
   const row = db.prepare(`SELECT * FROM execution WHERE id = ?`).get(id) as unknown as
     | { id: string; status: string; response: string | null; error: string | null }
@@ -667,14 +754,6 @@ async function waitForStatus(id: string, status: string): Promise<void> {
   }
   assert.fail(`execution ${id} 未变成 ${status}（当前 ${executionRow(id).status}）`);
 }
-
-const stub = new StubCopilot();
-const memberService = new MemberService(db);
-const knowledgeService = new KnowledgeService(db);
-const team = new TeamService(db, memberService, stub as never, knowledgeService);
-
-const alice = team.createMember({ name: 'Alice', role: 'Analyst' });
-const bob = team.createMember({ name: 'Bob', role: 'Reviewer' });
 
 const sendRaw = team.sendMessage.bind(team);
 

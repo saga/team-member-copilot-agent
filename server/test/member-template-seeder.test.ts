@@ -29,6 +29,7 @@ process.env.COPILOT_WARMUP = 'false';
 const { db } = await import('../db.js');
 const { MemberService } = await import('../member-service.js');
 const { seedMemberTemplates } = await import('../member-template-seeder.js');
+const { createCapabilityStack } = await import('./support.js');
 
 after(() => {
   db.close();
@@ -36,6 +37,17 @@ after(() => {
 });
 
 const memberService = new MemberService(db);
+
+/**
+ * 模板 provisioning 会写能力绑定，而绑定要对着**注册表**校验。
+ *
+ * 这里用与 TeamService 用例同一份装配（support.ts）—— 如果反过来手写一份只含
+ * 模板用到的 Provider 的注册表，那么「模板写了一个部署里不存在的 Provider ID」
+ * 就会在这份测试里通过，只在生产启动时才炸。
+ */
+const stack = createCapabilityStack(db, memberService, () => {
+  throw new Error('这条用例不该执行 team 工具');
+});
 
 /** 仓库里真实的那份模板目录。测试从仓库根目录跑，所以相对路径可用。 */
 const REAL_TEMPLATES = path.resolve('config/member-templates');
@@ -67,7 +79,22 @@ interface TemplateFiles {
   /** 覆盖 systemPromptFile / memoryFile，用于穿越用例。 */
   systemPromptFile?: string;
   memoryFile?: string;
+  /** 覆盖默认能力组成；不传就用一份「协议层最小集」。 */
+  capabilities?: Record<string, unknown>;
 }
+
+/**
+ * 默认能力组成：与 `defaultMemberCapabilities()` 同形。
+ *
+ * 模板里的 `capabilities` 现在是**必填**——「这个 Member 能用什么」不该有一个
+ * 隐式默认（隐式默认会让漏配的模板安静地拿到一些能力）。所以 fixture 也得显式
+ * 写出来，而不是靠 seeder 兜底。
+ */
+const FIXTURE_CAPABILITIES = {
+  skills: [{ providerId: 'team.filesystem-skills' }, { providerId: 'member.filesystem-skills' }],
+  knowledge: [{ providerId: 'local.filesystem-knowledge', selector: '$personal' }],
+  tools: [{ providerId: 'team.core-tools' }, { providerId: 'knowledge.tools' }],
+};
 
 function writeTemplate(root: string, directory: string, files: TemplateFiles): void {
   const dir = path.join(root, directory);
@@ -82,6 +109,7 @@ function writeTemplate(root: string, directory: string, files: TemplateFiles): v
       role: files.extraManifest?.role ?? 'Test Role',
       systemPromptFile: files.systemPromptFile ?? 'SYSTEM_PROMPT.md',
       memoryFile: files.memoryFile ?? 'MEMORY.md',
+      capabilities: files.capabilities ?? FIXTURE_CAPABILITIES,
       ...files.extraManifest,
     }, null, 2),
   );
@@ -94,7 +122,7 @@ function writeTemplate(root: string, directory: string, files: TemplateFiles): v
 
 describe('真实模板目录：三个默认 Member', () => {
   it('第一次 provisioning 三个 key 全部创建，且配置正确落到 member 表', () => {
-    const result = seedMemberTemplates(memberService, REAL_TEMPLATES);
+    const result = seedMemberTemplates(memberService, REAL_TEMPLATES, stack.capabilities, stack.resolver);
 
     for (const key of KNOWN_KEYS) {
       assert.ok(result.created.includes(key), `没有 provision ${key}`);
@@ -110,11 +138,28 @@ describe('真实模板目录：三个默认 Member', () => {
     assert.equal(engineer.handle, 'engineer');
     assert.equal(security.handle, 'security');
 
-    // 只有 Engineer 拿到 coding：架构师和 Security Reviewer 默认不该因为
+    // 只有 Engineer 绑定了宿主工具：架构师和 Security Reviewer 不该因为
     // 「自己是这个角色」就获得宿主机代码执行能力。
-    assert.equal(engineer.toolProfile, 'coding');
-    assert.equal(architect.toolProfile, 'safe');
-    assert.equal(security.toolProfile, 'safe');
+    //
+    // 注意这只代表它们**想要**：能不能真的用还要部署层放行
+    // （HOST_CODING_TOOLS），两件事刻意分开。
+    assert.deepEqual(
+      stack.capabilities.get(engineer.id).tools,
+      [
+        { providerId: 'knowledge.tools' },
+        { providerId: 'runtime.host-coding-tools' },
+        { providerId: 'team.core-tools' },
+      ],
+      'Engineer 应该多绑定一条宿主工具',
+    );
+    for (const member of [architect, security]) {
+      assert.ok(
+        !stack.capabilities
+          .get(member.id)
+          .tools.some((binding) => binding.providerId === 'runtime.host-coding-tools'),
+        `${member.handle} 不该绑定宿主工具`,
+      );
+    }
 
     // system prompt 是从磁盘读进来的，不是模板 JSON 里的某个字符串字段
     assert.ok(architect.systemPrompt.length > 200, 'architect 的 system prompt 应该来自 SYSTEM_PROMPT.md');
@@ -124,8 +169,29 @@ describe('真实模板目录：三个默认 Member', () => {
     assert.equal(architect.model, null);
   });
 
+  it('模板里的 capabilities 落到 member_capability_binding，三类都在', () => {
+    // 这条是上面那条的补充：上面只看 tools，这里确认 skills / knowledge 也真的
+    // 落了库 —— 少接一段（比如 seeder 只写了 tools）在别处不会有断言变红。
+    const security = memberService.findBySeedKey('financial-services.security-reviewer')!;
+    const bindings = stack.capabilities.get(security.id);
+
+    assert.deepEqual(bindings.skills, [
+      { providerId: 'member.filesystem-skills' },
+      { providerId: 'team.filesystem-skills' },
+    ]);
+    assert.deepEqual(bindings.knowledge, [
+      { providerId: 'local.filesystem-knowledge', selector: '$personal' },
+      { providerId: 'local.filesystem-knowledge', selector: 'financial-core' },
+      { providerId: 'local.filesystem-knowledge', selector: 'security-controls' },
+    ]);
+    assert.deepEqual(bindings.tools, [
+      { providerId: 'knowledge.tools' },
+      { providerId: 'team.core-tools' },
+    ]);
+  });
+
   it('第二次执行全部跳过，一个都不重建', () => {
-    const result = seedMemberTemplates(memberService, REAL_TEMPLATES);
+    const result = seedMemberTemplates(memberService, REAL_TEMPLATES, stack.capabilities, stack.resolver);
 
     assert.deepEqual(result.created, []);
     for (const key of KNOWN_KEYS) {
@@ -176,7 +242,7 @@ describe('模板只负责第一次', () => {
       systemPrompt: 'Template prompt v1',
     });
 
-    const first = seedMemberTemplates(memberService, root);
+    const first = seedMemberTemplates(memberService, root, stack.capabilities, stack.resolver);
     assert.deepEqual(first.created, ['test.analyst']);
 
     const created = memberService.findBySeedKey('test.analyst')!;
@@ -186,7 +252,7 @@ describe('模板只负责第一次', () => {
       systemPrompt: 'Custom prompt',
     });
 
-    const second = seedMemberTemplates(memberService, root);
+    const second = seedMemberTemplates(memberService, root, stack.capabilities, stack.resolver);
     assert.deepEqual(second.created, []);
     assert.deepEqual(second.skipped, ['test.analyst']);
 
@@ -203,11 +269,11 @@ describe('模板只负责第一次', () => {
     const root = newTemplateRoot();
     writeTemplate(root, 'renamed', { key: 'test.renamed', handle: 'renamed', name: 'Renamed' });
 
-    seedMemberTemplates(memberService, root);
+    seedMemberTemplates(memberService, root, stack.capabilities, stack.resolver);
     const created = memberService.findBySeedKey('test.renamed')!;
     memberService.update(created.id, { handle: 'completely-different-handle' });
 
-    const again = seedMemberTemplates(memberService, root);
+    const again = seedMemberTemplates(memberService, root, stack.capabilities, stack.resolver);
     assert.deepEqual(again.created, []);
     assert.deepEqual(again.skipped, ['test.renamed']);
 
@@ -220,12 +286,12 @@ describe('模板只负责第一次', () => {
     const root = newTemplateRoot();
     writeTemplate(root, 'retired', { key: 'test.retired', handle: 'retired', name: 'Retired' });
 
-    seedMemberTemplates(memberService, root);
+    seedMemberTemplates(memberService, root, stack.capabilities, stack.resolver);
     const created = memberService.findBySeedKey('test.retired')!;
 
     memberService.update(created.id, { status: 'archived' });
 
-    const again = seedMemberTemplates(memberService, root);
+    const again = seedMemberTemplates(memberService, root, stack.capabilities, stack.resolver);
     assert.deepEqual(again.created, [], '归档的 Member 不该被重新建出来');
     assert.deepEqual(again.skipped, ['test.retired']);
 
@@ -245,7 +311,7 @@ describe('模板只负责第一次', () => {
       systemPrompt: 'Template prompt v1',
     });
 
-    seedMemberTemplates(memberService, root);
+    seedMemberTemplates(memberService, root, stack.capabilities, stack.resolver);
     const created = memberService.findBySeedKey('test.evolving')!;
     assert.equal(memberService.get(created.id).systemPrompt, 'Template prompt v1');
 
@@ -255,7 +321,7 @@ describe('模板只负责第一次', () => {
       'Template prompt v2 — totally different personality',
     );
 
-    const again = seedMemberTemplates(memberService, root);
+    const again = seedMemberTemplates(memberService, root, stack.capabilities, stack.resolver);
     assert.deepEqual(again.created, []);
 
     const after = memberService.get(created.id);
@@ -275,7 +341,7 @@ describe('模板只负责第一次', () => {
       memory: '# Long-term Memory\n\n- 记住这条初始背景',
     });
 
-    seedMemberTemplates(memberService, root);
+    seedMemberTemplates(memberService, root, stack.capabilities, stack.resolver);
     const created = memberService.findBySeedKey('test.mnemonic')!;
 
     const memory = memberService.getMemory(created.id).content;
@@ -293,7 +359,7 @@ describe('模板配置错误必须大声报出来', () => {
     writeTemplate(root, 'dup-b', { key: 'test.dup', handle: 'dup-b' });
 
     assert.throws(
-      () => seedMemberTemplates(memberService, root),
+      () => seedMemberTemplates(memberService, root, stack.capabilities, stack.resolver),
       /重复的 Member template key/,
       '同一个 key 会让其中一个永远建不出来，必须报错',
     );
@@ -307,7 +373,7 @@ describe('模板配置错误必须大声报出来', () => {
       systemPromptFile: '../../etc/passwd',
     });
 
-    assert.throws(() => seedMemberTemplates(memberService, root), /越界/);
+    assert.throws(() => seedMemberTemplates(memberService, root, stack.capabilities, stack.resolver), /越界/);
     assert.equal(memberService.findBySeedKey('test.escape'), null);
   });
 
@@ -315,7 +381,7 @@ describe('模板配置错误必须大声报出来', () => {
     const root = newTemplateRoot();
     fs.mkdirSync(path.join(root, 'empty-dir'), { recursive: true });
 
-    assert.throws(() => seedMemberTemplates(memberService, root), /缺少 member\.json/);
+    assert.throws(() => seedMemberTemplates(memberService, root, stack.capabilities, stack.resolver), /缺少 member\.json/);
   });
 
   it('member.json 不是合法 JSON / 字段不合法都抛错', () => {
@@ -323,7 +389,7 @@ describe('模板配置错误必须大声报出来', () => {
 
     fs.mkdirSync(path.join(root, 'broken'), { recursive: true });
     fs.writeFileSync(path.join(root, 'broken', 'member.json'), '{ not json');
-    assert.throws(() => seedMemberTemplates(memberService, root), /不是合法 JSON/);
+    assert.throws(() => seedMemberTemplates(memberService, root, stack.capabilities, stack.resolver), /不是合法 JSON/);
 
     fs.rmSync(path.join(root, 'broken'), { recursive: true });
     fs.mkdirSync(path.join(root, 'invalid'), { recursive: true });
@@ -332,12 +398,41 @@ describe('模板配置错误必须大声报出来', () => {
       JSON.stringify({ key: 'test.invalid', handle: 'x', name: 'X' }),
     );
     // 少了 role
-    assert.throws(() => seedMemberTemplates(memberService, root), /不合法/);
+    assert.throws(() => seedMemberTemplates(memberService, root, stack.capabilities, stack.resolver), /不合法/);
   });
 
   it('模板目录不存在时返回空结果，不抛（这份部署不需要模板）', () => {
-    const result = seedMemberTemplates(memberService, path.join(dataDir, 'nope-does-not-exist'));
+    const result = seedMemberTemplates(
+      memberService,
+      path.join(dataDir, 'nope-does-not-exist'),
+      stack.capabilities,
+      stack.resolver,
+    );
     assert.deepEqual(result, { created: [], skipped: [] });
+  });
+
+  it('模板引用了未注册的 Provider ID → 直接抛，且不留下半成品 Member', () => {
+    // 拼错的 Provider ID 如果被静默接受，表现为「这个 Member 少了检索能力」，
+    // 而不是一个启动错误 —— 它会照常回答，只是答案不再有依据。
+    // 所以校验必须发生在建 Member **之前**：否则会留下一个没有能力的 Member，
+    // 而且第二次启动会被幂等判据跳过，永远修不好。
+    const root = newTemplateRoot();
+    writeTemplate(root, 'typo', {
+      key: 'test.typo',
+      handle: 'typo',
+      capabilities: {
+        skills: [{ providerId: 'team.filesystem-skill' }], // 少一个 s
+        knowledge: [],
+        tools: [],
+      },
+    });
+
+    assert.throws(
+      () =>
+        seedMemberTemplates(memberService, root, stack.capabilities, stack.resolver),
+      /未注册 Skill Provider：team\.filesystem-skill/,
+    );
+    assert.equal(memberService.findBySeedKey('test.typo'), null);
   });
 
   it('enabled: false 的模板既不创建也不计入 skipped', () => {
@@ -348,7 +443,7 @@ describe('模板配置错误必须大声报出来', () => {
       extraManifest: { enabled: false },
     });
 
-    const result = seedMemberTemplates(memberService, root);
+    const result = seedMemberTemplates(memberService, root, stack.capabilities, stack.resolver);
     assert.deepEqual(result, { created: [], skipped: [] });
     assert.equal(memberService.findBySeedKey('test.disabled'), null);
   });
@@ -359,7 +454,7 @@ describe('模板配置错误必须大声报出来', () => {
     fs.writeFileSync(path.join(root, '.hidden', 'member.json'), '{');
     fs.writeFileSync(path.join(root, '.DS_Store'), 'junk');
 
-    const result = seedMemberTemplates(memberService, root);
+    const result = seedMemberTemplates(memberService, root, stack.capabilities, stack.resolver);
     assert.deepEqual(result, { created: [], skipped: [] });
   });
 });

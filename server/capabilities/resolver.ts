@@ -46,10 +46,16 @@ export class CapabilityResolver {
   ): Promise<RuntimeCapabilities> {
     this.registry.validateMemberCapabilities(capabilities);
 
-    const skills: SkillArtifact[] = [];
+    const skillEntries: ResolvedSkill[] = [];
     for (const binding of capabilities.skills) {
       const provider = this.registry.skillProvider(binding.providerId);
-      skills.push(...(await provider.resolve(context, binding)));
+      for (const artifact of await provider.resolve(context, binding)) {
+        skillEntries.push({
+          providerId: provider.id,
+          providerVersion: provider.version,
+          artifact,
+        });
+      }
     }
 
     const knowledge: ResolvedKnowledgeBinding[] = [];
@@ -74,17 +80,30 @@ export class CapabilityResolver {
       tools.push(...(await provider.resolve(toolContext, binding)));
     }
 
-    const dedupedSkills = dedupe(skills, (skill) => skill.name, 'Skill');
+    const dedupedSkills = dedupe(skillEntries, (entry) => entry.artifact.name, 'Skill');
     const dedupedTools = dedupe(tools, (tool) => tool.name, 'Tool');
 
     return {
-      skills: dedupedSkills,
+      skills: dedupedSkills.map((entry) => entry.artifact),
       knowledge,
       tools: dedupedTools,
       toolIndex: new Map(dedupedTools.map((tool) => [tool.name, tool])),
       manifestHash: manifestHashOf(dedupedSkills, knowledge, dedupedTools),
     };
   }
+}
+
+/**
+ * Skill 的解析结果，按 Provider 成对记下来。
+ *
+ * 光有 `SkillArtifact` 不够：artifact 上的 `version` 是**内容指纹**（Provider
+ * 自己决定粒度），它答不了「同一个 ID 背后的实现换了一版」——那是 Provider 的
+ * `version`。两者都要进 manifest。
+ */
+interface ResolvedSkill {
+  providerId: string;
+  providerVersion: string;
+  artifact: SkillArtifact;
 }
 
 function dedupe<T>(items: T[], keyOf: (item: T) => string, label: string): T[] {
@@ -118,17 +137,20 @@ function dedupe<T>(items: T[], keyOf: (item: T) => string, label: string): T[] {
  * 能力只要 Provider 注册顺序变了就会算出不同的哈希。
  */
 function manifestHashOf(
-  skills: SkillArtifact[],
+  skills: ResolvedSkill[],
   knowledge: ResolvedKnowledgeBinding[],
   tools: RuntimeTool[],
 ): string {
   const payload = {
     skills: [...skills]
-      .sort(byKey((skill) => `${skill.providerId}\u0000${skill.name}`))
-      .map((skill) => ({
-        providerId: skill.providerId,
-        name: skill.name,
-        version: skill.version,
+      .sort(byKey((entry) => `${entry.providerId}\u0000${entry.artifact.name}`))
+      .map((entry) => ({
+        providerId: entry.providerId,
+        // Provider 实现版本 + 内容指纹，两个都要：前者是「换了一版实现」，
+        // 后者是「同一版实现下内容变了」。
+        providerVersion: entry.providerVersion,
+        name: entry.artifact.name,
+        version: entry.artifact.version,
       })),
     knowledge: [...knowledge]
       .sort(byKey((item) => `${item.provider.id}\u0000${item.binding.selector ?? ''}`))

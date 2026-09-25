@@ -25,7 +25,6 @@ process.env.COPILOT_WARMUP = 'false';
 
 const { db } = await import('../db.js');
 const { MemberService } = await import('../member-service.js');
-const { TeamService } = await import('../team-service.js');
 const { executionIdForWake, StubCopilot, createTestStack } = await import('./support.js');
 
 const stub = new StubCopilot();

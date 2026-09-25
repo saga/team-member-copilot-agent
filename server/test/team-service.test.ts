@@ -26,7 +26,6 @@ process.env.COPILOT_WARMUP = 'false';
 const { config } = await import('../config.js');
 const { db } = await import('../db.js');
 const { MemberService } = await import('../member-service.js');
-const { TeamService } = await import('../team-service.js');
 const { singleExecutionId, muteAllMembers, createTestStack } = await import('./support.js');
 
 interface RunTurnInput {
@@ -148,11 +147,10 @@ let teamConversationId: string;
 
 before(() => {
   researcher = team.createMember({ name: 'Researcher', role: 'Research Analyst' });
-  coder = team.createMember({
-    name: 'Coder',
-    role: 'Software Engineer',
-    toolProfile: 'coding',
-  });
+  // 「这个人能碰宿主机」现在是一条能力绑定，不再是 createMember 上的一个字段
+  // —— 默认能力刻意不含宿主工具，要的话得显式绑。这些用例不考工具能力，
+  // 所以它就只是个名字像工程师的普通 Member。
+  coder = team.createMember({ name: 'Coder', role: 'Software Engineer' });
   reviewer = team.createMember({ name: 'Reviewer', role: 'Reviewer' });
   analyst = team.createMember({ name: 'Analyst', role: 'Data Analyst' });
   archivist = team.createMember({ name: 'Archivist', role: 'Knowledge Manager' });

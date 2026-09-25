@@ -6,6 +6,7 @@ import { config } from '../../config.js';
 import { hashText } from '../../content-hash.js';
 import { now } from '../../db.js';
 import { badRequest, notFound, forbidden } from '../../http-error.js';
+import { documentPathIssue } from './knowledge-document-limits.js';
 import type { CapabilityBinding } from '../../domain.js';
 import type { CapabilityService } from '../service.js';
 import type {
@@ -26,6 +27,7 @@ import type {
  *
  *   正文     <teamKnowledgeRoot>/<key>/...        与 <memberHomeRoot>/<id>/knowledge/...
  *   索引     knowledge_base / knowledge_document / knowledge_document_fts
+ *   边界     只有文本格式、且不超过单份上限的文件会被索引（knowledge-document-limits.ts）
  *
  * 磁盘是正文 source of truth。`writeDocument()`（API 写入）与 `syncFromDisk()`
  * （扫描目录）是两条等价入口，靠 (kb, relative_path) 唯一键 + content_hash 幂等
@@ -271,6 +273,11 @@ export class LocalFilesystemKnowledgeProvider implements KnowledgeProvider {
   }): KnowledgeDocumentRecord {
     const kb = this.get(input.knowledgeBaseId);
     const relativePath = input.relativePath.split('/').map(safeSegment).join('/');
+
+    // 与扫目录共用同一个判据：一边拒绝、一边接受是这类不一致最常见的形态。
+    const issue = documentPathIssue(relativePath, Buffer.byteLength(input.content, 'utf8'));
+    if (issue) throw badRequest(`不写入这份文档：${issue}`);
+
     const contentHash = hashText(input.content);
 
     const target = this.resolveDocumentPath(kb, relativePath);
@@ -398,6 +405,13 @@ export class LocalFilesystemKnowledgeProvider implements KnowledgeProvider {
           relativePath.split('/').forEach(safeSegment);
         } catch {
           warnSkip(`${kb.key}/${relativePath}`, new Error('路径含非法字符'));
+          continue;
+        }
+
+        // 先 stat 再读：超大文件在读之前就该被挡下，而不是先读进内存再判断。
+        const issue = documentPathIssue(relativePath, fs.statSync(full).size);
+        if (issue) {
+          warnSkip(`${kb.key}/${relativePath}`, new Error(issue));
           continue;
         }
 

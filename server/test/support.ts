@@ -27,19 +27,33 @@ import { NO_REPLY_SENTINEL } from '../member-decision.js';
  *   - CopilotService 是 stub（不拉起真实 CLI 进程）
  *   - 不注册 routes
  */
-export interface TestStack {
-  team: TeamService;
+export interface CapabilityStack {
   capabilities: CapabilityService;
   knowledge: LocalFilesystemKnowledgeProvider;
   registry: CapabilityRegistry;
   resolver: CapabilityResolver;
 }
 
-export function createTestStack(
+export interface TestStack extends CapabilityStack {
+  team: TeamService;
+}
+
+/**
+ * 只装能力层（不需要 TeamService / Copilot）。
+ *
+ * 模板 provisioning、Provider 契约这些用例只用得上能力层，但它们必须与
+ * TeamService 的用例走**同一份**注册表 —— 否则「模板里写的 Provider ID 在部署里
+ * 存不存在」这件事就有两套答案。
+ *
+ * `resolveTeam` 是 CoreTeamToolProvider 的反向依赖（它执行的是业务编排），
+ * 用惰性回调打断循环；纯能力层的用例可以传一个直接抛的实现 —— 那些工具在
+ * 这些用例里只会被「解析出来」，不会被真正执行。
+ */
+export function createCapabilityStack(
   db: DatabaseSync,
   members: MemberService,
-  copilot: CopilotService,
-): TestStack {
+  resolveTeam: () => TeamService,
+): CapabilityStack {
   const capabilities = new CapabilityService(db);
   const knowledge = new LocalFilesystemKnowledgeProvider(db, capabilities);
 
@@ -54,22 +68,28 @@ export function createTestStack(
   );
   registry.registerKnowledgeProvider(knowledge);
 
-  // 与 app.ts 同样的反向依赖：工具执行的是业务编排，装配时用惰性闭包打断循环。
-  let team!: TeamService;
   registry.registerToolProvider(
     new CoreTeamToolProvider({
-      delegateMember: (input) => team.delegateMember(input),
-      rememberMember: (input) => team.rememberMember(input),
-      messageMember: (input) => team.messageMember(input),
+      delegateMember: (input) => resolveTeam().delegateMember(input),
+      rememberMember: (input) => resolveTeam().rememberMember(input),
+      messageMember: (input) => resolveTeam().messageMember(input),
     }),
   );
   registry.registerToolProvider(new KnowledgeToolProvider());
   registry.registerToolProvider(new HostCodingToolProvider());
 
-  const resolver = new CapabilityResolver(registry);
-  team = new TeamService(db, members, copilot, capabilities, resolver);
+  return { capabilities, knowledge, registry, resolver: new CapabilityResolver(registry) };
+}
 
-  return { team, capabilities, knowledge, registry, resolver };
+export function createTestStack(
+  db: DatabaseSync,
+  members: MemberService,
+  copilot: CopilotService,
+): TestStack {
+  let team!: TeamService;
+  const stack = createCapabilityStack(db, members, () => team);
+  team = new TeamService(db, members, copilot, stack.capabilities, stack.resolver);
+  return { ...stack, team };
 }
 
 /** 直接调 Provider 时用的最小上下文。 */
