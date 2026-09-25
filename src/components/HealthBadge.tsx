@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { Badge, Tooltip } from 'antd';
 import { api, type Health } from '../lib/api';
 
 export function HealthBadge() {
@@ -17,18 +18,20 @@ export function HealthBadge() {
     };
   }, []);
 
-  if (!health) return <span className="badge">连接检查中…</span>;
-  const cls =
-    health.copilot === 'connected'
-      ? 'badge badge-ok'
-      : health.copilot === 'idle'
-        ? 'badge badge-warn'
-        : 'badge badge-error';
-  const label =
-    health.copilot === 'connected'
-      ? 'Copilot 已连接'
-      : health.copilot === 'idle'
-        ? 'Copilot 待连接（首个会话时建连）'
-        : `Copilot 连接失败：${health.copilotError ?? 'unknown'}`;
-  return <span className={cls}>{label}</span>;
+  if (!health) return <Badge status="processing" text={<span style={{ color: '#fff' }}>连接检查中…</span>} />;
+  if (health.copilot === 'connected') {
+    return <Badge status="success" text={<span style={{ color: '#fff' }}>Copilot 已连接</span>} />;
+  }
+  if (health.copilot === 'idle') {
+    return (
+      <Tooltip title="首个会话时建连">
+        <Badge status="warning" text={<span style={{ color: '#fff' }}>Copilot 待连接</span>} />
+      </Tooltip>
+    );
+  }
+  return (
+    <Tooltip title={health.copilotError ?? 'unknown'}>
+      <Badge status="error" text={<span style={{ color: '#fff' }}>Copilot 连接失败</span>} />
+    </Tooltip>
+  );
 }

@@ -1,3 +1,5 @@
+import { Button, List, Tag } from 'antd';
+import { PlusOutlined } from '@ant-design/icons';
 import type { Conversation, Member } from '../../lib/api';
 import { GroupCreator } from './GroupCreator';
 import { isMemberDm } from './constants';
@@ -20,14 +22,11 @@ interface ConversationListProps {
  * 在列表里长得一模一样 —— 一个是「我跟 Alice 说话」，一个是「Alice 和 Bob
  * 在说话」，用户一眼要能分清。
  */
-function describeConversation(conversation: Conversation): string {
-  if (isMemberDm(conversation)) {
-    return `private · ${conversation.members.length} members`;
-  }
-  if (conversation.kind === 'group') {
-    return `group · ${conversation.members.length} members`;
-  }
-  return conversation.kind;
+function conversationTag(conversation: Conversation) {
+  if (isMemberDm(conversation)) return <Tag color="purple">private</Tag>;
+  if (conversation.kind === 'group') return <Tag color="blue">group · {conversation.members.length}</Tag>;
+  if (conversation.kind === 'work') return <Tag color="gold">work</Tag>;
+  return <Tag>direct</Tag>;
 }
 
 export function ConversationList({
@@ -41,29 +40,47 @@ export function ConversationList({
   onCreateGroup,
 }: ConversationListProps) {
   return (
-    <div className="sidebar-section">
-      <div className="sidebar-title">Conversations</div>
-
-      {conversations.map((conversation) => (
-        <button
-          key={conversation.id}
-          type="button"
-          className={
-            conversation.id === selectedId ? 'conversation-row selected' : 'conversation-row'
-          }
-          onClick={() => onSelect(conversation.id)}
-        >
-          <strong>{conversation.title}</strong>
-          <span>{describeConversation(conversation)}</span>
-        </button>
-      ))}
+    <div>
+      <List
+        size="small"
+        dataSource={conversations}
+        locale={{ emptyText: '还没有会话。' }}
+        renderItem={(conversation) => (
+          <List.Item
+            onClick={() => onSelect(conversation.id)}
+            style={{
+              cursor: 'pointer',
+              background: conversation.id === selectedId ? '#e6f4ff' : undefined,
+              borderRadius: 8,
+              padding: '8px 12px',
+            }}
+          >
+            <List.Item.Meta
+              title={conversation.title}
+              description={
+                <>
+                  {conversationTag(conversation)}{' '}
+                  {conversation.members.map((m) => m.name).join(' · ')}
+                </>
+              }
+            />
+          </List.Item>
+        )}
+      />
 
       {showCreator ? (
         <GroupCreator members={members} onCreate={onCreateGroup} onCancel={onCancelCreator} />
       ) : (
-        <button type="button" className="group-button" onClick={onToggleCreator}>
-          + New Team
-        </button>
+        <Button
+          type="dashed"
+          block
+          size="small"
+          icon={<PlusOutlined />}
+          onClick={onToggleCreator}
+          style={{ marginTop: 8 }}
+        >
+          New Team
+        </Button>
       )}
     </div>
   );

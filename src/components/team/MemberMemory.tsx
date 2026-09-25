@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { Alert, Button, Input, Space, Spin } from 'antd';
 import { api, type Member } from '../../lib/api';
 
 interface MemberMemoryProps {
@@ -97,39 +98,39 @@ export function MemberMemory({ member }: MemberMemoryProps) {
     }
   }
 
-  if (loading) return <p className="sidebar-hint">Loading memory…</p>;
+  if (loading) return <Spin size="small" tip="Loading memory…" />;
 
   return (
-    <div className="member-memory">
-      <p className="sidebar-hint">
+    <Space direction="vertical" style={{ width: '100%' }}>
+      <span style={{ color: '#666', fontSize: 13 }}>
         这段内容每轮都会注入 {member.name} 的 system prompt。它只属于这个 Member，
         不随 conversation 变化。Agent 干活时也会往这里写 —— 保存时会检查版本，
         不会把它的写入覆盖掉。
-      </p>
+      </span>
 
-      <textarea
-        className="memory-textarea"
+      <Input.TextArea
         value={content}
         onChange={(e) => setContent(e.target.value)}
         spellCheck={false}
+        rows={14}
+        style={{ fontFamily: 'ui-monospace, monospace', fontSize: 13 }}
         placeholder={'# Long-term Memory\n\n用户喜欢先看风险再看收益。'}
       />
 
-      {error && <div className="error">{error}</div>}
+      {error && <Alert type="error" showIcon message={error} />}
       {conflict && (
-        <p className="sidebar-hint">
-          上面是你正在编辑的内容，它基于的旧版本已经过期。检查之后可以再点一次
-          Save 强制覆盖，或者点 Revert 放弃你的改动。
-        </p>
+        <Alert
+          type="warning"
+          showIcon
+          message="你编辑的内容基于的旧版本已过期。检查之后可以再点一次 Save 强制覆盖，或者点 Revert 放弃改动。"
+        />
       )}
 
-      <div className="panel-actions">
-        <button type="button" onClick={() => void save()} disabled={busy || !dirty}>
-          {busy ? 'Saving…' : conflict ? 'Save anyway' : 'Save Memory'}
-        </button>
-        <button
-          type="button"
-          className="ghost"
+      <Space>
+        <Button type="primary" onClick={() => void save()} disabled={busy || !dirty} loading={busy}>
+          {conflict ? 'Save anyway' : 'Save Memory'}
+        </Button>
+        <Button
           onClick={() => {
             setContent(loaded.content);
             setConflict(false);
@@ -138,9 +139,9 @@ export function MemberMemory({ member }: MemberMemoryProps) {
           disabled={busy || !dirty}
         >
           Revert
-        </button>
-        {savedAt && !dirty && <span className="sidebar-hint">已保存 {savedAt}</span>}
-      </div>
-    </div>
+        </Button>
+        {savedAt && !dirty && <span style={{ color: '#999' }}>已保存 {savedAt}</span>}
+      </Space>
+    </Space>
   );
 }

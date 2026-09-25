@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { Modal, Tabs, Tag } from 'antd';
 import type { Member } from '../../lib/api';
 import { MemberEditor } from './MemberEditor';
 import { MemberMemory } from './MemberMemory';
@@ -25,55 +26,40 @@ type TabKey = 'profile' | 'memory' | 'skills';
 export function MemberProfile({ member, onSaved, onClose }: MemberProfileProps) {
   const [tab, setTab] = useState<TabKey>('profile');
 
-  const tabs: Array<{ key: TabKey; label: string }> = [
-    { key: 'profile', label: 'Profile' },
-    { key: 'memory', label: 'Memory' },
-    { key: 'skills', label: 'Skills' },
-  ];
-
   return (
-    <div className="profile-overlay" role="dialog" aria-label={`${member.name} 的档案`}>
-      <div className="profile-panel">
-        <header className="profile-head">
-          <div>
-            <h2>{member.name}</h2>
-            <p className="sub">
-              @{member.handle} · {member.role}
-            </p>
-            {member.seedKey && (
-              // 只读来源标记：改了名字之后仍然看得出「这个人最初是哪份模板建出来的」。
-              // 模板只负责第一次出现，Profile 的修改不会被它覆盖。
-              <p className="sub" title="由 member template provision；修改 Profile 不会回写模板">
-                Provisioned from <code>{member.seedKey}</code>
-              </p>
-            )}
-          </div>
-          <button type="button" className="ghost" onClick={onClose}>
-            Close
-          </button>
-        </header>
-
-        <nav className="tab-bar">
-          {tabs.map((item) => (
-            <button
-              key={item.key}
-              type="button"
-              className={item.key === tab ? 'tab selected' : 'tab'}
-              onClick={() => setTab(item.key)}
-            >
-              {item.label}
-            </button>
-          ))}
-        </nav>
-
-        <div className="profile-body">
-          {tab === 'profile' && (
-            <MemberEditor member={member} onSaved={onSaved} onCancel={onClose} />
+    <Modal
+      open
+      onCancel={onClose}
+      footer={null}
+      width={720}
+      title={
+        <>
+          {member.name}{' '}
+          <span style={{ color: '#999', fontWeight: 400, fontSize: 13 }}>
+            @{member.handle} · {member.role}
+          </span>{' '}
+          {member.seedKey && (
+            <Tag title="由 member template provision；修改 Profile 不会回写模板">
+              from {member.seedKey}
+            </Tag>
           )}
-          {tab === 'memory' && <MemberMemory member={member} />}
-          {tab === 'skills' && <MemberSkills member={member} />}
-        </div>
-      </div>
-    </div>
+        </>
+      }
+    >
+      <Tabs
+        activeKey={tab}
+        onChange={(key) => setTab(key as TabKey)}
+        items={[
+          { key: 'profile', label: 'Profile' },
+          { key: 'memory', label: 'Memory' },
+          { key: 'skills', label: 'Skills' },
+        ]}
+      />
+      {tab === 'profile' && (
+        <MemberEditor member={member} onSaved={onSaved} onCancel={onClose} />
+      )}
+      {tab === 'memory' && <MemberMemory member={member} />}
+      {tab === 'skills' && <MemberSkills member={member} />}
+    </Modal>
   );
 }

@@ -1,7 +1,11 @@
 import { useEffect, useState } from 'react';
-import { api, type Conversation, type ConversationMemberState, type Member } from '../../lib/api';
+import { Avatar, Badge, Button, Select, Space, Tag, Tooltip, Typography } from 'antd';
+import type { Conversation, ConversationMemberState, Member } from '../../lib/api';
 import { GroupMemberManager } from './GroupMemberManager';
 import { EVERYONE, EVERYONE_LABEL, isMemberDm, type MemberStatusLookup } from './constants';
+import { api } from '../../lib/api';
+
+const { Title, Text } = Typography;
 
 interface ConversationHeaderProps {
   conversation: Conversation;
@@ -22,7 +26,7 @@ interface ConversationHeaderProps {
 }
 
 /**
- * 会话头：成员 chip（含 wakeStatus / muted）+ 收件人选择器 + 成员管理面板。
+ * 会话头：成员头像组（含 wakeStatus / muted）+ 收件人选择器 + 成员管理面板。
  *
  * 收件人默认是 Everyone，而不是 `conversation.defaultMemberId` —— 后者是
  * 「这个房间默认归谁」，拿它当 group 的默认收件人会把多成员讨论降级成单人聊天。
@@ -43,6 +47,7 @@ export function ConversationHeader({
   const isGroup = conversation.kind === 'group';
   const isDm = isMemberDm(conversation);
   const [projectName, setProjectName] = useState<string | null>(null);
+
   useEffect(() => {
     if (!conversation.projectId) {
       setProjectName(null);
@@ -58,79 +63,66 @@ export function ConversationHeader({
 
   return (
     <>
-      <header className="conversation-header">
-        <div>
-          <h2>{conversation.title}</h2>
-          {projectName && <div className="sidebar-hint">Project: {projectName}</div>}
-          <div className="member-chips">
+      <div style={{ padding: '12px 18px 0' }}>
+        <Space align="center" wrap>
+          <Title level={4} style={{ margin: 0 }}>
+            {conversation.title}
+          </Title>
+          <Tag color={conversation.kind === 'group' ? 'blue' : conversation.kind === 'work' ? 'gold' : 'default'}>
+            {conversation.kind}
+          </Tag>
+          {projectName && <Tag color="cyan">Project: {projectName}</Tag>}
+        </Space>
+
+        <div style={{ marginTop: 8, display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+          <Avatar.Group max={{ count: 8 }}>
             {conversation.members.map((member) => {
               const status = memberStatus(member.id);
-              const className = `member-chip ${status.className}`;
-
-              // 静音只对 group 有意义：direct / work 的 dispatcher 路径不看
-              // muted，点它只会造成「UI 说静音了、其实照样回」的错觉。
-              if (!isGroup) {
-                return (
-                  <span key={member.id} className={className}>
-                    <span className="member-chip-status">{status.label}</span>
-                    @{member.handle}
-                  </span>
-                );
-              }
-
+              const dot = status.className === 'working' ? 'processing' : status.className === 'muted' ? 'default' : 'success';
               return (
-                <button
-                  key={member.id}
-                  type="button"
-                  className={className}
-                  onClick={() => onToggleMute(member.id)}
-                  title={`${member.name} · ${status.label}（点击${
-                    status.className === 'muted' ? '取消静音' : '静音'
-                  }）`}
-                >
-                  <span className="member-chip-status">{status.label}</span>
-                  @{member.handle}
-                </button>
+                <Tooltip key={member.id} title={`${member.name} · ${status.label}（点击静音切换）`}>
+                  <span onClick={isGroup ? () => onToggleMute(member.id) : undefined} style={{ cursor: isGroup ? 'pointer' : 'default' }}>
+                    <Badge dot status={dot as 'processing' | 'default' | 'success'}>
+                      <Avatar>{member.name.slice(0, 1).toUpperCase()}</Avatar>
+                    </Badge>
+                  </span>
+                </Tooltip>
               );
             })}
-          </div>
-        </div>
+          </Avatar.Group>
 
-        <div className="header-actions">
-          {isGroup && (
-            <button type="button" className="ghost" onClick={onToggleMembers}>
-              Members
-            </button>
-          )}
-
-          {isGroup ? (
-            <select
-              className="recipient-select"
-              value={recipientMemberId}
-              onChange={(e) => onRecipientChange(e.target.value)}
-              aria-label="选择这条消息的收件人"
-            >
-              <option value={EVERYONE}>{EVERYONE_LABEL}</option>
-              {conversation.members
-                .filter((member) => member.status === 'active')
-                .map((member) => (
-                  <option key={member.id} value={member.id}>
-                    @{member.handle}
-                  </option>
-                ))}
-            </select>
-          ) : isDm ? (
-            // 私聊房间的用户是旁观者，写「To Alice」会让人以为自己在跟 Alice 说话
-            <span className="recipient-static">
-              {conversation.members.map((member) => member.name).join(' ↔ ')}
-            </span>
-          ) : (
-            <span className="recipient-static">
-              {conversation.members[0] ? `To ${conversation.members[0].name}` : 'No member'}
-            </span>
-          )}
+          <Space>
+            {isGroup && (
+              <Button size="small" onClick={onToggleMembers}>
+                Members
+              </Button>
+            )}
+            {isGroup ? (
+              <Select
+                size="small"
+                style={{ minWidth: 140 }}
+                value={recipientMemberId}
+                onChange={onRecipientChange}
+                aria-label="选择这条消息的收件人"
+                options={[
+                  { value: EVERYONE, label: EVERYONE_LABEL },
+                  ...conversation.members
+                    .filter((member) => member.status === 'active')
+                    .map((member) => ({ value: member.id, label: `@${member.handle}` })),
+                ]}
+              />
+            ) : (
+              <Text type="secondary">
+                {isDm
+                  ? conversation.members.map((member) => member.name).join(' ↔ ')
+                  : conversation.members[0]
+                    ? `To ${conversation.members[0].name}`
+                    : 'No member'}
+              </Text>
+            )}
+          </Space>
         </div>
-      </header>
+      </div>
 
       {showMembers && isGroup && (
         <GroupMemberManager

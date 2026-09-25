@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { Alert, Empty, Layout, Space, Tag } from 'antd';
 import {
   api,
   type Conversation,
@@ -21,6 +22,8 @@ import { MessageComposer } from './team/MessageComposer';
 import { MemberProfile } from './team/MemberProfile';
 import { TeamSidebar } from './team/TeamSidebar';
 import { EVERYONE, type MemberStatus, type MemberStatusLookup } from './team/constants';
+
+const { Content, Sider } = Layout;
 
 /** 还在推进中的 execution 状态；到了其它状态就说明这条 execution 已经收尾。 */
 const ACTIVE_STATUSES: ExecutionStatus[] = ['queued', 'running', 'waiting_for_member'];
@@ -557,35 +560,41 @@ export function TeamChat() {
   }
 
   return (
-    <div className="team-layout">
-      <TeamSidebar
-        members={members}
-        conversations={conversations}
-        selectedConversationId={conversationId}
-        onSelectConversation={setConversationId}
-        showNewMember={showNewMember}
-        onToggleNewMember={() => {
-          setShowGroupCreator(false);
-          setShowNewMember((value) => !value);
-        }}
-        onCreateMember={createMember}
-        onCancelNewMember={() => setShowNewMember(false)}
-        onChatMember={(member) => void createDirect(member)}
-        onEditMember={(member) => setEditingMemberId(member.id)}
-        showGroupCreator={showGroupCreator}
-        onToggleGroupCreator={() => {
-          setShowNewMember(false);
-          setShowGroupCreator(true);
-        }}
-        onCancelGroupCreator={() => setShowGroupCreator(false)}
-        onCreateGroup={createGroup}
-      />
+    <Layout style={{ height: '100%' }}>
+      <Sider width={320} theme="light" className="team-sider">
+        <TeamSidebar
+          members={members}
+          conversations={conversations}
+          selectedConversationId={conversationId}
+          onSelectConversation={setConversationId}
+          showNewMember={showNewMember}
+          onToggleNewMember={() => {
+            setShowGroupCreator(false);
+            setShowNewMember((value) => !value);
+          }}
+          onCreateMember={createMember}
+          onCancelNewMember={() => setShowNewMember(false)}
+          onChatMember={(member) => void createDirect(member)}
+          onEditMember={(member) => setEditingMemberId(member.id)}
+          showGroupCreator={showGroupCreator}
+          onToggleGroupCreator={() => {
+            setShowNewMember(false);
+            setShowGroupCreator(true);
+          }}
+          onCancelGroupCreator={() => setShowGroupCreator(false)}
+          onCreateGroup={createGroup}
+        />
+      </Sider>
 
-      <section className="team-main">
-        {!selectedConversation && <div className="empty-state">先选择一个 Team Member。</div>}
+      <Layout>
+        {!selectedConversation && (
+          <Content style={{ display: 'grid', placeItems: 'center', color: '#999' }}>
+            <Empty description="先选择一个 Team Member" />
+          </Content>
+        )}
 
         {selectedConversation && (
-          <>
+          <Content style={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>
             <ConversationHeader
               conversation={selectedConversation}
               allMembers={members}
@@ -605,14 +614,16 @@ export function TeamChat() {
             />
 
             {activeExecutions.length > 0 && (
-              <div className="runtime-strip">
+              <Space wrap style={{ padding: '8px 18px 0' }}>
                 {activeExecutions.map((execution) => (
-                  <span key={execution.id} className={`runtime-chip ${execution.status}`}>
-                    <span className="runtime-dot" />
+                  <Tag
+                    key={execution.id}
+                    color={execution.status === 'waiting_for_member' ? 'warning' : 'processing'}
+                  >
                     {memberLabel(execution.memberId)} · {STATUS_LABEL[execution.status]}
-                  </span>
+                  </Tag>
                 ))}
-              </div>
+              </Space>
             )}
 
             <ConversationMessages
@@ -624,7 +635,16 @@ export function TeamChat() {
               scrollRef={scrollRef}
             />
 
-            {error && <div className="error">{error}</div>}
+            {error && (
+              <Alert
+                type="error"
+                showIcon
+                closable
+                onClose={() => setError(null)}
+                message={error}
+                style={{ margin: '0 18px' }}
+              />
+            )}
 
             <MessageComposer
               conversation={selectedConversation}
@@ -634,9 +654,9 @@ export function TeamChat() {
               busy={busy}
               disabled={!conversationId}
             />
-          </>
+          </Content>
         )}
-      </section>
+      </Layout>
 
       {editingMember && (
         <MemberProfile
@@ -645,6 +665,6 @@ export function TeamChat() {
           onClose={() => setEditingMemberId(null)}
         />
       )}
-    </div>
+    </Layout>
   );
 }

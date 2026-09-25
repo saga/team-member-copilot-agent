@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { Button, Card, Input, Space } from 'antd';
 
 interface NewMemberFormProps {
   onCreate: (input: { name: string; role: string }) => Promise<void>;
@@ -29,26 +30,19 @@ export function NewMemberForm({ onCreate, onCancel }: NewMemberFormProps) {
   }
 
   return (
-    <div className="new-member">
-      <input
-        value={name}
-        onChange={(e) => setName(e.target.value)}
-        placeholder="Member name"
-        autoFocus
-      />
-      <input
-        value={role}
-        onChange={(e) => setRole(e.target.value)}
-        placeholder="Role"
-      />
-      <div className="panel-actions">
-        <button type="button" onClick={() => void submit()} disabled={!canCreate}>
-          {busy ? 'Creating…' : 'Create'}
-        </button>
-        <button type="button" className="ghost" onClick={onCancel} disabled={busy}>
-          Cancel
-        </button>
-      </div>
-    </div>
+    <Card size="small" style={{ marginBottom: 8 }}>
+      <Space direction="vertical" style={{ width: '100%' }}>
+        <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Member name" autoFocus />
+        <Input value={role} onChange={(e) => setRole(e.target.value)} placeholder="Role" />
+        <Space>
+          <Button type="primary" size="small" onClick={() => void submit()} disabled={!canCreate} loading={busy}>
+            Create
+          </Button>
+          <Button size="small" onClick={onCancel} disabled={busy}>
+            Cancel
+          </Button>
+        </Space>
+      </Space>
+    </Card>
   );
 }

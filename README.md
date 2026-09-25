@@ -878,19 +878,23 @@ config/
     financial-senior-engineer/
     financial-security-reviewer/
 
-src/                          # Vite + React 前端
-  App.tsx
-  index.css
+src/                          # Vite + React + Ant Design 前端
+  App.tsx                     # ConfigProvider + Layout（Header/Content）
+  index.css                   # 仅保留布局级覆盖，组件样式走 antd token
   components/
-    HealthBadge.tsx
-    TeamChat.tsx              # 编排：conversation / SSE / 状态合并
+    HealthBadge.tsx           # antd Badge（success/warning/error）
+    TeamChat.tsx              # 编排：conversation / SSE / 状态合并（Layout Sider/Content + Alert/Tag）
     team/                     # TeamChat 的拆分：list / messages / composer / 各编辑面板
-      ConversationList.tsx
-      ConversationMessages.tsx
-      MessageComposer.tsx
-      MemberEditor.tsx        # 含 Archive
+      TeamSidebar.tsx         # Collapse 五分区：Members/Projects/Work/Schedules/Conversations
+      TeamSections.tsx        # Projects/Work/Schedules（Card + List + Tag）
+      ConversationList.tsx    # antd List（Tag 区分 private/group/work/direct）
+      ConversationMessages.tsx  # @ant-design/x Bubble.List + Timeline（delegation）
+      MessageComposer.tsx     # @ant-design/x Sender
+      ConversationHeader.tsx  # Avatar.Group + Tag + Select
+      GroupMemberManager.tsx  # antd Table（有未完成工作时禁止 Remove）
+      MemberEditor.tsx        # antd Form + Collapse（Capabilities 只读）+ Popconfirm Archive
       MemberMemory.tsx        # 乐观并发（409 → Save anyway）
-      GroupMemberManager.tsx  # 有未完成工作时禁止 Remove
+      MemberProfile.tsx       # antd Modal + Tabs
       ...
   lib/api.ts                  # 后端 API 客户端（含 SSE 解析）
 

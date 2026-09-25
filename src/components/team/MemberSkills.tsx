@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
+import { Alert, Button, List, Space, Spin, Upload } from 'antd';
+import { DeleteOutlined, UploadOutlined } from '@ant-design/icons';
 import { api, type Member, type MemberSkill } from '../../lib/api';
 
 interface MemberSkillsProps {
@@ -59,6 +61,7 @@ export function MemberSkills({ member }: MemberSkillsProps) {
       // 同一个文件连选两次也要能触发 onChange
       if (fileRef.current) fileRef.current.value = '';
     }
+    return false;
   }
 
   async function remove(name: string) {
@@ -75,51 +78,57 @@ export function MemberSkills({ member }: MemberSkillsProps) {
   }
 
   return (
-    <div className="member-skills">
-      <p className="sidebar-hint">
-        这些 skill 会挂进 {member.name} 的每一个 Copilot session。zip 里需要有
-        SKILL.md。
-      </p>
+    <Space direction="vertical" style={{ width: '100%' }}>
+      <span style={{ color: '#666', fontSize: 13 }}>
+        这些 skill 会挂进 {member.name} 的每一个 Copilot session。zip 里需要有 SKILL.md。
+      </span>
 
-      {loading && <p className="sidebar-hint">Loading skills…</p>}
-
-      {!loading && skills.length === 0 && <p className="sidebar-hint">No skills installed.</p>}
-
-      {skills.map((skill) => (
-        <div key={skill.name} className="skill-row">
-          <div className="skill-ident">
-            <strong>{skill.name}</strong>
-            <span>{skill.description || '（SKILL.md 里没有描述）'}</span>
-            <span className="skill-meta">
-              {skill.fileCount} 个文件 · {new Date(skill.updatedAt).toLocaleDateString()}
-            </span>
-          </div>
-          <button
-            type="button"
-            className="danger"
-            onClick={() => void remove(skill.name)}
-            disabled={busy}
-          >
-            Remove
-          </button>
-        </div>
-      ))}
-
-      {error && <div className="error">{error}</div>}
-
-      <div className="panel-actions">
-        <input
-          ref={fileRef}
-          type="file"
-          accept=".zip,application/zip"
-          onChange={(e) => {
-            const file = e.target.files?.[0];
-            if (file) void upload(file);
-          }}
-          disabled={busy}
+      {loading ? (
+        <Spin size="small" tip="Loading skills…" />
+      ) : (
+        <List
+          size="small"
+          dataSource={skills}
+          locale={{ emptyText: 'No skills installed.' }}
+          renderItem={(skill) => (
+            <List.Item
+              actions={[
+                <Button
+                  key="remove"
+                  danger
+                  size="small"
+                  icon={<DeleteOutlined />}
+                  onClick={() => void remove(skill.name)}
+                  disabled={busy}
+                >
+                  Remove
+                </Button>,
+              ]}
+            >
+              <List.Item.Meta
+                title={skill.name}
+                description={`${skill.description || '（SKILL.md 里没有描述）'} · ${skill.fileCount} 个文件 · ${new Date(skill.updatedAt).toLocaleDateString()}`}
+              />
+            </List.Item>
+          )}
         />
-        {busy && <span className="sidebar-hint">处理中…</span>}
-      </div>
-    </div>
+      )}
+
+      {error && <Alert type="error" showIcon message={error} />}
+
+      <Upload
+        accept=".zip,application/zip"
+        showUploadList={false}
+        disabled={busy}
+        beforeUpload={(file) => {
+          void upload(file);
+          return false;
+        }}
+      >
+        <Button icon={<UploadOutlined />} loading={busy}>
+          上传 skill zip
+        </Button>
+      </Upload>
+    </Space>
   );
 }

@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { Alert, Button, Card, Select, Space, Table, Tag } from 'antd';
 import {
   api,
   type Conversation,
@@ -82,84 +83,82 @@ export function GroupMemberManager({
   }
 
   return (
-    <div className="member-manager">
-      <div className="panel-head">
-        <div className="panel-title">Team Members</div>
-        <button type="button" className="ghost" onClick={onClose}>
-          Close
-        </button>
-      </div>
+    <Card size="small" title="Team Members" extra={<Button size="small" type="text" onClick={onClose}>Close</Button>} style={{ margin: '12px 18px 0' }}>
+      <Table
+        size="small"
+        pagination={false}
+        dataSource={conversation.members}
+        rowKey="id"
+        columns={[
+          { title: '成员', key: 'name', render: (_, member) => <><strong>{member.name}</strong> <span style={{ color: '#999' }}>@{member.handle}</span></> },
+          { title: '角色', dataIndex: 'role', key: 'role' },
+          {
+            title: '状态',
+            key: 'status',
+            render: (_, member) => {
+              const state = states[member.id];
+              const hasWork = Boolean(state?.pendingWake) || (state && state.wakeStatus !== 'idle');
+              return (
+                <Space>
+                  {member.status !== 'active' && <Tag color="error">archived</Tag>}
+                  {hasWork && <Tag color="warning">有未完成的工作</Tag>}
+                  {state?.muted && <Tag>muted</Tag>}
+                </Space>
+              );
+            },
+          },
+          {
+            title: '操作',
+            key: 'actions',
+            render: (_, member) => {
+              const state = states[member.id];
+              const hasWork = Boolean(state?.pendingWake) || (state && state.wakeStatus !== 'idle');
+              const busy = busyMemberId === member.id;
+              return (
+                <Space>
+                  <Button size="small" onClick={() => toggleMute(member.id)} loading={busy}>
+                    {state?.muted ? 'Unmute' : 'Mute'}
+                  </Button>
+                  <Button
+                    size="small"
+                    danger
+                    onClick={() => remove(member.id)}
+                    loading={busy}
+                    disabled={removeDisabled || hasWork}
+                    title={
+                      removeDisabled
+                        ? 'Team 至少需要两个成员'
+                        : hasWork
+                          ? `${member.name} 还有未完成的工作，等它跑完或先取消对应的 execution`
+                          : `移出 ${member.name}`
+                    }
+                  >
+                    Remove
+                  </Button>
+                </Space>
+              );
+            },
+          },
+        ]}
+      />
 
-      <div className="member-table">
-        {conversation.members.map((member) => {
-          const state = states[member.id];
-          const muted = state?.muted ?? false;
-          const archived = member.status !== 'active';
-          const busy = busyMemberId === member.id;
-
-          // 「有活没干完」：排队的唤醒，或者还在 queued / running / cooldown。
-          // 这条判断只是把服务端真会拒绝的操作提前变灰 —— 真正的闸门在
-          // assertMemberNotBusy，前端猜不出确切原因，所以点不动时把话说明白。
-          const hasWork = Boolean(state?.pendingWake) || (state && state.wakeStatus !== 'idle');
-
-          return (
-            <div key={member.id} className="member-table-row">
-              <div className="member-table-ident">
-                <strong>{member.name}</strong>
-                <span>@{member.handle}</span>
-              </div>
-              <div className="member-table-role">{member.role}</div>
-              <div className="member-table-actions">
-                {archived && <span className="tag">archived</span>}
-                {hasWork && <span className="tag">有未完成的工作</span>}
-                <button type="button" onClick={() => toggleMute(member.id)} disabled={busy}>
-                  {muted ? 'Unmute' : 'Mute'}
-                </button>
-                <button
-                  type="button"
-                  className="danger"
-                  onClick={() => remove(member.id)}
-                  disabled={busy || removeDisabled || hasWork}
-                  title={
-                    removeDisabled
-                      ? 'Team 至少需要两个成员'
-                      : hasWork
-                        ? `${member.name} 还有未完成的工作，等它跑完或先取消对应的 execution`
-                        : `移出 ${member.name}`
-                  }
-                >
-                  Remove
-                </button>
-              </div>
-            </div>
-          );
-        })}
-      </div>
-
-      <div className="add-member">
-        <select
+      <div style={{ marginTop: 12 }}>
+        <Select
           value=""
-          onChange={(e) => {
-            if (e.target.value) add(e.target.value);
+          onChange={(value) => {
+            if (value) add(value);
           }}
           disabled={addable.length === 0}
-          aria-label="加入成员"
-        >
-          <option value="">
-            {addable.length === 0 ? '没有可加入的成员' : 'Add member…'}
-          </option>
-          {addable.map((member) => (
-            <option key={member.id} value={member.id}>
-              {member.name} · {member.role}
-            </option>
-          ))}
-        </select>
+          placeholder={addable.length === 0 ? '没有可加入的成员' : 'Add member…'}
+          style={{ minWidth: 240 }}
+          options={addable.map((member) => ({ value: member.id, label: `${member.name} · ${member.role}` }))}
+        />
       </div>
 
       {removeDisabled && (
-        <p className="sidebar-hint">Team 至少保留两个成员；要变单聊请直接和该成员开一个会话。</p>
+        <Alert type="info" showIcon message="Team 至少保留两个成员；要变单聊请直接和该成员开一个会话。" style={{ marginTop: 8 }} />
       )}
-      {error && <div className="error">{error}</div>}
-    </div>
+      {error && <Alert type="error" showIcon message={error} style={{ marginTop: 8 }} />}
+    </Card>
   );
 }

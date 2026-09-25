@@ -1,10 +1,13 @@
 import { useEffect, useState } from 'react';
+import { Button, Card, Input, List, Space, Tag } from 'antd';
+import { PlusOutlined } from '@ant-design/icons';
 import { api, type Project, type ScheduledWake, type WorkItem } from '../../lib/api';
 
 /** Projects：只有列表 + 新建，不做完整 Project 页。 */
 export function ProjectSection({ onChanged }: { onChanged?: () => void }) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [name, setName] = useState('');
+  const [busy, setBusy] = useState(false);
 
   async function refresh() {
     try {
@@ -20,30 +23,40 @@ export function ProjectSection({ onChanged }: { onChanged?: () => void }) {
 
   async function create() {
     if (!name.trim()) return;
-    await api.createProject({ name: name.trim() });
-    setName('');
-    await refresh();
-    onChanged?.();
+    setBusy(true);
+    try {
+      await api.createProject({ name: name.trim() });
+      setName('');
+      await refresh();
+      onChanged?.();
+    } finally {
+      setBusy(false);
+    }
   }
 
   return (
-    <div className="sidebar-section">
-      <div className="sidebar-title">Projects</div>
-      {projects.map((project) => (
-        <div key={project.id} className="member-row">
-          <div className="member-row-ident">
-            <strong>{project.name}</strong>
-            <span>{project.status}</span>
-          </div>
-        </div>
-      ))}
-      <div className="panel-actions">
-        <input value={name} onChange={(e) => setName(e.target.value)} placeholder="New project" />
-        <button type="button" onClick={() => void create()} disabled={!name.trim()}>
+    <Card size="small" bordered={false} style={{ marginBottom: 8 }}>
+      <List
+        size="small"
+        dataSource={projects}
+        locale={{ emptyText: '还没有 Project。' }}
+        renderItem={(project) => (
+          <List.Item>
+            <List.Item.Meta
+              title={project.name}
+              description={project.status !== 'active' ? project.status : project.description || undefined}
+            />
+            {project.status !== 'active' && <Tag color="default">{project.status}</Tag>}
+          </List.Item>
+        )}
+      />
+      <Space.Compact block>
+        <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="New project" size="small" />
+        <Button type="primary" size="small" icon={<PlusOutlined />} onClick={() => void create()} disabled={!name.trim()} loading={busy}>
           Add
-        </button>
-      </div>
-    </div>
+        </Button>
+      </Space.Compact>
+    </Card>
   );
 }
 
@@ -51,6 +64,7 @@ export function ProjectSection({ onChanged }: { onChanged?: () => void }) {
 export function WorkSection({ members }: { members: { id: string; name: string }[] }) {
   const [items, setItems] = useState<WorkItem[]>([]);
   const [title, setTitle] = useState('');
+  const [busy, setBusy] = useState(false);
 
   async function refresh() {
     try {
@@ -68,53 +82,67 @@ export function WorkSection({ members }: { members: { id: string; name: string }
 
   async function create() {
     if (!title.trim()) return;
-    await api.createWorkItem({ title: title.trim() });
-    setTitle('');
-    await refresh();
+    setBusy(true);
+    try {
+      await api.createWorkItem({ title: title.trim() });
+      setTitle('');
+      await refresh();
+    } finally {
+      setBusy(false);
+    }
   }
 
-  const groups: { key: string; label: string; items: WorkItem[] }[] = [
-    { key: 'todo', label: 'Todo', items: items.filter((i) => i.status === 'todo') },
-    { key: 'in_progress', label: 'In Progress', items: items.filter((i) => i.status === 'in_progress') },
-    { key: 'blocked', label: 'Blocked', items: items.filter((i) => i.status === 'blocked') },
-    { key: 'done', label: 'Done', items: items.filter((i) => i.status === 'done') },
+  const groups: { key: string; label: string; color: string; items: WorkItem[] }[] = [
+    { key: 'todo', label: 'Todo', color: 'default', items: items.filter((i) => i.status === 'todo') },
+    { key: 'in_progress', label: 'In Progress', color: 'processing', items: items.filter((i) => i.status === 'in_progress') },
+    { key: 'blocked', label: 'Blocked', color: 'warning', items: items.filter((i) => i.status === 'blocked') },
+    { key: 'done', label: 'Done', color: 'success', items: items.filter((i) => i.status === 'done') },
   ];
 
   return (
-    <div className="sidebar-section">
-      <div className="sidebar-title">Work</div>
+    <Card size="small" bordered={false} style={{ marginBottom: 8 }}>
       {groups.map((group) => (
-        <div key={group.key}>
-          <div className="sidebar-hint">
-            {group.label} ({group.items.length})
-          </div>
-          {group.items.slice(0, 8).map((item) => (
-            <div key={item.id} className="member-row">
-              <div className="member-row-ident">
-                <strong>{item.title}</strong>
-                <span>
-                  {assigneeName(item, members)}
-                  {item.claimedByMemberId ? ` · claimed` : ''}
-                </span>
-              </div>
-              <div className="member-row-actions">
-                {item.status !== 'done' && (
-                  <button type="button" className="ghost" onClick={() => void api.updateWorkItem(item.id, { status: 'done' }).then(refresh)}>
-                    Done
-                  </button>
-                )}
-              </div>
-            </div>
-          ))}
+        <div key={group.key} style={{ marginBottom: 8 }}>
+          <Tag color={group.color}>
+            {group.label} {group.items.length}
+          </Tag>
+          <List
+            size="small"
+            dataSource={group.items.slice(0, 8)}
+            locale={{ emptyText: undefined }}
+            renderItem={(item) => (
+              <List.Item
+                actions={
+                  item.status !== 'done'
+                    ? [
+                        <Button
+                          key="done"
+                          type="link"
+                          size="small"
+                          onClick={() => void api.updateWorkItem(item.id, { status: 'done' }).then(refresh)}
+                        >
+                          Done
+                        </Button>,
+                      ]
+                    : []
+                }
+              >
+                <List.Item.Meta
+                  title={item.title}
+                  description={`${assigneeName(item, members)}${item.claimedByMemberId ? ' · claimed' : ''}`}
+                />
+              </List.Item>
+            )}
+          />
         </div>
       ))}
-      <div className="panel-actions">
-        <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="New work item" />
-        <button type="button" onClick={() => void create()} disabled={!title.trim()}>
+      <Space.Compact block>
+        <Input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="New work item" size="small" />
+        <Button type="primary" size="small" icon={<PlusOutlined />} onClick={() => void create()} disabled={!title.trim()} loading={busy}>
           Add
-        </button>
-      </div>
-    </div>
+        </Button>
+      </Space.Compact>
+    </Card>
   );
 }
 
@@ -138,18 +166,20 @@ export function ScheduleSection() {
   if (active.length === 0) return null;
 
   return (
-    <div className="sidebar-section">
-      <div className="sidebar-title">Schedules ({active.length})</div>
-      {active.slice(0, 5).map((schedule) => (
-        <div key={schedule.id} className="member-row">
-          <div className="member-row-ident">
-            <strong>{schedule.prompt.slice(0, 40)}</strong>
-            <span>
-              {schedule.type} · {schedule.nextRunAt.slice(0, 16).replace('T', ' ')}
-            </span>
-          </div>
-        </div>
-      ))}
-    </div>
+    <Card size="small" bordered={false} title={`Schedules (${active.length})`} style={{ marginBottom: 8 }}>
+      <List
+        size="small"
+        dataSource={active.slice(0, 5)}
+        renderItem={(schedule) => (
+          <List.Item>
+            <List.Item.Meta
+              title={schedule.prompt.slice(0, 40)}
+              description={`${schedule.type} · ${schedule.nextRunAt.slice(0, 16).replace('T', ' ')}`}
+            />
+            <Tag>{schedule.type}</Tag>
+          </List.Item>
+        )}
+      />
+    </Card>
   );
 }

@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { Alert, Button, Card, Checkbox, Input, Select, Space } from 'antd';
 import { api, type Member, type Project } from '../../lib/api';
 
 interface GroupCreatorProps {
@@ -20,7 +21,7 @@ interface GroupCreatorProps {
  */
 export function GroupCreator({ members, onCreate, onCancel }: GroupCreatorProps) {
   const [title, setTitle] = useState('');
-  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [selected, setSelected] = useState<string[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectId, setProjectId] = useState('');
   const [busy, setBusy] = useState(false);
@@ -33,26 +34,14 @@ export function GroupCreator({ members, onCreate, onCancel }: GroupCreatorProps)
       .catch(() => {});
   }, []);
 
-  const canCreate = title.trim().length > 0 && selected.size >= 2 && !busy;
-
-  function toggle(memberId: string) {
-    setSelected((current) => {
-      const next = new Set(current);
-      if (next.has(memberId)) {
-        next.delete(memberId);
-      } else {
-        next.add(memberId);
-      }
-      return next;
-    });
-  }
+  const canCreate = title.trim().length > 0 && selected.length >= 2 && !busy;
 
   async function submit() {
     if (!canCreate) return;
     setBusy(true);
     setError(null);
     try {
-      await onCreate({ title: title.trim(), memberIds: [...selected], projectId: projectId || null });
+      await onCreate({ title: title.trim(), memberIds: selected, projectId: projectId || null });
     } catch (e) {
       // 失败时保持面板打开：调用方（TeamChat）成功后会自己把它收起来
       setError(e instanceof Error ? e.message : String(e));
@@ -62,65 +51,42 @@ export function GroupCreator({ members, onCreate, onCancel }: GroupCreatorProps)
   }
 
   return (
-    <div className="group-creator">
-      <div className="panel-title">New Team</div>
-
-      <label className="field">
-        <span>Team name</span>
-        <input
-          value={title}
-          onChange={(e) => setTitle(e.target.value)}
-          placeholder="Investment Review"
-          autoFocus
+    <Card size="small" title="New Team" style={{ marginTop: 8 }}>
+      <Space direction="vertical" style={{ width: '100%' }}>
+        <Input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Investment Review" autoFocus />
+        <Select
+          value={projectId}
+          onChange={setProjectId}
+          placeholder="Project (optional)"
+          allowClear
+          style={{ width: '100%' }}
+          options={[{ value: '', label: 'No project' }, ...projects.map((p) => ({ value: p.id, label: p.name }))]}
         />
-      </label>
-
-      <label className="field">
-        <span>Project (optional)</span>
-        <select value={projectId} onChange={(e) => setProjectId(e.target.value)}>
-          <option value="">No project</option>
-          {projects.map((project) => (
-            <option key={project.id} value={project.id}>
-              {project.name}
-            </option>
-          ))}
-        </select>
-      </label>
-
-      <div className="field">
-        <span>Members</span>
-        <div className="checkbox-list">
-          {members.map((member) => (
-            <label key={member.id} className="checkbox-row">
-              <input
-                type="checkbox"
-                checked={selected.has(member.id)}
-                onChange={() => toggle(member.id)}
-              />
-              <span className="checkbox-label">{member.name}</span>
-              <span className="checkbox-hint">{member.role}</span>
-            </label>
-          ))}
-          {members.length < 2 && (
-            <p className="sidebar-hint">至少需要 2 个 Member 才能建 Team。</p>
-          )}
-        </div>
-      </div>
-
-      <div className="panel-actions">
-        <button type="button" onClick={() => void submit()} disabled={!canCreate}>
-          {busy ? 'Creating…' : 'Create Team'}
-        </button>
-        <button type="button" className="ghost" onClick={onCancel} disabled={busy}>
-          Cancel
-        </button>
-      </div>
-
-      {error && <div className="error">{error}</div>}
-
-      {selected.size === 1 && (
-        <p className="sidebar-hint">Team 至少两个成员 —— 一个成员就是单聊。</p>
-      )}
-    </div>
+        <Checkbox.Group
+          value={selected}
+          onChange={(values) => setSelected(values as string[])}
+          style={{ width: '100%' }}
+        >
+          <Space direction="vertical" style={{ width: '100%' }}>
+            {members.map((member) => (
+              <Checkbox key={member.id} value={member.id}>
+                {member.name} <span style={{ color: '#999' }}>{member.role}</span>
+              </Checkbox>
+            ))}
+          </Space>
+        </Checkbox.Group>
+        {members.length < 2 && <Alert type="warning" showIcon message="至少需要 2 个 Member 才能建 Team。" />}
+        {selected.length === 1 && <Alert type="info" showIcon message="Team 至少两个成员 —— 一个成员就是单聊。" />}
+        {error && <Alert type="error" showIcon message={error} />}
+        <Space>
+          <Button type="primary" size="small" onClick={() => void submit()} disabled={!canCreate} loading={busy}>
+            Create Team
+          </Button>
+          <Button size="small" onClick={onCancel} disabled={busy}>
+            Cancel
+          </Button>
+        </Space>
+      </Space>
+    </Card>
   );
 }

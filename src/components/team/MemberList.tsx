@@ -1,4 +1,6 @@
 import { useEffect, useState } from 'react';
+import { Avatar, Badge, Button, List, Tag } from 'antd';
+import { MessageOutlined, SettingOutlined, UserAddOutlined } from '@ant-design/icons';
 import { api, type Member, type TeamPresence } from '../../lib/api';
 import { NewMemberForm } from './NewMemberForm';
 
@@ -11,6 +13,14 @@ interface MemberListProps {
   onChat: (member: Member) => void;
   onEdit: (member: Member) => void;
 }
+
+const AVAILABILITY_DOT: Record<string, 'success' | 'warning' | 'default' | 'error'> = {
+  available: 'success',
+  away: 'warning',
+  paused: 'default',
+  busy: 'processing' as unknown as 'success',
+  offline: 'error',
+};
 
 /**
  * 侧栏的 Team Members。
@@ -46,38 +56,75 @@ export function MemberList({
   }, [members.length]);
 
   return (
-    <div className="sidebar-section">
-      <div className="sidebar-title">
-        Team Members
-        <button type="button" onClick={onToggleNewMember} aria-label="新建 Member">
-          {showNewMember ? '×' : '+'}
-        </button>
+    <div>
+      <div style={{ marginBottom: 8 }}>
+        <Button
+          type="dashed"
+          block
+          size="small"
+          icon={<UserAddOutlined />}
+          onClick={onToggleNewMember}
+        >
+          {showNewMember ? '取消' : '新建 Member'}
+        </Button>
       </div>
 
-      {showNewMember && (
-        <NewMemberForm onCreate={onCreateMember} onCancel={onCancelNewMember} />
-      )}
+      {showNewMember && <NewMemberForm onCreate={onCreateMember} onCancel={onCancelNewMember} />}
 
-      {members.length === 0 && <p className="sidebar-hint">还没有 Member，点 + 创建一个。</p>}
-
-      {members.map((member) => (
-        <div key={member.id} className="member-row">
-          <div className="member-row-ident">
-            <strong>
-              {member.name} · {presence[member.id]?.availability ?? 'available'}
-            </strong>
-            <span>{member.role}</span>
-          </div>
-          <div className="member-row-actions">
-            <button type="button" onClick={() => onChat(member)}>
-              Chat
-            </button>
-            <button type="button" className="ghost" onClick={() => onEdit(member)}>
-              Edit
-            </button>
-          </div>
-        </div>
-      ))}
+      <List
+        size="small"
+        dataSource={members}
+        locale={{ emptyText: '还没有 Member，点上面创建一个。' }}
+        renderItem={(member) => {
+          const availability = presence[member.id]?.availability ?? 'available';
+          return (
+            <List.Item
+              actions={[
+                <Button
+                  key="chat"
+                  type="link"
+                  size="small"
+                  icon={<MessageOutlined />}
+                  onClick={() => onChat(member)}
+                >
+                  Chat
+                </Button>,
+                <Button
+                  key="edit"
+                  type="link"
+                  size="small"
+                  icon={<SettingOutlined />}
+                  onClick={() => onEdit(member)}
+                >
+                  Edit
+                </Button>,
+              ]}
+            >
+              <List.Item.Meta
+                avatar={
+                  <Badge
+                    dot
+                    status={AVAILABILITY_DOT[availability] ?? 'success'}
+                    title={availability}
+                  >
+                    <Avatar>{member.name.slice(0, 1).toUpperCase()}</Avatar>
+                  </Badge>
+                }
+                title={
+                  <>
+                    {member.name}{' '}
+                    <Tag color={availability === 'paused' ? 'default' : 'success'}>
+                      {availability}
+                    </Tag>
+                    {member.status !== 'active' && <Tag color="error">archived</Tag>}
+                  </>
+                }
+                description={`@${member.handle} · ${member.role}`}
+              />
+            </List.Item>
+          );
+        }}
+      />
     </div>
   );
 }
