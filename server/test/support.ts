@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import type { DatabaseSync } from 'node:sqlite';
+import type { CopilotService, RunMemberTurnInput } from '../copilot.js';
 import type { WakePlan } from '../group-dispatcher.js';
 import type { TeamService } from '../team-service.js';
+import { NO_REPLY_SENTINEL } from '../member-decision.js';
 
 /**
  * 测试共享助手。放在 support.ts 而不是 *.test.ts，避免被 `npm test` 的
@@ -76,5 +78,58 @@ export function singleExecutionId(
 export function muteAllMembers(team: TeamService, conversationId: string): void {
   for (const member of team.getConversation(conversationId).members) {
     team.setMemberMuted(conversationId, member.id, true);
+  }
+}
+
+/** 一次 turn 的观察记录。断言身份 / 记忆隔离时看的是 `systemPrompt`。 */
+export interface StubTurn {
+  executionId: string;
+  memberId: string;
+  systemPrompt: string;
+  prompt: string;
+}
+
+/**
+ * 只回一句话的 Copilot stub。
+ *
+ * 它存在的理由不只是「别调真的引擎」：`systemPrompt` 是**真正下发**给引擎的那份文本，
+ * 断言「两个 Member 拿到不同的人格」时必须看它 —— 只查数据库里存了两个不同字段，
+ * 证明不了隔离有没有真的生效。
+ *
+ * `skip` 模式模拟「这个 Member 判断自己没什么可补的」。
+ */
+export class StubCopilot {
+  mode: 'reply' | 'skip' = 'reply';
+  readonly turns: StubTurn[] = [];
+
+  async runMemberTurn(input: RunMemberTurnInput): Promise<string> {
+    this.turns.push({
+      executionId: input.executionId,
+      memberId: input.member.id,
+      systemPrompt: input.systemPrompt,
+      prompt: input.prompt,
+    });
+    return this.mode === 'skip' ? NO_REPLY_SENTINEL : `reply from ${input.member.name}`;
+  }
+
+  reset(): void {
+    this.turns.length = 0;
+    this.mode = 'reply';
+  }
+
+  turnFor(executionId: string): StubTurn {
+    const turn = this.turns.find((item) => item.executionId === executionId);
+    assert.ok(turn, `没有捕获到 execution ${executionId} 的 turn`);
+    return turn;
+  }
+
+  /**
+   * 以 CopilotService 的身份传给 TeamService。
+   *
+   * TeamService 只会调 `this.copilot.runMemberTurn(...)`（方法调用，`this` 是 stub
+   * 自己），所以传 stub 本体是安全的，不需要 bind。
+   */
+  get asCopilot(): CopilotService {
+    return this as unknown as CopilotService;
   }
 }

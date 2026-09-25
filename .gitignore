@@ -13,6 +13,9 @@
 # Local runtime data (sqlite db / member homes / workspaces / copilot session state)
 /.data/
 
+# Agent workspace memory (daily logs / project notes) — per-machine, not shared
+/.workbuddy/
+
 # Logs
 npm-debug.log*
 yarn-debug.log*

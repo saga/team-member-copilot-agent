@@ -405,8 +405,13 @@ export function TeamChat() {
   }
 
   async function createDirect(member: Member) {
+    // 必须限定「房间里只有这一个 Member」：Member 之间的私聊同样是 kind='direct'，
+    // 只看 kind 的话，点 Alice 的 [Chat] 会一头撞进 Alice 和 Bob 的私聊。
     const existing = conversations.find(
-      (item) => item.kind === 'direct' && item.members.some((m) => m.id === member.id),
+      (item) =>
+        item.kind === 'direct' &&
+        item.members.length === 1 &&
+        item.members[0].id === member.id,
     );
     if (existing) {
       setConversationId(existing.id);

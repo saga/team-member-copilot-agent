@@ -9,6 +9,8 @@ import { ConversationMemberService } from './conversation-member-service.js';
 import { GroupDispatcher, type DispatchPlan, type WakePlan } from './group-dispatcher.js';
 import { MemberTurnScheduler, type PendingWake } from './member-turn-scheduler.js';
 import { NO_REPLY_SENTINEL, parseMemberTurnOutcome } from './member-decision.js';
+import { badRequest, conflict, notFound } from './http-error.js';
+import { MemberConversationService, isMemberDm, type MemberDirectMessage } from './member-conversation-service.js';
 import {
   MemberService,
   type CreateMemberInput,
@@ -210,29 +212,21 @@ export class ExecutionCancelledError extends Error {
 }
 
 /** 业务校验失败统一带 400，由 middleware/errorHandler 的 sendError 翻译成 HTTP。 */
-function badRequest(message: string): Error {
-  return Object.assign(new Error(message), { status: 400 });
-}
-
-/** 资源不存在统一带 404。 */
-function notFound(message: string): Error {
-  return Object.assign(new Error(message), { status: 404 });
-}
-
-/** 请求合法但与当前状态冲突（比如 cancel 一条已经结束的 execution）。 */
-function conflict(message: string): Error {
-  return Object.assign(new Error(message), { status: 409 });
-}
 
 /**
  * Conversation 的 kind 决定 roster 形状。这条约束必须在 Service 层 enforce：
  * HTTP API 是公开的，不能靠 UI 替业务规则兜底。
+ *
+ * `direct` 允许 1~2 个 Member，因为一个 direct 房间有两种含义，靠 roster 大小区分：
+ *   1 个 Member  —— 用户 ↔ 该 Member
+ *   2 个 Member  —— Member ↔ Member 的私聊（没有用户参与）
+ * 后者由 MemberConversationService 建，消息一律带 targetMemberId 指定对端。
  */
 function assertConversationKindShape(kind: ConversationKind, memberCount: number): void {
   switch (kind) {
     case 'direct':
-      if (memberCount !== 1) {
-        throw badRequest('direct conversation 必须只有一个 Member');
+      if (memberCount < 1 || memberCount > 2) {
+        throw badRequest('direct conversation 需要一个 Member（用户单聊）或两个 Member（Member 私聊）');
       }
       return;
     case 'group':
@@ -276,6 +270,8 @@ export class TeamService {
   private readonly dispatcher: GroupDispatcher;
   /** 「消息到了」和「Agent 开始跑」之间的那一层：串行 + 合并。 */
   private readonly scheduler: MemberTurnScheduler;
+  /** Member ↔ Member 私聊的房间拓扑（find-or-create / 列表 / 发送）。 */
+  private readonly memberConversations: MemberConversationService;
 
   constructor(
     private readonly db: DatabaseSync,
@@ -285,6 +281,7 @@ export class TeamService {
     this.contextAssembler = new ContextAssembler(db);
     this.states = new ConversationMemberService(db);
     this.dispatcher = new GroupDispatcher(db, this.states, config.groupAutoWakeRounds);
+    this.memberConversations = new MemberConversationService(db, this);
     this.scheduler = new MemberTurnScheduler(
       this.states,
       (wake) => this.runWake(wake),
@@ -538,6 +535,13 @@ export class TeamService {
     const content = input.content.trim();
     if (!content) throw badRequest('消息内容不能为空');
 
+    // Member 之间的私聊是他们的私人对话，用户只能旁观。
+    // 放行的话这条 user 消息会掉进 dispatcher 的「非 group」分支去取 active[0]，
+    // 具体唤醒谁取决于 roster 顺序 —— 一个由数据排列决定的随机行为。
+    if (isMemberDm(conversation)) {
+      throw badRequest('这是 Member 之间的私聊，可以直接看，但不能以用户身份发言');
+    }
+
     // 显式指定收件人时先校验：一条没人收的消息不该落库
     if (input.targetMemberId) this.requireActiveMember(conversation, input.targetMemberId);
 
@@ -574,6 +578,106 @@ export class TeamService {
       wakes: plan.wakes,
       unresolvedMentions: plan.unresolvedMentions,
     };
+  }
+
+  /**
+   * 以某个 Member 的身份发一条消息 —— Member ↔ Member 私聊的写入路径。
+   *
+   * 和 sendMessage 只有两点不同，其余完全共用：
+   *
+   *   senderType            member 而不是 user
+   *   targetMemberId        必填。DM 房间是「两个 Member 的 direct 房间」，
+   *                         dispatcher 的「非 group」分支会取 `active[0]`，
+   *                         不点名就可能取到发送者自己，退化成一轮空唤醒。
+   *
+   * 刻意不复用 delegateMember：那条路是**阻塞**的（父 execution 进
+   * waiting_for_member，一直等到子 execution 跑完并返回结果），适合 ask_member
+   * 的「我必须拿到答案才能继续」。DM 是一条消息，发出去就该返回。
+   */
+  async sendMemberMessage(input: {
+    conversationId: string;
+    fromMemberId: string;
+    targetMemberId: string;
+    content: string;
+  }): Promise<SendMessageResult> {
+    const conversation = this.getConversation(input.conversationId);
+    const content = input.content.trim();
+    if (!content) throw badRequest('消息内容不能为空');
+
+    const from = this.requireActiveMember(conversation, input.fromMemberId);
+    const target = this.requireActiveMember(conversation, input.targetMemberId);
+    if (from.id === target.id) throw badRequest('不能给自己发消息');
+
+    const message: ConversationMessage = {
+      id: randomUUID(),
+      conversationId: conversation.id,
+      messageSequence: this.nextMessageSequence(conversation.id),
+      senderType: 'member',
+      senderId: from.id,
+      targetMemberId: target.id,
+      replyToMessageId: null,
+      content,
+      executionId: null,
+      createdAt: now(),
+    };
+
+    this.insertMessage(message);
+    this.touchConversation(conversation.id);
+    this.emit(conversation.id, { type: 'message.created', data: message });
+
+    const plan = this.dispatcher.plan({ conversation, message, authorMemberId: from.id });
+    for (const wake of plan.wakes) {
+      this.scheduler.enqueue({
+        conversationId: conversation.id,
+        memberId: wake.memberId,
+        reason: wake.reason,
+        triggerSequence: wake.triggerSequence,
+      });
+    }
+
+    return { message, wakes: plan.wakes, unresolvedMentions: plan.unresolvedMentions };
+  }
+
+  // ------------------------------------------------ Member ↔ Member 私聊
+
+  /**
+   * 下面四个是 MemberConversationService 的门面。
+   *
+   * 房间拓扑（find-or-create / 唯一性 / 列表）在那边，消息写入在 sendMemberMessage，
+   * 这里只做转发 —— 让 route、CopilotHost、测试都只依赖 TeamService 一个入口，
+   * 不必各自知道该 new 哪个 service。
+   */
+
+  listDirectMessages(memberId: string): MemberDirectMessage[] {
+    return this.memberConversations.list(memberId);
+  }
+
+  /** 找到或创建两个 Member 之间的私聊房间。 */
+  openDirectMessage(a: string, b: string): Conversation {
+    return this.memberConversations.open(a, b);
+  }
+
+  /** 以某个 Member 的身份给另一个 Member 发消息（UI / REST 侧）。 */
+  sendDirectMessage(input: {
+    fromMemberId: string;
+    toMemberId: string;
+    content: string;
+  }): Promise<SendMessageResult & { conversation: Conversation; peer: Member }> {
+    return this.memberConversations.send(input);
+  }
+
+  /** CopilotHost 的实现：Member 在自己 turn 里调 message_member tool 时走这里。 */
+  async messageMember(input: {
+    fromMemberId: string;
+    targetMemberId: string;
+    content: string;
+  }): Promise<{ conversationId: string; messageId: string }> {
+    const result = await this.memberConversations.send({
+      fromMemberId: input.fromMemberId,
+      toMemberId: input.targetMemberId,
+      content: input.content,
+    });
+    return { conversationId: result.conversation.id, messageId: result.message.id };
   }
 
   /**
@@ -1432,11 +1536,16 @@ export class TeamService {
 
       // Team discussion 的闭环：这条新消息可能该唤醒别人。
       // 必须带 authorMemberId，否则这个 Member 会被自己的消息再唤醒一次。
-      this.dispatchMessage({
-        conversation: input.conversation,
-        message,
-        authorMemberId: input.member.id,
-      });
+      //
+      // DM 房间例外：那里没有人在旁边盯着，让回复自动唤醒对方会让两个 Member
+      // 无限对谈下去。DM 的唤醒只由「显式发一条消息」触发，见 isMemberDm。
+      if (!isMemberDm(input.conversation)) {
+        this.dispatchMessage({
+          conversation: input.conversation,
+          message,
+          authorMemberId: input.member.id,
+        });
+      }
 
       return outcome.content;
     } catch (error) {

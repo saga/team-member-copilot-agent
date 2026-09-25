@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import type { CopilotService, RunMemberTurnInput } from '../copilot.js';
 import type { Member } from '../domain.js';
 
 /**
@@ -31,52 +30,12 @@ process.env.COPILOT_WARMUP = 'false';
 const { db } = await import('../db.js');
 const { MemberService } = await import('../member-service.js');
 const { TeamService } = await import('../team-service.js');
-const { NO_REPLY_SENTINEL } = await import('../member-decision.js');
-const { executionIdForWake, muteAllMembers } = await import('./support.js');
+const { executionIdForWake, muteAllMembers, StubCopilot } = await import('./support.js');
 
 const ALICE_PROMPT = 'ALICE_PERSONA_SENTINEL';
 const BOB_PROMPT = 'BOB_PERSONA_SENTINEL';
 const ALICE_MEMORY = 'ALICE_MEMORY_SENTINEL';
 const BOB_MEMORY = 'BOB_MEMORY_SENTINEL';
-
-interface TurnRecord {
-  executionId: string;
-  memberId: string;
-  systemPrompt: string;
-  prompt: string;
-}
-
-/**
- * 只回一句话的 stub。
- *
- * `skip` 模式用来模拟「这个 Member 判断自己没什么可补的」——
- * 这正是 group discussion 里最容易被实现成 bug 的一条路径。
- */
-class StubCopilot {
-  mode: 'reply' | 'skip' = 'reply';
-  readonly turns: TurnRecord[] = [];
-
-  async runMemberTurn(input: RunMemberTurnInput): Promise<string> {
-    this.turns.push({
-      executionId: input.executionId,
-      memberId: input.member.id,
-      systemPrompt: input.systemPrompt,
-      prompt: input.prompt,
-    });
-    return this.mode === 'skip' ? NO_REPLY_SENTINEL : `reply from ${input.member.name}`;
-  }
-
-  reset(): void {
-    this.turns.length = 0;
-    this.mode = 'reply';
-  }
-
-  turnFor(executionId: string): TurnRecord {
-    const turn = this.turns.find((item) => item.executionId === executionId);
-    assert.ok(turn, `没有捕获到 execution ${executionId} 的 turn`);
-    return turn;
-  }
-}
 
 interface ExecutionRow {
   id: string;
@@ -92,7 +51,7 @@ interface ExecutionRow {
 
 const stub = new StubCopilot();
 const memberService = new MemberService(db);
-const team = new TeamService(db, memberService, stub as unknown as CopilotService);
+const team = new TeamService(db, memberService, stub.asCopilot);
 
 function executionRow(id: string): ExecutionRow {
   const row = db.prepare(`SELECT * FROM execution WHERE id = ?`).get(id) as unknown as

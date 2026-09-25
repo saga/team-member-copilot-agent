@@ -271,9 +271,20 @@ describe('Conversation / Runtime 边界', () => {
   });
 
   it('kind 的形状约束在 Service 层强制（API 是公开的）', () => {
+    // direct 允许 1~2 个 Member：1 个 = 用户 ↔ Member，2 个 = Member ↔ Member 私聊。
+    // 3 个就不是 direct 了。
     assert.throws(
-      () => team.createConversation({ kind: 'direct', memberIds: [coder.id, reviewer.id] }),
-      /direct conversation 必须只有一个 Member/,
+      () =>
+        team.createConversation({
+          kind: 'direct',
+          memberIds: [coder.id, reviewer.id, analyst.id],
+        }),
+      /direct conversation 需要一个 Member/,
+    );
+    assert.equal(
+      team.createConversation({ kind: 'direct', memberIds: [coder.id, reviewer.id] }).members.length,
+      2,
+      '两个 Member 的 direct = Member 私聊，必须允许',
     );
     assert.throws(
       () => team.createConversation({ kind: 'group', memberIds: [coder.id] }),

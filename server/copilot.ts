@@ -50,6 +50,18 @@ export interface CopilotHost {
     reason?: string;
   }): Promise<string>;
   rememberMember(input: { memberId: string; content: string }): Promise<string>;
+  /**
+   * 给另一个 Member 发一条私聊消息。
+   *
+   * 返回的是「消息已送达」，不是对方的回答 —— 这正是它和 delegateMember 的分界：
+   * delegateMember 会阻塞到对方交付结果（父 execution 进 waiting_for_member），
+   * 这里只是投递。要对方回了才推进当前工作，就该用 ask_member。
+   */
+  messageMember(input: {
+    fromMemberId: string;
+    targetMemberId: string;
+    content: string;
+  }): Promise<{ conversationId: string; messageId: string }>;
 }
 
 export interface RunMemberTurnInput {
@@ -222,7 +234,11 @@ export class CopilotService {
           content: input.systemPrompt,
         },
         skillDirectories: [pathForSkills(input.member.id)],
-        tools: [this.createAskMemberTool(), this.createRememberMemberTool()],
+        tools: [
+          this.createAskMemberTool(),
+          this.createRememberMemberTool(),
+          this.createMessageMemberTool(),
+        ],
         availableTools,
         // SDK 默认 false。不打开的话 assistant.message_delta 根本不会发，
         // 前端的实时增量就永远是空的。
@@ -425,6 +441,35 @@ export class CopilotService {
           task: args.task,
           reason: args.reason,
         });
+      },
+    });
+  }
+
+  private createMessageMemberTool() {
+    return defineTool('message_member', {
+      description:
+        'Send a private message to another Team Member. The two of you then share a persistent ' +
+        '1:1 conversation. Use this to hand over context, ask for an opinion, or follow up — ' +
+        'without blocking your own turn. It returns as soon as the message is delivered: ' +
+        'it does NOT wait for a reply and does NOT give you the answer. ' +
+        'Use ask_member instead when you need their result before you can continue working.',
+      parameters: z.object({
+        memberId: z.string().describe('Target Team Member ID'),
+        content: z.string().min(1).max(8000).describe('The message to send'),
+      }),
+      skipPermission: true,
+      handler: async (
+        args: { memberId: string; content: string },
+        invocation: ToolInvocation,
+      ) => {
+        const context = this.executionContexts.get(invocation.sessionId);
+        if (!context) throw new Error('找不到当前 Member execution context');
+        const result = await this.host.messageMember({
+          fromMemberId: context.memberId,
+          targetMemberId: args.memberId,
+          content: args.content,
+        });
+        return `Delivered to ${args.memberId} in conversation ${result.conversationId}. They will see it in their own inbox.`;
       },
     });
   }

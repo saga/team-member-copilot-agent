@@ -1,6 +1,6 @@
 import type { Conversation, ConversationMemberState, Member } from '../../lib/api';
 import { GroupMemberManager } from './GroupMemberManager';
-import { EVERYONE, EVERYONE_LABEL, type MemberStatusLookup } from './constants';
+import { EVERYONE, EVERYONE_LABEL, isMemberDm, type MemberStatusLookup } from './constants';
 
 interface ConversationHeaderProps {
   conversation: Conversation;
@@ -40,6 +40,7 @@ export function ConversationHeader({
   onStateChanged,
 }: ConversationHeaderProps) {
   const isGroup = conversation.kind === 'group';
+  const isDm = isMemberDm(conversation);
 
   return (
     <>
@@ -103,6 +104,11 @@ export function ConversationHeader({
                   </option>
                 ))}
             </select>
+          ) : isDm ? (
+            // 私聊房间的用户是旁观者，写「To Alice」会让人以为自己在跟 Alice 说话
+            <span className="recipient-static">
+              {conversation.members.map((member) => member.name).join(' ↔ ')}
+            </span>
           ) : (
             <span className="recipient-static">
               {conversation.members[0] ? `To ${conversation.members[0].name}` : 'No member'}

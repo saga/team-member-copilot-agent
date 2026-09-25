@@ -1,5 +1,6 @@
 import type { Conversation, Member } from '../../lib/api';
 import { GroupCreator } from './GroupCreator';
+import { isMemberDm } from './constants';
 
 interface ConversationListProps {
   conversations: Conversation[];
@@ -10,6 +11,23 @@ interface ConversationListProps {
   onToggleCreator: () => void;
   onCancelCreator: () => void;
   onCreateGroup: (input: { title: string; memberIds: string[] }) => Promise<void>;
+}
+
+/**
+ * 副标题。
+ *
+ * Member 之间的私聊和用户单聊共用 `kind = 'direct'`，只显示 kind 会让两者
+ * 在列表里长得一模一样 —— 一个是「我跟 Alice 说话」，一个是「Alice 和 Bob
+ * 在说话」，用户一眼要能分清。
+ */
+function describeConversation(conversation: Conversation): string {
+  if (isMemberDm(conversation)) {
+    return `private · ${conversation.members.length} members`;
+  }
+  if (conversation.kind === 'group') {
+    return `group · ${conversation.members.length} members`;
+  }
+  return conversation.kind;
 }
 
 export function ConversationList({
@@ -36,10 +54,7 @@ export function ConversationList({
           onClick={() => onSelect(conversation.id)}
         >
           <strong>{conversation.title}</strong>
-          <span>
-            {conversation.kind}
-            {conversation.kind !== 'direct' ? ` · ${conversation.members.length} members` : ''}
-          </span>
+          <span>{describeConversation(conversation)}</span>
         </button>
       ))}
 

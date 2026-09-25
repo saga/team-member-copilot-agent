@@ -49,6 +49,22 @@ export interface ConversationMessage {
   createdAt: string;
 }
 
+/**
+ * 两个 Member 之间的私聊。
+ *
+ * 房间在库里就是「roster 恰好两个人的 direct conversation」—— 和「用户 ↔ 单个
+ * Member」共用同一个 kind，靠成员数区分。所以判断某个 direct 房间是不是私聊，
+ * 必须看 `members.length === 2`，不能只看 kind。
+ */
+export interface MemberDirectMessage {
+  conversation: Conversation;
+  /** 对话的另一方。 */
+  peer: Member;
+  lastMessage: ConversationMessage | null;
+  /** 从这个 Member 的视角看，还没读到的消息数。 */
+  unread: number;
+}
+
 export type ExecutionStatus =
   | 'queued'
   | 'running'
@@ -283,6 +299,35 @@ export const api = {
         body: JSON.stringify({ muted }),
       },
     ).then(json<{ state: ConversationMemberState }>);
+  },
+
+  /**
+   * 这个 Member 参与的全部私聊。
+   *
+   * 和「用户 ↔ Member 单聊」是两个东西：那个是 `kind === 'direct'` 且
+   * `members.length === 1`，这个是 `members.length === 2`。
+   */
+  listDirectMessages(memberId: string): Promise<{ conversations: MemberDirectMessage[] }> {
+    return fetch(
+      `${API_BASE}/api/members/${encodeURIComponent(memberId)}/direct-messages`,
+    ).then(json<{ conversations: MemberDirectMessage[] }>);
+  },
+
+  /**
+   * 以这个 Member 的身份给另一个 Member 发一条私聊消息。
+   *
+   * 202：消息已落库、对方已入队，对方的回复通过那个房间的 SSE 推。
+   * 房间不存在时会自动建立 —— 调用方不需要「先开房间再发消息」两段式。
+   */
+  sendDirectMessage(
+    memberId: string,
+    input: { toMemberId: string; content: string },
+  ): Promise<SendMessageResult & { conversation: Conversation; peer: Member }> {
+    return fetch(`${API_BASE}/api/members/${encodeURIComponent(memberId)}/direct-messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    }).then(json<SendMessageResult & { conversation: Conversation; peer: Member }>);
   },
 
   listConversations(): Promise<{ conversations: Conversation[] }> {

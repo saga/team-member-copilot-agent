@@ -40,6 +40,11 @@ const memorySchema = z.object({
   content: z.string().max(200_000),
 });
 
+const directMessageSchema = z.object({
+  toMemberId: z.string().min(1),
+  content: z.string().trim().min(1).max(20000),
+});
+
 export function membersRouter(team: TeamService) {
   const router = Router();
 
@@ -104,6 +109,48 @@ export function membersRouter(team: TeamService) {
     }
     try {
       res.json({ content: team.replaceMemberMemory(req.params.id, parsed.data.content) });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  // ------------------------------------------------- Member ↔ Member 私聊
+
+  /**
+   * 这个 Member 参与的全部私聊，按最后活动时间倒序。
+   *
+   * 私聊房间在库里就是「两个 Member 的 direct conversation」—— 复用 direct
+   * 而不是新增 kind，是为了不动 `conversation.kind` 的 CHECK 约束
+   * （SQLite 改不了它，只能重建表，而这张表被 6 张表 FK 引用）。
+   */
+  router.get('/:id/direct-messages', (req, res) => {
+    try {
+      res.json({ conversations: team.listDirectMessages(req.params.id) });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  /**
+   * 以这个 Member 的身份给另一个 Member 发消息。
+   *
+   * 202：消息已落库、对方已入队，对方的回复通过那个房间的 SSE 推。
+   * 房间不存在时自动建立，调用方不需要「先开房间再发消息」两段式。
+   */
+  router.post('/:id/direct-messages', async (req, res) => {
+    const parsed = directMessageSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues.map((i) => i.message).join('; ') });
+      return;
+    }
+    try {
+      res.status(202).json(
+        await team.sendDirectMessage({
+          fromMemberId: req.params.id,
+          toMemberId: parsed.data.toMemberId,
+          content: parsed.data.content,
+        }),
+      );
     } catch (error) {
       sendError(res, error);
     }

@@ -24,6 +24,7 @@ let teamService!: TeamService;
 const copilotService = new CopilotService({
   delegateMember: (input) => teamService.delegateMember(input),
   rememberMember: (input) => teamService.rememberMember(input),
+  messageMember: (input) => teamService.messageMember(input),
 });
 
 const memberService = new MemberService(db);
