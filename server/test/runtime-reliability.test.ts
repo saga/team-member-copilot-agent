@@ -27,6 +27,7 @@ process.env.COPILOT_WARMUP = 'false';
 const { config } = await import('../config.js');
 const { db } = await import('../db.js');
 const { MemberService } = await import('../member-service.js');
+const { KnowledgeService } = await import('../knowledge-service.js');
 const { TeamService } = await import('../team-service.js');
 const { ContextAssembler } = await import('../context-assembler.js');
 const { RecoveryService } = await import('../recovery-service.js');
@@ -224,6 +225,10 @@ describe('schema 就位（PRAGMA user_version）', () => {
         'conversation_event',
         'member_runtime',
         'execution',
+        'knowledge_base',
+        'member_team_knowledge_base',
+        'knowledge_document',
+        'knowledge_document_fts',
       ];
       assert.deepEqual(
         Object.fromEntries(tables.map((table) => [table, tableColumns(handle, table)])),
@@ -317,12 +322,33 @@ describe('schema 就位（PRAGMA user_version）', () => {
             'trigger_message_sequence',
             'wake_reason',
             'config_snapshot',
-            'started_at',
-            'ended_at',
-            'created_at',
-          ],
-        },
-      );
+          'started_at',
+          'ended_at',
+          'created_at',
+        ],
+        knowledge_base: [
+          'id',
+          'scope',
+          'key',
+          'name',
+          'description',
+          'member_id',
+          'created_at',
+          'updated_at',
+        ],
+        member_team_knowledge_base: ['member_id', 'knowledge_base_id', 'created_at'],
+        knowledge_document: [
+          'id',
+          'knowledge_base_id',
+          'title',
+          'relative_path',
+          'content_hash',
+          'source_uri',
+          'updated_at',
+        ],
+        knowledge_document_fts: ['document_id', 'title', 'content'],
+      },
+    );
 
       const indexes = (
         handle
@@ -338,7 +364,9 @@ describe('schema 就位（PRAGMA user_version）', () => {
         'idx_execution_conversation_created',
         'idx_execution_parent',
         'idx_execution_status',
+        'idx_knowledge_document_kb',
         'idx_member_seed_key',
+        'idx_member_team_knowledge_base_member',
         'idx_message_client_request',
         'idx_message_conversation_created',
         'idx_message_conversation_sequence',
@@ -456,7 +484,8 @@ describe('schema 就位（PRAGMA user_version）', () => {
 
 const stub = new StubCopilot();
 const memberService = new MemberService(db);
-const team = new TeamService(db, memberService, stub as unknown as CopilotService);
+const knowledgeService = new KnowledgeService(db);
+const team = new TeamService(db, memberService, stub as unknown as CopilotService, knowledgeService);
 
 const alice = team.createMember({ name: 'Alice', role: 'Analyst' });
 const bob = team.createMember({ name: 'Bob', role: 'Reviewer' });

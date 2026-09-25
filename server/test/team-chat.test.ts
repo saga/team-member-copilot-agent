@@ -29,6 +29,7 @@ process.env.COPILOT_WARMUP = 'false';
 
 const { db } = await import('../db.js');
 const { MemberService } = await import('../member-service.js');
+const { KnowledgeService } = await import('../knowledge-service.js');
 const { TeamService } = await import('../team-service.js');
 const { executionIdForWake, muteAllMembers, StubCopilot } = await import('./support.js');
 
@@ -51,7 +52,8 @@ interface ExecutionRow {
 
 const stub = new StubCopilot();
 const memberService = new MemberService(db);
-const team = new TeamService(db, memberService, stub.asCopilot);
+const knowledgeService = new KnowledgeService(db);
+const team = new TeamService(db, memberService, stub.asCopilot, knowledgeService);
 
 function executionRow(id: string): ExecutionRow {
   const row = db.prepare(`SELECT * FROM execution WHERE id = ?`).get(id) as unknown as

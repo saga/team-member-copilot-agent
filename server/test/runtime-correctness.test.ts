@@ -24,6 +24,7 @@ process.env.COPILOT_WARMUP = 'false';
 
 const { db } = await import('../db.js');
 const { MemberService } = await import('../member-service.js');
+const { KnowledgeService } = await import('../knowledge-service.js');
 const { TeamService } = await import('../team-service.js');
 const { CopilotService, isSessionNotFound, isTurnTimeout } = await import('../copilot.js');
 const { DefaultToolPolicy } = await import('../tool-policy.js');
@@ -212,7 +213,7 @@ describe('resumeSession 的降级必须窄', () => {
   it('resume 成功 → 不建新 session', async () => {
     const fakeSession = createFakeSession({});
     const fake = createFakeClient({ resume: async () => fakeSession.session });
-    const copilot = new CopilotService({} as never, { createClient: () => fake.client });
+    const copilot = new CopilotService({} as never, { knowledge: knowledgeService, createClient: () => fake.client });
 
     const result = await copilot.runMemberTurn(turnInput());
 
@@ -232,7 +233,7 @@ describe('resumeSession 的降级必须窄', () => {
       // session 还在磁盘上 —— 说明这不是「session 不存在」
       metadata: async () => ({ sessionId: 'sess-1' }),
     });
-    const copilot = new CopilotService({} as never, { createClient: () => fake.client });
+    const copilot = new CopilotService({} as never, { knowledge: knowledgeService, createClient: () => fake.client });
 
     await assert.rejects(() => copilot.runMemberTurn(turnInput()), /No GitHub OAuth token/);
 
@@ -249,7 +250,7 @@ describe('resumeSession 的降级必须窄', () => {
       },
       create: async () => fresh.session,
     });
-    const copilot = new CopilotService({} as never, { createClient: () => fake.client });
+    const copilot = new CopilotService({} as never, { knowledge: knowledgeService, createClient: () => fake.client });
 
     const result = await copilot.runMemberTurn(turnInput());
 
@@ -268,7 +269,7 @@ describe('resumeSession 的降级必须窄', () => {
       metadata: async () => undefined, // 权威来源确认：真的没有了
       create: async () => fresh.session,
     });
-    const copilot = new CopilotService({} as never, { createClient: () => fake.client });
+    const copilot = new CopilotService({} as never, { knowledge: knowledgeService, createClient: () => fake.client });
 
     await copilot.runMemberTurn(turnInput());
     assert.equal(fake.calls.create, 1);
@@ -285,7 +286,7 @@ describe('resumeSession 的降级必须窄', () => {
       },
       create: async () => createFakeSession({}).session,
     });
-    const copilot = new CopilotService({} as never, { createClient: () => fake.client });
+    const copilot = new CopilotService({} as never, { knowledge: knowledgeService, createClient: () => fake.client });
 
     await assert.rejects(() => copilot.runMemberTurn(turnInput()), /connection lost mid-handshake/);
     assert.equal(fake.calls.create, 0, '无法确认就必须让原始错误抛出');
@@ -300,7 +301,7 @@ describe('sendAndWait 超时 → abort', () => {
       },
     });
     const fake = createFakeClient({ resume: async () => fakeSession.session });
-    const copilot = new CopilotService({} as never, { createClient: () => fake.client });
+    const copilot = new CopilotService({} as never, { knowledge: knowledgeService, createClient: () => fake.client });
 
     await assert.rejects(() => copilot.runMemberTurn(turnInput()), /Timeout after 600000ms/);
 
@@ -316,7 +317,7 @@ describe('sendAndWait 超时 → abort', () => {
       },
     });
     const fake = createFakeClient({ resume: async () => fakeSession.session });
-    const copilot = new CopilotService({} as never, { createClient: () => fake.client });
+    const copilot = new CopilotService({} as never, { knowledge: knowledgeService, createClient: () => fake.client });
 
     await assert.rejects(() => copilot.runMemberTurn(turnInput()), /No GitHub OAuth token/);
     assert.equal(fakeSession.calls.abort, 0, '普通失败不该 abort');
@@ -325,7 +326,7 @@ describe('sendAndWait 超时 → abort', () => {
   it('正常结束不 abort', async () => {
     const fakeSession = createFakeSession({});
     const fake = createFakeClient({ resume: async () => fakeSession.session });
-    const copilot = new CopilotService({} as never, { createClient: () => fake.client });
+    const copilot = new CopilotService({} as never, { knowledge: knowledgeService, createClient: () => fake.client });
 
     await copilot.runMemberTurn(turnInput());
     assert.equal(fakeSession.calls.abort, 0);
@@ -334,7 +335,7 @@ describe('sendAndWait 超时 → abort', () => {
   it('cancelTurn 找不到 execution 时如实返回 found=false', async () => {
     const fakeSession = createFakeSession({});
     const fake = createFakeClient({ resume: async () => fakeSession.session });
-    const copilot = new CopilotService({} as never, { createClient: () => fake.client });
+    const copilot = new CopilotService({} as never, { knowledge: knowledgeService, createClient: () => fake.client });
 
     assert.deepEqual(await copilot.cancelTurn('nope'), {
       found: false,
@@ -354,7 +355,7 @@ describe('sendAndWait 超时 → abort', () => {
       },
     });
     const holdingClient = createFakeClient({ resume: async () => holding.session });
-    const copilot2 = new CopilotService({} as never, { createClient: () => holdingClient.client });
+    const copilot2 = new CopilotService({} as never, { knowledge: knowledgeService, createClient: () => holdingClient.client });
 
     const turn = copilot2.runMemberTurn(turnInput());
     await new Promise((resolve) => setTimeout(resolve, 20));
@@ -433,6 +434,7 @@ async function runTurnCapturing(
   const copilot = new CopilotService(
     {} as never,
     {
+      knowledge: knowledgeService,
       createClient: () => fake.client,
       ...(options.toolPolicy ? { toolPolicy: options.toolPolicy } : {}),
     },
@@ -668,7 +670,8 @@ async function waitForStatus(id: string, status: string): Promise<void> {
 
 const stub = new StubCopilot();
 const memberService = new MemberService(db);
-const team = new TeamService(db, memberService, stub as never);
+const knowledgeService = new KnowledgeService(db);
+const team = new TeamService(db, memberService, stub as never, knowledgeService);
 
 const alice = team.createMember({ name: 'Alice', role: 'Analyst' });
 const bob = team.createMember({ name: 'Bob', role: 'Reviewer' });

@@ -9,5 +9,6 @@
   "toolProfile": "safe",
   "systemPromptFile": "SYSTEM_PROMPT.md",
   "memoryFile": "MEMORY.md",
+  "teamKnowledgeBaseKeys": ["financial-core", "security-controls"],
   "enabled": true
 }

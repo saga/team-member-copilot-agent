@@ -21,6 +21,18 @@ export const config = {
   dataDir,
   dbPath: path.join(dataDir, 'team-member.db'),
   memberHomeRoot: path.join(dataDir, 'members'),
+  /**
+   * 团队统一 Skill 目录。Copilot session 会同时加载它和 Member 的个人 skills
+   * 目录（SDK 支持多个 skillDirectories）。放「所有 Member 都该会的程序化
+   * 方法论」，每个 Member 的专长留在各自的 <memberHome>/<id>/skills/ 里。
+   */
+  teamSkillRoot: path.join(dataDir, 'team', 'skills'),
+  /**
+   * 团队 KB 的资料根目录：<teamKnowledgeRoot>/<kbKey>/...。
+   * 启动时会扫描子目录，目录即 KB（key = 目录名），文件落盘即可被检索；
+   * API 写入的文档也落在同一棵树上。Member 个人 KB 在 <memberHomeRoot>/<id>/knowledge/。
+   */
+  teamKnowledgeRoot: path.join(dataDir, 'team', 'knowledge'),
   workspaceRoot: path.join(dataDir, 'workspaces'),
   copilotBaseDirectory: path.join(dataDir, 'copilot'),
   localUserId: env('LOCAL_USER_ID', 'local-user'),

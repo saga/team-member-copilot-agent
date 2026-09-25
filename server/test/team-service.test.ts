@@ -26,6 +26,7 @@ process.env.COPILOT_WARMUP = 'false';
 const { config } = await import('../config.js');
 const { db } = await import('../db.js');
 const { MemberService } = await import('../member-service.js');
+const { KnowledgeService } = await import('../knowledge-service.js');
 const { TeamService } = await import('../team-service.js');
 const { singleExecutionId, muteAllMembers } = await import('./support.js');
 
@@ -72,7 +73,8 @@ interface RuntimeRow {
 
 const stub = new StubCopilot();
 const memberService = new MemberService(db);
-const team = new TeamService(db, memberService, stub as unknown as CopilotService);
+const knowledgeService = new KnowledgeService(db);
+const team = new TeamService(db, memberService, stub as unknown as CopilotService, knowledgeService);
 
 const sendRaw = team.sendMessage.bind(team);
 

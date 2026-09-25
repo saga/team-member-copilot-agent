@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Server } from 'node:http';
-import { app, copilotService, memberService, teamService } from './app.js';
+import { app, copilotService, memberService, knowledgeService, teamService } from './app.js';
 import { config } from './config.js';
 import { db, migration } from './db.js';
 import { RecoveryService } from './recovery-service.js';
@@ -21,11 +21,13 @@ let server: Server | null = null;
 /**
  * 启动顺序很重要：
  *   1. schema 就位（db.ts 在 import 时已完成；空库建，形状不符直接让启动失败）
- *   2. Member provisioning —— 默认团队要在 recovery 之前就位，否则恢复出来的
+ *   2. Knowledge 兜底（磁盘资料进索引 / personal KB 补齐）—— 模板要绑 team KB，
+ *      所以这一步必须先于 provisioning
+ *   3. Member provisioning —— 默认团队要在 recovery 之前就位，否则恢复出来的
  *      execution 可能指向一个还没被创建出来的 Member
- *   3. 崩溃恢复 —— 必须在开始接请求之前，否则客户端会看到一个正在被改写的中途状态
- *   4. 重新提交 queued 的 root execution / 重新派发丢失的唤醒（fire-and-forget）
- *   5. listen
+ *   4. 崩溃恢复 —— 必须在开始接请求之前，否则客户端会看到一个正在被改写的中途状态
+ *   5. 重新提交 queued 的 root execution / 重新派发丢失的唤醒（fire-and-forget）
+ *   6. listen
  */
 async function bootstrap(): Promise<void> {
   // eslint-disable-next-line no-console
@@ -35,8 +37,22 @@ async function bootstrap(): Promise<void> {
       : `[server] schema v${migration.to}（已就绪）`,
   );
 
+  // 磁盘同步先于模板 provisioning：模板里声明的 team KB key 要求 KB 行已经存在。
+  // Personal KB 与 Member 一一对应且创建路径不止一条（API / 模板 / 旧库），
+  // 所以在启动时统一兜一遍幂等 ensure，而不是在每个创建入口各记一次。
+  for (const member of memberService.list()) {
+    knowledgeService.ensurePersonalKnowledgeBase(member.id, member.name);
+  }
+
+  // 磁盘即资料入口：team KB 目录缺行则建，文件按 hash 幂等进索引。
+  const synced = knowledgeService.syncFromDisk(memberService.list().map((m) => m.id));
+  // eslint-disable-next-line no-console
+  console.log(
+    `[server] knowledge sync: team+${synced.teamBases} personal+${synced.personalBases} indexed=${synced.indexed}`,
+  );
+
   if (config.seedDefaultMembers) {
-    const seeded = seedMemberTemplates(memberService, config.memberTemplatesDir);
+    const seeded = seedMemberTemplates(memberService, config.memberTemplatesDir, knowledgeService);
     // 启动日志里必须能看出「这次是建了人还是只是确认过」：两种都会让 Member 列表
     // 是满的，但只有 created 非空时才说明模板目录真的被读到了。
     // eslint-disable-next-line no-console

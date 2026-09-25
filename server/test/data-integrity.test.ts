@@ -30,6 +30,7 @@ process.env.COPILOT_WARMUP = 'false';
 const { config } = await import('../config.js');
 const { db } = await import('../db.js');
 const { MemberService } = await import('../member-service.js');
+const { KnowledgeService } = await import('../knowledge-service.js');
 const { TeamService } = await import('../team-service.js');
 const { resolveMentions } = await import('../group-dispatcher.js');
 const { singleExecutionId, muteAllMembers } = await import('./support.js');
@@ -58,7 +59,8 @@ class StubCopilot {
 
 const stub = new StubCopilot();
 const memberService = new MemberService(db);
-const team = new TeamService(db, memberService, stub as unknown as CopilotService);
+const knowledgeService = new KnowledgeService(db);
+const team = new TeamService(db, memberService, stub as unknown as CopilotService, knowledgeService);
 
 function makeMember(name: string, handle: string): Member {
   return memberService.create({ name, handle, role: 'Analyst', style: 'concise' });

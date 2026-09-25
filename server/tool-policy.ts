@@ -35,7 +35,14 @@ import type { ToolProfile } from './domain.js';
  */
 
 /** 应用自己注册的 custom tool。声明与放行共用这一份清单。 */
-export const CUSTOM_TOOLS = ['ask_member', 'message_member', 'remember_member'] as const;
+export const CUSTOM_TOOLS = [
+  'ask_member',
+  'message_member',
+  'remember_member',
+  'search_team_knowledge',
+  'search_personal_knowledge',
+  'open_knowledge_document',
+] as const;
 
 /**
  * 会触达宿主机的 built-in。

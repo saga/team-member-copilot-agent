@@ -9,5 +9,6 @@
   "toolProfile": "coding",
   "systemPromptFile": "SYSTEM_PROMPT.md",
   "memoryFile": "MEMORY.md",
+  "teamKnowledgeBaseKeys": ["financial-core", "architecture-standards"],
   "enabled": true
 }

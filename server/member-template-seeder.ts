@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
 import type { MemberService } from './member-service.js';
+import type { KnowledgeService } from './knowledge-service.js';
 
 /**
  * Member template provisioning。
@@ -45,6 +46,16 @@ const memberTemplateSchema = z.object({
   toolProfile: z.enum(['safe', 'coding']).default('safe'),
   systemPromptFile: z.string().min(1).default('SYSTEM_PROMPT.md'),
   memoryFile: z.string().min(1).default('MEMORY.md'),
+  /**
+   * 创建时绑定的 team KB key。只在 Member 第一次出现时生效一次：绑定的前提是
+   * KB 行已经存在（磁盘扫描或 API 先建），缺的 key 静默跳过 —— 资料没就位不该
+   * 拦住 Member 落地，但也不能反过来「按模板把用户解绑的 KB 重新绑回去」，
+   * 所以这只发生在创建那一刻，之后绑定完全归 API 管。
+   */
+  teamKnowledgeBaseKeys: z
+    .array(z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/))
+    .max(50)
+    .default([]),
   /** 关掉一个模板不会删掉已建出来的 Member，只是不再 provision 它。 */
   enabled: z.boolean().default(true),
 });
@@ -128,7 +139,11 @@ function loadTemplate(root: string, directory: string): {
  * 在启动日志里立刻看到它，而不是「默认团队少了两个人但服务照常起来了」。
  * 目录本身不存在是另一回事 —— 那说明这份部署不需要模板，返回空即可。
  */
-export function seedMemberTemplates(memberService: MemberService, rootDirectory: string): SeedResult {
+export function seedMemberTemplates(
+  memberService: MemberService,
+  rootDirectory: string,
+  knowledge?: KnowledgeService,
+): SeedResult {
   if (!fs.existsSync(rootDirectory)) {
     return { created: [], skipped: [] };
   }
@@ -162,7 +177,7 @@ export function seedMemberTemplates(memberService: MemberService, rootDirectory:
       continue;
     }
 
-    memberService.create(
+    const member = memberService.create(
       {
         name: template.name,
         handle: template.handle,
@@ -175,6 +190,18 @@ export function seedMemberTemplates(memberService: MemberService, rootDirectory:
       },
       { seedKey: template.key, initialMemory: memory },
     );
+
+    if (knowledge) {
+      knowledge.ensurePersonalKnowledgeBase(member.id, member.name);
+
+      const kbIds = template.teamKnowledgeBaseKeys
+        .map((key) => knowledge.findByKey('team', key))
+        .filter((kb): kb is NonNullable<typeof kb> => kb !== null)
+        .map((kb) => kb.id);
+      if (kbIds.length > 0) {
+        knowledge.setTeamKnowledgeBases(member.id, kbIds);
+      }
+    }
 
     created.push(template.key);
   }

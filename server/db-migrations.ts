@@ -20,7 +20,7 @@ import type { DatabaseSync } from 'node:sqlite';
  *
  * 程序不认识任何别的编号 —— 没有升级代码，认出来也无从下手。
  */
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 7;
 
 /**
  * 当前 schema 的完整定义，按最终形状写。
@@ -261,6 +261,78 @@ CREATE INDEX idx_execution_parent
 
 CREATE INDEX idx_execution_status
   ON execution(status);
+
+-- ─────────────────────────────────────────────── Knowledge Base ───────────
+--
+-- 专业度分层里「知道什么」的部分：
+--
+--   Skill   = How（少量程序化方法论，进 session context）
+--   KB      = What（大量事实资料，按需检索，永不全量进 prompt）
+--   Memory  = Member 自己学到的动态事实
+--
+-- 权限模型在表形状里就是封闭的：team KB 通过 member_team_knowledge_base 显式
+-- 绑定到 Member（不是所有人都自动看到全部资料），personal KB 一人一个且
+-- member_id 即属主。两条 CHECK 把 scope 和属主绑死，不存在「team KB 却有
+-- 属主」这种中间态。
+
+CREATE TABLE knowledge_base (
+  id TEXT PRIMARY KEY,
+  scope TEXT NOT NULL
+    CHECK (scope IN ('team', 'personal')),
+  key TEXT NOT NULL,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  member_id TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  CHECK (
+    (scope = 'team' AND member_id IS NULL)
+    OR
+    (scope = 'personal' AND member_id IS NOT NULL)
+  ),
+  UNIQUE (scope, key),
+  FOREIGN KEY (member_id)
+    REFERENCES member(id)
+    ON DELETE CASCADE
+);
+
+CREATE TABLE member_team_knowledge_base (
+  member_id TEXT NOT NULL,
+  knowledge_base_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (member_id, knowledge_base_id),
+  FOREIGN KEY (member_id)
+    REFERENCES member(id)
+    ON DELETE CASCADE,
+  FOREIGN KEY (knowledge_base_id)
+    REFERENCES knowledge_base(id)
+    ON DELETE CASCADE
+);
+
+CREATE TABLE knowledge_document (
+  id TEXT PRIMARY KEY,
+  knowledge_base_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  relative_path TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  source_uri TEXT,
+  updated_at TEXT NOT NULL,
+  UNIQUE (knowledge_base_id, relative_path),
+  FOREIGN KEY (knowledge_base_id)
+    REFERENCES knowledge_base(id)
+    ON DELETE CASCADE
+);
+
+-- 全文检索。document_id UNINDEXED：命中后要 JOIN 回 knowledge_document 拿
+-- 权限过滤用的 kb 归属，所以只在这里存 id。
+CREATE VIRTUAL TABLE knowledge_document_fts
+  USING fts5(document_id UNINDEXED, title, content);
+
+CREATE INDEX idx_knowledge_document_kb
+  ON knowledge_document(knowledge_base_id);
+
+CREATE INDEX idx_member_team_knowledge_base_member
+  ON member_team_knowledge_base(member_id);
 `;
 
 export function getUserVersion(db: DatabaseSync): number {

@@ -20,3 +20,8 @@ export function notFound(message: string): Error {
 export function conflict(message: string): Error {
   return Object.assign(new Error(message), { status: 409 });
 }
+
+/** 身份已知但没有权限（比如访问不属于该 Member 的 Knowledge Base）。 */
+export function forbidden(message: string): Error {
+  return Object.assign(new Error(message), { status: 403 });
+}

@@ -13,6 +13,53 @@ export type MemberStatus = 'active' | 'archived';
 
 export type ToolProfile = 'safe' | 'coding';
 
+// ------------------------------------------------------------- Knowledge Base
+
+export type KnowledgeBaseScope = 'team' | 'personal';
+
+export interface KnowledgeBase {
+  id: string;
+  scope: KnowledgeBaseScope;
+  /** 稳定的目录名 / 引用名。team KB 全局唯一；personal KB 固定为 member-<memberId>。 */
+  key: string;
+  name: string;
+  description: string;
+  /** personal KB 的属主；team KB 为 null。 */
+  memberId: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface KnowledgeDocument {
+  id: string;
+  knowledgeBaseId: string;
+  title: string;
+  /** 相对 KB 根目录的路径，也是 (kb, path) 唯一键。 */
+  relativePath: string;
+  /** 全文 sha256 —— 磁盘同步靠它跳过没变过的文件。 */
+  contentHash: string;
+  sourceUri: string | null;
+  updatedAt: string;
+}
+
+export interface KnowledgeSearchHit {
+  documentId: string;
+  knowledgeBaseId: string;
+  knowledgeBaseName: string;
+  scope: KnowledgeBaseScope;
+  title: string;
+  snippet: string;
+  /** 稳定的引用标记，格式 [KB:<key>/<documentId>]。 */
+  citation: string;
+  sourceUri: string | null;
+}
+
+/** 某 Member 视角下能看到的 KB。检索 ACL 与 prompt 里的清单共用这一个查询。 */
+export interface MemberKnowledgeProfile {
+  teamKnowledgeBases: KnowledgeBase[];
+  personalKnowledgeBases: KnowledgeBase[];
+}
+
 export interface Member {
   id: string;
   handle: string;
