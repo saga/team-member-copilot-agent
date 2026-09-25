@@ -59,6 +59,22 @@ export function conversationsRouter(team: TeamService) {
     }
   });
 
+  /**
+   * conversation 的 execution 列表，按创建时间正序。
+   *
+   * 客户端按 `parentExecutionId` 自己组执行树 —— 不需要服务端出一个 tree 接口，
+   * 那只是在缓存一个随时会变的视图。
+   */
+  router.get('/:id/executions', (req, res) => {
+    const requested = Number(req.query.limit ?? 200);
+    const limit = Number.isFinite(requested) ? Math.min(Math.max(requested, 1), 1000) : 200;
+    try {
+      res.json({ executions: team.listExecutions(req.params.id, limit) });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
   router.post('/:id/messages', async (req, res) => {
     const parsed = sendMessageSchema.safeParse(req.body ?? {});
     if (!parsed.success) {

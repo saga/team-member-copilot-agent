@@ -212,13 +212,55 @@ describe('Conversation / Runtime 边界', () => {
     );
   });
 
-  it('conversation 至少保留一个 Member', () => {
+  it('只有 group 允许增减成员，direct / work 的成员固定', () => {
     const solo = team.createConversation({
       kind: 'direct',
       memberIds: [coder.id],
       defaultMemberId: coder.id,
     });
-    assert.throws(() => team.removeMember(solo.id, coder.id), /至少保留一个/);
+    assert.throws(() => team.removeMember(solo.id, coder.id), /只有 group 允许增减成员/);
+    assert.throws(() => team.addMember(solo.id, reviewer.id), /只有 group 允许增减成员/);
+
+    const work = team.createConversation({
+      kind: 'work',
+      memberIds: [coder.id],
+      defaultMemberId: coder.id,
+    });
+    assert.throws(() => team.addMember(work.id, reviewer.id), /只有 group 允许增减成员/);
+  });
+
+  it('group 移出成员后仍须满足 group 形状约束', () => {
+    const group = team.createConversation({
+      kind: 'group',
+      memberIds: [coder.id, reviewer.id],
+      defaultMemberId: coder.id,
+    });
+
+    // 移出后只剩 1 个成员 → 不再是合法 group
+    assert.throws(() => team.removeMember(group.id, reviewer.id), /至少需要两个 Member/);
+
+    // 加第三个成员后可以移出
+    team.addMember(group.id, analyst.id);
+    const after = team.removeMember(group.id, analyst.id);
+    assert.deepEqual(
+      after.members.map((member) => member.id).sort(),
+      [coder.id, reviewer.id].sort(),
+    );
+  });
+
+  it('kind 的形状约束在 Service 层强制（API 是公开的）', () => {
+    assert.throws(
+      () => team.createConversation({ kind: 'direct', memberIds: [coder.id, reviewer.id] }),
+      /direct conversation 必须只有一个 Member/,
+    );
+    assert.throws(
+      () => team.createConversation({ kind: 'group', memberIds: [coder.id] }),
+      /group conversation 至少需要两个 Member/,
+    );
+    assert.throws(
+      () => team.createConversation({ kind: 'work', memberIds: [coder.id, reviewer.id] }),
+      /work conversation 当前必须只有一个 Member/,
+    );
   });
 
   it('group conversation 未指定 targetMemberId 且无默认成员时报 400', () => {

@@ -154,6 +154,47 @@ export const api = {
     ).then(json<{ messages: ConversationMessage[] }>);
   },
 
+  /**
+   * conversation 的 execution 列表（创建时间正序）。
+   * 客户端按 `parentExecutionId` 自己组执行树。
+   */
+  listExecutions(
+    conversationId: string,
+    limit = 200,
+  ): Promise<{ executions: ExecutionRecord[] }> {
+    return fetch(
+      `${API_BASE}/api/conversations/${encodeURIComponent(conversationId)}/executions?limit=${limit}`,
+    ).then(json<{ executions: ExecutionRecord[] }>);
+  },
+
+  getExecution(executionId: string): Promise<{ execution: ExecutionRecord }> {
+    return fetch(`${API_BASE}/api/executions/${encodeURIComponent(executionId)}`).then(
+      json<{ execution: ExecutionRecord }>,
+    );
+  },
+
+  /**
+   * retry 生成一条新的 execution（`retryOfExecutionId` 指回原记录），
+   * 原记录保持不变。返回 202 + 新 execution。
+   */
+  retryExecution(
+    executionId: string,
+  ): Promise<{ executionId: string; execution: ExecutionRecord }> {
+    return fetch(`${API_BASE}/api/executions/${encodeURIComponent(executionId)}/retry`, {
+      method: 'POST',
+    }).then(json<{ executionId: string; execution: ExecutionRecord }>);
+  },
+
+  /**
+   * cancel 会等引擎真的停下来才返回，返回的是**最终状态**。
+   * 409 = 与当前状态冲突（已结束 / waiting_for_member 暂不支持取消）。
+   */
+  cancelExecution(executionId: string): Promise<{ execution: ExecutionRecord }> {
+    return fetch(`${API_BASE}/api/executions/${encodeURIComponent(executionId)}/cancel`, {
+      method: 'POST',
+    }).then(json<{ execution: ExecutionRecord }>);
+  },
+
   sendMessage(
     conversationId: string,
     input: { content: string; targetMemberId?: string; replyToMessageId?: string },

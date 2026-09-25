@@ -45,6 +45,24 @@ function parseEvent<T>(event: MessageEvent): T | null {
   }
 }
 
+/**
+ * 按 id 去重、按 messageSequence 排序地合并消息。
+ *
+ * 三条来源会同时写 messages：SSE、GET /messages、POST /messages 的乐观插入。
+ * 任何一个用「整体替换」或「无脑 append」都会在慢 API / 网络抖动 / SSE 重连时
+ * 丢消息或乱序，所以统一走这个收敛函数。
+ */
+function mergeMessages(
+  current: ConversationMessage[],
+  incoming: ConversationMessage[],
+): ConversationMessage[] {
+  const byId = new Map(current.map((item) => [item.id, item]));
+  for (const message of incoming) {
+    byId.set(message.id, message);
+  }
+  return [...byId.values()].sort((a, b) => a.messageSequence - b.messageSequence);
+}
+
 export function TeamChat() {
   const [members, setMembers] = useState<Member[]>([]);
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -139,7 +157,11 @@ export function TeamChat() {
     void api
       .listMessages(activeId)
       .then((result) => {
-        setMessages(result.messages);
+        // 必须 merge 而不是 replace：SSE 和这个 GET 是并发的。
+        // 如果 SSE 先推来一条新消息、GET 后返回，直接 setMessages(result.messages)
+        // 会把那条新消息覆盖掉。
+        setMessages((current) => mergeMessages(current, result.messages));
+
         setStreaming((current) => {
           // 历史里已经有 execution 的最终消息，就把对应的流式占位清掉
           const finished = new Set(
@@ -164,9 +186,7 @@ export function TeamChat() {
       const message = parseEvent<ConversationMessage>(event as MessageEvent);
       if (!message) return;
 
-      setMessages((current) =>
-        current.some((item) => item.id === message.id) ? current : [...current, message],
-      );
+      setMessages((current) => mergeMessages(current, [message]));
 
       if (message.executionId) {
         const executionId = message.executionId;
@@ -329,11 +349,7 @@ export function TeamChat() {
         targetMemberId: targetMemberId || undefined,
       });
       // 202：消息已落库。乐观插入，SSE 到达时会按 id 去重。
-      setMessages((current) =>
-        current.some((item) => item.id === result.message.id)
-          ? current
-          : [...current, result.message],
-      );
+      setMessages((current) => mergeMessages(current, [result.message]));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setInput(content);

@@ -15,6 +15,7 @@ import type {
   Conversation,
   ConversationEvent,
   ConversationEventType,
+  ConversationKind,
   ConversationMessage,
   ExecutionKind,
   ExecutionRecord,
@@ -148,6 +149,34 @@ const REPLAY_BATCH = 500;
  */
 const REPLAY_MAX_EVENTS = 5000;
 
+/** 还在推进中的 execution 状态。 */
+const ACTIVE_STATUSES: ReadonlySet<ExecutionStatus> = new Set([
+  'queued',
+  'running',
+  'waiting_for_member',
+]);
+
+/** 已经结束、不会再变的 execution 状态。 */
+const TERMINAL_STATUSES: ReadonlySet<ExecutionStatus> = new Set([
+  'completed',
+  'failed',
+  'cancelled',
+  'interrupted',
+]);
+
+const CANCEL_REASON = '已被用户取消';
+
+/**
+ * 一条 execution 在真正开跑前发现「自己不该跑了」时抛这个。
+ * 和 failed 区分开：取消不是故障，UI / 日志不该按错误处理。
+ */
+export class ExecutionCancelledError extends Error {
+  constructor(message: string = CANCEL_REASON) {
+    super(message);
+    this.name = 'ExecutionCancelledError';
+  }
+}
+
 /** 业务校验失败统一带 400，由 middleware/errorHandler 的 sendError 翻译成 HTTP。 */
 function badRequest(message: string): Error {
   return Object.assign(new Error(message), { status: 400 });
@@ -158,6 +187,35 @@ function notFound(message: string): Error {
   return Object.assign(new Error(message), { status: 404 });
 }
 
+/** 请求合法但与当前状态冲突（比如 cancel 一条已经结束的 execution）。 */
+function conflict(message: string): Error {
+  return Object.assign(new Error(message), { status: 409 });
+}
+
+/**
+ * Conversation 的 kind 决定 roster 形状。这条约束必须在 Service 层 enforce：
+ * HTTP API 是公开的，不能靠 UI 替业务规则兜底。
+ */
+function assertConversationKindShape(kind: ConversationKind, memberCount: number): void {
+  switch (kind) {
+    case 'direct':
+      if (memberCount !== 1) {
+        throw badRequest('direct conversation 必须只有一个 Member');
+      }
+      return;
+    case 'group':
+      if (memberCount < 2) {
+        throw badRequest('group conversation 至少需要两个 Member');
+      }
+      return;
+    case 'work':
+      if (memberCount !== 1) {
+        throw badRequest('work conversation 当前必须只有一个 Member');
+      }
+      return;
+  }
+}
+
 export class TeamService {
   private readonly listeners = new Map<string, Set<Listener>>();
   /**
@@ -165,6 +223,17 @@ export class TeamService {
    * 否则同一个 Copilot session 会被并发 sendAndWait 撕裂。
    */
   private readonly runtimeLocks = new Map<string, Promise<unknown>>();
+  /**
+   * 已请求取消、但 turn 还没收尾的 executionId。
+   *
+   * 为什么需要内存标记而不是只改 DB：一条 running 的 execution 由它自己的
+   * turn 负责写终态，外部抢先写 `cancelled` 会被 turn 的收尾覆盖。所以取消是
+   * 「先发信号 → turn 观察到信号后自己写成 cancelled」。
+   *
+   * 这也意味着取消信号只在**本进程内**有效 —— 和 RecoveryService 一样，
+   * 当前实现假设单进程独占。多副本要升级成 DB 层的 cancel_requested 标记。
+   */
+  private readonly cancelRequests = new Set<string>();
   private readonly contextAssembler: ContextAssembler;
 
   constructor(
@@ -226,7 +295,19 @@ export class TeamService {
 
     const id = randomUUID();
     const createdAt = now();
+    // kind 省略时按成员数推断 —— 推断结果天然满足下面的形状约束
     const kind = input.kind ?? (memberIds.length > 1 ? 'group' : 'direct');
+
+    assertConversationKindShape(kind, memberIds.length);
+
+    // 归档的 Member 是历史事实，不能作为新 conversation 的成员
+    const archived = members.filter((member) => member.status !== 'active');
+    if (archived.length > 0) {
+      throw badRequest(
+        `不能把已归档的 Member 加入 conversation：${archived.map((m) => m.name).join(', ')}`,
+      );
+    }
+
     const defaultMemberId = input.defaultMemberId ?? (memberIds.length === 1 ? memberIds[0] : null);
 
     if (defaultMemberId && !memberIds.includes(defaultMemberId)) {
@@ -274,8 +355,17 @@ export class TeamService {
   }
 
   addMember(conversationId: string, memberId: string): Conversation {
-    this.getConversation(conversationId);
-    this.members.get(memberId);
+    const conversation = this.getConversation(conversationId);
+    if (conversation.kind !== 'group') {
+      throw badRequest(
+        `${conversation.kind} conversation 的成员是固定的，只有 group 允许增减成员`,
+      );
+    }
+
+    const member = this.members.get(memberId);
+    if (member.status !== 'active') {
+      throw badRequest(`不能把已归档的 Member 加入 conversation：${member.name}`);
+    }
 
     this.db
       .prepare(
@@ -296,9 +386,16 @@ export class TeamService {
 
   removeMember(conversationId: string, memberId: string): Conversation {
     const conversation = this.getConversation(conversationId);
-    if (conversation.members.length <= 1) {
-      throw badRequest('Conversation 至少保留一个 Member');
+    if (conversation.kind !== 'group') {
+      throw badRequest(
+        `${conversation.kind} conversation 的成员是固定的，只有 group 允许增减成员`,
+      );
     }
+
+    // 移出后 roster 仍要满足 kind 的形状约束（group 至少两个成员），
+    // 否则会造出一个不合法的 group。
+    const remaining = conversation.members.filter((member) => member.id !== memberId);
+    assertConversationKindShape(conversation.kind, remaining.length);
 
     this.db
       .prepare(
@@ -416,8 +513,10 @@ export class TeamService {
       execution,
       prompt: content,
     }).catch((error: unknown) => {
-      // executeMemberTurn 内部已经把 execution 标记为 failed 并广播，
+      // executeMemberTurn 内部已经把 execution 标记为终态并广播，
       // 这里只是防止 fire-and-forget 变成 unhandled rejection。
+      // 取消是预期路径，不该刷 error 日志。
+      if (error instanceof ExecutionCancelledError) return;
       // eslint-disable-next-line no-console
       console.error(
         '[team] interactive execution failed:',
@@ -448,8 +547,10 @@ export class TeamService {
     reason?: string;
   }): Promise<string> {
     const conversation = this.getConversation(input.conversationId);
+    // fromMember 用宽松版：这一轮已经在跑了，中途被归档不该把正在进行的 turn 打断。
     const fromMember = this.requireConversationMember(conversation, input.fromMemberId);
-    const targetMember = this.requireConversationMember(conversation, input.targetMemberId);
+    // targetMember 用严格版：归档的 Member 不能再接新活。
+    const targetMember = this.requireActiveMember(conversation, input.targetMemberId);
 
     const parent = this.getExecution(input.parentExecutionId);
 
@@ -608,6 +709,96 @@ export class TeamService {
   }
 
   /**
+   * 某 conversation 的 execution 列表，按创建时间正序（最新 limit 条）。
+   *
+   * 刻意不提供 `/executions/:id/tree`：调用方按 `parentExecutionId` 自己组树就够了，
+   * 服务端算一次树只是在缓存一个随时会变的视图。
+   */
+  listExecutions(conversationId: string, limit = 200): ExecutionRecord[] {
+    this.getConversation(conversationId);
+
+    const rows = this.db
+      .prepare(
+        `
+        SELECT *
+        FROM execution
+        WHERE conversation_id = ?
+        ORDER BY created_at DESC, rowid DESC
+        LIMIT ?
+        `,
+      )
+      .all(conversationId, limit) as unknown as ExecutionRow[];
+
+    return rows.reverse().map(mapExecution);
+  }
+
+  /**
+   * 取消一条 execution。
+   *
+   * 顺序很重要：**先让引擎真的停下来，再决定终态**。反过来写
+   * `UPDATE ... status = 'cancelled'` 会造出「DB 说已取消、Agent 还在跑」的假取消，
+   * 比不取消更危险 —— 它让操作者以为副作用已经停了。
+   *
+   * 第一版不支持 waiting_for_member 的 cascade cancel：
+   *
+   *   A → waiting B → waiting C
+   *
+   * 取消一棵正在等待的子树属于 cancellation propagation，要连子树的执行体一起处理，
+   * 不值得在这一版扩大范围。先把 queued / running 做正确。
+   */
+  async cancelExecution(executionId: string): Promise<ExecutionRecord> {
+    const execution = this.getExecution(executionId);
+
+    if (execution.status === 'cancelled') return execution;
+    if (TERMINAL_STATUSES.has(execution.status)) {
+      throw conflict(`execution 已经结束（${execution.status}），不能 cancel`);
+    }
+    if (execution.status === 'waiting_for_member') {
+      throw conflict(
+        'execution 正在等待其他 Member（waiting_for_member），暂不支持 cancel：' +
+          '取消等待中的子树需要处理整棵树的取消传播',
+      );
+    }
+
+    if (execution.status === 'queued') {
+      // 还没进引擎，落库即可。runTurn 开跑前会重新确认状态，不会偷偷跑起来。
+      this.updateExecution(executionId, {
+        status: 'cancelled',
+        error: CANCEL_REASON,
+        endedAt: now(),
+      });
+      this.emitExecution(this.getExecution(executionId));
+      return this.getExecution(executionId);
+    }
+
+    // running：先发信号 + abort，再等这一轮的 turn 自己收尾。
+    const runtimeId = execution.runtimeId;
+    this.cancelRequests.add(executionId);
+    let result: Awaited<ReturnType<CopilotService['cancelTurn']>>;
+    try {
+      result = await this.copilot.cancelTurn(executionId);
+      if (runtimeId) await this.waitForRuntimeIdle(runtimeId);
+    } finally {
+      this.cancelRequests.delete(executionId);
+    }
+
+    // eslint-disable-next-line no-console
+    console.log(
+      `[team] cancel ${executionId}: found=${result.found} aborted=${result.aborted} idle=${result.idle}`,
+    );
+
+    const final = this.getExecution(executionId);
+    if (ACTIVE_STATUSES.has(final.status)) {
+      // 引擎收尾后状态还是活的 —— 说明 cancel 没真正生效。绝不硬写成 cancelled：
+      // 那会留下一条「DB 说取消、实际还在跑」的记录。
+      throw conflict(
+        `cancel 未生效，execution 仍处于 ${final.status}（abort found=${result.found} aborted=${result.aborted}）`,
+      );
+    }
+    return final;
+  }
+
+  /**
    * 显式 retry。绝不自动重跑被中断的 execution：
    * Copilot session 可能已经执行完工具但没来得及落库，自动重跑会重复执行。
    *
@@ -616,16 +807,13 @@ export class TeamService {
    */
   retryExecution(executionId: string): { executionId: string } {
     const original = this.getExecution(executionId);
-    if (
-      original.status === 'queued' ||
-      original.status === 'running' ||
-      original.status === 'waiting_for_member'
-    ) {
-      throw badRequest(`execution 仍在进行中（${original.status}），不能 retry`);
+    if (ACTIVE_STATUSES.has(original.status)) {
+      throw conflict(`execution 仍在进行中（${original.status}），不能 retry`);
     }
 
     const conversation = this.getConversation(original.conversationId);
-    const member = this.requireConversationMember(conversation, original.memberId);
+    // 归档的 Member 不接新活 —— retry 也是一次新活
+    const member = this.requireActiveMember(conversation, original.memberId);
 
     const retry: ExecutionRecord = {
       id: randomUUID(),
@@ -676,7 +864,8 @@ export class TeamService {
     let member: Member;
     try {
       conversation = this.getConversation(execution.conversationId);
-      member = this.requireConversationMember(conversation, execution.memberId);
+      // 归档的 Member 不再接活：这条 queued 直接判 interrupted 并说明原因
+      member = this.requireActiveMember(conversation, execution.memberId);
     } catch (error) {
       this.updateExecution(executionId, {
         status: 'interrupted',
@@ -837,29 +1026,51 @@ export class TeamService {
     runtime: MemberRuntime;
   }): Promise<string> {
     const runtime = input.runtime;
+    const executionId = input.execution.id;
     const startedAt = now();
+
+    // 排队期间状态可能被改掉（cancel 直接落库 cancelled；recovery 可能标 interrupted）。
+    // 开跑前必须重新确认这条 execution 还该跑 —— 否则一条已取消的 execution 会在
+    // runtime 锁一放开时偷偷跑起来。
+    const persisted = this.findExecution(executionId);
+    if (!persisted || persisted.status !== 'queued') {
+      throw new ExecutionCancelledError(
+        `execution 在排队期间状态变为 ${persisted?.status ?? 'deleted'}，不再执行`,
+      );
+    }
 
     this.updateRuntime(runtime.id, {
       status: 'running',
-      activeExecutionId: input.execution.id,
+      activeExecutionId: executionId,
       lastUsedAt: startedAt,
     });
-    this.updateExecution(input.execution.id, {
+    this.updateExecution(executionId, {
       runtimeId: runtime.id,
       status: 'running',
       startedAt,
       endedAt: null,
       error: null,
     });
-    this.emitExecution(this.getExecution(input.execution.id));
+    this.emitExecution(this.getExecution(executionId));
+
+    // 上面两次写之间是 cancel 的窗口期：cancel 对 running 只发信号、不写 DB，
+    // 所以这里必须再确认一次信号，避免「信号发了但这一轮照跑到底」。
+    if (this.cancelRequests.has(executionId)) {
+      throw new ExecutionCancelledError();
+    }
 
     // 只注入「自该 runtime 上次成功 turn 以来新增的 shared messages」。
     // Copilot session 自己已经记着这个 Member 的历史，整段重放会重复。
     const context = this.contextAssembler.assemble({
       runtime,
-      currentExecutionId: input.execution.id,
+      currentExecutionId: executionId,
       currentPrompt: input.prompt,
     });
+
+    // 被取消时把已产出的半截内容留在 execution.response 里，便于 UI 展示与排查。
+    // 两个来源：流式增量（streamed），以及 abort 让 sendAndWait 正常返回的那半截结果（partial）。
+    let streamed = '';
+    let partial: string | null = null;
 
     try {
       const systemPrompt = this.buildMemberSystemPrompt(input.conversation, input.member);
@@ -870,25 +1081,33 @@ export class TeamService {
         systemPrompt,
         prompt: context.prompt,
         sourceMemberId: input.sourceMemberId,
-        executionId: input.execution.id,
+        executionId,
         conversationId: input.conversation.id,
         onDelta: (delta) => {
+          streamed += delta;
           this.emit(input.conversation.id, {
             type: 'message.delta',
             data: {
-              executionId: input.execution.id,
+              executionId,
               memberId: input.member.id,
               delta,
             },
           });
         },
       });
+      partial = result;
+
+      // abort 会让 sendAndWait **正常返回**半截结果（不是抛错），所以取消检查
+      // 不能只放在 catch 里，否则被取消的 execution 会被记成 completed。
+      if (this.cancelRequests.has(executionId)) {
+        throw new ExecutionCancelledError();
+      }
 
       const message = this.insertMemberMessage({
         conversationId: input.conversation.id,
         memberId: input.member.id,
         content: result,
-        executionId: input.execution.id,
+        executionId,
         replyToMessageId: null,
       });
 
@@ -900,31 +1119,37 @@ export class TeamService {
         lastContextMessageSequence: context.consumedThroughSequence,
         lastUsedAt: now(),
       });
-      this.updateExecution(input.execution.id, {
+      this.updateExecution(executionId, {
         status: 'completed',
         response: result,
         endedAt: now(),
       });
 
       this.emit(input.conversation.id, { type: 'message.created', data: message });
-      this.emitExecution(this.getExecution(input.execution.id));
+      this.emitExecution(this.getExecution(executionId));
       this.touchConversation(input.conversation.id);
 
       return result;
     } catch (error) {
+      const cancelled =
+        error instanceof ExecutionCancelledError || this.cancelRequests.has(executionId);
       const message = error instanceof Error ? error.message : String(error);
 
+      // 取消不是故障：runtime 回到 idle 而不是 error，checkpoint 不推进
+      // （半截 turn 的上下文不该被当成「已经注入过了」）。
       this.updateRuntime(runtime.id, {
-        status: 'error',
+        status: cancelled ? 'idle' : 'error',
         activeExecutionId: null,
         lastUsedAt: now(),
       });
-      this.updateExecution(input.execution.id, {
-        status: 'failed',
+      this.updateExecution(executionId, {
+        status: cancelled ? 'cancelled' : 'failed',
+        // 引擎自己返回的那半截更完整（流式可能只到一半），优先用它。
+        response: cancelled ? (partial || streamed || null) : undefined,
         error: message,
         endedAt: now(),
       });
-      this.emitExecution(this.getExecution(input.execution.id));
+      this.emitExecution(this.getExecution(executionId));
 
       throw error;
     }
@@ -1154,15 +1379,21 @@ export class TeamService {
   }
 
   private resolveTargetMember(conversation: Conversation, targetMemberId?: string): Member {
-    if (targetMemberId) return this.requireConversationMember(conversation, targetMemberId);
+    if (targetMemberId) return this.requireActiveMember(conversation, targetMemberId);
     if (conversation.defaultMemberId) {
-      return this.requireConversationMember(conversation, conversation.defaultMemberId);
+      return this.requireActiveMember(conversation, conversation.defaultMemberId);
     }
-    if (conversation.members.length === 1) return conversation.members[0];
+
+    const active = conversation.members.filter((member) => member.status === 'active');
+    if (active.length === 1) return active[0];
+    if (active.length === 0) {
+      throw badRequest('conversation 里没有可用的 Member（都归档了？）');
+    }
 
     throw badRequest('group conversation 必须指定 targetMemberId');
   }
 
+  /** roster 里能找到就行（含已归档）—— 用于查历史、校验父 execution 归属。 */
   private requireConversationMember(conversation: Conversation, memberId: string): Member {
     const member = conversation.members.find((item) => item.id === memberId);
     if (!member) {
@@ -1171,7 +1402,25 @@ export class TeamService {
     return member;
   }
 
+  /**
+   * 能派新活。已归档的 Member 保留在 roster 里（历史事实），但不能作为新的
+   * 执行目标 —— 「它在历史上参与过」和「它现在可以接活」是两件事。
+   */
+  private requireActiveMember(conversation: Conversation, memberId: string): Member {
+    const member = this.requireConversationMember(conversation, memberId);
+    if (member.status !== 'active') {
+      throw badRequest(`Member ${member.name} 已归档，不能作为新的执行目标`);
+    }
+    return member;
+  }
+
   private hydrateConversation(row: ConversationRow): Conversation {
+    // 刻意**不**过滤 m.status = 'active'。
+    //
+    // conversation_member / default_member_id / conversation_message / execution
+    // 都还指向已归档的 Member，把它们从 roster 里抹掉只会让「历史事实」和
+    // 「当前可用性」混在一起：UI 会突然少一个人，而 DB 里到处是它的引用。
+    // 正确做法是保留完整 roster，由 requireActiveMember() 单独拦「能不能派活」。
     const memberRows = this.db
       .prepare(
         `
@@ -1180,7 +1429,6 @@ export class TeamService {
         JOIN conversation_member cm
           ON cm.member_id = m.id
         WHERE cm.conversation_id = ?
-          AND m.status = 'active'
         ORDER BY cm.joined_at
         `,
       )
@@ -1475,6 +1723,17 @@ export class TeamService {
       release();
       if (this.runtimeLocks.get(runtimeId) === current) this.runtimeLocks.delete(runtimeId);
     }
+  }
+
+  /**
+   * 等某个 runtime 上正在跑的那一轮结束。
+   *
+   * 靠的是 runtimeLocks 里的 promise：它在锁释放时才 resolve。cancel 需要它来保证
+   * 「cancel 返回时这一轮真的已经收尾」，而不是只把 abort 请求丢出去就返回。
+   */
+  private async waitForRuntimeIdle(runtimeId: string): Promise<void> {
+    const current = this.runtimeLocks.get(runtimeId);
+    if (current) await current.catch(() => {});
   }
 }
 

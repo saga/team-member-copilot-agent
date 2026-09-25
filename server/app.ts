@@ -10,6 +10,7 @@ import { TeamService } from './team-service.js';
 import { healthRouter } from './routes/health.js';
 import { membersRouter } from './routes/members.js';
 import { conversationsRouter } from './routes/conversations.js';
+import { executionsRouter } from './routes/executions.js';
 import { errorHandler } from './middleware/errorHandler.js';
 
 /**
@@ -36,6 +37,7 @@ app.use(express.json({ limit: '1mb' }));
 app.use('/api/health', healthRouter);
 app.use('/api/members', membersRouter(teamService));
 app.use('/api/conversations', conversationsRouter(teamService));
+app.use('/api/executions', executionsRouter(teamService));
 
 // 未匹配的 /api/* 返回 JSON 404，不要掉进下面的 SPA fallback 拿到一份 HTML
 app.use('/api', (_req, res) => {
