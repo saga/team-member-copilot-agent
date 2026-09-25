@@ -70,6 +70,9 @@ function normalizeHandle(value: string): string {
   return normalized || `member-${randomUUID().slice(0, 8)}`;
 }
 
+/** 记忆文件的一级标题；replaceMemory 用它保证文件里只有一个标题。 */
+const MEMORY_TITLE = /^\s*#\s*Long-?term Memory\s*/i;
+
 /**
  * 长期 Member 身份。Member 是跨 conversation 稳定的业务对象，
  * 它的 SOUL / memory / skills 落在 member home，而不是任何 conversation 里。
@@ -223,6 +226,38 @@ export class MemberService {
     if (!fs.existsSync(file)) return '';
     // 只回传尾部，避免长记忆把 system prompt 撑爆
     return fs.readFileSync(file, 'utf8').slice(-16000);
+  }
+
+  /**
+   * 完整读取长期记忆（供 UI 编辑）。
+   *
+   * 和 readMemory() 的区别是**故意的**：那个是拼进 system prompt 用的，只给
+   * 尾部 16000 字符；如果编辑器也用它，用户一保存就会把被截掉的前半段永久
+   * 丢掉。改记忆必须看到全文。
+   */
+  getMemory(memberId: string): string {
+    this.get(memberId);
+    this.ensureHome(memberId);
+    return fs.readFileSync(this.memoryPath(memberId), 'utf8');
+  }
+
+  /**
+   * 整体覆盖长期记忆。
+   *
+   * 文件恒定以 `# Long-term Memory` 开头：appendMemory 与 replaceMemory 都
+   * 走这一个归一化，避免出现两个标题（UI 的文本框里显示的就是含标题的全文）。
+   */
+  replaceMemory(memberId: string, content: string): void {
+    this.get(memberId);
+    this.ensureHome(memberId);
+
+    const body = content.replace(MEMORY_TITLE, '').trim();
+
+    fs.writeFileSync(
+      this.memoryPath(memberId),
+      body ? `# Long-term Memory\n\n${body}\n` : '# Long-term Memory\n\n',
+      'utf8',
+    );
   }
 
   appendMemory(memberId: string, content: string): string {

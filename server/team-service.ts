@@ -898,6 +898,22 @@ export class TeamService {
     return Promise.resolve(this.members.appendMemory(input.memberId, input.content));
   }
 
+  /**
+   * Member 长期记忆的读写。
+   *
+   * 落在 `.data/members/<id>/memory/MEMORY.md`，不进数据库：记忆是自然语言
+   * 文本，用户会想直接看 / 直接改，一个文件比一张两列表更好用。
+   * Member 级（跨 conversation 稳定），不是 runtime 级。
+   */
+  getMemberMemory(memberId: string): string {
+    return this.members.getMemory(memberId);
+  }
+
+  replaceMemberMemory(memberId: string, content: string): string {
+    this.members.replaceMemory(memberId, content);
+    return this.members.getMemory(memberId);
+  }
+
   // ------------------------------------------------------------- Execution
 
   getExecution(id: string): ExecutionRecord {

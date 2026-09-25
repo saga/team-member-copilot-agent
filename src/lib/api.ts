@@ -199,6 +199,27 @@ export const api = {
     }).then(json<{ member: Member }>);
   },
 
+  /**
+   * Member 的长期记忆全文。
+   *
+   * 刻意不是「给 prompt 用的截断版」：编辑器拿到截断内容再整体保存，
+   * 会把被截掉的前半段永久丢掉。
+   */
+  getMemberMemory(memberId: string): Promise<{ content: string }> {
+    return fetch(`${API_BASE}/api/members/${encodeURIComponent(memberId)}/memory`).then(
+      json<{ content: string }>,
+    );
+  },
+
+  /** 整体覆盖；返回归一化后真正落盘的内容。 */
+  replaceMemberMemory(memberId: string, content: string): Promise<{ content: string }> {
+    return fetch(`${API_BASE}/api/members/${encodeURIComponent(memberId)}/memory`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content }),
+    }).then(json<{ content: string }>);
+  },
+
   /** 房间里每个 Member 的读游标 / 唤醒状态 / 是否静音。 */
   listConversationState(
     conversationId: string,

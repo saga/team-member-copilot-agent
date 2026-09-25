@@ -542,6 +542,18 @@ button:disabled {
   min-height: 130px;
 }
 
+.memory-textarea {
+  width: 100%;
+  min-height: 300px;
+  resize: vertical;
+  padding: 10px;
+  border: 1px solid #d5d9de;
+  border-radius: 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
 
 
 .runtime-strip {

@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import type { Member } from '../../lib/api';
 import { MemberEditor } from './MemberEditor';
+import { MemberMemory } from './MemberMemory';
 
 interface MemberProfileProps {
   member: Member;
@@ -8,7 +9,7 @@ interface MemberProfileProps {
   onClose: () => void;
 }
 
-type TabKey = 'profile';
+type TabKey = 'profile' | 'memory';
 
 /**
  * Member 的主页。刻意用 tab 把「它是谁」「它记得什么」分开：
@@ -23,7 +24,10 @@ type TabKey = 'profile';
 export function MemberProfile({ member, onSaved, onClose }: MemberProfileProps) {
   const [tab, setTab] = useState<TabKey>('profile');
 
-  const tabs: Array<{ key: TabKey; label: string }> = [{ key: 'profile', label: 'Profile' }];
+  const tabs: Array<{ key: TabKey; label: string }> = [
+    { key: 'profile', label: 'Profile' },
+    { key: 'memory', label: 'Memory' },
+  ];
 
   return (
     <div className="profile-overlay" role="dialog" aria-label={`${member.name} 的档案`}>
@@ -57,6 +61,7 @@ export function MemberProfile({ member, onSaved, onClose }: MemberProfileProps) 
           {tab === 'profile' && (
             <MemberEditor member={member} onSaved={onSaved} onCancel={onClose} />
           )}
+          {tab === 'memory' && <MemberMemory member={member} />}
         </div>
       </div>
     </div>

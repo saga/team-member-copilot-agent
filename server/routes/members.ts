@@ -36,6 +36,10 @@ const updateMemberSchema = z.object({
   status: z.enum(['active', 'archived']).optional(),
 });
 
+const memorySchema = z.object({
+  content: z.string().max(200_000),
+});
+
 export function membersRouter(team: TeamService) {
   const router = Router();
 
@@ -72,6 +76,34 @@ export function membersRouter(team: TeamService) {
     }
     try {
       res.json({ member: team.updateMember(req.params.id, parsed.data) });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  /**
+   * Member 的长期记忆（全文，不是给 prompt 用的截断版）。
+   *
+   * 记忆文件在 `.data/members/<id>/memory/MEMORY.md`，同时被
+   * buildMemberSystemPrompt 注入到每一轮的 persona 里。
+   */
+  router.get('/:id/memory', (req, res) => {
+    try {
+      res.json({ content: team.getMemberMemory(req.params.id) });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  /** 整体覆盖。PUT 而不是 PATCH：调用方提交的就是文件的全部内容。 */
+  router.put('/:id/memory', (req, res) => {
+    const parsed = memorySchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: 'content 必须是 string' });
+      return;
+    }
+    try {
+      res.json({ content: team.replaceMemberMemory(req.params.id, parsed.data.content) });
     } catch (error) {
       sendError(res, error);
     }
