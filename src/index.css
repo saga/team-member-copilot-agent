@@ -231,6 +231,192 @@ button.member-chip:hover {
   padding: 4px 10px;
 }
 
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+
+/* ---------------------------------------------------------- team panels */
+
+button.ghost {
+  background: transparent;
+  border: 1px solid #d5d9de;
+  border-radius: 6px;
+  padding: 5px 10px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+button.ghost:hover:not(:disabled) {
+  background: #f2f4f7;
+}
+
+button.danger {
+  border-color: #e3b4ba;
+  color: #a3182b;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.panel-title {
+  font-weight: 700;
+  font-size: 13px;
+  margin-bottom: 8px;
+}
+
+.panel-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.panel-head .panel-title {
+  margin-bottom: 0;
+}
+
+.panel-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.field {
+  display: block;
+  margin-bottom: 10px;
+}
+
+.field > span {
+  display: block;
+  font-size: 12px;
+  color: #555;
+  margin-bottom: 4px;
+}
+
+.field > input,
+.field > textarea,
+.field > select {
+  width: 100%;
+  padding: 7px 8px;
+  border: 1px solid #d5d9de;
+  border-radius: 6px;
+}
+
+.field > textarea {
+  resize: vertical;
+  min-height: 60px;
+  font: inherit;
+}
+
+.group-creator {
+  border: 1px solid #e3e6ea;
+  border-radius: 10px;
+  padding: 10px;
+  background: #fbfcfd;
+  margin-top: 10px;
+}
+
+.checkbox-list {
+  max-height: 220px;
+  overflow-y: auto;
+  border: 1px solid #e3e6ea;
+  border-radius: 8px;
+  padding: 6px;
+  background: #fff;
+}
+
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 4px;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.checkbox-row:hover {
+  background: #f4f6f8;
+}
+
+.checkbox-label {
+  font-weight: 600;
+}
+
+.checkbox-hint {
+  color: #888;
+  font-size: 12px;
+}
+
+.member-manager {
+  border-bottom: 1px solid #eee;
+  background: #fbfcfd;
+  padding: 12px 16px;
+}
+
+.member-table {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.member-table-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) minmax(100px, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  background: #fff;
+  border: 1px solid #e8eaee;
+  border-radius: 8px;
+  padding: 7px 10px;
+  font-size: 13px;
+}
+
+.member-table-ident {
+  display: flex;
+  flex-direction: column;
+}
+
+.member-table-ident span {
+  color: #888;
+  font-size: 12px;
+}
+
+.member-table-role {
+  color: #555;
+}
+
+.member-table-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.tag {
+  font-size: 11px;
+  background: #f0f1f3;
+  border-radius: 999px;
+  padding: 2px 7px;
+  color: #777;
+}
+
+.add-member {
+  margin-top: 8px;
+}
+
+.add-member select {
+  padding: 6px 8px;
+  border: 1px solid #d5d9de;
+  border-radius: 6px;
+  min-width: 200px;
+}
+
+
 .runtime-strip {
   display: flex;
   flex-wrap: wrap;

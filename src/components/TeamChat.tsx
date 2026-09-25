@@ -10,6 +10,8 @@ import {
   type ExecutionStatus,
   type Member,
 } from '../lib/api';
+import { GroupCreator } from './team/GroupCreator';
+import { GroupMemberManager } from './team/GroupMemberManager';
 
 interface StreamState {
   executionId: string;
@@ -93,6 +95,8 @@ export function TeamChat() {
   const [showNewMember, setShowNewMember] = useState(false);
   const [newMemberName, setNewMemberName] = useState('');
   const [newMemberRole, setNewMemberRole] = useState('');
+  const [showGroupCreator, setShowGroupCreator] = useState(false);
+  const [showMemberManager, setShowMemberManager] = useState(false);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   // 供只依赖 conversationId 的 effect 读取最新 conversations，避免每次刷新都重连 SSE
@@ -136,12 +140,22 @@ export function TeamChat() {
     return { className: 'idle', label: '● idle' };
   }
 
+  function applyStateChanged(state: ConversationMemberState) {
+    setConversationStates((current) => ({ ...current, [state.memberId]: state }));
+  }
+
+  function applyConversationChanged(next: Conversation) {
+    setConversations((current) =>
+      current.map((conversation) => (conversation.id === next.id ? next : conversation)),
+    );
+  }
+
   async function toggleMuted(memberId: string): Promise<void> {
     if (!conversationId) return;
     const muted = !conversationStates[memberId]?.muted;
     try {
       const result = await api.setMemberMuted(conversationId, memberId, muted);
-      setConversationStates((current) => ({ ...current, [memberId]: result.state }));
+      applyStateChanged(result.state);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -198,6 +212,8 @@ export function TeamChat() {
     setExecutions({});
     setConversationStates({});
     setError(null);
+    // 成员管理面板属于「当前房间」，切房间就收起，避免看起来像在管另一个 Team
+    setShowMemberManager(false);
 
     if (conversation?.kind === 'group') {
       setRecipientMemberId(EVERYONE);
@@ -377,22 +393,22 @@ export function TeamChat() {
     setConversationId(result.conversation.id);
   }
 
-  async function createGroup() {
-    if (members.length < 2) {
-      setError('至少需要 2 个 Member 才能创建 Team Conversation。');
-      return;
+  async function createGroup(input: { title: string; memberIds: string[] }) {
+    try {
+      const result = await api.createConversation({
+        kind: 'group',
+        title: input.title,
+        memberIds: input.memberIds,
+      });
+      setConversations((current) => [
+        result.conversation,
+        ...current.filter((item) => item.id !== result.conversation.id),
+      ]);
+      setConversationId(result.conversation.id);
+      setShowGroupCreator(false);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
     }
-    const selected = members.slice(0, 3);
-    const result = await api.createConversation({
-      kind: 'group',
-      title: 'Team Discussion',
-      memberIds: selected.map((member) => member.id),
-    });
-    setConversations((current) => [
-      result.conversation,
-      ...current.filter((item) => item.id !== result.conversation.id),
-    ]);
-    setConversationId(result.conversation.id);
   }
 
   async function createMember() {
@@ -490,9 +506,24 @@ export function TeamChat() {
             </button>
           ))}
 
-          <button type="button" className="group-button" onClick={() => void createGroup()}>
-            + New Team Conversation
-          </button>
+          {showGroupCreator ? (
+            <GroupCreator
+              members={members}
+              onCreate={createGroup}
+              onCancel={() => setShowGroupCreator(false)}
+            />
+          ) : (
+            <button
+              type="button"
+              className="group-button"
+              onClick={() => {
+                setShowNewMember(false);
+                setShowGroupCreator(true);
+              }}
+            >
+              + New Team
+            </button>
+          )}
         </div>
 
         <div className="sidebar-section">
@@ -553,30 +584,53 @@ export function TeamChat() {
                 </div>
               </div>
 
-              {selectedConversation.kind === 'group' ? (
-                <select
-                  className="recipient-select"
-                  value={recipientMemberId}
-                  onChange={(e) => setRecipientMemberId(e.target.value)}
-                  aria-label="选择这条消息的收件人"
-                >
-                  <option value={EVERYONE}>Everyone</option>
-                  {selectedConversation.members
-                    .filter((member) => member.status === 'active')
-                    .map((member) => (
-                      <option key={member.id} value={member.id}>
-                        @{member.handle}
-                      </option>
-                    ))}
-                </select>
-              ) : (
-                <span className="recipient-static">
-                  {selectedConversation.members[0]
-                    ? `To ${selectedConversation.members[0].name}`
-                    : 'No member'}
-                </span>
-              )}
+              <div className="header-actions">
+                {selectedConversation.kind === 'group' && (
+                  <button
+                    type="button"
+                    className="ghost"
+                    onClick={() => setShowMemberManager((value) => !value)}
+                  >
+                    Members
+                  </button>
+                )}
+
+                {selectedConversation.kind === 'group' ? (
+                  <select
+                    className="recipient-select"
+                    value={recipientMemberId}
+                    onChange={(e) => setRecipientMemberId(e.target.value)}
+                    aria-label="选择这条消息的收件人"
+                  >
+                    <option value={EVERYONE}>Everyone</option>
+                    {selectedConversation.members
+                      .filter((member) => member.status === 'active')
+                      .map((member) => (
+                        <option key={member.id} value={member.id}>
+                          @{member.handle}
+                        </option>
+                      ))}
+                  </select>
+                ) : (
+                  <span className="recipient-static">
+                    {selectedConversation.members[0]
+                      ? `To ${selectedConversation.members[0].name}`
+                      : 'No member'}
+                  </span>
+                )}
+              </div>
             </header>
+
+            {showMemberManager && selectedConversation.kind === 'group' && (
+              <GroupMemberManager
+                conversation={selectedConversation}
+                allMembers={members}
+                states={conversationStates}
+                onConversationChanged={applyConversationChanged}
+                onStateChanged={applyStateChanged}
+                onClose={() => setShowMemberManager(false)}
+              />
+            )}
 
             {activeExecutions.length > 0 && (
               <div className="runtime-strip">
