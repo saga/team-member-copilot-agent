@@ -12,6 +12,7 @@ import { NO_REPLY_SENTINEL, parseMemberTurnOutcome } from './member-decision.js'
 import {
   MemberService,
   type CreateMemberInput,
+  type MemberSkill,
   type UpdateMemberInput,
 } from './member-service.js';
 import type { CopilotService } from './copilot.js';
@@ -912,6 +913,26 @@ export class TeamService {
   replaceMemberMemory(memberId: string, content: string): string {
     this.members.replaceMemory(memberId, content);
     return this.members.getMemory(memberId);
+  }
+
+  // ------------------------------------------------------------ Skill
+
+  /**
+   * Member 自己的 skill 目录（`.data/members/<id>/skills/`）。
+   *
+   * 这些目录会通过 Copilot SDK 的 `skillDirectories` 挂进该 Member 的每一个
+   * session，所以它是**能力**，不是附件。
+   */
+  listMemberSkills(memberId: string): MemberSkill[] {
+    return this.members.listSkills(memberId);
+  }
+
+  installMemberSkill(memberId: string, archive: Buffer, filename: string): MemberSkill {
+    return this.members.installSkill(memberId, archive, filename);
+  }
+
+  removeMemberSkill(memberId: string, name: string): void {
+    this.members.removeSkill(memberId, name);
   }
 
   // ------------------------------------------------------------- Execution

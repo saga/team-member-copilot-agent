@@ -124,6 +124,14 @@ export interface ConversationMemberState {
   updatedAt: string;
 }
 
+/** Member 自己的 skill（`.data/members/<id>/skills/<name>`）。 */
+export interface MemberSkill {
+  name: string;
+  description: string;
+  fileCount: number;
+  updatedAt: string;
+}
+
 export interface Health {
   status: string;
   timestamp: string;
@@ -218,6 +226,36 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ content }),
     }).then(json<{ content: string }>);
+  },
+
+  listMemberSkills(memberId: string): Promise<{ skills: MemberSkill[] }> {
+    return fetch(`${API_BASE}/api/members/${encodeURIComponent(memberId)}/skills`).then(
+      json<{ skills: MemberSkill[] }>,
+    );
+  },
+
+  /**
+   * 上传 zip 安装一个 skill。
+   *
+   * 直接把 File 当 body（raw），不走 multipart —— 只有一个文件，
+   * 多一层 parser 只会多一个依赖和一个临时目录。文件名走 query。
+   */
+  uploadMemberSkill(memberId: string, file: File): Promise<{ skill: MemberSkill }> {
+    return fetch(
+      `${API_BASE}/api/members/${encodeURIComponent(memberId)}/skills?filename=${encodeURIComponent(file.name)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': file.type || 'application/zip' },
+        body: file,
+      },
+    ).then(json<{ skill: MemberSkill }>);
+  },
+
+  deleteMemberSkill(memberId: string, name: string): Promise<{ skills: MemberSkill[] }> {
+    return fetch(
+      `${API_BASE}/api/members/${encodeURIComponent(memberId)}/skills/${encodeURIComponent(name)}`,
+      { method: 'DELETE' },
+    ).then(json<{ skills: MemberSkill[] }>);
   },
 
   /** 房间里每个 Member 的读游标 / 唤醒状态 / 是否静音。 */

@@ -2,6 +2,7 @@ import { useState } from 'react';
 import type { Member } from '../../lib/api';
 import { MemberEditor } from './MemberEditor';
 import { MemberMemory } from './MemberMemory';
+import { MemberSkills } from './MemberSkills';
 
 interface MemberProfileProps {
   member: Member;
@@ -9,7 +10,7 @@ interface MemberProfileProps {
   onClose: () => void;
 }
 
-type TabKey = 'profile' | 'memory';
+type TabKey = 'profile' | 'memory' | 'skills';
 
 /**
  * Member 的主页。刻意用 tab 把「它是谁」「它记得什么」分开：
@@ -27,6 +28,7 @@ export function MemberProfile({ member, onSaved, onClose }: MemberProfileProps) 
   const tabs: Array<{ key: TabKey; label: string }> = [
     { key: 'profile', label: 'Profile' },
     { key: 'memory', label: 'Memory' },
+    { key: 'skills', label: 'Skills' },
   ];
 
   return (
@@ -62,6 +64,7 @@ export function MemberProfile({ member, onSaved, onClose }: MemberProfileProps) 
             <MemberEditor member={member} onSaved={onSaved} onCancel={onClose} />
           )}
           {tab === 'memory' && <MemberMemory member={member} />}
+          {tab === 'skills' && <MemberSkills member={member} />}
         </div>
       </div>
     </div>

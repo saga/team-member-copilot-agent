@@ -554,6 +554,35 @@ button:disabled {
   line-height: 1.55;
 }
 
+.skill-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  border: 1px solid #e8eaee;
+  border-radius: 8px;
+  padding: 9px 11px;
+  margin-bottom: 6px;
+  background: #fff;
+}
+
+.skill-ident {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.skill-ident span {
+  color: #666;
+  font-size: 12px;
+}
+
+.skill-ident .skill-meta {
+  color: #999;
+  font-size: 11px;
+}
+
 
 
 .runtime-strip {
