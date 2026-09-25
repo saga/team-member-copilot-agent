@@ -10,29 +10,19 @@ import {
   type ExecutionStatus,
   type Member,
 } from '../lib/api';
-import { GroupCreator } from './team/GroupCreator';
-import { GroupMemberManager } from './team/GroupMemberManager';
+import { ConversationHeader } from './team/ConversationHeader';
+import {
+  ConversationMessages,
+  type DelegationLog,
+  type StreamState,
+} from './team/ConversationMessages';
+import { MessageComposer } from './team/MessageComposer';
 import { MemberProfile } from './team/MemberProfile';
-
-interface StreamState {
-  executionId: string;
-  memberId: string;
-  content: string;
-}
-
-interface DelegationLog {
-  executionId: string;
-  fromMemberId: string;
-  targetMemberId: string;
-  task: string;
-  status: 'running' | 'done' | 'error';
-}
+import { TeamSidebar } from './team/TeamSidebar';
+import { EVERYONE, type MemberStatus, type MemberStatusLookup } from './team/constants';
 
 /** 还在推进中的 execution 状态；到了其它状态就说明这条 execution 已经收尾。 */
 const ACTIVE_STATUSES: ExecutionStatus[] = ['queued', 'running', 'waiting_for_member'];
-
-/** 收件人下拉里代表「不点名，交给 GroupDispatcher 决定唤醒谁」的哨兵值。 */
-const EVERYONE = '';
 
 const STATUS_LABEL: Record<ExecutionStatus, string> = {
   queued: '排队中',
@@ -70,6 +60,15 @@ function mergeMessages(
   return [...byId.values()].sort((a, b) => a.messageSequence - b.messageSequence);
 }
 
+/**
+ * Team UI 的容器：只持有「当前会话 / 当前成员 / 实时状态」，其余交给 team/* 子组件。
+ *
+ * 三条数据通道必须分清，混起来就会出现难查的不一致：
+ *
+ *   conversation_message  —— 大家都能看到的消息（SSE message.created）
+ *   execution.updated     —— 谁在跑、跑到哪一步（runtime 状态条）
+ *   conversation_member_state —— 每个成员在房间里的读游标 / 唤醒状态 / 静音
+ */
 export function TeamChat() {
   const [members, setMembers] = useState<Member[]>([]);
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -94,8 +93,6 @@ export function TeamChat() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showNewMember, setShowNewMember] = useState(false);
-  const [newMemberName, setNewMemberName] = useState('');
-  const [newMemberRole, setNewMemberRole] = useState('');
   const [showGroupCreator, setShowGroupCreator] = useState(false);
   const [showMemberManager, setShowMemberManager] = useState(false);
   /**
@@ -132,72 +129,6 @@ export function TeamChat() {
   }
 
   /**
-   * 成员在房间里的状态，用来渲染 ●idle / ●working / 🔇muted。
-   *
-   * muted 以服务端为准（它是 dispatcher 的真实输入）；wakeStatus 只覆盖
-   * 「有唤醒在排队 / 在跑」；两者都没有但有活跃 execution 时兜底成 working，
-   * 免得调度器状态和 UI 出现一瞬不一致。
-   */
-  function memberStatus(memberId: string): { className: string; label: string } {
-    const state = conversationStates[memberId];
-    if (state?.muted) return { className: 'muted', label: '🔇 muted' };
-
-    const wake = state?.wakeStatus;
-    if (wake === 'running' || wake === 'queued') return { className: 'working', label: '● working' };
-
-    if (activeExecutions.some((execution) => execution.memberId === memberId)) {
-      return { className: 'working', label: '● working' };
-    }
-    return { className: 'idle', label: '● idle' };
-  }
-
-  function applyStateChanged(state: ConversationMemberState) {
-    setConversationStates((current) => ({ ...current, [state.memberId]: state }));
-  }
-
-  function applyConversationChanged(next: Conversation) {
-    setConversations((current) =>
-      current.map((conversation) => (conversation.id === next.id ? next : conversation)),
-    );
-  }
-
-  /**
-   * Member 身份改完之后，两个地方都持有它的副本，必须一起更新：
-   *   members                     —— 侧栏、mention 解析、选择器
-   *   conversation.members        —— header 的成员 chip、recipient 下拉
-   * 漏掉后者会出现「名字改了但群里的 chip 还是旧的」。
-   *
-   * 归档的 Member 直接从侧栏移除（listMembers 只返回 active），但保留在
-   * conversation roster 里 —— 那是历史事实。
-   */
-  function applyMemberSaved(next: Member) {
-    setMembers((current) =>
-      next.status === 'active'
-        ? current.map((member) => (member.id === next.id ? next : member))
-        : current.filter((member) => member.id !== next.id),
-    );
-    setConversations((current) =>
-      current.map((conversation) => ({
-        ...conversation,
-        members: conversation.members.map((member) =>
-          member.id === next.id ? next : member,
-        ),
-      })),
-    );
-  }
-
-  async function toggleMuted(memberId: string): Promise<void> {
-    if (!conversationId) return;
-    const muted = !conversationStates[memberId]?.muted;
-    try {
-      const result = await api.setMemberMuted(conversationId, memberId, muted);
-      applyStateChanged(result.state);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    }
-  }
-
-  /**
    * 每个 Member 当前最活跃的那条 execution。
    * 一个 Member 可能同时挂着几条（被多次委派），只展示最新的一条即可。
    */
@@ -212,6 +143,27 @@ export function TeamChat() {
     }
     return [...byMember.values()].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }, [executions]);
+
+  /**
+   * 成员在房间里的状态，用来渲染 ●idle / ●working / 🔇muted。
+   *
+   * muted 以服务端为准（它是 dispatcher 的真实输入）；wakeStatus 覆盖「有唤醒
+   * 在排队 / 在跑」；两者都没有但有活跃 execution 时兜底成 working，免得调度器
+   * 状态和 UI 出现一瞬不一致。
+   */
+  const memberStatus: MemberStatusLookup = (memberId) => {
+    const state = conversationStates[memberId];
+    if (state?.muted) return { className: 'muted', label: '🔇 muted' };
+
+    const wake = state?.wakeStatus;
+    if (wake === 'running' || wake === 'queued') {
+      return { className: 'working', label: '● working' };
+    }
+    if (activeExecutions.some((execution) => execution.memberId === memberId)) {
+      return { className: 'working', label: '● working' };
+    }
+    return { className: 'idle', label: '● idle' } satisfies MemberStatus;
+  };
 
   async function refresh() {
     const [membersResult, conversationsResult] = await Promise.all([
@@ -408,6 +360,50 @@ export function TeamChat() {
     node.scrollTo({ top: node.scrollHeight });
   }, [messages, streaming, delegations, executions]);
 
+  function applyStateChanged(state: ConversationMemberState) {
+    setConversationStates((current) => ({ ...current, [state.memberId]: state }));
+  }
+
+  function applyConversationChanged(next: Conversation) {
+    setConversations((current) =>
+      current.map((conversation) => (conversation.id === next.id ? next : conversation)),
+    );
+  }
+
+  /**
+   * Member 身份改完之后，两个地方都持有它的副本，必须一起更新：
+   *   members                —— 侧栏、mention 解析、选择器
+   *   conversation.members   —— header 的成员 chip、recipient 下拉
+   * 漏掉后者会出现「名字改了但群里的 chip 还是旧的」。
+   *
+   * 归档的 Member 直接从侧栏移除（listMembers 只返回 active），但保留在
+   * conversation roster 里 —— 那是历史事实。
+   */
+  function applyMemberSaved(next: Member) {
+    setMembers((current) =>
+      next.status === 'active'
+        ? current.map((member) => (member.id === next.id ? next : member))
+        : current.filter((member) => member.id !== next.id),
+    );
+    setConversations((current) =>
+      current.map((conversation) => ({
+        ...conversation,
+        members: conversation.members.map((member) => (member.id === next.id ? next : member)),
+      })),
+    );
+  }
+
+  async function toggleMuted(memberId: string): Promise<void> {
+    if (!conversationId) return;
+    const muted = !conversationStates[memberId]?.muted;
+    try {
+      const result = await api.setMemberMuted(conversationId, memberId, muted);
+      applyStateChanged(result.state);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
   async function createDirect(member: Member) {
     const existing = conversations.find(
       (item) => item.kind === 'direct' && item.members.some((m) => m.id === member.id),
@@ -429,39 +425,33 @@ export function TeamChat() {
     setConversationId(result.conversation.id);
   }
 
+  /**
+   * 新建 Team。**不传 defaultMemberId** —— 收件人集合是全部成员，
+   * 由服务端 GroupDispatcher 决定每一轮唤醒谁。
+   */
   async function createGroup(input: { title: string; memberIds: string[] }) {
-    try {
-      const result = await api.createConversation({
-        kind: 'group',
-        title: input.title,
-        memberIds: input.memberIds,
-      });
-      setConversations((current) => [
-        result.conversation,
-        ...current.filter((item) => item.id !== result.conversation.id),
-      ]);
-      setConversationId(result.conversation.id);
-      setShowGroupCreator(false);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    }
+    const result = await api.createConversation({
+      kind: 'group',
+      title: input.title,
+      memberIds: input.memberIds,
+    });
+    setConversations((current) => [
+      result.conversation,
+      ...current.filter((item) => item.id !== result.conversation.id),
+    ]);
+    setConversationId(result.conversation.id);
+    setShowGroupCreator(false);
   }
 
-  async function createMember() {
-    const name = newMemberName.trim();
-    const role = newMemberRole.trim();
-    if (!name || !role) return;
-
+  async function createMember(input: { name: string; role: string }): Promise<void> {
     const result = await api.createMember({
-      name,
-      role,
+      name: input.name,
+      role: input.role,
       description: '',
       style: 'clear and concise',
       toolProfile: 'safe',
     });
     setMembers((current) => [...current, result.member]);
-    setNewMemberName('');
-    setNewMemberRole('');
     setShowNewMember(false);
     // 新建只拿到 name + role，personality / system prompt / model 还是空的。
     // 直接开一个单聊等于让一个空壳人格开始干活，所以先把档案页打开。
@@ -487,7 +477,11 @@ export function TeamChat() {
 
       // 房间里没人认领这些 @ —— 服务端刻意不广播，如实告诉用户。
       if (result.unresolvedMentions.length > 0) {
-        setError(`没有匹配到这些成员：${result.unresolvedMentions.map((m) => `@${m}`).join(' ')}。消息没有派给任何人。`);
+        setError(
+          `没有匹配到这些成员：${result.unresolvedMentions
+            .map((mention) => `@${mention}`)
+            .join(' ')}。消息没有派给任何人。`,
+        );
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -499,185 +493,47 @@ export function TeamChat() {
 
   return (
     <div className="team-layout">
-      <aside className="team-sidebar">
-        <div className="sidebar-section">
-          <div className="sidebar-title">
-            Team Members
-            <button
-              type="button"
-              onClick={() => setShowNewMember((value) => !value)}
-              aria-label="新建 Member"
-            >
-              +
-            </button>
-          </div>
-
-          {showNewMember && (
-            <div className="new-member">
-              <input
-                value={newMemberName}
-                onChange={(e) => setNewMemberName(e.target.value)}
-                placeholder="Member name"
-              />
-              <input
-                value={newMemberRole}
-                onChange={(e) => setNewMemberRole(e.target.value)}
-                placeholder="Role"
-              />
-              <button type="button" onClick={() => void createMember()}>
-                Create
-              </button>
-            </div>
-          )}
-
-          {members.length === 0 && <p className="sidebar-hint">还没有 Member，点 + 创建一个。</p>}
-
-          {members.map((member) => (
-            <div key={member.id} className="member-row">
-              <div className="member-row-ident">
-                <strong>{member.name}</strong>
-                <span>{member.role}</span>
-              </div>
-              <div className="member-row-actions">
-                <button type="button" onClick={() => void createDirect(member)}>
-                  Chat
-                </button>
-                <button
-                  type="button"
-                  className="ghost"
-                  onClick={() => setEditingMemberId(member.id)}
-                >
-                  Edit
-                </button>
-              </div>
-            </div>
-          ))}
-
-          {showGroupCreator ? (
-            <GroupCreator
-              members={members}
-              onCreate={createGroup}
-              onCancel={() => setShowGroupCreator(false)}
-            />
-          ) : (
-            <button
-              type="button"
-              className="group-button"
-              onClick={() => {
-                setShowNewMember(false);
-                setShowGroupCreator(true);
-              }}
-            >
-              + New Team
-            </button>
-          )}
-        </div>
-
-        <div className="sidebar-section">
-          <div className="sidebar-title">Conversations</div>
-          {conversations.map((conversation) => (
-            <button
-              key={conversation.id}
-              type="button"
-              className={
-                conversation.id === conversationId ? 'conversation-row selected' : 'conversation-row'
-              }
-              onClick={() => setConversationId(conversation.id)}
-            >
-              <strong>{conversation.title}</strong>
-              <span>{conversation.kind}</span>
-            </button>
-          ))}
-        </div>
-      </aside>
+      <TeamSidebar
+        members={members}
+        conversations={conversations}
+        selectedConversationId={conversationId}
+        onSelectConversation={setConversationId}
+        showNewMember={showNewMember}
+        onToggleNewMember={() => {
+          setShowGroupCreator(false);
+          setShowNewMember((value) => !value);
+        }}
+        onCreateMember={createMember}
+        onCancelNewMember={() => setShowNewMember(false)}
+        onChatMember={(member) => void createDirect(member)}
+        onEditMember={(member) => setEditingMemberId(member.id)}
+        showGroupCreator={showGroupCreator}
+        onToggleGroupCreator={() => {
+          setShowNewMember(false);
+          setShowGroupCreator(true);
+        }}
+        onCancelGroupCreator={() => setShowGroupCreator(false)}
+        onCreateGroup={createGroup}
+      />
 
       <section className="team-main">
         {!selectedConversation && <div className="empty-state">先选择一个 Team Member。</div>}
 
         {selectedConversation && (
           <>
-            <header className="conversation-header">
-              <div>
-                <h2>{selectedConversation.title}</h2>
-                <div className="member-chips">
-                  {selectedConversation.members.map((member) => {
-                    const status = memberStatus(member.id);
-                    const className = `member-chip ${status.className}`;
-
-                    // 静音只对 group 有意义：direct / work 房间的 dispatcher 路径
-                    // 不看 muted，点它只会造成「UI 说静音了、其实照样回」的错觉。
-                    if (selectedConversation.kind !== 'group') {
-                      return (
-                        <span key={member.id} className={className}>
-                          <span className="member-chip-status">{status.label}</span>
-                          @{member.handle}
-                        </span>
-                      );
-                    }
-
-                    return (
-                      <button
-                        key={member.id}
-                        type="button"
-                        className={className}
-                        onClick={() => void toggleMuted(member.id)}
-                        title={`${member.name} · ${status.label}（点击${status.className === 'muted' ? '取消静音' : '静音'}）`}
-                      >
-                        <span className="member-chip-status">{status.label}</span>
-                        @{member.handle}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-
-              <div className="header-actions">
-                {selectedConversation.kind === 'group' && (
-                  <button
-                    type="button"
-                    className="ghost"
-                    onClick={() => setShowMemberManager((value) => !value)}
-                  >
-                    Members
-                  </button>
-                )}
-
-                {selectedConversation.kind === 'group' ? (
-                  <select
-                    className="recipient-select"
-                    value={recipientMemberId}
-                    onChange={(e) => setRecipientMemberId(e.target.value)}
-                    aria-label="选择这条消息的收件人"
-                  >
-                    <option value={EVERYONE}>Everyone</option>
-                    {selectedConversation.members
-                      .filter((member) => member.status === 'active')
-                      .map((member) => (
-                        <option key={member.id} value={member.id}>
-                          @{member.handle}
-                        </option>
-                      ))}
-                  </select>
-                ) : (
-                  <span className="recipient-static">
-                    {selectedConversation.members[0]
-                      ? `To ${selectedConversation.members[0].name}`
-                      : 'No member'}
-                  </span>
-                )}
-              </div>
-            </header>
-
-            {showMemberManager && selectedConversation.kind === 'group' && (
-              <GroupMemberManager
-                conversation={selectedConversation}
-                allMembers={members}
-                states={conversationStates}
-                onConversationChanged={applyConversationChanged}
-                onStateChanged={applyStateChanged}
-                onClose={() => setShowMemberManager(false)}
-              />
-            )}
+            <ConversationHeader
+              conversation={selectedConversation}
+              allMembers={members}
+              states={conversationStates}
+              memberStatus={memberStatus}
+              recipientMemberId={recipientMemberId}
+              onRecipientChange={setRecipientMemberId}
+              onToggleMute={(memberId) => void toggleMuted(memberId)}
+              showMembers={showMemberManager}
+              onToggleMembers={() => setShowMemberManager((value) => !value)}
+              onConversationChanged={applyConversationChanged}
+              onStateChanged={applyStateChanged}
+            />
 
             {activeExecutions.length > 0 && (
               <div className="runtime-strip">
@@ -690,79 +546,25 @@ export function TeamChat() {
               </div>
             )}
 
-            <div className="conversation-messages" ref={scrollRef}>
-              {messages.length === 0 && (
-                <p className="hint">
-                  {selectedConversation.kind === 'group'
-                    ? '收件人保持 Everyone 时不点名，消息会派给房间里所有可用成员，各自判断要不要发言（可以沉默）；要指名就选具体成员，或在正文里 @handle。'
-                    : `${selectedConversation.members[0]?.name ?? '该成员'} 会用你自己的记忆、人格和工作区回答；它也可以用 ask_member 把子任务委派给其他成员。`}
-                </p>
-              )}
-
-              {messages.map((message) => (
-                <div key={message.id} className={`conversation-message ${message.senderType}`}>
-                  <div className="message-author">
-                    {message.senderType === 'member'
-                      ? memberLabel(message.senderId)
-                      : message.senderType === 'user'
-                        ? 'You'
-                        : 'System'}
-                  </div>
-                  <pre>{message.content}</pre>
-                </div>
-              ))}
-
-              {Object.values(streaming).map((stream) => (
-                <div
-                  key={stream.executionId}
-                  className="conversation-message member streaming"
-                  data-execution={stream.executionId}
-                >
-                  <div className="message-author">{memberLabel(stream.memberId)}</div>
-                  <pre>{stream.content || '▍'}</pre>
-                </div>
-              ))}
-
-              {delegations.length > 0 && (
-                <div className="delegation-log">
-                  {delegations.map((item) => (
-                    <div key={item.executionId} className={`delegation-row ${item.status}`}>
-                      <span className="delegation-arrow">
-                        {memberLabel(item.fromMemberId)} → {memberLabel(item.targetMemberId)}
-                      </span>
-                      <span className="delegation-task">{item.task}</span>
-                      <span className="delegation-status">
-                        {item.status === 'running' ? '进行中' : item.status === 'done' ? '完成' : '失败'}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
+            <ConversationMessages
+              conversation={selectedConversation}
+              messages={messages}
+              streaming={streaming}
+              delegations={delegations}
+              memberLabel={memberLabel}
+              scrollRef={scrollRef}
+            />
 
             {error && <div className="error">{error}</div>}
 
-            <div className="conversation-composer">
-              <textarea
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' && !e.shiftKey) {
-                    e.preventDefault();
-                    void send();
-                  }
-                }}
-                placeholder={
-                  selectedConversation.kind === 'group'
-                    ? '对团队说点什么…（Enter 发送 / Shift+Enter 换行；@handle 指名，或直接 @ 某人）'
-                    : `给 ${selectedConversation.members[0]?.name ?? '成员'} 发消息…（Enter 发送 / Shift+Enter 换行）`
-                }
-                disabled={!conversationId}
-              />
-              <button type="button" onClick={() => void send()} disabled={busy || !input.trim()}>
-                Send
-              </button>
-            </div>
+            <MessageComposer
+              conversation={selectedConversation}
+              value={input}
+              onChange={setInput}
+              onSend={() => void send()}
+              busy={busy}
+              disabled={!conversationId}
+            />
           </>
         )}
       </section>

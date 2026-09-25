@@ -22,6 +22,7 @@ export function GroupCreator({ members, onCreate, onCancel }: GroupCreatorProps)
   const [title, setTitle] = useState('');
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const canCreate = title.trim().length > 0 && selected.size >= 2 && !busy;
 
@@ -40,8 +41,12 @@ export function GroupCreator({ members, onCreate, onCancel }: GroupCreatorProps)
   async function submit() {
     if (!canCreate) return;
     setBusy(true);
+    setError(null);
     try {
       await onCreate({ title: title.trim(), memberIds: [...selected] });
+    } catch (e) {
+      // 失败时保持面板打开：调用方（TeamChat）成功后会自己把它收起来
+      setError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
     }
@@ -89,6 +94,8 @@ export function GroupCreator({ members, onCreate, onCancel }: GroupCreatorProps)
           Cancel
         </button>
       </div>
+
+      {error && <div className="error">{error}</div>}
 
       {selected.size === 1 && (
         <p className="sidebar-hint">Team 至少两个成员 —— 一个成员就是单聊。</p>
