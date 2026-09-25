@@ -1,4 +1,5 @@
-import type { Conversation, ConversationMemberState, Member } from '../../lib/api';
+import { useEffect, useState } from 'react';
+import { api, type Conversation, type ConversationMemberState, type Member } from '../../lib/api';
 import { GroupMemberManager } from './GroupMemberManager';
 import { EVERYONE, EVERYONE_LABEL, isMemberDm, type MemberStatusLookup } from './constants';
 
@@ -41,12 +42,26 @@ export function ConversationHeader({
 }: ConversationHeaderProps) {
   const isGroup = conversation.kind === 'group';
   const isDm = isMemberDm(conversation);
+  const [projectName, setProjectName] = useState<string | null>(null);
+  useEffect(() => {
+    if (!conversation.projectId) {
+      setProjectName(null);
+      return;
+    }
+    api
+      .listProjects()
+      .then((result) => {
+        setProjectName(result.projects.find((p) => p.id === conversation.projectId)?.name ?? null);
+      })
+      .catch(() => {});
+  }, [conversation.projectId]);
 
   return (
     <>
       <header className="conversation-header">
         <div>
           <h2>{conversation.title}</h2>
+          {projectName && <div className="sidebar-hint">Project: {projectName}</div>}
           <div className="member-chips">
             {conversation.members.map((member) => {
               const status = memberStatus(member.id);

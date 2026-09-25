@@ -15,6 +15,7 @@ import { KnowledgeToolProvider } from '../capabilities/providers/knowledge-tools
 import { HostCodingToolProvider } from '../capabilities/providers/host-tools.js';
 import type { MemberService } from '../member-service.js';
 import { NO_REPLY_SENTINEL } from '../member-decision.js';
+import { TeamStructureService } from '../team-structure-service.js';
 
 /**
  * 测试用的能力装配。
@@ -36,6 +37,7 @@ export interface CapabilityStack {
 
 export interface TestStack extends CapabilityStack {
   team: TeamService;
+  structure: TeamStructureService;
 }
 
 /**
@@ -73,6 +75,9 @@ export function createCapabilityStack(
       delegateMember: (input) => resolveTeam().delegateMember(input),
       rememberMember: (input) => resolveTeam().rememberMember(input),
       messageMember: (input) => resolveTeam().messageMember(input),
+      listWorkItems: (input) => resolveTeam().listWorkItemsForAgent(input),
+      claimWorkItem: (input) => resolveTeam().claimWorkItemForAgent(input),
+      updateWorkItem: (input) => resolveTeam().updateWorkItemForAgent(input),
     }),
   );
   registry.registerToolProvider(new KnowledgeToolProvider());
@@ -88,8 +93,9 @@ export function createTestStack(
 ): TestStack {
   let team!: TeamService;
   const stack = createCapabilityStack(db, members, () => team);
-  team = new TeamService(db, members, copilot, stack.capabilities, stack.resolver);
-  return { ...stack, team };
+  const structure = new TeamStructureService(db);
+  team = new TeamService(db, members, copilot, stack.capabilities, stack.resolver, structure);
+  return { ...stack, team, structure };
 }
 
 /** 直接调 Provider 时用的最小上下文。 */

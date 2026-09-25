@@ -35,14 +35,18 @@ export class FilesystemSkillProvider implements SkillProvider {
     private readonly root: string | ((context: CapabilityContext) => string),
   ) {}
 
-  async resolve(context: CapabilityContext, _binding: CapabilityBinding): Promise<SkillArtifact[]> {
+  async resolve(context: CapabilityContext, binding: CapabilityBinding): Promise<SkillArtifact[]> {
     const root = typeof this.root === 'function' ? this.root(context) : this.root;
     if (!fs.existsSync(root)) return [];
 
+    // selector 为空 = 全部；否则只加载点名的 skill（逗号/空白分隔）。
+    // binding 看起来细粒度、实际全量返回等于没有边界，所以这里必须真的过滤。
+    const only = parseSkillSelector(binding.selector);
     const artifacts: SkillArtifact[] = [];
 
     for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
       if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+      if (only && !only.has(entry.name)) continue;
 
       const directory = path.join(root, entry.name);
       const skillFile = path.join(directory, 'SKILL.md');
@@ -59,12 +63,72 @@ export class FilesystemSkillProvider implements SkillProvider {
         name: entry.name,
         description: readDescription(content),
         directory,
-        version: hashText(content),
+        // skill 是 bundle：SKILL.md 之外 scripts/ references/ templates/ 变了也要换版本，
+        // 否则 execution 审计看到的是同一个版本、跑的却是两份实现。
+        version: hashSkillDirectory(directory),
       });
+    }
+
+    if (only) {
+      for (const name of only) {
+        if (!artifacts.some((artifact) => artifact.name === name)) {
+          // eslint-disable-next-line no-console
+          console.warn(`[capability] ${this.id} 没有名为 ${name} 的 skill（selector 指向了不存在的目录）`);
+        }
+      }
     }
 
     return artifacts.sort((a, b) => a.name.localeCompare(b.name));
   }
+}
+
+/**
+ * selector 语义：空 = 全部；否则是 skill 目录名清单（逗号/空白分隔）。
+ *
+ * 逗号与空白都认：模板里写 `research, security-review` 与 `research security-review`
+ * 都是同一件事，不值得为分隔符定第二种语法。
+ */
+function parseSkillSelector(selector: string | undefined): Set<string> | null {
+  if (!selector?.trim()) return null;
+  const names = selector
+    .split(/[,\s]+/)
+    .map((name) => name.trim())
+    .filter(Boolean);
+  return names.length > 0 ? new Set(names) : null;
+}
+
+/**
+ * 整个 skill 目录的指纹：相对路径 + 文件内容逐个拼接后 hash。
+ *
+ * 按路径排序保证稳定性；读失败的文件直接跳过 —— 一个坏掉的附件不该让整个
+ * skill 在解析阶段消失（SKILL.md 缺失仍跳过，见 resolve）。
+ */
+function hashSkillDirectory(directory: string): string {
+  const files: string[] = [];
+  const walk = (dir: string): void => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name.startsWith('.')) continue;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+        continue;
+      }
+      if (entry.isFile()) files.push(full);
+    }
+  };
+  walk(directory);
+  files.sort();
+
+  const payload: string[] = [];
+  for (const full of files) {
+    const relative = path.relative(directory, full).split(path.sep).join('/');
+    try {
+      payload.push(`${relative}\0${fs.readFileSync(full, 'utf8')}\0`);
+    } catch {
+      continue;
+    }
+  }
+  return hashText(payload.join(''));
 }
 
 /**

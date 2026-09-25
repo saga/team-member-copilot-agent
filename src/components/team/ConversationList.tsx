@@ -10,7 +10,7 @@ interface ConversationListProps {
   showCreator: boolean;
   onToggleCreator: () => void;
   onCancelCreator: () => void;
-  onCreateGroup: (input: { title: string; memberIds: string[] }) => Promise<void>;
+  onCreateGroup: (input: { title: string; memberIds: string[]; projectId?: string | null }) => Promise<void>;
 }
 
 /**

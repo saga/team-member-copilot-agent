@@ -2,6 +2,14 @@ import { Router } from 'express';
 import { z } from 'zod';
 import type { TeamService } from '../team-service.js';
 import { sendError } from '../middleware/errorHandler.js';
+import { isAdminAuthorized } from '../middleware/apiScope.js';
+import { isTeamAdmin } from '../middleware/teamScope.js';
+
+/** 改 capability boundary 必须 owner/admin：token 或 Team role 任一通过。 */
+function canAdmin(req: Parameters<typeof isAdminAuthorized>[0]): boolean {
+  if (isAdminAuthorized(req)) return true;
+  return isTeamAdmin(req, 'owner', 'admin');
+}
 
 /**
  * Member 的能力组成（Skill / Knowledge / Tool 的 Provider 引用）。
@@ -39,7 +47,12 @@ export function capabilitiesRouter(team: TeamService) {
     }
   });
 
+  // 改的是 Agent 的 capability boundary，不是普通读写：必须 owner/admin。
   router.put('/members/:memberId', (req, res) => {
+    if (!canAdmin(req)) {
+      res.status(403).json({ error: '需要 Team owner/admin（或有效的 ADMIN_API_TOKEN）' });
+      return;
+    }
     const parsed = capabilitiesSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
       res.status(400).json({

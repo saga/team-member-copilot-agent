@@ -17,7 +17,8 @@ import type { RuntimeTool, ToolDecision, ToolExecutionContext } from './capabili
  * 判据只有三个，全部来自 RuntimeTool 的声明：
  *
  *   requiresHostAccess  + 部署开关   —— 会触达宿主机的工具要部署层放行
- *   risk === 'privileged'            —— 高风险动作必须走独立决策，这里一律拒绝
+ *   risk === 'privileged' / 'external-write' —— 高风险动作必须有独立决策：
+ *     没有 authorize() 直接拒绝，有则以它的结论为准
  *   authorize()                      —— Provider 自己的逐次判定（路径白名单等）
  *
  * `if (toolName === 'bash')` 这种写法之所以必须消失：它让「新增一个工具」变成
@@ -76,8 +77,21 @@ export class DefaultToolPolicy implements ToolPolicy {
       );
     }
 
+    // privileged 一律拒绝：它要的是独立 Policy 服务的决策，不是 Provider 自己的
+    // authorize() 自证清白 —— 后者让「执行动作的人」同时当「批准动作的人」。
     if (tool.risk === 'privileged') {
       return deny('privileged Tool 必须经过独立 Policy 决策，授权层不直接放行');
+    }
+
+    // external-write 默认拒绝：必须有 authorize() 且它明确放行。
+    // 没有它时直接拒绝 —— 否则以后加一个 send_email（无 authorize）会默认允许。
+    if (tool.risk === 'external-write') {
+      if (!tool.authorize) {
+        return deny('external-write Tool 缺少独立 Policy 决策（authorize），默认拒绝');
+      }
+      const decision = await tool.authorize(context, args);
+      if (!decision.allowed) return decision;
+      return { allowed: true, reason: `policy allow: ${decision.reason}` };
     }
 
     if (tool.authorize) {

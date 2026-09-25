@@ -27,6 +27,23 @@ export interface CoreToolHost {
 
   rememberMember(input: { memberId: string; content: string }): Promise<string>;
 
+  listWorkItems(input: {
+    memberId: string;
+    scope?: 'mine' | 'available' | 'all';
+    projectId?: string;
+    status?: string;
+  }): Promise<string>;
+
+  claimWorkItem(input: { memberId: string; workItemId: string }): Promise<string>;
+
+  updateWorkItem(input: {
+    memberId: string;
+    workItemId: string;
+    status?: string;
+    title?: string;
+    description?: string;
+  }): Promise<string>;
+
   /**
    * 给另一个 Member 发一条私聊消息。
    *
@@ -112,6 +129,61 @@ export class CoreTeamToolProvider implements ToolProvider {
           this.host.rememberMember({
             memberId: context.memberId,
             content: String(args.content),
+          }),
+      },
+      {
+        providerId: this.id,
+        kind: 'custom',
+        name: 'list_work_items',
+        description:
+          'List team work items you can work on. Prefer this over asking the user what to do next.',
+        risk: 'read',
+        parameters: z.object({
+          scope: z.enum(['mine', 'available', 'all']).optional().describe('mine = assigned to you or claimed by you; available = unclaimed and unblocked; all = team open items'),
+          projectId: z.string().min(1).optional().describe('Filter by project'),
+          status: z.string().min(1).optional().describe('Filter by status'),
+        }),
+        execute: (context, args) =>
+          this.host.listWorkItems({
+            memberId: context.memberId,
+            ...(args.scope === undefined ? {} : { scope: args.scope as 'mine' | 'available' | 'all' }),
+            ...(args.projectId === undefined ? {} : { projectId: String(args.projectId) }),
+            ...(args.status === undefined ? {} : { status: String(args.status) }),
+          }),
+      },
+      {
+        providerId: this.id,
+        kind: 'custom',
+        name: 'claim_work_item',
+        description:
+          'Atomically claim a work item so no other member starts the same work. Claim sets it to in_progress.',
+        risk: 'coordination',
+        parameters: z.object({
+          workItemId: z.string().min(1).describe('The work item to claim'),
+        }),
+        execute: (context, args) =>
+          this.host.claimWorkItem({ memberId: context.memberId, workItemId: String(args.workItemId) }),
+      },
+      {
+        providerId: this.id,
+        kind: 'custom',
+        name: 'update_work_item',
+        description:
+          'Update a work item you claimed (status/title/description). Only the claimer or a team admin can mark done/cancelled.',
+        risk: 'coordination',
+        parameters: z.object({
+          workItemId: z.string().min(1).describe('The work item to update'),
+          status: z.enum(['todo', 'in_progress', 'blocked', 'done', 'cancelled']).optional(),
+          title: z.string().min(1).max(300).optional(),
+          description: z.string().max(8000).optional(),
+        }),
+        execute: (context, args) =>
+          this.host.updateWorkItem({
+            memberId: context.memberId,
+            workItemId: String(args.workItemId),
+            ...(args.status === undefined ? {} : { status: String(args.status) }),
+            ...(args.title === undefined ? {} : { title: String(args.title) }),
+            ...(args.description === undefined ? {} : { description: String(args.description) }),
           }),
       },
     ];

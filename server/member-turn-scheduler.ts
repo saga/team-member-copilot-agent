@@ -146,6 +146,7 @@ function keyOf(conversationId: string, memberId: string): string {
 const REASON_PRIORITY: Record<WakeReason, number> = {
   mention: 3,
   direct: 2,
+  schedule: 2,
   follow_up: 1,
   open_discussion: 0,
 };

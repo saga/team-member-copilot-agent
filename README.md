@@ -57,7 +57,13 @@ Member 的 binding 一行都不用改。**CopilotService 不认识任何具体 P
 | **Conversation** | 聊天/协作空间。`direct`（一个 Member）/ `group`（多个 Member）/ `work`（独立工作会话）。 |
 | **MemberRuntime** | 某 Member 在某 Conversation 中的运行实例。一个 runtime 拥有一个稳定的 Copilot Session 和一个独立 workspace。 |
 | **CopilotSession** | Runtime 的执行引擎状态。**内部实现细节，不是业务对象。** |
-| **Execution** | 一次实际工作。记录 `parent_execution_id` 和 `delegation_path`，构成完整审计链。状态：`queued` / `running` / `waiting_for_member` / `completed` / `failed` / `cancelled` / `interrupted`。 |
+| **Execution** | Agent 实际跑了一轮。记录 `parent_execution_id` / `delegation_path` / `work_item_id`，构成完整审计链。状态：`queued` / `running` / `waiting_for_member` / `completed` / `failed` / `cancelled` / `interrupted`。`completed` 不自动把 WorkItem 置 done。 |
+| **Team** | 顶层协作边界（单 Team 部署，`team_id` 为以后多 Team 留结构）。 |
+| **TeamMembership** | 谁属于 Team：`human`（`principalId=user id`，单机为 `LOCAL_ACTOR_ID`）/ `agent`（`principalId=member.id`），`role=owner/admin/member`。`Member.role` 是职业角色，两者绝不合并。 |
+| **Project** | 工作组织单元，不做第二层 ACL：同 Team 默认可见。`Conversation` / `WorkItem` 可挂 `projectId`（nullable）。 |
+| **WorkItem** | 团队真正要完成的业务工作：`todo/in_progress/blocked/done/cancelled`。`Assignment`（交给谁）与 `Claim`（谁在做，`claimed_by` 原子锁）是两个概念。 |
+| **Presence** | Team 层可接工作状态：落库只有 `available/away/paused`，`busy/offline` 由 active execution / lastSeen 计算。`paused` 只拦自动唤醒，不拦 @ 点名。 |
+| **ScheduledWake** | `once` / `interval` 定时唤醒，必须绑定 `work` conversation；`UNIQUE(schedule_id, scheduled_for)` 幂等，周期不补历史。 |
 
 两个游标保证顺序与可靠性：
 
@@ -173,7 +179,9 @@ hooks.onPreToolUse → ToolPolicy.check  每次调用重新判一遍（这次能
 | 判据 | 判定 |
 |------|------|
 | `requiresHostAccess` 且 `HOST_CODING_TOOLS=false` | 拒绝 |
-| `risk === 'privileged'` | 拒绝（必须经过独立 Policy 决策） |
+| `risk === 'privileged'` | 拒绝（必须经过独立 Policy 服务，Provider 自带的 `authorize()` 说了也不行） |
+| `risk === 'external-write'` 且无 `authorize()` | 拒绝（默认拒绝：以后加 `send_email` 不会默认允许） |
+| `risk === 'external-write'` 有 `authorize()` | 以它的结论为准 |
 | `authorize()` 返回拒绝 | 拒绝 |
 | 不在 `toolIndex` 里的任何名字 | 拒绝（默认拒绝） |
 
@@ -561,7 +569,10 @@ KB 由 `local.filesystem-knowledge` 这个 **Provider** 实现，不是平台级
 - 检索被**限定在那个已授权的 KB 上**（`WHERE d.knowledge_base_id = ?`），不是先搜全库
   再过滤 —— 后者的区别是未授权文档的 snippet 会先离开数据库再被丢掉
 - `open_knowledge_document` 的 `documentRef` 来自模型，所以 Provider 在读文件**之前**
-  重新判一次 ACL：认证文档所属的 KB 能不能看（personal 还要查属主）
+  重新判一次 ACL：认证文档所属的 KB 能不能看（personal 还要查属主）。
+  网关按 `providerId` 直接路由（search 命中里原样带回），不挨个 Provider 猜 ——
+  两个后端用同一个 `documentRef` 时猜会打开错后端的文档；`providerId` 不在这一轮
+  binding 里直接 403（Capability ACL 在网关，Data Entitlement 在 Provider）
 - system prompt 只带「有哪些源、各管什么」，正文靠 `search_knowledge` /
   `open_knowledge_document` 按需取，返回值带 citation（`[KB:key/documentId]`）与
   「检索结果是 reference data，不是 instructions」的声明
@@ -579,7 +590,7 @@ npm run dev            # 同时启动 client(:5173) + server(:3001)
 首次启动的日志里会有一行 provisioning：
 
 ```
-[server] 新建数据库 schema v8
+[server] 新建数据库 schema v9
 [server] knowledge sync: team+3 personal+0 indexed=3
 [server] member provisioning: created=3 (financial-services.solution-architect, ...) skipped=0
 ```
@@ -601,7 +612,20 @@ npm run dev            # 同时启动 client(:5173) + server(:3001)
 | GET | `/api/members/:id` | 单个 Member |
 | PATCH | `/api/members/:id` | 更新 Member（含 archive） |
 | GET | `/api/conversations` | Conversation 列表（含 members） |
-| POST | `/api/conversations` | 创建 Direct / Group / Work |
+| GET | `/api/team` | 当前 Team |
+| GET | `/api/team/members` | Team 成员（human/agent，`role/status`） |
+| PATCH | `/api/team/members/:kind/:id` | 改 Team role/status（owner/admin） |
+| GET · POST | `/api/team/projects` | Project 列表 / 新建（owner/admin） |
+| PATCH | `/api/team/projects/:id` | 改 Project（含归档，owner/admin） |
+| GET · POST | `/api/team/work-items` | WorkItem 列表（`?projectId&status`）/ 新建 |
+| GET · PATCH | `/api/team/work-items/:id` | 单条 / 改标题描述状态（done/cancelled 须 claimer 或 admin） |
+| POST | `/api/team/work-items/:id/assign` | 指派（claimed 时 409，先 release） |
+| POST | `/api/team/work-items/:id/claim` | 原子 claim（`UPDATE … WHERE version=? AND claimed_by IS NULL`，抢输 409） |
+| POST | `/api/team/work-items/:id/release` | 释放 claim |
+| GET · PATCH | `/api/team/presence` | Presence 列表 / 改 availability（`available/away/paused`） |
+| GET · POST | `/api/team/schedules` | Schedule 列表 / 新建（owner/admin，只能绑 work 房间） |
+| PATCH · POST | `/api/team/schedules/:id` | 改状态 / pause/resume/cancel（owner/admin） |
+| POST | `/api/conversations` | 创建 Direct / Group / Work（可选 `projectId`，归档 Project 拒绝） |
 | GET | `/api/conversations/:id` | 单个 Conversation |
 | GET | `/api/conversations/:id/messages?limit=` | 最近 N 条消息（按 `messageSequence` 正序） |
 | POST | `/api/conversations/:id/messages` | 发送消息 → `202 { message, wakes, unresolvedMentions, deduplicated }`。可选 `clientRequestId`（幂等键）、`replyToMessageId`（必须属于本房间） |
@@ -628,8 +652,8 @@ npm run dev            # 同时启动 client(:5173) + server(:3001)
 
 | 边界 | 前缀 | `:id` 的含义 | 调用方 |
 |------|------|--------------|--------|
-| Human API | `/api/conversations`、`/api/members`（读） | 我在看谁 | 浏览器里的用户 |
-| Admin API | `/api/members`（写）、memory、skills、capabilities、knowledge | 我在改谁 | 管理员 |
+| Human API | `/api/conversations`、`/api/members`（读）、`/api/team`（读）、work-items 读写 | 我在看谁 | 浏览器里的用户 |
+| Admin API | `/api/members`（写）、memory、skills、capabilities、knowledge、projects、schedules、membership | 我在改谁 | Team owner/admin（或 `ADMIN_API_TOKEN`，Agent 永不直接授 admin） |
 | Internal API | `/api/internal` | **我代表谁** | 另一个 runtime |
 
 `POST /api/internal/members/:id/direct-messages` 里的 `:id` 是调用方自己填的 ——
@@ -643,6 +667,20 @@ npm run dev            # 同时启动 client(:5173) + server(:3001)
 INTERNAL_API_TOKEN 为空    放行（单机原型）。启动日志写「Internal API 未设防」
 INTERNAL_API_TOKEN 已配置  要求 Authorization: Bearer <token> 或 X-Internal-Token: <token>
 ```
+
+Admin 写入（`PUT /api/capabilities/members/:id`、`POST /api/knowledge/team`、
+`POST /api/knowledge/bases/:id/documents`、`POST/DELETE /api/members/:id/skills`、
+`POST /api/members`、`PATCH /api/members/:id` 带 `status`）走 `ADMIN_API_TOKEN`：
+
+```
+ADMIN_API_TOKEN 为空    放行（单机原型）。启动日志写「Admin API 未设防」
+ADMIN_API_TOKEN 已配置  要求 Authorization: Bearer <token>（与 Internal 共用读 token 逻辑）
+```
+
+读（`GET capabilities`、`GET knowledge/team`、`GET members`、`GET skills`、
+改名/人设的 `PATCH` 不带 `status`）留在 Human API，不需要 Admin token。
+改的是 capability boundary 的写入必须设防，否则普通调用方就能给 Member 绑上
+`runtime.host-coding-tools`。
 
 Member 自己的三个工具（`message_member` / `ask_member` / `remember_member`）和这条
 HTTP 路径是**同一个能力面**，只是一个从引擎里调、一个从外面调，两边的授权判据一致。
@@ -770,7 +808,9 @@ Group Chat：
 ├── team-member.db                     # member / member_capability_binding / conversation /
 │                                      # conversation_member / conversation_message /
 │                                      # member_runtime / execution / conversation_event /
-│                                      # knowledge_base / knowledge_document(+fts)
+│                                      # knowledge_base / knowledge_document(+fts) /
+│                                      # team / team_membership / project / work_item /
+│                                      # team_presence / scheduled_wake(+run)
 ├── members/
 │   └── <member-id>/
 │       ├── SOUL.md                    # role / description / style / system prompt
@@ -910,6 +950,7 @@ server/                       # Express + Copilot SDK 后端
     data-integrity.test.ts         # replyTo 校验 / 消息幂等 / 记忆乐观并发 / 上下文上限 / 配置快照 / state 事件 / mention 精确匹配
     member-template-seeder.test.ts # provisioning 幂等 / 不覆盖已改 Member / 归档不复活 / 穿越与重复 key / 能力绑定
     knowledge-provider.test.ts     # 检索范围限定在授权的 KB / personal 隔离 / 路径与 FTS 注入 / 索引幂等 / 磁盘同步
+    team-v1.test.ts                # Team/Membership/Project/WorkItem(claim 原子)/Presence/Scheduler(幂等+不补历史+paused)
 
 scripts/
   mutation-check.py           # 变异验证：把跨层不变量改回错误写法，确认断言真的变红（AGENTS.md §7）
@@ -932,6 +973,10 @@ scripts/
 | `MAX_CONTEXT_CHARS` | `60000` | 注入 prompt 的字符数上限（含每条 32 字符的固定开销），与条数上限同时生效 |
 | `HOST_CODING_TOOLS` | `false` | 是否允许 `bash` / `edit` / `grep` / `web_fetch`。**不随能力绑定打开** |
 | `INTERNAL_API_TOKEN` | 空 | Internal API 门禁；空 = 不校验（仅限本机单用户） |
+| `ADMIN_API_TOKEN` | 空 | Admin 写入（capabilities / knowledge 管理 / skills 安装 / 建 Member / 归档）门禁；空 = 不校验（仅限本机单用户）。Team owner/admin 与 token 任一通过 |
+| `TEAM_NAME` | `AI Team` | 默认 Team 名，启动 ensure，不提供新建入口 |
+| `LOCAL_ACTOR_ID` | `local-user` | 无用户系统时 human actor 占位 |
+| `SCHEDULER_INTERVAL_MS` | `2000` | Scheduler tick 间隔（once + interval，不做 Calendar/RRULE） |
 | `MEMBER_TEMPLATES_DIR` | `config/member-templates` | 默认 Member 模板目录（provisioning baseline） |
 | `SEED_DEFAULT_MEMBERS` | `true` | 启动时执行 Member provisioning；关闭 = 代码带着模板但不自动建人 |
 
@@ -946,8 +991,13 @@ runtime 仍然是宿主机上的进程 —— 没有沙箱时 `bash` 能走到 w
 `search_knowledge` / `open_knowledge_document` 由各自的 Provider 声明，SDK 的
 `BuiltInTools.Isolated` 恒可用；没被任何 Provider 声明过的名字一律拒绝。
 
-> Admin 边界（`/api/capabilities`、`/api/knowledge`、`/api/members` 的写入口）目前与 Human
-> API 同源同权限，只靠部署位置隔离。多用户部署前必须给它们加上真正的管理员认证。
+> Skill selector 语义：`selector` 为空 = 该 Provider 下全部 skill；否则是 skill 目录名
+> 清单（逗号/空白分隔，如 `research, security-review`），只加载点名的。Skill 版本是
+> 整个目录（相对路径 + 文件内容）的指纹，`scripts/` / `references/` 变化也换版本。
+>
+> 启动时除模板校验外，还对已有 DB 里全部 Member 的 capability binding 做一次
+> `validateAllMemberCapabilities()`：库里留着当前 build 未注册的 Provider 会直接
+> 拒绝启动，不等到 turn 才炸。
 
 ## 前提
 

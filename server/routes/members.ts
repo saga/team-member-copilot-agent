@@ -2,6 +2,13 @@ import express, { Router } from 'express';
 import { z } from 'zod';
 import type { TeamService } from '../team-service.js';
 import { sendError } from '../middleware/errorHandler.js';
+import { isAdminAuthorized } from '../middleware/apiScope.js';
+import { isTeamAdmin } from '../middleware/teamScope.js';
+
+function canAdmin(req: Parameters<typeof isAdminAuthorized>[0]): boolean {
+  if (isAdminAuthorized(req)) return true;
+  return isTeamAdmin(req, 'owner', 'admin');
+}
 
 const createMemberSchema = z.object({
   name: z.string().trim().min(1).max(100),
@@ -55,7 +62,12 @@ export function membersRouter(team: TeamService) {
     res.json({ members: team.listMembers() });
   });
 
+  // 建 Member 自带一组默认能力，归档则决定它接不接活：都是 Admin 面的写入。
   router.post('/', (req, res) => {
+    if (!canAdmin(req)) {
+      res.status(403).json({ error: '需要 Team owner/admin（或有效的 ADMIN_API_TOKEN）' });
+      return;
+    }
     const parsed = createMemberSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
       res.status(400).json({ error: parsed.error.issues.map((i) => i.message).join('; ') });
@@ -76,7 +88,13 @@ export function membersRouter(team: TeamService) {
     }
   });
 
+  // 改名字/人设是 Human 面；改 status（归档/恢复）是 Admin 面（决定接不接活）。
+  // 同一条 PATCH 上按 body 里有没有 status 分流，避免「改个名字也要 admin token」。
   router.patch('/:id', (req, res) => {
+    if ((req.body as { status?: unknown } | undefined)?.status !== undefined && !canAdmin(req)) {
+      res.status(403).json({ error: '需要 Team owner/admin（或有效的 ADMIN_API_TOKEN）' });
+      return;
+    }
     const parsed = updateMemberSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
       res.status(400).json({ error: parsed.error.issues.map((i) => i.message).join('; ') });
@@ -112,6 +130,10 @@ export function membersRouter(team: TeamService) {
    * 不带则强制覆盖。
    */
   router.put('/:id/memory', (req, res) => {
+    if (!canAdmin(req)) {
+      res.status(403).json({ error: '需要 Team owner/admin（或有效的 ADMIN_API_TOKEN）' });
+      return;
+    }
     const parsed = memorySchema.safeParse(req.body ?? {});
     if (!parsed.success) {
       res.status(400).json({ error: 'content 必须是 string（expectedVersion 可选）' });
@@ -172,6 +194,10 @@ export function membersRouter(team: TeamService) {
       limit: '25mb',
     }),
     (req, res) => {
+      if (!canAdmin(req)) {
+        res.status(403).json({ error: '需要 Team owner/admin（或有效的 ADMIN_API_TOKEN）' });
+        return;
+      }
       if (!Buffer.isBuffer(req.body)) {
         res.status(400).json({
           error: '请以 application/zip（或 application/octet-stream）上传 skill 压缩包',
@@ -190,6 +216,10 @@ export function membersRouter(team: TeamService) {
   );
 
   router.delete('/:id/skills/:name', (req, res) => {
+    if (!canAdmin(req)) {
+      res.status(403).json({ error: '需要 Team owner/admin（或有效的 ADMIN_API_TOKEN）' });
+      return;
+    }
     try {
       team.removeMemberSkill(req.params.id, req.params.name);
       res.json({ skills: team.listMemberSkills(req.params.id) });

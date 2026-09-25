@@ -1,6 +1,7 @@
 import type { Conversation, Member } from '../../lib/api';
 import { ConversationList } from './ConversationList';
 import { MemberList } from './MemberList';
+import { ProjectSection, ScheduleSection, WorkSection } from './TeamSections';
 
 interface TeamSidebarProps {
   members: Member[];
@@ -19,10 +20,10 @@ interface TeamSidebarProps {
   showGroupCreator: boolean;
   onToggleGroupCreator: () => void;
   onCancelGroupCreator: () => void;
-  onCreateGroup: (input: { title: string; memberIds: string[] }) => Promise<void>;
+  onCreateGroup: (input: { title: string; memberIds: string[]; projectId?: string | null }) => Promise<void>;
 }
 
-/** 左栏：Member 与 Conversation 两个列表。只负责排布与转发。 */
+/** 左栏：Members / Projects / Work / Conversations。只负责排布与转发。 */
 export function TeamSidebar({
   members,
   conversations,
@@ -50,6 +51,12 @@ export function TeamSidebar({
         onChat={onChatMember}
         onEdit={onEditMember}
       />
+
+      <ProjectSection />
+
+      <WorkSection members={members} />
+
+      <ScheduleSection />
 
       <ConversationList
         conversations={conversations}

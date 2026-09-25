@@ -20,7 +20,7 @@ import type { DatabaseSync } from 'node:sqlite';
  *
  * 程序不认识任何别的编号 —— 没有升级代码，认出来也无从下手。
  */
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 9;
 
 /**
  * 当前 schema 的完整定义，按最终形状写。
@@ -89,8 +89,226 @@ CREATE INDEX idx_member_capability_provider
 CREATE INDEX idx_member_capability_member
   ON member_capability_binding(member_id);
 
+-- ─────────────────────────────────────────────── Team 业务模型 v1 ─────
+--
+-- Team 是顶层协作边界：Membership / Project / WorkItem / Presence / Schedule
+-- 都挂在它下面。当前部署只有一个 Team，但形状上带 team_id，为以后多 Team 留结构。
+-- Project 只是工作组织单元，不做第二层 ACL；Assignment/Claim 是 work_item 的字段，
+-- 不是独立的表。
+
+CREATE TABLE team (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  created_by TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE team_membership (
+  team_id TEXT NOT NULL,
+  kind TEXT NOT NULL
+    CHECK (kind IN ('human', 'agent')),
+  principal_id TEXT NOT NULL,
+  -- Member.role 是职业角色（Architect），这里是 Team 权限角色（owner/admin/member），
+  -- 两者绝不合并。
+  role TEXT NOT NULL
+    CHECK (role IN ('owner', 'admin', 'member')),
+  status TEXT NOT NULL DEFAULT 'active'
+    CHECK (status IN ('active', 'inactive')),
+  joined_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (team_id, kind, principal_id),
+  FOREIGN KEY (team_id)
+    REFERENCES team(id)
+    ON DELETE CASCADE
+);
+
+CREATE INDEX idx_team_membership_team
+  ON team_membership(team_id, status);
+
+CREATE INDEX idx_team_membership_principal
+  ON team_membership(kind, principal_id, status);
+
+CREATE TABLE project (
+  id TEXT PRIMARY KEY,
+  team_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'active'
+    CHECK (status IN ('active', 'archived')),
+  created_by TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (team_id)
+    REFERENCES team(id)
+    ON DELETE CASCADE
+);
+
+CREATE INDEX idx_project_team_status
+  ON project(team_id, status);
+
+CREATE TABLE work_item (
+  id TEXT PRIMARY KEY,
+  team_id TEXT NOT NULL,
+  project_id TEXT,
+  title TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'todo'
+    CHECK (
+      status IN (
+        'todo',
+        'in_progress',
+        'blocked',
+        'done',
+        'cancelled'
+      )
+    ),
+  assignee_kind TEXT
+    CHECK (
+      assignee_kind IS NULL
+      OR assignee_kind IN ('human', 'agent')
+    ),
+  assignee_id TEXT,
+  claimed_by_member_id TEXT,
+  claimed_execution_id TEXT,
+  claimed_at TEXT,
+  version INTEGER NOT NULL DEFAULT 1,
+  created_by TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  CHECK (
+    (assignee_kind IS NULL AND assignee_id IS NULL)
+    OR
+    (assignee_kind IS NOT NULL AND assignee_id IS NOT NULL)
+  ),
+  FOREIGN KEY (team_id)
+    REFERENCES team(id)
+    ON DELETE CASCADE,
+  FOREIGN KEY (project_id)
+    REFERENCES project(id)
+    ON DELETE SET NULL,
+  FOREIGN KEY (claimed_by_member_id)
+    REFERENCES member(id)
+);
+
+CREATE INDEX idx_work_item_team_status
+  ON work_item(team_id, status);
+
+CREATE INDEX idx_work_item_project_status
+  ON work_item(project_id, status);
+
+CREATE INDEX idx_work_item_assignee
+  ON work_item(assignee_kind, assignee_id, status);
+
+CREATE INDEX idx_work_item_claim
+  ON work_item(claimed_by_member_id);
+
+-- Presence 只存可配置的 availability（available/away/paused），busy/offline 由系统
+-- 按 active execution 与 lastSeen 计算，不落库，否则三边打架。
+CREATE TABLE team_presence (
+  team_id TEXT NOT NULL,
+  kind TEXT NOT NULL
+    CHECK (kind IN ('human', 'agent')),
+  principal_id TEXT NOT NULL,
+  availability TEXT NOT NULL DEFAULT 'available'
+    CHECK (availability IN ('available', 'away', 'paused')),
+  last_seen_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (team_id, kind, principal_id),
+  FOREIGN KEY (team_id)
+    REFERENCES team(id)
+    ON DELETE CASCADE
+);
+
+-- Scheduler 只做 once + interval，不做 Calendar/RRULE。conversation_id 必填且
+-- 限定 work 房间：Schedule 不自建 runtime，只进已有 Conversation 的执行链。
+CREATE TABLE scheduled_wake (
+  id TEXT PRIMARY KEY,
+  team_id TEXT NOT NULL,
+  member_id TEXT NOT NULL,
+  conversation_id TEXT NOT NULL,
+  project_id TEXT,
+  work_item_id TEXT,
+  prompt TEXT NOT NULL,
+  type TEXT NOT NULL
+    CHECK (type IN ('once', 'interval')),
+  run_at TEXT NOT NULL,
+  interval_seconds INTEGER,
+  next_run_at TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active'
+    CHECK (
+      status IN (
+        'active',
+        'paused',
+        'completed',
+        'cancelled'
+      )
+    ),
+  last_fired_at TEXT,
+  last_error TEXT,
+  created_by TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  CHECK (
+    (type = 'once' AND interval_seconds IS NULL)
+    OR
+    (type = 'interval' AND interval_seconds IS NOT NULL AND interval_seconds > 0)
+  ),
+  FOREIGN KEY (team_id)
+    REFERENCES team(id)
+    ON DELETE CASCADE,
+  FOREIGN KEY (member_id)
+    REFERENCES member(id),
+  FOREIGN KEY (conversation_id)
+    REFERENCES conversation(id)
+    ON DELETE CASCADE,
+  FOREIGN KEY (project_id)
+    REFERENCES project(id)
+    ON DELETE SET NULL,
+  FOREIGN KEY (work_item_id)
+    REFERENCES work_item(id)
+    ON DELETE SET NULL
+);
+
+CREATE INDEX idx_scheduled_wake_due
+  ON scheduled_wake(status, next_run_at);
+
+CREATE INDEX idx_scheduled_wake_member
+  ON scheduled_wake(member_id, status);
+
+-- 幂等锚点：UNIQUE(schedule_id, scheduled_for) 保证 crash 后不会对同一时间点
+-- 执行两遍。周期任务不补历史，只执行一次并跳到下一个 future slot。
+CREATE TABLE scheduled_wake_run (
+  id TEXT PRIMARY KEY,
+  schedule_id TEXT NOT NULL,
+  scheduled_for TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'queued'
+    CHECK (
+      status IN (
+        'queued',
+        'running',
+        'completed',
+        'failed'
+      )
+    ),
+  execution_id TEXT,
+  created_at TEXT NOT NULL,
+  started_at TEXT,
+  ended_at TEXT,
+  error TEXT,
+  UNIQUE (schedule_id, scheduled_for),
+  FOREIGN KEY (schedule_id)
+    REFERENCES scheduled_wake(id)
+    ON DELETE CASCADE,
+  FOREIGN KEY (execution_id)
+    REFERENCES execution(id)
+);
+
 CREATE TABLE conversation (
   id TEXT PRIMARY KEY,
+  team_id TEXT NOT NULL,
+  project_id TEXT,
   title TEXT NOT NULL,
   kind TEXT NOT NULL
     CHECK (kind IN ('direct', 'group', 'work')),
@@ -102,10 +320,19 @@ CREATE TABLE conversation (
   message_sequence INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
+  FOREIGN KEY (team_id)
+    REFERENCES team(id)
+    ON DELETE CASCADE,
+  FOREIGN KEY (project_id)
+    REFERENCES project(id)
+    ON DELETE SET NULL,
   FOREIGN KEY (default_member_id)
     REFERENCES member(id)
     ON DELETE SET NULL
 );
+
+CREATE INDEX idx_conversation_team
+  ON conversation(team_id, updated_at);
 
 CREATE TABLE conversation_member (
   conversation_id TEXT NOT NULL,
@@ -233,6 +460,7 @@ CREATE TABLE execution (
   id TEXT PRIMARY KEY,
   conversation_id TEXT NOT NULL,
   member_id TEXT NOT NULL,
+  work_item_id TEXT,
   runtime_id TEXT,
   parent_execution_id TEXT,
   delegation_path TEXT NOT NULL DEFAULT '[]',
@@ -260,7 +488,7 @@ CREATE TABLE execution (
   -- 这一轮最终判断了什么（发言 / 沉默）以及唤醒它的那条消息
   decision TEXT,
   trigger_message_sequence INTEGER,
-  -- 为什么唤醒这个 Member（direct / mention / open_discussion / follow_up）。
+  -- 为什么唤醒这个 Member（direct / mention / open_discussion / follow_up / schedule）。
   -- 落库是为了重启恢复时能忠实重放同一轮，而不是猜一个。
   wake_reason TEXT,
   -- 这一轮跑的时候，这个 Member 的配置长什么样。
@@ -277,6 +505,9 @@ CREATE TABLE execution (
     ON DELETE CASCADE,
   FOREIGN KEY (member_id)
     REFERENCES member(id),
+  FOREIGN KEY (work_item_id)
+    REFERENCES work_item(id)
+    ON DELETE SET NULL,
   FOREIGN KEY (runtime_id)
     REFERENCES member_runtime(id),
   FOREIGN KEY (parent_execution_id)
@@ -293,6 +524,9 @@ CREATE INDEX idx_execution_parent
 
 CREATE INDEX idx_execution_status
   ON execution(status);
+
+CREATE INDEX idx_execution_work_item
+  ON execution(work_item_id);
 
 -- ─────────────────────────────────────────────── Knowledge Base ───────────
 --

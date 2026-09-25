@@ -83,12 +83,40 @@ export function requireInternalToken() {
   };
 }
 
+/** Admin token 是否通过。空配置 = 单机原型，直接放行（启动日志会写明未设防）。 */
+export function isAdminAuthorized(req: Request): boolean {
+  if (!config.adminApiToken) return true;
+  const presented = readPresentedToken(req);
+  return !!presented && tokensMatch(presented, config.adminApiToken);
+}
+
+/**
+ * Admin API 的门禁：改 capability boundary 的写入（capabilities / knowledge 管理 /
+ * skills 安装 / 建 Member / 归档）。只用在「整条路由都是 Admin」的写入上；
+ * 同一个 router 里读写混放时（如 PATCH 改名 vs 归档），调用方用 isAdminAuthorized()
+ * 在 handler 内部分流 —— Express 5 给多 handler 的 req.params 推断会退化成
+ * string|string[]，多一个中间件就多一处 as string。
+ */
+export function requireAdminToken() {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    if (isAdminAuthorized(req)) {
+      next();
+      return;
+    }
+    res.status(401).json({ error: 'Admin API 需要有效的 ADMIN_API_TOKEN' });
+  };
+}
+
 /**
  * 启动时的一句话体检。把「当前有哪些边界是真的存在的」写进日志 ——
  * 一个只在文档里存在的边界等于没有边界。
  */
 export function describeApiBoundary(): string {
-  return config.internalApiToken
+  const internal = config.internalApiToken
     ? 'Internal API(/api/internal) 已启用 token 校验'
     : 'Internal API(/api/internal) 未设防（INTERNAL_API_TOKEN 为空，仅限本机单用户）';
+  const admin = config.adminApiToken
+    ? 'Admin API(capabilities/knowledge/skills 写入) 已启用 token 校验'
+    : 'Admin API(capabilities/knowledge/skills 写入) 未设防（ADMIN_API_TOKEN 为空，仅限本机单用户）';
+  return `${internal}；${admin}`;
 }

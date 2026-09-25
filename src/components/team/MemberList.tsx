@@ -1,4 +1,5 @@
-import type { Member } from '../../lib/api';
+import { useEffect, useState } from 'react';
+import { api, type Member, type TeamPresence } from '../../lib/api';
 import { NewMemberForm } from './NewMemberForm';
 
 interface MemberListProps {
@@ -29,6 +30,21 @@ export function MemberList({
   onChat,
   onEdit,
 }: MemberListProps) {
+  // Team presence：只读显示，不替换房间内的 working/muted。
+  const [presence, setPresence] = useState<Record<string, TeamPresence>>({});
+  useEffect(() => {
+    api
+      .listPresence()
+      .then((result) => {
+        const map: Record<string, TeamPresence> = {};
+        for (const item of result.presence) {
+          if (item.kind === 'agent') map[item.principalId] = item;
+        }
+        setPresence(map);
+      })
+      .catch(() => {});
+  }, [members.length]);
+
   return (
     <div className="sidebar-section">
       <div className="sidebar-title">
@@ -47,7 +63,9 @@ export function MemberList({
       {members.map((member) => (
         <div key={member.id} className="member-row">
           <div className="member-row-ident">
-            <strong>{member.name}</strong>
+            <strong>
+              {member.name} · {presence[member.id]?.availability ?? 'available'}
+            </strong>
             <span>{member.role}</span>
           </div>
           <div className="member-row-actions">

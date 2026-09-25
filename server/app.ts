@@ -16,6 +16,8 @@ import { CoreTeamToolProvider } from './capabilities/providers/core-tools.js';
 import { KnowledgeToolProvider } from './capabilities/providers/knowledge-tools.js';
 import { HostCodingToolProvider } from './capabilities/providers/host-tools.js';
 import { DefaultToolPolicy } from './tool-policy.js';
+import { TeamStructureService } from './team-structure-service.js';
+import { SchedulerService } from './scheduler-service.js';
 import { healthRouter } from './routes/health.js';
 import { membersRouter } from './routes/members.js';
 import { capabilitiesRouter } from './routes/capabilities.js';
@@ -23,7 +25,9 @@ import { knowledgeRouter } from './routes/knowledge.js';
 import { internalRouter } from './routes/internal.js';
 import { conversationsRouter } from './routes/conversations.js';
 import { executionsRouter } from './routes/executions.js';
+import { teamRouter } from './routes/team.js';
 import { errorHandler } from './middleware/errorHandler.js';
+import { initTeamScope } from './middleware/teamScope.js';
 
 /**
  * 依赖装配集中在这里，index.ts 和 route 都不再各自 new service()。
@@ -41,9 +45,11 @@ import { errorHandler } from './middleware/errorHandler.js';
  * 引擎不认识任何具体 Provider，它只接受一份解析好的 RuntimeCapabilities。
  */
 let teamService!: TeamService;
+let schedulerService!: SchedulerService;
 
 const memberService = new MemberService(db);
 const capabilityService = new CapabilityService(db);
+const structureService = new TeamStructureService(db);
 
 const localKnowledgeProvider = new LocalFilesystemKnowledgeProvider(db, capabilityService);
 
@@ -65,6 +71,9 @@ registry.registerToolProvider(
     delegateMember: (input) => teamService.delegateMember(input),
     rememberMember: (input) => teamService.rememberMember(input),
     messageMember: (input) => teamService.messageMember(input),
+    listWorkItems: (input) => teamService.listWorkItemsForAgent(input),
+    claimWorkItem: (input) => teamService.claimWorkItemForAgent(input),
+    updateWorkItem: (input) => teamService.updateWorkItemForAgent(input),
   }),
 );
 registry.registerToolProvider(new KnowledgeToolProvider());
@@ -82,7 +91,13 @@ teamService = new TeamService(
   copilotService,
   capabilityService,
   capabilityResolver,
+  structureService,
 );
+
+schedulerService = new SchedulerService(structureService, () => teamService);
+
+// teamScope 的默认 Team 在 index 启动时 ensure 后再 init（库尚未就位时无 id 可用）。
+// 这里先给一个占位，index 会用真实 teamId 重新 init。
 
 // Skill / KB 的目录是「放进去就生效」的磁盘约定，必须先存在。
 // KB 行本身由启动时的 syncFromDisk 按 directory 建，这里只兜目录。
@@ -98,6 +113,7 @@ app.use('/api/health', healthRouter);
 app.use('/api/members', membersRouter(teamService));
 app.use('/api/capabilities', capabilitiesRouter(teamService));
 app.use('/api/knowledge', knowledgeRouter(localKnowledgeProvider));
+app.use('/api/team', teamRouter(structureService));
 app.use('/api/conversations', conversationsRouter(teamService));
 app.use('/api/executions', executionsRouter(teamService));
 // 以某个 Member 的身份说话 —— 独立的命名空间 + token 门禁，见 middleware/apiScope.ts
@@ -132,4 +148,8 @@ export {
   localKnowledgeProvider,
   registry,
   teamService,
+  structureService,
+  schedulerService,
 };
+
+export { initTeamScope };

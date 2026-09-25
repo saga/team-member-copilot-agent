@@ -67,8 +67,122 @@ export interface Member {
 
 export type ConversationKind = 'direct' | 'group' | 'work';
 
+export interface Team {
+  id: string;
+  name: string;
+  description: string;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type TeamParticipantKind = 'human' | 'agent';
+
+export type TeamRole = 'owner' | 'admin' | 'member';
+
+export type TeamMembershipStatus = 'active' | 'inactive';
+
+export interface TeamMembership {
+  teamId: string;
+  kind: TeamParticipantKind;
+  principalId: string;
+  role: TeamRole;
+  status: TeamMembershipStatus;
+  joinedAt: string;
+  updatedAt: string;
+}
+
+export interface PrincipalRef {
+  kind: TeamParticipantKind;
+  principalId: string;
+}
+
+export type ProjectStatus = 'active' | 'archived';
+
+export interface Project {
+  id: string;
+  teamId: string;
+  name: string;
+  description: string;
+  status: ProjectStatus;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type WorkItemStatus = 'todo' | 'in_progress' | 'blocked' | 'done' | 'cancelled';
+
+export interface WorkItem {
+  id: string;
+  teamId: string;
+  projectId: string | null;
+  title: string;
+  description: string;
+  status: WorkItemStatus;
+  assigneeKind: TeamParticipantKind | null;
+  assigneeId: string | null;
+  claimedByMemberId: string | null;
+  claimedExecutionId: string | null;
+  claimedAt: string | null;
+  version: number;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type PresenceAvailability = 'available' | 'away' | 'paused';
+
+export interface TeamPresence {
+  teamId: string;
+  kind: TeamParticipantKind;
+  principalId: string;
+  availability: PresenceAvailability;
+  lastSeenAt: string;
+  updatedAt: string;
+}
+
+export type ScheduledWakeType = 'once' | 'interval';
+
+export type ScheduledWakeStatus = 'active' | 'paused' | 'completed' | 'cancelled';
+
+export interface ScheduledWake {
+  id: string;
+  teamId: string;
+  memberId: string;
+  conversationId: string;
+  projectId: string | null;
+  workItemId: string | null;
+  prompt: string;
+  type: ScheduledWakeType;
+  runAt: string;
+  intervalSeconds: number | null;
+  nextRunAt: string;
+  status: ScheduledWakeStatus;
+  lastFiredAt: string | null;
+  lastError: string | null;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type ScheduledWakeRunStatus = 'queued' | 'running' | 'completed' | 'failed';
+
+export interface ScheduledWakeRun {
+  id: string;
+  scheduleId: string;
+  scheduledFor: string;
+  status: ScheduledWakeRunStatus;
+  executionId: string | null;
+  createdAt: string;
+  startedAt: string | null;
+  endedAt: string | null;
+  error: string | null;
+}
+
 export interface Conversation {
   id: string;
+  teamId: string;
+  projectId: string | null;
   title: string;
   kind: ConversationKind;
   defaultMemberId: string | null;
@@ -127,7 +241,7 @@ export type TurnMode = 'direct' | 'discussion' | 'delegation';
  *
  * direct / mention 必须回答；open_discussion / follow_up 允许 <NO_REPLY>。
  */
-export type WakeReason = 'direct' | 'mention' | 'open_discussion' | 'follow_up';
+export type WakeReason = 'direct' | 'mention' | 'open_discussion' | 'follow_up' | 'schedule';
 
 /**
  * Member 的一次 turn 的产出。
@@ -184,6 +298,7 @@ export interface ExecutionRecord {
   id: string;
   conversationId: string;
   memberId: string;
+  workItemId: string | null;
   runtimeId: string | null;
   parentExecutionId: string | null;
   /** 从根到当前的 Member 链，用来防 A→B→C→A 和无限深链。 */
@@ -272,6 +387,7 @@ export interface PendingWake {
   memberId: string;
   reason: WakeReason;
   triggerSequence: number;
+  workItemId?: string | null;
 }
 
 /**

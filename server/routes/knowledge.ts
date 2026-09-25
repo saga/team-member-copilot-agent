@@ -2,6 +2,13 @@ import { Router } from 'express';
 import { z } from 'zod';
 import type { LocalFilesystemKnowledgeProvider } from '../capabilities/providers/filesystem-knowledge.js';
 import { sendError } from '../middleware/errorHandler.js';
+import { isAdminAuthorized } from '../middleware/apiScope.js';
+import { isTeamAdmin } from '../middleware/teamScope.js';
+
+function canAdmin(req: Parameters<typeof isAdminAuthorized>[0]): boolean {
+  if (isAdminAuthorized(req)) return true;
+  return isTeamAdmin(req, 'owner', 'admin');
+}
 
 /**
  * `local.filesystem-knowledge` 这个 Provider 的管理面。
@@ -33,6 +40,10 @@ export function knowledgeRouter(knowledge: LocalFilesystemKnowledgeProvider) {
   });
 
   router.post('/team', (req, res) => {
+    if (!canAdmin(req)) {
+      res.status(403).json({ error: '需要 Team owner/admin（或有效的 ADMIN_API_TOKEN）' });
+      return;
+    }
     const parsed = createBaseSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
       res.status(400).json({ error: parsed.error.issues.map((i) => i.message).join('; ') });
@@ -46,6 +57,10 @@ export function knowledgeRouter(knowledge: LocalFilesystemKnowledgeProvider) {
   });
 
   router.post('/bases/:knowledgeBaseId/documents', (req, res) => {
+    if (!canAdmin(req)) {
+      res.status(403).json({ error: '需要 Team owner/admin（或有效的 ADMIN_API_TOKEN）' });
+      return;
+    }
     const parsed = documentSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
       res.status(400).json({ error: parsed.error.issues.map((i) => i.message).join('; ') });

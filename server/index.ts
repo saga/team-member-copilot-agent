@@ -9,6 +9,9 @@ import {
   capabilityService,
   capabilityResolver,
   teamService,
+  structureService,
+  schedulerService,
+  initTeamScope,
 } from './app.js';
 import { config } from './config.js';
 import { db, migration } from './db.js';
@@ -29,14 +32,17 @@ let server: Server | null = null;
 /**
  * 启动顺序很重要：
  *   1. schema 就位（db.ts 在 import 时已完成；空库建，形状不符直接让启动失败）
- *   2. Knowledge 兜底（磁盘资料进索引 / personal KB 补齐）—— 模板引用的 team KB
+ *   2. ensure 默认 Team + human owner（TeamScope 门禁与 conversation 归属的前提）
+ *   3. Knowledge 兜底（磁盘资料进索引 / personal KB 补齐）—— 模板引用的 team KB
  *      要先存在，所以这一步必须先于 provisioning
- *   3. Member provisioning —— 默认团队要在 recovery 之前就位，否则恢复出来的
+ *   4. Member provisioning —— 默认团队要在 recovery 之前就位，否则恢复出来的
  *      execution 可能指向一个还没被创建出来的 Member。
  *      模板里的能力引用在这一步对注册表校验：写错一个 Provider ID 就启动失败。
- *   4. 崩溃恢复 —— 必须在开始接请求之前，否则客户端会看到一个正在被改写的中途状态
- *   5. 重新提交 queued 的 root execution / 重新派发丢失的唤醒（fire-and-forget）
- *   6. listen
+ *   5. 存量 Member 补 agent membership（provisioning 只建新人，不补旧库）
+ *   6. 崩溃恢复 + schedule run 恢复 —— 必须在开始接请求之前，否则客户端会看到
+ *      一个正在被改写的中途状态；Scheduler 必须在 Recovery 完成后才启动
+ *   7. 重新提交 queued 的 root execution / 重新派发丢失的唤醒（fire-and-forget）
+ *   8. 启动 Scheduler → listen
  */
 async function bootstrap(): Promise<void> {
   // eslint-disable-next-line no-console
@@ -45,6 +51,16 @@ async function bootstrap(): Promise<void> {
       ? `[server] 新建数据库 schema v${migration.to}`
       : `[server] schema v${migration.to}（已就绪）`,
   );
+
+  // 默认 Team 先行：membership / conversation team_id / teamScope 都依赖它。
+  const team = structureService.ensureDefaultTeam();
+  structureService.ensureHumanOwner(team.id, config.localActorId);
+  initTeamScope(structureService, team.id);
+  // eslint-disable-next-line no-console
+  console.log(`[server] team: ${team.name} (${team.id})`);
+  for (const member of memberService.list()) {
+    structureService.ensureAgentMembership(team.id, member.id);
+  }
 
   // 磁盘同步先于模板 provisioning：模板引用的 team KB key 要求 KB 行已经存在。
   // Personal KB 与 Member 一一对应且创建路径不止一条（API / 模板 / 旧库），
@@ -77,6 +93,18 @@ async function bootstrap(): Promise<void> {
     );
   }
 
+  // provisioning 建的新人也要进 Team（seed 路径不走 TeamService.createMember）。
+  for (const member of memberService.list()) {
+    structureService.ensureAgentMembership(team.id, member.id);
+  }
+
+  // 已有 DB 里的坏 binding 必须在接请求前挡掉：模板只校验新创建的 Member，
+  // 而旧库里可能留着当前 build 已不注册的 Provider（比如换了构建、删了插件）。
+  // 等到真正执行 turn 才炸，症状是「回答变奇怪」而不是一条错误。
+  for (const member of memberService.list()) {
+    capabilityResolver.validate(capabilityService.get(member.id));
+  }
+
   if (config.recoverOnStartup) {
     const report = new RecoveryService(db, new ConversationMemberService(db)).recover();
     // eslint-disable-next-line no-console
@@ -100,7 +128,15 @@ async function bootstrap(): Promise<void> {
     for (const wake of report.lostWakes) {
       teamService.redispatchWake(wake);
     }
+
+    // schedule run 恢复：queued/running 且无 execution 的重新建 execution。
+    // 依靠 UNIQUE(schedule_id, scheduled_for) 不会重复 fire。
+    schedulerService.recoverQueuedRuns();
   }
+
+  // Scheduler 在 Recovery 完成后才启动：否则旧 execution 的 interrupted 标记
+  // 与 schedule 触发会同时碰同一个 Member。
+  schedulerService.start();
 
   server = app.listen(config.port, () => {
     // eslint-disable-next-line no-console
@@ -129,6 +165,7 @@ async function shutdown(signal: string): Promise<void> {
   // eslint-disable-next-line no-console
   console.log(`[server] received ${signal}, draining...`);
   try {
+    schedulerService.stop();
     if (server) {
       await new Promise<void>((resolve) => server!.close(() => resolve()));
     }

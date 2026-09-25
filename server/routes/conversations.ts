@@ -9,6 +9,7 @@ const createConversationSchema = z.object({
   kind: z.enum(['direct', 'group', 'work']).optional(),
   memberIds: z.array(z.string().min(1)).min(1).max(20),
   defaultMemberId: z.string().optional(),
+  projectId: z.string().min(1).nullable().optional(),
 });
 
 const sendMessageSchema = z.object({

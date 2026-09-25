@@ -84,6 +84,8 @@ export class ContextAssembler {
     wakeReason: WakeReason | null;
     /** 本次要处理的内容（direct = 用户那条消息；discussion 只是提示；delegation = 任务）。 */
     currentPrompt: string;
+    /** 有 workItemId 时才带的最小工作上下文，不全量塞 Project。 */
+    work?: { projectName: string | null; title: string; status: string; assignee: string | null } | null;
   }): MemberContext {
     const rows = this.db
       .prepare(
@@ -145,9 +147,25 @@ export class ContextAssembler {
       turnMode: TurnMode;
       wakeReason: WakeReason | null;
       currentPrompt: string;
+      work?: { projectName: string | null; title: string; status: string; assignee: string | null } | null;
     },
   ): string {
     const sections: string[] = [];
+
+    // 最小工作上下文：只在有 workItemId 时出现，不塞整个 Project。
+    if (input.work) {
+      sections.push(
+        [
+          'Current Work Item',
+          input.work.projectName ? `Project: ${input.work.projectName}` : null,
+          `Task: ${input.work.title}`,
+          `Status: ${input.work.status}`,
+          input.work.assignee ? `Assignee: ${input.work.assignee}` : null,
+        ]
+          .filter(Boolean)
+          .join('\n'),
+      );
+    }
 
     if (input.turnMode === 'discussion') {
       sections.push(this.roomHeader(input.conversation, input.member));

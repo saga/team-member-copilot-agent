@@ -23,6 +23,7 @@ import type { CopilotService } from './copilot.js';
 import { defaultMemberCapabilities } from './capabilities/defaults.js';
 import type { CapabilityResolver } from './capabilities/resolver.js';
 import type { CapabilityService } from './capabilities/service.js';
+import type { TeamStructureService } from './team-structure-service.js';
 import type { ResolvedKnowledgeBinding, RuntimeCapabilities } from './capabilities/types.js';
 import type {
   Conversation,
@@ -41,8 +42,10 @@ import type {
   MemberRuntime,
   PendingWake,
   StoredConversationEvent,
+  TeamRole,
   TurnMode,
   WakeReason,
+  WorkItemStatus,
 } from './domain.js';
 
 /**
@@ -67,6 +70,8 @@ import type {
 
 interface ConversationRow {
   id: string;
+  team_id: string;
+  project_id: string | null;
   title: string;
   kind: 'direct' | 'group' | 'work';
   default_member_id: string | null;
@@ -95,6 +100,7 @@ interface ExecutionRow {
   id: string;
   conversation_id: string;
   member_id: string;
+  work_item_id: string | null;
   runtime_id: string | null;
   parent_execution_id: string | null;
   delegation_path: string;
@@ -161,6 +167,7 @@ export interface CreateConversationInput {
   kind?: 'direct' | 'group' | 'work';
   memberIds: string[];
   defaultMemberId?: string;
+  projectId?: string | null;
 }
 
 /**
@@ -318,6 +325,7 @@ export class TeamService {
      * 就不再反映这一轮真的用了什么。
      */
     private readonly capabilityResolver: CapabilityResolver,
+    private readonly structure?: TeamStructureService,
   ) {
     this.contextAssembler = new ContextAssembler(db);
     this.states = new ConversationMemberService(db, (conversationId, change) => {
@@ -358,7 +366,20 @@ export class TeamService {
     // 手工建出来的人也要有一组能跑起来的默认能力：skill 来源、个人资料库、
     // 协作与检索工具。缺了它的症状是「新同事像是不会用工具」。
     this.capabilities.replace(member.id, defaultMemberCapabilities());
+    // 新 Agent 自动加入默认 Team。membership 是组织状态，不是 persona 的一部分。
+    try {
+      const team = this.defaultTeam();
+      this.structure?.ensureAgentMembership(team.id, member.id);
+      this.structure?.touchPresence(team.id, 'agent', member.id);
+    } catch {
+      // structure 尚未装配（测试只建 TeamService 时）则跳过，membership 由上层补。
+    }
     return member;
+  }
+
+  private defaultTeam(): { id: string } {
+    if (!this.structure) throw notFound('Team 尚未初始化');
+    return this.structure.ensureDefaultTeam();
   }
 
   // --------------------------------------------------------------- 能力
@@ -457,11 +478,43 @@ export class TeamService {
       input.title?.trim() ||
       (kind === 'group' ? members.map((m) => m.name).join(' · ') : members[0].name);
 
+    // Team 归属：单 Team 部署取默认 Team；成员不在 Team 里则自动补 membership
+    // （provisioning/旧库路径），已在但 inactive 的仍拒绝。
+    let teamId = '';
+    let projectId: string | null = input.projectId?.trim() || null;
+    try {
+      const team = this.defaultTeam();
+      teamId = team.id;
+      for (const memberId of memberIds) {
+        try {
+          this.structure?.requireActiveMembership(teamId, 'agent', memberId);
+        } catch {
+          this.structure?.ensureAgentMembership(teamId, memberId);
+          this.structure?.requireActiveMembership(teamId, 'agent', memberId);
+        }
+      }
+      if (projectId && this.structure) {
+        const project = this.structure.getProject(projectId);
+        if (project.teamId !== teamId) throw badRequest('Project 不属于这个 Team');
+        if (project.status !== 'active') throw badRequest('已归档的 Project 不能建 Conversation');
+      }
+    } catch (error) {
+      // structure 未装配时退回无 Team 校验（旧测试路径）；有 structure 则错误向上传。
+      if (this.structure) throw error;
+      const fallback = this.db.prepare(`SELECT id FROM team ORDER BY created_at LIMIT 1`).get() as unknown as
+        | { id: string }
+        | undefined;
+      if (!fallback) throw badRequest('Team 尚未初始化');
+      teamId = fallback.id;
+    }
+
     this.db
       .prepare(
         `
         INSERT INTO conversation (
           id,
+          team_id,
+          project_id,
           title,
           kind,
           default_member_id,
@@ -471,10 +524,10 @@ export class TeamService {
           created_at,
           updated_at
         )
-        VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
         `,
       )
-      .run(id, title, kind, defaultMemberId, config.localUserId, createdAt, createdAt);
+      .run(id, teamId, projectId, title, kind, defaultMemberId, config.localUserId, createdAt, createdAt);
 
     const insertMember = this.db.prepare(
       `
@@ -506,6 +559,10 @@ export class TeamService {
     const member = this.members.get(memberId);
     if (member.status !== 'active') {
       throw badRequest(`不能把已归档的 Member 加入 conversation：${member.name}`);
+    }
+    // 必须是 active Team 成员：Team 之外的人不能被拉进房间。
+    if (this.structure) {
+      this.structure.requireActiveMembership(conversation.teamId, 'agent', memberId);
     }
 
     this.db
@@ -894,6 +951,7 @@ export class TeamService {
       id: randomUUID(),
       conversationId: conversation.id,
       memberId: member.id,
+      workItemId: (wake as { workItemId?: string | null }).workItemId ?? null,
       runtimeId: null,
       parentExecutionId: null,
       delegationPath: [member.id],
@@ -1116,6 +1174,8 @@ export class TeamService {
       id: randomUUID(),
       conversationId: conversation.id,
       memberId: targetMember.id,
+      // delegation 带上父的 workItem：同一项业务工作的审计链不断。
+      workItemId: parent.workItemId,
       runtimeId: null,
       parentExecutionId: parent.id,
       delegationPath: [...parent.delegationPath, targetMember.id],
@@ -1219,6 +1279,80 @@ export class TeamService {
 
   rememberMember(input: { memberId: string; content: string }): Promise<string> {
     return Promise.resolve(this.members.appendMemory(input.memberId, input.content));
+  }
+
+  /**
+   * Agent 工作工具的服务端实现。授权由服务端判断，不信 LLM 参数：
+   * claim/update 的 claimer 检查在 TeamStructureService 里，list 默认只给
+   * 本 Team 的未完成项。
+   */
+  async listWorkItemsForAgent(input: {
+    memberId: string;
+    scope?: 'mine' | 'available' | 'all';
+    projectId?: string;
+    status?: string;
+  }): Promise<string> {
+    if (!this.structure) throw notFound('Team 尚未初始化');
+    const team = this.defaultTeam();
+    const scope = input.scope ?? 'available';
+    const all = this.structure.listWorkItems(team.id, {
+      ...(input.projectId ? { projectId: input.projectId } : {}),
+      ...(input.status ? { status: input.status as WorkItemStatus } : {}),
+    });
+    const open = all.filter((w) => w.status !== 'done' && w.status !== 'cancelled');
+    let items = open;
+    if (scope === 'mine') {
+      items = open.filter((w) => w.assigneeId === input.memberId || w.claimedByMemberId === input.memberId);
+    } else if (scope === 'available') {
+      items = open.filter((w) => !w.claimedByMemberId && w.status !== 'blocked');
+    }
+    return JSON.stringify({
+      source: 'work',
+      items: items.slice(0, 20).map((w) => ({
+        id: w.id,
+        title: w.title,
+        status: w.status,
+        projectId: w.projectId,
+        assigneeId: w.assigneeId,
+        claimedBy: w.claimedByMemberId,
+        version: w.version,
+      })),
+    });
+  }
+
+  async claimWorkItemForAgent(input: { memberId: string; workItemId: string }): Promise<string> {
+    if (!this.structure) throw notFound('Team 尚未初始化');
+    // 当前 execution 未知时传 null：claim 只锁工作，不绑定执行；scheduler/turn 侧
+    // 在建 execution 时再把 workItemId 写进 execution。
+    const item = this.structure.claimWorkItem(input.workItemId, { memberId: input.memberId });
+    return JSON.stringify({ workItemId: item.id, status: item.status, version: item.version });
+  }
+
+  async updateWorkItemForAgent(input: {
+    memberId: string;
+    workItemId: string;
+    status?: string;
+    title?: string;
+    description?: string;
+  }): Promise<string> {
+    if (!this.structure) throw notFound('Team 尚未初始化');
+    const team = this.defaultTeam();
+    let teamRole: TeamRole | undefined;
+    try {
+      teamRole = this.structure.getMembership(team.id, 'agent', input.memberId).role;
+    } catch {
+      teamRole = undefined;
+    }
+    const item = this.structure.updateWorkItem(
+      input.workItemId,
+      {
+        ...(input.status ? { status: input.status as WorkItemStatus } : {}),
+        ...(input.title ? { title: input.title } : {}),
+        ...(input.description ? { description: input.description } : {}),
+      },
+      { kind: 'agent', principalId: input.memberId, teamRole },
+    );
+    return JSON.stringify({ workItemId: item.id, status: item.status, version: item.version });
   }
 
   /**
@@ -1380,6 +1514,7 @@ export class TeamService {
       id: randomUUID(),
       conversationId: original.conversationId,
       memberId: original.memberId,
+      workItemId: original.workItemId,
       runtimeId: null,
       parentExecutionId: original.parentExecutionId,
       delegationPath: [...original.delegationPath],
@@ -1477,6 +1612,76 @@ export class TeamService {
         error instanceof Error ? error.message : error,
       );
     }
+  }
+
+  /**
+   * Scheduler 入口：为一次到期的 scheduled wake 建 execution 并入队。
+   *
+   * 不自建 runtime：execution 落进绑定的 work conversation，复用 MemberTurnScheduler
+   * 的串行 + 合并。kind=member_work，wakeReason=schedule，trigger 无消息。
+   */
+  async enqueueScheduledWork(input: {
+    conversationId: string;
+    memberId: string;
+    prompt: string;
+    workItemId?: string | null;
+    projectId?: string | null;
+  }): Promise<string> {
+    const conversation = this.getConversation(input.conversationId);
+    if (conversation.kind !== 'work') throw badRequest('Schedule 只能绑定 work conversation');
+    const member = this.requireActiveMember(conversation, input.memberId);
+    // paused 只拦自动唤醒，@ 点名仍走聊天路径；这里是自动路径，必须检查。
+    try {
+      const team = this.defaultTeam();
+      const stored = this.structure?.getPresence(team.id, 'agent', member.id);
+      if (stored?.availability === 'paused') throw badRequest('Member 已暂停，不接受自动唤醒');
+    } catch (error) {
+      if (this.structure && error instanceof Error && error.message.includes('已暂停')) throw error;
+    }
+
+    const execution: ExecutionRecord = {
+      id: randomUUID(),
+      conversationId: conversation.id,
+      memberId: member.id,
+      workItemId: input.workItemId ?? null,
+      runtimeId: null,
+      parentExecutionId: null,
+      delegationPath: [member.id],
+      kind: 'member_work',
+      status: 'queued',
+      prompt: input.prompt,
+      response: null,
+      error: null,
+      waitingForRuntimeId: null,
+      retryOfExecutionId: null,
+      decision: null,
+      triggerMessageSequence: null,
+      wakeReason: 'schedule',
+      configSnapshot: null,
+      startedAt: null,
+      endedAt: null,
+      createdAt: now(),
+    };
+    this.insertExecution(execution);
+    this.emitExecution(execution);
+    this.scheduler.enqueue({
+      conversationId: conversation.id,
+      memberId: member.id,
+      reason: 'schedule',
+      triggerSequence: conversation.messageSequence,
+      workItemId: execution.workItemId,
+    });
+    return execution.id;
+  }
+
+  /** 是否有未结束的 execution（presence 的 busy 判据，不落库）。 */
+  hasActiveExecution(memberId: string): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS present FROM execution WHERE member_id = ? AND status IN ('queued', 'running', 'waiting_for_member') LIMIT 1`,
+      )
+      .get(memberId) as unknown as { present: number } | undefined;
+    return !!row;
   }
 
   // ------------------------------------------------------- Durable events
@@ -1645,6 +1850,14 @@ export class TeamService {
       error: null,
     });
     this.emitExecution(this.getExecution(executionId));
+    // Presence：开跑即 lastSeen 前进（有效 busy 由 hasActiveExecution 计算，不落库）。
+    // paused 不会被覆盖：touch 只动 lastSeen，不动 availability。
+    try {
+      const team = this.defaultTeam();
+      this.structure?.touchPresence(team.id, 'agent', input.member.id);
+    } catch {
+      // 无 structure 时跳过
+    }
 
     // 上面两次写之间是 cancel 的窗口期：cancel 对 running 只发信号、不写 DB，
     // 所以这里必须再确认一次信号，避免「信号发了但这一轮照跑到底」。
@@ -1662,6 +1875,7 @@ export class TeamService {
       triggerMessageSequence: input.triggerMessageSequence,
       wakeReason: input.wakeReason,
       currentPrompt: input.prompt,
+      work: this.workContextFor(input.execution.workItemId),
     });
 
     // 被取消时把已产出的半截内容留在 execution.response 里，便于 UI 展示与排查。
@@ -1769,6 +1983,7 @@ export class TeamService {
       this.emit(input.conversation.id, { type: 'message.created', data: message });
       this.emitExecution(this.getExecution(executionId));
       this.touchConversation(input.conversation.id);
+      this.touchAgentPresence(input.member.id);
 
       // Team discussion 的闭环：这条新消息可能该唤醒别人。
       // 必须带 authorMemberId，否则这个 Member 会被自己的消息再唤醒一次。
@@ -1804,8 +2019,46 @@ export class TeamService {
         endedAt: now(),
       });
       this.emitExecution(this.getExecution(executionId));
+      this.touchAgentPresence(input.member.id);
 
       throw error;
+    }
+  }
+
+  private touchAgentPresence(memberId: string): void {
+    try {
+      const team = this.defaultTeam();
+      this.structure?.touchPresence(team.id, 'agent', memberId);
+    } catch {
+      // 无 structure 时跳过
+    }
+  }
+
+  /** 最小工作上下文：execution 有 workItemId 时才查，不全量塞 Project。 */
+  private workContextFor(
+    workItemId: string | null,
+  ): { projectName: string | null; title: string; status: string; assignee: string | null } | null {
+    if (!workItemId) return null;
+    try {
+      const row = this.db
+        .prepare(
+          `SELECT w.title, w.status, w.assignee_id, p.name AS project_name
+           FROM work_item w LEFT JOIN project p ON p.id = w.project_id WHERE w.id = ?`,
+        )
+        .get(workItemId) as unknown as
+        | { title: string; status: string; assignee_id: string | null; project_name: string | null }
+        | undefined;
+      if (!row) return null;
+      let assignee: string | null = null;
+      if (row.assignee_id) {
+        const member = this.db.prepare(`SELECT name FROM member WHERE id = ?`).get(row.assignee_id) as unknown as
+          | { name: string }
+          | undefined;
+        assignee = member?.name ?? row.assignee_id;
+      }
+      return { projectName: row.project_name, title: row.title, status: row.status, assignee };
+    } catch {
+      return null;
     }
   }
 
@@ -2342,6 +2595,8 @@ export class TeamService {
 
     return {
       id: row.id,
+      teamId: row.team_id,
+      projectId: row.project_id,
       title: row.title,
       kind: row.kind,
       defaultMemberId: row.default_member_id,
@@ -2375,6 +2630,7 @@ export class TeamService {
           id,
           conversation_id,
           member_id,
+          work_item_id,
           runtime_id,
           parent_execution_id,
           delegation_path,
@@ -2393,13 +2649,14 @@ export class TeamService {
           ended_at,
           created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `,
       )
       .run(
         execution.id,
         execution.conversationId,
         execution.memberId,
+        execution.workItemId,
         execution.runtimeId,
         execution.parentExecutionId,
         JSON.stringify(execution.delegationPath),
@@ -2740,6 +2997,7 @@ function mapExecution(row: ExecutionRow): ExecutionRecord {
     id: row.id,
     conversationId: row.conversation_id,
     memberId: row.member_id,
+    workItemId: row.work_item_id,
     runtimeId: row.runtime_id,
     parentExecutionId: row.parent_execution_id,
     delegationPath: JSON.parse(row.delegation_path) as string[],

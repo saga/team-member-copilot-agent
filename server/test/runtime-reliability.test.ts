@@ -152,8 +152,10 @@ describe('schema 就位（PRAGMA user_version）', () => {
       handle.exec(`
         INSERT INTO member (id, handle, name, role, created_at, updated_at)
         VALUES ('m', 'm', 'M', 'R', 't', 't');
-        INSERT INTO conversation (id, title, kind, created_by, created_at, updated_at)
-        VALUES ('c', 'C', 'direct', 'u', 't', 't');
+        INSERT INTO team (id, name, created_by, created_at, updated_at)
+        VALUES ('t1', 'T', 'u', 't', 't');
+        INSERT INTO conversation (id, team_id, title, kind, created_by, created_at, updated_at)
+        VALUES ('c', 't1', 'C', 'direct', 'u', 't', 't');
         INSERT INTO execution (id, conversation_id, member_id, kind, status, prompt, created_at)
         VALUES ('e', 'c', 'm', 'interactive', 'interrupted', 'p', 't');
       `);
@@ -216,6 +218,13 @@ describe('schema 就位（PRAGMA user_version）', () => {
 
       const tables = [
         'member',
+        'team',
+        'team_membership',
+        'project',
+        'work_item',
+        'team_presence',
+        'scheduled_wake',
+        'scheduled_wake_run',
         'conversation',
         'conversation_member',
         'conversation_member_state',
@@ -245,8 +254,85 @@ describe('schema 就位（PRAGMA user_version）', () => {
             'created_at',
             'updated_at',
           ],
+          team: ['id', 'name', 'description', 'created_by', 'created_at', 'updated_at'],
+          team_membership: [
+            'team_id',
+            'kind',
+            'principal_id',
+            'role',
+            'status',
+            'joined_at',
+            'updated_at',
+          ],
+          project: [
+            'id',
+            'team_id',
+            'name',
+            'description',
+            'status',
+            'created_by',
+            'created_at',
+            'updated_at',
+          ],
+          work_item: [
+            'id',
+            'team_id',
+            'project_id',
+            'title',
+            'description',
+            'status',
+            'assignee_kind',
+            'assignee_id',
+            'claimed_by_member_id',
+            'claimed_execution_id',
+            'claimed_at',
+            'version',
+            'created_by',
+            'created_at',
+            'updated_at',
+          ],
+          team_presence: [
+            'team_id',
+            'kind',
+            'principal_id',
+            'availability',
+            'last_seen_at',
+            'updated_at',
+          ],
+          scheduled_wake: [
+            'id',
+            'team_id',
+            'member_id',
+            'conversation_id',
+            'project_id',
+            'work_item_id',
+            'prompt',
+            'type',
+            'run_at',
+            'interval_seconds',
+            'next_run_at',
+            'status',
+            'last_fired_at',
+            'last_error',
+            'created_by',
+            'created_at',
+            'updated_at',
+          ],
+          scheduled_wake_run: [
+            'id',
+            'schedule_id',
+            'scheduled_for',
+            'status',
+            'execution_id',
+            'created_at',
+            'started_at',
+            'ended_at',
+            'error',
+          ],
           conversation: [
             'id',
+            'team_id',
+            'project_id',
             'title',
             'kind',
             'default_member_id',
@@ -305,6 +391,7 @@ describe('schema 就位（PRAGMA user_version）', () => {
             'id',
             'conversation_id',
             'member_id',
+            'work_item_id',
             'runtime_id',
             'parent_execution_id',
             'delegation_path',
@@ -364,9 +451,11 @@ describe('schema 就位（PRAGMA user_version）', () => {
       assert.deepEqual(indexes, [
         'idx_conversation_event_replay',
         'idx_conversation_member_state_wake',
+        'idx_conversation_team',
         'idx_execution_conversation_created',
         'idx_execution_parent',
         'idx_execution_status',
+        'idx_execution_work_item',
         'idx_knowledge_document_kb',
         'idx_member_capability_member',
         'idx_member_capability_provider',
@@ -374,6 +463,15 @@ describe('schema 就位（PRAGMA user_version）', () => {
         'idx_message_client_request',
         'idx_message_conversation_created',
         'idx_message_conversation_sequence',
+        'idx_project_team_status',
+        'idx_scheduled_wake_due',
+        'idx_scheduled_wake_member',
+        'idx_team_membership_principal',
+        'idx_team_membership_team',
+        'idx_work_item_assignee',
+        'idx_work_item_claim',
+        'idx_work_item_project_status',
+        'idx_work_item_team_status',
       ]);
     } finally {
       handle.close();
@@ -1053,11 +1151,14 @@ describe('RecoveryService', () => {
       INSERT INTO member (id, handle, name, role, created_at, updated_at)
       VALUES ('m', 'm', 'M', 'R', 't', 't');
 
+      INSERT INTO team (id, name, created_by, created_at, updated_at)
+      VALUES ('t1', 'T', 'u', 't', 't');
+
       -- 两个 conversation：member_runtime 有 UNIQUE(conversation_id, member_id)，
       -- 同一个 Member 在同一 conversation 里只能有一个 runtime
-      INSERT INTO conversation (id, title, kind, created_by, created_at, updated_at)
-      VALUES ('c', 'C', 'direct', 'u', 't', 't'),
-             ('c2', 'C2', 'direct', 'u', 't', 't');
+      INSERT INTO conversation (id, team_id, title, kind, created_by, created_at, updated_at)
+      VALUES ('c', 't1', 'C', 'direct', 'u', 't', 't'),
+             ('c2', 't1', 'C2', 'direct', 'u', 't', 't');
 
       INSERT INTO conversation_member (conversation_id, member_id, joined_at)
       VALUES ('c', 'm', 't'), ('c2', 'm', 't');
@@ -1125,8 +1226,11 @@ describe('RecoveryService', () => {
       VALUES ('m1', 'alice', 'Alice', 'Analyst', 't', 't'),
              ('m2', 'bob', 'Bob', 'Engineer', 't', 't');
 
-      INSERT INTO conversation (id, title, kind, created_by, message_sequence, created_at, updated_at)
-      VALUES ('c', 'Room', 'group', 'u', 23, 't', 't');
+      INSERT INTO team (id, name, created_by, created_at, updated_at)
+      VALUES ('t1', 'T', 'u', 't', 't');
+
+      INSERT INTO conversation (id, team_id, title, kind, created_by, message_sequence, created_at, updated_at)
+      VALUES ('c', 't1', 'Room', 'group', 'u', 23, 't', 't');
 
       INSERT INTO conversation_member (conversation_id, member_id, joined_at)
       VALUES ('c', 'm1', 't'), ('c', 'm2', 't');

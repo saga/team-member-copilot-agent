@@ -64,8 +64,89 @@ export interface MemberCapabilities {
   tools: CapabilityBinding[];
 }
 
+export interface Team {
+  id: string;
+  name: string;
+  description: string;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TeamMembership {
+  teamId: string;
+  kind: 'human' | 'agent';
+  principalId: string;
+  role: 'owner' | 'admin' | 'member';
+  status: 'active' | 'inactive';
+  joinedAt: string;
+  updatedAt: string;
+}
+
+export interface Project {
+  id: string;
+  teamId: string;
+  name: string;
+  description: string;
+  status: 'active' | 'archived';
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type WorkItemStatus = 'todo' | 'in_progress' | 'blocked' | 'done' | 'cancelled';
+
+export interface WorkItem {
+  id: string;
+  teamId: string;
+  projectId: string | null;
+  title: string;
+  description: string;
+  status: WorkItemStatus;
+  assigneeKind: 'human' | 'agent' | null;
+  assigneeId: string | null;
+  claimedByMemberId: string | null;
+  claimedExecutionId: string | null;
+  claimedAt: string | null;
+  version: number;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TeamPresence {
+  teamId: string;
+  kind: 'human' | 'agent';
+  principalId: string;
+  availability: 'available' | 'away' | 'paused';
+  lastSeenAt: string;
+  updatedAt: string;
+}
+
+export interface ScheduledWake {
+  id: string;
+  teamId: string;
+  memberId: string;
+  conversationId: string;
+  projectId: string | null;
+  workItemId: string | null;
+  prompt: string;
+  type: 'once' | 'interval';
+  runAt: string;
+  intervalSeconds: number | null;
+  nextRunAt: string;
+  status: 'active' | 'paused' | 'completed' | 'cancelled';
+  lastFiredAt: string | null;
+  lastError: string | null;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface Conversation {
   id: string;
+  teamId: string;
+  projectId: string | null;
   title: string;
   kind: 'direct' | 'group' | 'work';
   defaultMemberId: string | null;
@@ -144,6 +225,7 @@ export interface ExecutionRecord {
   id: string;
   conversationId: string;
   memberId: string;
+  workItemId: string | null;
   runtimeId: string | null;
   parentExecutionId: string | null;
   delegationPath: string[];
@@ -169,7 +251,7 @@ export interface ExecutionRecord {
  *   open_discussion 用户没 @ 任何人，让房间成员自行判断要不要发言
  *   follow_up       另一个 Member 发言后顺带被唤醒（受 autoWakeRounds 限制）
  */
-export type WakeReason = 'direct' | 'mention' | 'open_discussion' | 'follow_up';
+export type WakeReason = 'direct' | 'mention' | 'open_discussion' | 'follow_up' | 'schedule';
 
 /** 一条消息唤醒了哪个 Member、为什么。 */
 export interface WakePlan {
@@ -481,6 +563,7 @@ export const api = {
     kind?: 'direct' | 'group' | 'work';
     memberIds: string[];
     defaultMemberId?: string;
+    projectId?: string | null;
   }): Promise<{ conversation: Conversation }> {
     return fetch(`${API_BASE}/api/conversations`, {
       method: 'POST',
@@ -599,5 +682,102 @@ export const api = {
   eventsUrl(conversationId: string, since?: number): string {
     const base = `${API_BASE}/api/conversations/${encodeURIComponent(conversationId)}/events`;
     return since && since > 0 ? `${base}?since=${since}` : base;
+  },
+
+  getTeam(): Promise<{ team: Team }> {
+    return fetch(`${API_BASE}/api/team`).then(json<{ team: Team }>);
+  },
+
+  listProjects(): Promise<{ projects: Project[] }> {
+    return fetch(`${API_BASE}/api/team/projects`).then(json<{ projects: Project[] }>);
+  },
+
+  createProject(input: { name: string; description?: string }): Promise<{ project: Project }> {
+    return fetch(`${API_BASE}/api/team/projects`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    }).then(json<{ project: Project }>);
+  },
+
+  listWorkItems(filter?: { projectId?: string; status?: string }): Promise<{ workItems: WorkItem[] }> {
+    const params = new URLSearchParams();
+    if (filter?.projectId) params.set('projectId', filter.projectId);
+    if (filter?.status) params.set('status', filter.status);
+    const suffix = params.toString() ? `?${params.toString()}` : '';
+    return fetch(`${API_BASE}/api/team/work-items${suffix}`).then(json<{ workItems: WorkItem[] }>);
+  },
+
+  createWorkItem(input: { title: string; description?: string; projectId?: string | null }): Promise<{ workItem: WorkItem }> {
+    return fetch(`${API_BASE}/api/team/work-items`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    }).then(json<{ workItem: WorkItem }>);
+  },
+
+  updateWorkItem(id: string, input: { title?: string; description?: string; status?: WorkItemStatus }): Promise<{ workItem: WorkItem }> {
+    return fetch(`${API_BASE}/api/team/work-items/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    }).then(json<{ workItem: WorkItem }>);
+  },
+
+  assignWorkItem(id: string, assignee: { kind: 'human' | 'agent'; principalId: string } | null): Promise<{ workItem: WorkItem }> {
+    return fetch(`${API_BASE}/api/team/work-items/${encodeURIComponent(id)}/assign`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(assignee ?? {}),
+    }).then(json<{ workItem: WorkItem }>);
+  },
+
+  claimWorkItem(id: string, memberId: string): Promise<{ workItem: WorkItem }> {
+    return fetch(`${API_BASE}/api/team/work-items/${encodeURIComponent(id)}/claim`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ memberId }),
+    }).then(json<{ workItem: WorkItem }>);
+  },
+
+  releaseWorkItem(id: string): Promise<{ workItem: WorkItem }> {
+    return fetch(`${API_BASE}/api/team/work-items/${encodeURIComponent(id)}/release`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    }).then(json<{ workItem: WorkItem }>);
+  },
+
+  listPresence(): Promise<{ presence: TeamPresence[] }> {
+    return fetch(`${API_BASE}/api/team/presence`).then(json<{ presence: TeamPresence[] }>);
+  },
+
+  setPresence(kind: 'human' | 'agent', id: string, availability: 'available' | 'away' | 'paused'): Promise<{ presence: TeamPresence }> {
+    return fetch(`${API_BASE}/api/team/presence/${encodeURIComponent(kind)}/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ availability }),
+    }).then(json<{ presence: TeamPresence }>);
+  },
+
+  listSchedules(): Promise<{ schedules: ScheduledWake[] }> {
+    return fetch(`${API_BASE}/api/team/schedules`).then(json<{ schedules: ScheduledWake[] }>);
+  },
+
+  createSchedule(input: {
+    memberId: string;
+    conversationId: string;
+    projectId?: string | null;
+    workItemId?: string | null;
+    prompt: string;
+    type: 'once' | 'interval';
+    runAt: string;
+    intervalSeconds?: number | null;
+  }): Promise<{ schedule: ScheduledWake }> {
+    return fetch(`${API_BASE}/api/team/schedules`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    }).then(json<{ schedule: ScheduledWake }>);
   },
 };

@@ -144,6 +144,50 @@ MUTATIONS = [
             ("server/member-template-seeder.ts", "    resolver.validate(templateCapabilities);\n", "")
         ],
     },
+    {
+        "name": "claim 去掉 claimed_by IS NULL（双抢都成功）",
+        "test": "server/test/team-v1.test.ts",
+        "steps": [
+            (
+                "server/team-structure-service.ts",
+                "           AND claimed_by_member_id IS NULL\n",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "done/cancelled 不验 claimer（路过也能结单）",
+        "test": "server/test/team-v1.test.ts",
+        "steps": [
+            (
+                "server/team-structure-service.ts",
+                "      if (!isClaimer && !isAdmin && !isCreatorHuman) {\n        throw forbidden('只有当前 claimer 或 Team admin/owner 能 done/cancelled');\n      }\n",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "删掉 schedule 幂等 UNIQUE（同一时间点执行两遍）",
+        "test": "server/test/team-v1.test.ts",
+        "steps": [
+            (
+                "server/db-migrations.ts",
+                "  UNIQUE (schedule_id, scheduled_for),\n",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "paused 成员仍执行 schedule（自动唤醒不看 presence）",
+        "test": "server/test/team-v1.test.ts",
+        "steps": [
+            (
+                "server/scheduler-service.ts",
+                "        if (presence.availability === 'paused') continue;\n",
+                "",
+            )
+        ],
+    },
 ]
 
 

@@ -91,6 +91,13 @@ export const config = {
    */
   internalApiToken: env('INTERNAL_API_TOKEN', ''),
   /**
+   * Admin API（capabilities / knowledge 管理 / skills 安装）的共享 token。
+   *
+   * 空 = 不做门禁（localhost 单用户原型）。只要服务不是只跑在本机就必须填，
+   * 否则任何能访问服务的人都能给 Member 开宿主能力（capability boundary 提升）。
+   */
+  adminApiToken: env('ADMIN_API_TOKEN', ''),
+  /**
    * 默认 Member 模板目录。
    *
    * 这里的文件是 **provisioning baseline**，不是运行时 source of truth：
@@ -108,4 +115,10 @@ export const config = {
    * 会想这么做（否则模板目录里的每一条都可能在某个空环境下被创建出来）。
    */
   seedDefaultMembers: env('SEED_DEFAULT_MEMBERS', 'true') === 'true',
+  /** 单 Team 部署的默认 Team 名。启动时 ensure，不提供新建 Team 入口。 */
+  teamName: env('TEAM_NAME', 'AI Team'),
+  /** 没有真正用户系统时的 human actor 占位。接 Entra/OIDC 后只换 teamScope 的解析。 */
+  localActorId: env('LOCAL_ACTOR_ID', 'local-user'),
+  /** Scheduler tick 间隔（毫秒）。只做 once + interval，不做 Calendar/RRULE。 */
+  schedulerIntervalMs: intEnv('SCHEDULER_INTERVAL_MS', 2000),
 };
