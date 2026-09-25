@@ -15,6 +15,14 @@ const sendMessageSchema = z.object({
   content: z.string().trim().min(1).max(20000),
   targetMemberId: z.string().min(1).optional(),
   replyToMessageId: z.string().min(1).optional(),
+  /**
+   * 幂等键。同一个键第二次到达时不会再落一条消息，也不会再派一次唤醒，
+   * 而是把第一次那条原样返回（`deduplicated: true`）。
+   *
+   * 长度上限是防御性的：这个值会进 UNIQUE 索引，一个超长（或每次调用都变）
+   * 的值只会把索引撑大，不会带来任何好处。
+   */
+  clientRequestId: z.string().trim().min(1).max(200).optional(),
 });
 
 const addMemberSchema = z.object({

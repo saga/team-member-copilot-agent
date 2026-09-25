@@ -3,6 +3,7 @@ import {
   api,
   type Conversation,
   type ConversationMemberState,
+  type ConversationMemberStateChange,
   type ConversationMessage,
   type DelegationEvent,
   type DeltaEvent,
@@ -33,6 +34,20 @@ const STATUS_LABEL: Record<ExecutionStatus, string> = {
   cancelled: '已取消',
   interrupted: '已中断',
 };
+
+/**
+ * 生成一次发送的幂等键。
+ *
+ * `crypto.randomUUID` 只在安全上下文（https / localhost）可用，退回一个由
+ * 时间戳与随机数拼出来的值。这个键只要求「在本机一次会话内不重复」——
+ * 它不会被当成安全边界，只是让服务端能认出「这是同一次发送」。
+ */
+function newRequestId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return `web-${crypto.randomUUID()}`;
+  }
+  return `web-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
 
 function parseEvent<T>(event: MessageEvent): T | null {
   try {
@@ -103,6 +118,15 @@ export function TeamChat() {
    * 「顺手开了一个新会话」。
    */
   const [editingMemberId, setEditingMemberId] = useState<string | null>(null);
+
+  /**
+   * 上一次发送的幂等键。
+   *
+   * 只在「内容完全相同」时才复用：同一次发送的重试（响应丢了、用户又点了一次
+   * Send）应该收敛成一条消息；而用户改了内容再发是一次新的发送，复用旧键会
+   * 被服务端当成重试、把新内容默默丢掉。
+   */
+  const pendingSendRef = useRef<{ clientRequestId: string; content: string } | null>(null);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   // 供只依赖 conversationId 的 effect 读取最新 conversations，避免每次刷新都重连 SSE
@@ -286,6 +310,12 @@ export function TeamChat() {
       }
     });
 
+    source.addEventListener('conversation_member_state.updated', (event) => {
+      const change = parseEvent<ConversationMemberStateChange>(event as MessageEvent);
+      if (!change) return;
+      applyStateChanged(change);
+    });
+
     source.addEventListener('delegation.started', (event) => {
       const data = parseEvent<DelegationEvent>(event as MessageEvent);
       const fromMemberId = data?.fromMemberId;
@@ -325,12 +355,12 @@ export function TeamChat() {
   }, [conversationId]);
 
   /**
-   * 拉房间里每个 Member 的房间状态（wakeStatus / muted）。
+   * 进入房间时拉一次全量状态（wakeStatus / muted / 读游标）。
    *
-   * 依赖 `messages.length` 而不是 `executions`：wake_status 由服务端调度器在
-   * queued → running → idle 之间推进，而每条消息完成时都会新增一条 message
-   * （skip 除外），这个节奏足够跟上手感，又不会每条 token 增量都去戳一次接口。
-   * 静音切换走 local patch，不依赖这次刷新。
+   * 只依赖 conversationId：之后的每一次变化都由
+   * `conversation_member_state.updated` 事件推过来，不需要再靠「消息数变了」
+   * 这种间接信号去猜 —— NO_REPLY / 排队 / 静音都不伴随新消息，
+   * 靠消息数刷新会漏掉它们，而且会随每个 turn 都戳一次接口。
    */
   useEffect(() => {
     if (!conversationId) return;
@@ -340,9 +370,9 @@ export function TeamChat() {
       .listConversationState(conversationId)
       .then((result) => {
         if (cancelled) return;
-        setConversationStates(
-          Object.fromEntries(result.states.map((state) => [state.memberId, state])),
-        );
+        for (const state of result.states) {
+          applyStateChanged({ memberId: state.memberId, state });
+        }
       })
       .catch(() => {
         // 状态只是展示增强，拿不到不该打断聊天
@@ -351,7 +381,7 @@ export function TeamChat() {
     return () => {
       cancelled = true;
     };
-  }, [conversationId, messages.length]);
+  }, [conversationId]);
 
   // 新消息 / 新增量 / runtime 状态变化时贴底
   useEffect(() => {
@@ -360,8 +390,28 @@ export function TeamChat() {
     node.scrollTo({ top: node.scrollHeight });
   }, [messages, streaming, delegations, executions]);
 
-  function applyStateChanged(state: ConversationMemberState) {
-    setConversationStates((current) => ({ ...current, [state.memberId]: state }));
+  /**
+   * 应用一条房间状态变化（来自 SSE 或一次静音切换的响应）。
+   *
+   * 带 `updatedAt` 守卫：SSE 回放是时间正序的，但**首次连接时的 GET /state**
+   * 可能后到 —— 没有守卫的话，一个更旧的状态会盖掉更新的那条，UI 上表现成
+   * 「刚变成 working 又跳回 idle」。
+   */
+  function applyStateChanged(change: ConversationMemberStateChange) {
+    setConversationStates((current) => {
+      const next = { ...current };
+      const previous = next[change.memberId];
+
+      if (!change.state) {
+        // 状态消失 = 这个成员被移出房间
+        delete next[change.memberId];
+        return next;
+      }
+      if (previous && previous.updatedAt > change.state.updatedAt) return current;
+
+      next[change.memberId] = change.state;
+      return next;
+    });
   }
 
   function applyConversationChanged(next: Conversation) {
@@ -398,7 +448,7 @@ export function TeamChat() {
     const muted = !conversationStates[memberId]?.muted;
     try {
       const result = await api.setMemberMuted(conversationId, memberId, muted);
-      applyStateChanged(result.state);
+      applyStateChanged({ memberId: result.state.memberId, state: result.state });
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -467,6 +517,13 @@ export function TeamChat() {
     const content = input.trim();
     if (!content || !conversationId) return;
 
+    // 同一条内容的重试复用同一个幂等键：双击、或者上一次响应丢了再点一次，
+    // 都不会在房间里留下两条一样的消息。
+    const pending = pendingSendRef.current;
+    const clientRequestId =
+      pending && pending.content === content ? pending.clientRequestId : newRequestId();
+    pendingSendRef.current = { clientRequestId, content };
+
     setBusy(true);
     setError(null);
     setInput('');
@@ -476,7 +533,10 @@ export function TeamChat() {
         // Everyone（''）必须传 undefined：让服务端 GroupDispatcher 决定唤醒谁。
         // 传一个具体 memberId = 点名，等价于一次 @mention。
         targetMemberId: recipientMemberId || undefined,
+        clientRequestId,
       });
+      // 发出去了才清掉：失败时保留，好让「再点一次」变成一次真正的重试。
+      pendingSendRef.current = null;
       // 202：消息已落库。乐观插入，SSE 到达时会按 id 去重。
       setMessages((current) => mergeMessages(current, [result.message]));
 
@@ -537,7 +597,11 @@ export function TeamChat() {
               showMembers={showMemberManager}
               onToggleMembers={() => setShowMemberManager((value) => !value)}
               onConversationChanged={applyConversationChanged}
-              onStateChanged={applyStateChanged}
+              // 子组件只处理单个 state；状态「消失」只有 SSE 会带来，
+              // 统一在边界上包成同一种变化对象。
+              onStateChanged={(state) =>
+                applyStateChanged({ memberId: state.memberId, state })
+              }
             />
 
             {activeExecutions.length > 0 && (

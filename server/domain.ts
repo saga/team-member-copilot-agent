@@ -56,6 +56,14 @@ export interface ConversationMessage {
   senderId: string;
   targetMemberId: string | null;
   replyToMessageId: string | null;
+  /**
+   * 调用方为这次「发送」提供的幂等键（可以带前缀，比如 `web-<uuid>`）。
+   *
+   * 唯一性由 `UNIQUE(conversation_id, client_request_id)` 保证：同一个键第二次
+   * 到达时不会再落一条消息，也不会再派一次唤醒，而是把第一条原样返回。为 null
+   * 表示这条消息不参与去重（服务端内部产生的消息、以及没带键的调用方）。
+   */
+  clientRequestId: string | null;
   content: string;
   executionId: string | null;
   createdAt: string;
@@ -107,6 +115,31 @@ export type ExecutionStatus =
    */
   | 'interrupted';
 
+/**
+ * 一轮 execution 开跑那一刻，这个 Member 的配置快照。
+ *
+ * 为什么需要它：Member 的配置（system prompt / memory / skills / model /
+ * toolProfile）是**会变的**，而 execution 是「当时真的这样跑过一轮」的记录。
+ * 没有快照，事后只能看到两条 execution 行为不同，看不到它们的输入不同 ——
+ * 尤其是 retry：同一份 prompt 在今天重跑，用的已经是另一个人格、另一份记忆。
+ *
+ * `memberRevision` 用 `member.updated_at`：它是这个 Member 身份字段的写序号，
+ * 换过任何一个人格字段都会变。
+ */
+export interface ExecutionConfigSnapshot {
+  memberRevision: string;
+  model: string;
+  toolProfile: ToolProfile;
+  /** system prompt 全文的 sha256（不存全文：它可以从 member + memory 重算）。 */
+  systemPromptHash: string;
+  /** 长期记忆内容的 sha256。Agent 在 turn 里写记忆会让它变化。 */
+  memoryHash: string;
+  /** 已安装 skill 清单的 sha256（名字 + 各自 SKILL.md 的 mtime）。 */
+  skillManifestHash: string;
+  /** 部署层是否放行宿主工具。它决定 availableTools 的真实形状。 */
+  hostToolsEnabled: boolean;
+}
+
 export interface ExecutionRecord {
   id: string;
   conversationId: string;
@@ -138,6 +171,8 @@ export interface ExecutionRecord {
   triggerMessageSequence: number | null;
   /** 为什么唤醒这个 Member。落库是为了重启恢复时忠实重放同一轮。 */
   wakeReason: WakeReason | null;
+  /** 开跑那一刻这个 Member 的配置。历史数据为 null（当时没有记录）。 */
+  configSnapshot: ExecutionConfigSnapshot | null;
   startedAt: string | null;
   endedAt: string | null;
   createdAt: string;
@@ -199,6 +234,19 @@ export interface PendingWake {
   triggerSequence: number;
 }
 
+/**
+ * 房间状态的一条变化通知（`conversation_member_state.updated` 事件的 payload）。
+ *
+ * 做成 `{ memberId, state }` 而不是直接发 state 本身：状态**消失**也是一次
+ * 变化（成员被移出房间），而「消失」表达不出一个 ConversationMemberState。
+ * 用 null 表示它，比再发明一个 event type 干净。
+ */
+export interface ConversationMemberStateChange {
+  memberId: string;
+  /** null = 这个 Member 在这个房间里的状态已经不存在。 */
+  state: ConversationMemberState | null;
+}
+
 export interface MemberRuntime {
   id: string;
   conversationId: string;
@@ -225,6 +273,14 @@ export type ConversationEventType =
   | 'message.created'
   | 'message.delta'
   | 'execution.updated'
+  /**
+   * 某个 Member 在房间里的状态变了（读游标 / 唤醒状态 / 静音）。
+   *
+   * durable 事件，和别的状态一样先落库再广播：前端靠它把 ●idle / ●working /
+   * 🔇muted 实时化，而不是轮询。只依赖 message.created 是不够的 —— NO_REPLY /
+   * pending / mute 这些变化都不伴随新消息。
+   */
+  | 'conversation_member_state.updated'
   | 'delegation.started'
   | 'delegation.finished';
 

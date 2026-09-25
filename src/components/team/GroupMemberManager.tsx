@@ -92,9 +92,15 @@ export function GroupMemberManager({
 
       <div className="member-table">
         {conversation.members.map((member) => {
-          const muted = states[member.id]?.muted ?? false;
+          const state = states[member.id];
+          const muted = state?.muted ?? false;
           const archived = member.status !== 'active';
           const busy = busyMemberId === member.id;
+
+          // 「有活没干完」：排队的唤醒，或者还在 queued / running / cooldown。
+          // 这条判断只是把服务端真会拒绝的操作提前变灰 —— 真正的闸门在
+          // assertMemberNotBusy，前端猜不出确切原因，所以点不动时把话说明白。
+          const hasWork = Boolean(state?.pendingWake) || (state && state.wakeStatus !== 'idle');
 
           return (
             <div key={member.id} className="member-table-row">
@@ -105,6 +111,7 @@ export function GroupMemberManager({
               <div className="member-table-role">{member.role}</div>
               <div className="member-table-actions">
                 {archived && <span className="tag">archived</span>}
+                {hasWork && <span className="tag">有未完成的工作</span>}
                 <button type="button" onClick={() => toggleMute(member.id)} disabled={busy}>
                   {muted ? 'Unmute' : 'Mute'}
                 </button>
@@ -112,8 +119,14 @@ export function GroupMemberManager({
                   type="button"
                   className="danger"
                   onClick={() => remove(member.id)}
-                  disabled={busy || removeDisabled}
-                  title={removeDisabled ? 'Team 至少需要两个成员' : `移出 ${member.name}`}
+                  disabled={busy || removeDisabled || hasWork}
+                  title={
+                    removeDisabled
+                      ? 'Team 至少需要两个成员'
+                      : hasWork
+                        ? `${member.name} 还有未完成的工作，等它跑完或先取消对应的 execution`
+                        : `移出 ${member.name}`
+                  }
                 >
                   Remove
                 </button>

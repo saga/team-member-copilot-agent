@@ -47,6 +47,21 @@ export const config = {
    */
   groupAutoWakeRounds: intEnv('GROUP_AUTO_WAKE_ROUNDS', 2),
   /**
+   * 单轮注进入 prompt 的 shared message 条数上限。
+   *
+   * 没有它时会有一个很具体的事故：一个 Member 沉默很久（或被静音一段时间）
+   * 之后第一次被唤醒，checkpoint 停在很久以前，于是整段房间历史被一次性灌进
+   * prompt —— 既超出模型窗口，也把这一轮的真实意图埋在最底下。
+   */
+  maxContextMessages: intEnv('MAX_CONTEXT_MESSAGES', 100),
+  /**
+   * 单轮注入的 shared message 字符数上限（按 transcript 渲染后的长度算）。
+   *
+   * 和条数上限是两条独立的闸门：100 条长文和 100 条短句的差别是一个数量级。
+   * 两条都超的话按先到的那个截。见 context-assembler.ts 的 selectWindow()。
+   */
+  maxContextChars: intEnv('MAX_CONTEXT_CHARS', 60_000),
+  /**
    * 是否允许 Member 使用会触达宿主机的 built-in（bash / edit / grep / web_fetch）。
    *
    * 默认关闭，且**不随 toolProfile 打开**：成员把自己标成 coding 只是声明想要

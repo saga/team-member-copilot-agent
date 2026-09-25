@@ -763,7 +763,6 @@ describe('Execution cancel 状态机', () => {
     const conv = team.createConversation({
       kind: 'group',
       memberIds: [alice.id, bob.id],
-      defaultMemberId: alice.id,
     });
     muteAllMembers(team, conv.id);
 
@@ -875,7 +874,6 @@ describe('归档 Member 的 conversation 语义', () => {
     const conv = team.createConversation({
       kind: 'group',
       memberIds: [alice.id, bob.id],
-      defaultMemberId: alice.id,
     });
     // 这个用例只关心「bob 被点名那一轮」，把自动唤醒关掉
     muteAllMembers(team, conv.id);
@@ -932,7 +930,6 @@ describe('listExecutions', () => {
     const conv = team.createConversation({
       kind: 'group',
       memberIds: [alice.id, bob.id],
-      defaultMemberId: alice.id,
     });
     // 断言的是「恰好 2 条 execution」，所以每一轮都点名，不让讨论自己展开
     muteAllMembers(team, conv.id);

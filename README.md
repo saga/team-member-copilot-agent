@@ -169,6 +169,11 @@ hook 认不出 `sessionId` 属于哪个 execution 时也拒绝而不是放行 �
 | 并发 delegation 会死锁 | `delegation_path` 防同树环 + wait-for 图防跨树互相等待 |
 | DB 说失败 / 已取消，引擎还在跑 | `resumeSession` 错误分类收窄 + 超时 `abort()` + `activeSessions` 句柄，让 cancel 能真的落地 |
 | 排队中的唤醒经不起重启 | 唤醒的**触发消息序号与原因一起落库**，恢复时原样重派，而不是拿当前水位猜一个 |
+| 网络重试会写出重复消息 | `clientRequestId` 落到唯一索引上，重试命中已有那条并回 `deduplicated: true`（序号不会被重复分配） |
+| 两个人同时改同一份记忆 | `MEMORY.md` 的 `version` = 全文 sha256，PUT 带 `expectedVersion`，不匹配 `409` 且不写盘 |
+| 上下文无限增长会撑爆 prompt | `ContextAssembler` 按条数 + 字符数双重上限，**从最新往前取**，并在 transcript 前显式说明省略了多少条 |
+| 事后看不出「这一轮用的是哪份配置」 | `execution.config_snapshot` 存指纹（memberRevision / model / toolProfile / 各种 hash），不存全文 |
+| 状态变化没有消息可看，前端只能靠猜 | `conversation_member_state.updated` 落 `conversation_event` 再广播，前端按 `updatedAt` 合并 |
 
 ### 1. 崩溃恢复：宁可漏跑，不可重跑
 
@@ -282,6 +287,102 @@ scheduler 内存队列），任一条命中就 `409 Conflict` —— 不做「�
 `member_runtime` 行**换 sessionId 而不是删除**（`execution.runtime_id` 引用它且没有
 `ON DELETE`），重新加入自然拿到一个全新的 Copilot session，不会 resume 上一段任职的历史。
 
+### 7. `POST /messages` 是幂等的
+
+客户端网络重试、用户手抖点两次，都会让同一条消息落两遍。判据是 `clientRequestId`
+（不是内容 —— 两次真的发了同一句话是两件事，不是一次重试）：
+
+```ts
+sendMessage({ content, clientRequestId })
+  ↓
+查 (conversation_id, client_request_id)
+  ├── 命中 → 202 { message: 已有那条, deduplicated: true }   ← 不分配新序号、不唤醒任何人
+  └── 未命中 → 分配序号 → insert
+                 └── UNIQUE 冲突（并发重试）→ 回读那条并返回 deduplicated: true
+```
+
+三处容易写错的顺序：
+
+- **幂等检查必须在分配 `message_sequence` 之前。** 放到后面会给房间留下一个空号，
+  而所有「按序号推断」的东西（未读数、checkpoint 比较）都会看到一个不存在的消息。
+- **先检查仍然会漏并发**，所以 `insertMessage` 要接住 `UNIQUE constraint failed` 并回读
+  —— 两个请求都过了前置检查时，第二个撞索引才是收口点。判据是 `/UNIQUE constraint failed/i`，
+  `errcode === 2067` 只作次选（Node 版本间不保证一致）。
+- **前端只在内容不变时复用 key**（`pendingSendRef`）：改了内容再发是一次新发送，
+  复用旧 key 会让新内容被静默丢掉。成功才清 ref，失败保留，好让「再点一次」成为真重试。
+
+`replyToMessageId` 同理不能只信请求体：引用的消息不存在 → `400`，属于另一个房间 → `400`。
+不校验的话，前端拿到的一个过期 id 会把它变成一个跨房间的信息泄露口。
+
+### 8. 两份记忆与乐观并发
+
+`members/<id>/memory/MEMORY.md` 有两个写者：用户在 UI 里改、Agent 调 `remember_member`。
+后写的直接覆盖先写的，会安静地丢掉一段记忆。
+
+```ts
+MemberMemory { content: string; version: string }   // version = sha256(content)
+PUT /memory { content, expectedVersion? }
+  └── expectedVersion 与当前 version 不符 → 409（不写盘）
+```
+
+`appendMemory` 也改成读-改-写走同一条写入路径，避免与 `replaceMemory` 的
+temp → `fsync` → `rename` 交错。**写盘是原子的**：同目录内 `rename` 才有原子性保证，
+所以临时文件必须落在 `MEMORY.md` 旁边，不能丢进系统 temp。
+
+前端（`MemberMemory.tsx`）收到 `409` 时不重试：重新拉一次最新内容作为新基线，
+按钮文案变成 `Save anyway`，让「覆盖别人的修改」成为一次显式操作。
+
+`skillManifestHash` 用同一个 `hashText()`（`server/content-hash.ts`）——
+memory version / memoryHash / systemPromptHash 必须是**同一个实现**，
+各写各的会让两个本该相等的指纹永远不相等。
+
+### 9. 一轮 turn 用了哪份配置
+
+配置会漂移：有人在 Member 还跑着的时候改了 system prompt、换了 model、动了 skills。
+事后只能看到结果，看不出「当时喂进去的是什么」—— 配置快照回答的就是这个。
+
+```ts
+ExecutionConfigSnapshot {
+  memberRevision, model, toolProfile,
+  systemPromptHash, memoryHash, skillManifestHash, hostToolsEnabled
+}
+```
+
+只存指纹不存全文：全文能从 member 行 + 磁盘重算，存两份必然有一份过期。
+`memoryHash` 是**整份记忆文件**的指纹，不是「注入了 tail 16000 字符」的指纹 ——
+它回答的是「当时是哪一份记忆」，不是「当时塞进去了哪些字节」。
+
+写在 `runTurn()` 里，因为 `systemPromptHash` 依赖「当时真的拼出来的那段 prompt」。
+写入失败只 `console.warn` 不抛出（快照是旁证，不是这一轮的输入），但也不能静默。
+
+**retry 不继承原记录的快照**，新记录必须是它自己开跑那一刻的 —— 「配置漂移」正是
+对比两次执行的快照才看得出来的东西，继承会把这份证据抹掉。
+
+### 10. 状态变化也是事件
+
+`conversation_member_state` 的每一次变化（读游标推进、`wakeStatus`、`pendingWake`、
+静音、被移出）都落 `conversation_event` 再广播：
+
+```
+{ type: 'conversation_member_state.updated', data: { memberId, state: ConversationMemberState | null } }
+```
+
+否则前端只能靠「消息数变了」猜要不要刷新 —— 而 NO_REPLY、queued、mute 这三种
+状态变化**都不伴随新消息**，猜不出来。
+
+三处形状上的选择：
+
+- **`state` 为 `null` 表示「没有了」**（成员被移出）。比再发明一个 event type 干净：
+  消费方本来就要处理「这个 memberId 的 state 不存在」。
+- **回调签名带 `conversationId`**：状态消失时取不到 conversationId，
+  但它仍然属于某个房间的事件流。
+- **事务内只攒不广播**。`TeamService.transaction()` 期间 `emit()` 只 `persistEvent`
+  并攒进 `deferredEvents`，COMMIT 之后才 `broadcast`；回滚就一起丢掉。
+  支持嵌套（内层不再 `BEGIN`），否则内层提交会暴露出外层尚未提交的状态。
+
+前端（`TeamChat.tsx`）按 `updatedAt` 合并而不是直接覆盖：SSE 回放是时间正序，
+但首次连接的 `GET /state` 可能后到，没有守卫会「刚 working 又跳回 idle」。
+
 ## 快速开始
 
 ```bash
@@ -310,7 +411,7 @@ npm run dev            # 同时启动 client(:5173) + server(:3001)
 | POST | `/api/conversations` | 创建 Direct / Group / Work |
 | GET | `/api/conversations/:id` | 单个 Conversation |
 | GET | `/api/conversations/:id/messages?limit=` | 最近 N 条消息（按 `messageSequence` 正序） |
-| POST | `/api/conversations/:id/messages` | 发送消息 → `202 { message, executionId }` |
+| POST | `/api/conversations/:id/messages` | 发送消息 → `202 { message, wakes, unresolvedMentions, deduplicated }`。可选 `clientRequestId`（幂等键）、`replyToMessageId`（必须属于本房间） |
 | POST | `/api/conversations/:id/members` | 加入 Member（仅 `group`） |
 | DELETE | `/api/conversations/:id/members/:memberId` | 移出 Member（仅 `group`） |
 | GET | `/api/conversations/:id/events?since=` | 会话级 SSE（支持 `Last-Event-ID` 回放） |
@@ -318,7 +419,7 @@ npm run dev            # 同时启动 client(:5173) + server(:3001)
 | GET | `/api/conversations/:id/state` | 房间里每个 Member 的读游标 / 唤醒状态 / 静音 |
 | PATCH | `/api/conversations/:id/members/:memberId/state` | 静音 / 取消静音 |
 | GET | `/api/members/:id/direct-messages` | 该 Member 参与的全部私聊（只读） |
-| GET | `/api/members/:id/memory` · `PUT` | 该 Member 的长期记忆全文 |
+| GET | `/api/members/:id/memory` · `PUT` | 该 Member 的长期记忆 → `{ content, version }`；`PUT` 可带 `expectedVersion`，不匹配 `409` |
 | GET | `/api/members/:id/skills` · `POST` · `DELETE` | 该 Member 的 skill（zip 上传 / 卸载） |
 | POST | `/api/internal/members/:id/direct-messages` | **以 `:id` 的身份**发私聊 —— Internal API，见下 |
 | GET | `/api/executions/:id` | 单条 execution |
@@ -387,7 +488,8 @@ Conversation SSE
   ├── id: 2  execution.updated
   ├── id: 3  delegation.started
   ├── id: 4  message.created   (被委派的 Member)
-  └── id: 5  delegation.finished
+  ├── id: 5  conversation_member_state.updated
+  └── id: 6  delegation.finished
 ```
 
 ### 典型用法
@@ -424,16 +526,30 @@ Group Chat：
 {
   "kind": "group",
   "title": "Investment Review Team",
-  "memberIds": ["researcher-id", "coder-id", "reviewer-id"],
-  "defaultMemberId": "researcher-id"
+  "memberIds": ["researcher-id", "coder-id", "reviewer-id"]
 }
 ```
 
-发消息时用 `targetMemberId` 决定谁回应（第一版不做 LLM router，保持确定性）：
+`group` **不接受** `defaultMemberId`（传了直接 `400`）：收件人由 `GroupDispatcher`
+按 @mention 决定，留一个「默认谁接」的值只会让人以为它可以依赖。
+
+发消息时用 `targetMemberId` 决定谁回应（不做 LLM router，保持确定性）：
 
 ```json
 { "content": "请 @coder 根据这个结论写一个验证脚本", "targetMemberId": "coder-id" }
 ```
+
+`@mention` 的解析只做**精确匹配**，且 handle 优先于 name：
+
+```
+@<token>  →  byHandle.get(token) ?? byName.get(token)
+             两者都没有 → unresolved（不广播给全员）
+```
+
+不做前缀匹配（`@ann` 命中 `anna`）也不做「最长名字胜出」：token 里带空格时后者
+会让解析结果取决于谁的名字更长。`@Alice Chen` 会被截成 `Alice`，取不出来就进
+`unresolved` —— 这是一个取舍，不是缺陷：允许空格会让 `@Alice and Bob please look`
+变成一句有歧义的句子，而且没有正确答案。
 
 ## Storage
 
@@ -465,6 +581,7 @@ Group Chat：
 | 2 | `conversation.event_sequence` / `message_sequence`、`conversation_message.message_sequence`、`member_runtime.active_execution_id` / `last_context_message_sequence`、`execution.waiting_for_runtime_id` / `retry_of_execution_id`、`execution.status` 增加 `waiting_for_member` / `interrupted`、`conversation_event` |
 | 3 | `conversation_member_state`（Member 在房间里的读游标 + 唤醒状态）、`execution.decision` / `trigger_message_sequence` |
 | 4 | `conversation_member_state.pending_wake_trigger_sequence` / `pending_wake_reason`（唤醒的重放单位） |
+| 5 | `conversation_message.client_request_id` + `UNIQUE(conversation_id, client_request_id)`（消息幂等键）、`execution.config_snapshot`（这一轮用的是哪份配置）；并把历史 `group` 房间的 `default_member_id` 归零 |
 
 约定：
 
@@ -474,6 +591,9 @@ Group Chat：
 - 加列一律走 `ADD COLUMN`，不重建表 —— 这几张表被 6 张表 FK 引用，SQLite 改不了它们。
 - `execution` 要改 `status` 的 CHECK 约束，而 SQLite 不支持 `ALTER CHECK`，所以按官方 12 步流程重建表；重建期间 `PRAGMA foreign_keys = OFF` 必须放在 `BEGIN` **之前**（该 PRAGMA 在事务内无效），提交前跑 `PRAGMA foreign_key_check`。
 - 升级时会同步计数器与水位线：`conversation.message_sequence` 追上历史最大值（否则下一条消息撞 UNIQUE），`member_runtime.last_context_message_sequence` 推到当前最大序号（否则升级后立刻重复注入一次全量上下文）。
+- 幂等键的 `UNIQUE` 索引**允许 NULL**，而且这是刻意的：SQLite 认为 NULL 互不相等，所以不带 `clientRequestId` 的内部消息（Member 回复、委派结果）天然不参与去重，不需要额外分支。
+
+v4 → v5 的 `group` 归零是一次**数据修正**：`default_member_id` 在 `group` 上没有语义（收件人由 `GroupDispatcher` 按 @mention 决定），留着一个值只会让「这个房间默认谁接」看起来像个可以依赖的配置。迁移把它清掉，`createConversation()` 也从入口拒绝（`400` 而不是静默忽略 —— 静默忽略会让调用方以为设置成功了）。
 
 ### 两道环检测
 
@@ -494,14 +614,23 @@ src/                          # Vite + React 前端
   index.css
   components/
     HealthBadge.tsx
-    TeamChat.tsx
+    TeamChat.tsx              # 编排：conversation / SSE / 状态合并
+    team/                     # TeamChat 的拆分：list / messages / composer / 各编辑面板
+      ConversationList.tsx
+      ConversationMessages.tsx
+      MessageComposer.tsx
+      MemberEditor.tsx        # 含 Archive
+      MemberMemory.tsx        # 乐观并发（409 → Save anyway）
+      GroupMemberManager.tsx  # 有未完成工作时禁止 Remove
+      ...
   lib/api.ts                  # 后端 API 客户端（含 SSE 解析）
 
 server/                       # Express + Copilot SDK 后端
   config.ts                   # 环境变量
   db.ts                       # node:sqlite 打开 + 迁移
-  db-migrations.ts            # PRAGMA user_version 迁移（v1 → v4）
+  db-migrations.ts            # PRAGMA user_version 迁移（v1 → v5）
   domain.ts                   # Member / Conversation / Runtime / Execution 类型
+  content-hash.ts             # hashText() —— memory version / 各种 snapshot hash 的唯一实现
   copilot.ts                  # MemberRuntime → CopilotSession 执行引擎 + custom tools
   tool-policy.ts              # 工具声明与放行（同一个实例回答两个问题）
   context-assembler.ts        # 增量上下文（message_sequence checkpoint）
@@ -530,6 +659,7 @@ server/                       # Express + Copilot SDK 后端
     member-skills.test.ts          # skill 安装 / 卸载 / zip 校验
     runtime-reliability.test.ts    # 迁移 / 序号 / 增量上下文 / durable event / 恢复 / 死锁
     runtime-correctness.test.ts    # resume 分类 / 超时 abort / 工具授权接线 / cancel 状态机 / retry
+    data-integrity.test.ts         # replyTo 校验 / 消息幂等 / 记忆乐观并发 / 上下文上限 / 配置快照 / state 事件 / mention 精确匹配
 ```
 
 ## 环境变量
@@ -545,6 +675,8 @@ server/                       # Express + Copilot SDK 后端
 | `EXECUTION_TIMEOUT_MS` | `600000` | 单次 turn 上限（SDK 默认 60s 对带工具的真实任务太短） |
 | `RECOVER_ON_STARTUP` | `true` | 启动时跑 `RecoveryService`（单进程独占 DB 才安全） |
 | `GROUP_AUTO_WAKE_ROUNDS` | `2` | 无 `@mention` 的 member 发言最多连着唤醒几轮 |
+| `MAX_CONTEXT_MESSAGES` | `100` | 注入 prompt 的 shared message 条数上限（从最新往前取，至少 1 条） |
+| `MAX_CONTEXT_CHARS` | `60000` | 注入 prompt 的字符数上限（含每条 32 字符的固定开销），与条数上限同时生效 |
 | `HOST_CODING_TOOLS` | `false` | 是否允许 `bash` / `edit` / `grep` / `web_fetch`。**不随 `toolProfile` 打开** |
 | `INTERNAL_API_TOKEN` | 空 | Internal API 门禁；空 = 不校验（仅限本机单用户） |
 
@@ -566,8 +698,7 @@ runtime 仍然是宿主机上的进程 —— 没有沙箱时 `bash` 能走到 w
 
 ## 后续扩展点
 
-- **Execution UI**：`ExecutionStrip` / `ExecutionTree`（客户端按 `parentExecutionId` 组树）+ retry / cancel 按钮，并把 `TeamChat.tsx` 拆成 `src/components/team/`。
-- **Member 编辑器**：handle / description / style / systemPrompt / model / toolProfile / status，其中 `coding` 必须显式标注 "Host execution / Not sandboxed"。
+- **Execution UI**：`ExecutionStrip` / `ExecutionTree`（客户端按 `parentExecutionId` 组树）+ retry / cancel 按钮。`TeamChat.tsx` 已拆到 `src/components/team/`，但 execution 视图还没有独立组件。
 - **多副本**：`RecoveryService` 与 `cancelRequests` 目前都假设单进程。多副本前要把「谁是 owner」和取消信号都升级成 DB lease / 跨进程通道。
 - **认证**：`local-user` 是占位。接 Entra ID / AD / OIDC 时只改请求上下文，业务数据模型不动。
 - **会话记忆 vs Member 记忆**：`conversation_message` 是会话上下文，`members/<id>/memory/MEMORY.md` 是 Member 长期记忆，两者不要混。

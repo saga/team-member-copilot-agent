@@ -1,6 +1,12 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { now } from './db.js';
-import type { ConversationMemberState, PendingWake, WakeReason, WakeStatus } from './domain.js';
+import type {
+  ConversationMemberState,
+  ConversationMemberStateChange,
+  PendingWake,
+  WakeReason,
+  WakeStatus,
+} from './domain.js';
 
 interface StateRow {
   conversation_id: string;
@@ -28,9 +34,29 @@ interface StateRow {
  * 它们会分叉。Member 读完房间但选择不发言（decision = 'skip'）时，房间游标前进，
  * 而 session checkpoint 不动 —— 下一轮它确实需要重新看到那些消息，因为它的
  * Copilot session 从来没读过。
+ *
+ * 每次变化都会回调 `onChange`，由 TeamService 落成 durable 事件。刻意不做
+ * 「只在字段真的变了才回调」的比对：这张表只有 9 列、每轮改动个位数，
+ * 而代价是多一次 SELECT 和一套容易写错的比较逻辑。回调出去的永远是完整状态，
+ * 重复投递是无害的（应用方按 memberId 整体替换）。
  */
 export class ConversationMemberService {
-  constructor(private readonly db: DatabaseSync) {}
+  constructor(
+    private readonly db: DatabaseSync,
+    /**
+     * 状态行发生变化后回调一次。
+     *
+     * TeamService 传入的实现把它打成 `conversation_member_state.updated` 事件；
+     * RecoveryService 与测试不传 —— 恢复期没有任何订阅者，那里也不需要广播。
+     *
+     * 第一个参数是 conversationId 而不是从 state 里取：状态**消失**时
+     * （成员被移出房间）state 是 null，但它同样属于某个房间的事件流。
+     */
+    private readonly onChange: (
+      conversationId: string,
+      change: ConversationMemberStateChange,
+    ) => void = () => {},
+  ) {}
 
   /**
    * 幂等地保证状态行存在。
@@ -62,7 +88,9 @@ export class ConversationMemberService {
       )
       .run(conversationId, memberId, lastSeenMessageSequence, now());
 
-    return this.get(conversationId, memberId);
+    const state = this.get(conversationId, memberId);
+    this.onChange(conversationId, { memberId, state });
+    return state;
   }
 
   get(conversationId: string, memberId: string): ConversationMemberState {
@@ -116,6 +144,7 @@ export class ConversationMemberService {
         `,
       )
       .run(sequence, now(), conversationId, memberId);
+    this.emitState(conversationId, memberId);
   }
 
   markReplied(conversationId: string, memberId: string, sequence: number): void {
@@ -131,6 +160,7 @@ export class ConversationMemberService {
         `,
       )
       .run(sequence, now(), conversationId, memberId);
+    this.emitState(conversationId, memberId);
   }
 
   setWakeStatus(conversationId: string, memberId: string, status: WakeStatus): void {
@@ -146,6 +176,7 @@ export class ConversationMemberService {
         `,
       )
       .run(status, now(), conversationId, memberId);
+    this.emitState(conversationId, memberId);
   }
 
   /**
@@ -187,6 +218,7 @@ export class ConversationMemberService {
         conversationId,
         memberId,
       );
+    this.emitState(conversationId, memberId);
   }
 
   /**
@@ -214,6 +246,7 @@ export class ConversationMemberService {
         `,
       )
       .run(now(), conversationId, memberId);
+    this.emitState(conversationId, memberId);
   }
 
   /**
@@ -247,6 +280,7 @@ export class ConversationMemberService {
         expected.triggerSequence,
         expected.reason,
       );
+    this.emitState(conversationId, memberId);
   }
 
   setMuted(conversationId: string, memberId: string, muted: boolean): void {
@@ -262,6 +296,7 @@ export class ConversationMemberService {
         `,
       )
       .run(muted ? 1 : 0, now(), conversationId, memberId);
+    this.emitState(conversationId, memberId);
   }
 
   /** 成员被移出 conversation（或成员归档）时清理。 */
@@ -275,6 +310,18 @@ export class ConversationMemberService {
         `,
       )
       .run(conversationId, memberId);
+
+    // state = null：这个成员在这个房间里已经没有任何状态。前端据此删掉本地那份，
+    // 而不是继续显示一个已经被移出房间的成员。
+    this.onChange(conversationId, { memberId, state: null });
+  }
+
+  /**
+   * 变更回调的统一入口。读回整行再回调，保证投出去的是**落库后**的状态 ——
+   * 拿内存里拼的值会让「前端看到的状态」和「dispatcher 读到的事实」出现分叉。
+   */
+  private emitState(conversationId: string, memberId: string): void {
+    this.onChange(conversationId, { memberId, state: this.get(conversationId, memberId) });
   }
 
   /**

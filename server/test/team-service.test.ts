@@ -161,7 +161,6 @@ before(() => {
     kind: 'group',
     title: 'Investment Review Team',
     memberIds: [researcher.id, coder.id, reviewer.id, analyst.id, archivist.id],
-    defaultMemberId: researcher.id,
   });
   // 这个 group 是给 delegation / 审计链用例当「同一个房间里的多个 Member」用的。
   // 静音全体：这些用例每一轮都显式点名，不需要 open_discussion 广播把 5 个人
@@ -259,7 +258,6 @@ describe('Conversation / Runtime 边界', () => {
     const group = team.createConversation({
       kind: 'group',
       memberIds: [coder.id, reviewer.id],
-      defaultMemberId: coder.id,
     });
 
     // 移出后只剩 1 个成员 → 不再是合法 group
@@ -300,21 +298,34 @@ describe('Conversation / Runtime 边界', () => {
     );
   });
 
-  it('group conversation 未指定 targetMemberId 且无默认成员时报 400', () => {
+  it('defaultMemberId 只对 1:1 房间成立：越界报 400，group 直接拒绝', () => {
+    // 1:1 房间：必须是 roster 里的人
+    assert.throws(
+      () =>
+        team.createConversation({
+          kind: 'direct',
+          memberIds: [coder.id, reviewer.id],
+          defaultMemberId: 'not-in-conversation',
+        }),
+      /defaultMemberId 必须属于 conversation member/,
+    );
+
+    // group：这个字段在这里没有语义，显式传了要报错而不是被默默忽略 ——
+    // 静默忽略会让调用方以为自己设置成功了，然后把它当成默认收件人。
+    assert.throws(
+      () =>
+        team.createConversation({
+          kind: 'group',
+          memberIds: [coder.id, reviewer.id],
+          defaultMemberId: coder.id,
+        }),
+      /group conversation 不接受 defaultMemberId/,
+    );
+
     const group = team.createConversation({
       kind: 'group',
       memberIds: [coder.id, reviewer.id],
     });
-    try {
-      team.createConversation({
-        kind: 'group',
-        memberIds: [coder.id, reviewer.id],
-        defaultMemberId: 'not-in-conversation',
-      });
-      assert.fail('应该拒绝不属于 conversation 的 defaultMemberId');
-    } catch (error) {
-      assert.ok(error instanceof Error);
-    }
     assert.equal(group.defaultMemberId, null);
   });
 

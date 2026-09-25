@@ -153,20 +153,30 @@ export interface DispatchPlan {
 /**
  * `@` 后面允许的字符：非空白、非标点。
  *
- * 刻意不写 `[a-zA-Z0-9_-]+` —— Member 的 name 可以带空格和中文，
- * `@Alice Chen` / `@张三` 都得认。
+ * 刻意不写 `[a-zA-Z0-9_-]+`：handle 之外，Member 的 name 也可以被 @（含中文），
+ * `@张三` 得认。
+ *
+ * 代价是**空格会截断**：`@Alice Chen` 只会取出 `Alice`。这不是缺陷，是取舍 ——
+ * 允许空格的话，`@Alice and Bob please look` 就变成一个有歧义的句子，解析结果
+ * 取决于谁的名字更长。所以带空格的 name 必须用去掉空格的形式（`@AliceChen`）
+ * 或者 handle。取不出来时不猜：走 unresolved，由 API 如实告诉调用方。
  */
 const MENTION_PATTERN = /@([^\s@,，。；;：:！!？?、()（）[\]【】<>《》"'`]+)/g;
 
 /**
  * 把消息里的 @ 解析成 Member。
  *
- * 匹配顺序（都是大小写不敏感的确定性比较）：
- *   1. handle 全等          @alice      → handle "alice"
- *   2. name 全等            @Alice Chen → name "Alice Chen"
- *   3. name 去掉空格后全等  @AliceChen  → name "Alice Chen"
+ * 只做**全等**匹配，两条索引按优先级依次查：
  *
- * 同一个 Member 被多次 @ 只算一次。返回的 `unresolved` 是没匹配上的原文。
+ *   1. handle 全等   @alice       → handle "alice"
+ *   2. name 全等     @AliceChen   → name "Alice Chen"（去掉空格）
+ *   3. name 原样全等 @张三         → name "张三"
+ *
+ * 早先还有一个「前缀匹配」兜底，用来救 `@Alice` 这种只写了名字前半截的写法。
+ * 它制造的问题比解决的多：`@ann` 会匹配到 `@anna`，而且因为它排在 name 全等
+ * 之前，`@Alice Chen`（被空格截断成 `Alice`）会被它悄悄解析成另一个叫 Alice
+ * 的人。**猜错一个收件人比报「没匹配到」糟得多** —— 后者调用方还能看见。
+ * 同一个 Member 被多次 @ 只算一次；返回的 `unresolved` 是没匹配上的原文。
  */
 export function resolveMentions(
   content: string,
@@ -175,30 +185,29 @@ export function resolveMentions(
   const matched = new Map<string, Member>();
   const unresolved: string[] = [];
 
-  const index = members.map((member) => ({
-    member,
-    keys: [member.handle, member.name, member.name.replace(/\s+/g, '')]
-      .map((key) => key.trim().toLowerCase())
-      .filter(Boolean),
-  }));
+  // 两张索引分开查，而不是把 handle 和 name 混成一个 key 列表：handle 是显式
+  // 身份，name 是显示名，同一个 token 同时撞上两者时应该以 handle 为准，
+  // 而不是取决于 members 数组的排列顺序。
+  const byHandle = new Map<string, Member>();
+  const byName = new Map<string, Member>();
+
+  for (const member of members) {
+    const handle = member.handle.trim().toLowerCase();
+    if (handle && !byHandle.has(handle)) byHandle.set(handle, member);
+
+    for (const key of [member.name, member.name.replace(/\s+/g, '')]) {
+      const normalized = key.trim().toLowerCase();
+      if (normalized && !byName.has(normalized)) byName.set(normalized, member);
+    }
+  }
 
   for (const match of content.matchAll(MENTION_PATTERN)) {
     const raw = match[1];
     const token = raw.toLowerCase();
 
-    const hit = index.find((entry) => entry.keys.includes(token));
+    const hit = byHandle.get(token) ?? byName.get(token);
     if (hit) {
-      matched.set(hit.member.id, hit.member);
-      continue;
-    }
-
-    // `@AliceChen` 这种把 name 的空格去掉的写法：取最长匹配，避免
-    // 「Alice」把「Alice Chen」的前缀吃掉（同名前缀的两个 Member 也能区分）。
-    const prefixHit = index
-      .filter((entry) => entry.keys.some((key) => token.startsWith(key)))
-      .sort((a, b) => longestKey(b) - longestKey(a))[0];
-    if (prefixHit) {
-      matched.set(prefixHit.member.id, prefixHit.member);
+      matched.set(hit.id, hit);
       continue;
     }
 
@@ -206,8 +215,4 @@ export function resolveMentions(
   }
 
   return { matched: [...matched.values()], unresolved: [...new Set(unresolved)] };
-}
-
-function longestKey(entry: { keys: string[] }): number {
-  return entry.keys.reduce((max, key) => Math.max(max, key.length), 0);
 }

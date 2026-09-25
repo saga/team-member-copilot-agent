@@ -3,6 +3,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { config } from './config.js';
+import { hashText } from './content-hash.js';
 import { now } from './db.js';
 import { ContextAssembler } from './context-assembler.js';
 import { ConversationMemberService } from './conversation-member-service.js';
@@ -14,6 +15,7 @@ import { MemberConversationService, isMemberDm, type MemberDirectMessage } from 
 import {
   MemberService,
   type CreateMemberInput,
+  type MemberMemory,
   type MemberSkill,
   type UpdateMemberInput,
 } from './member-service.js';
@@ -25,6 +27,7 @@ import type {
   ConversationKind,
   ConversationMemberState,
   ConversationMessage,
+  ExecutionConfigSnapshot,
   ExecutionDecision,
   ExecutionKind,
   ExecutionRecord,
@@ -78,6 +81,7 @@ interface MessageRow {
   sender_id: string;
   target_member_id: string | null;
   reply_to_message_id: string | null;
+  client_request_id: string | null;
   content: string;
   execution_id: string | null;
   created_at: string;
@@ -100,6 +104,7 @@ interface ExecutionRow {
   decision: ExecutionDecision | null;
   trigger_message_sequence: number | null;
   wake_reason: string | null;
+  config_snapshot: string | null;
   started_at: string | null;
   ended_at: string | null;
   created_at: string;
@@ -166,6 +171,12 @@ export interface SendMessageResult {
    * 更糟的误解。调用方应当据此提示用户。
    */
   unresolvedMentions: string[];
+  /**
+   * 这次请求命中了幂等键：返回的是**已经存在的**那条消息，没有新建、也没有
+   * 重新派发唤醒。`wakes` / `unresolvedMentions` 在这种情况下一律为空 ——
+   * 当时的唤醒早就发生过了，重新派一次会变成一轮多余的 execution。
+   */
+  deduplicated: boolean;
 }
 
 /**
@@ -273,6 +284,15 @@ export class TeamService {
   private readonly scheduler: MemberTurnScheduler;
   /** Member ↔ Member 私聊的房间拓扑（find-or-create / 列表 / 发送）。 */
   private readonly memberConversations: MemberConversationService;
+  /**
+   * 事务期间攒下的 durable 事件，COMMIT 之后再广播。
+   *
+   * 为什么不在事务里直接广播：广播是「告诉订阅者这件事发生了」，而事务里的
+   * 事情还没发生完 —— 一旦回滚，前端已经看到的状态就是 DB 从没承认过的。
+   * 先落库、后广播的纪律在事务边界上同样要成立，否则它只在单条 SQL 上成立。
+   */
+  private inTransaction = false;
+  private deferredEvents: StoredConversationEvent[] = [];
 
   constructor(
     private readonly db: DatabaseSync,
@@ -280,7 +300,12 @@ export class TeamService {
     private readonly copilot: CopilotService,
   ) {
     this.contextAssembler = new ContextAssembler(db);
-    this.states = new ConversationMemberService(db);
+    this.states = new ConversationMemberService(db, (conversationId, change) => {
+      // 房间状态变化（读游标 / 唤醒状态 / 静音）也走同一条 durable 事件通道。
+      // 前端因此不需要靠「消息数变了」去猜状态是否该刷新 ——
+      // NO_REPLY / pending / mute 都不伴随新消息。
+      this.emit(conversationId, { type: 'conversation_member_state.updated', data: change });
+    });
     this.dispatcher = new GroupDispatcher(db, this.states, config.groupAutoWakeRounds);
     this.memberConversations = new MemberConversationService(db, this);
     this.scheduler = new MemberTurnScheduler(
@@ -367,7 +392,18 @@ export class TeamService {
       );
     }
 
-    const defaultMemberId = input.defaultMemberId ?? (memberIds.length === 1 ? memberIds[0] : null);
+    // group 房间没有「默认成员」这个概念。
+    //
+    // 那个字段的语义是「这个房间归谁」，只有 1:1 的房间成立。留在 group 上会
+    // 变成一个诱饵：调用方（或未来的某段 UI）会顺手把它当成默认收件人，于是
+    // 多人共享讨论被悄悄降级成单人聊天 —— 而且从数据上看不出这是错的。
+    // 显式传了就报错，而不是默默忽略：静默忽略会让调用方以为自己设置成功了。
+    if (kind === 'group' && input.defaultMemberId) {
+      throw badRequest('group conversation 不接受 defaultMemberId，收件人由 GroupDispatcher 决定');
+    }
+
+    const defaultMemberId =
+      kind === 'group' ? null : (input.defaultMemberId ?? (memberIds.length === 1 ? memberIds[0] : null));
 
     if (defaultMemberId && !memberIds.includes(defaultMemberId)) {
       throw badRequest('defaultMemberId 必须属于 conversation member');
@@ -547,6 +583,14 @@ export class TeamService {
     content: string;
     targetMemberId?: string;
     replyToMessageId?: string;
+    /**
+     * 调用方为这次「发送」提供的幂等键。
+     *
+     * 语义是「这条消息最多落库一次」：同一个键第二次到达时不会再产生消息、也
+     * 不会再派一次唤醒，而是把第一次那条原样返回（`deduplicated: true`）。
+     * 客户端重试、双击发送都靠它收敛。
+     */
+    clientRequestId?: string;
   }): Promise<SendMessageResult> {
     const conversation = this.getConversation(input.conversationId);
     const content = input.content.trim();
@@ -559,8 +603,26 @@ export class TeamService {
       throw badRequest('这是 Member 之间的私聊，可以直接看，但不能以用户身份发言');
     }
 
+    // 幂等检查必须在**分配序号之前**：走这条路的消息不该消费一个 message_sequence，
+    // 否则重试会给房间留下一个空号，而所有「按序号推断」的东西（未读数、
+    // checkpoint 比较）都会看到一个不存在的消息。
+    const clientRequestId = input.clientRequestId?.trim() || null;
+    if (clientRequestId) {
+      const existing = this.findMessageByClientRequestId(conversation.id, clientRequestId);
+      if (existing) {
+        return { message: existing, wakes: [], unresolvedMentions: [], deduplicated: true };
+      }
+    }
+
     // 显式指定收件人时先校验：一条没人收的消息不该落库
     if (input.targetMemberId) this.requireActiveMember(conversation, input.targetMemberId);
+
+    // 引用回复同样要在落库前校验。只存 id 不校验的话，把一个属于别的房间
+    // （或者根本不存在）的 id 写进来，读的人只会看到一个指不到任何东西的引用。
+    const replyToMessageId = this.requireMessageInConversation(
+      conversation.id,
+      input.replyToMessageId,
+    );
 
     const message: ConversationMessage = {
       id: randomUUID(),
@@ -569,14 +631,28 @@ export class TeamService {
       senderType: 'user',
       senderId: config.localUserId,
       targetMemberId: input.targetMemberId ?? null,
-      replyToMessageId: input.replyToMessageId ?? null,
+      replyToMessageId,
+      clientRequestId,
       content,
       // 一条消息可以唤醒多个 Member，外键装不下「触发它的 execution」
       executionId: null,
       createdAt: now(),
     };
 
-    this.insertMessage(message);
+    try {
+      this.insertMessage(message);
+    } catch (error) {
+      // 并发重试：两个请求都通过了上面的检查，第二个撞上 UNIQUE 索引。
+      // 这不是故障，是幂等键在起作用 —— 把先落库的那条返回给这一侧。
+      if (clientRequestId && isUniqueViolation(error)) {
+        const existing = this.findMessageByClientRequestId(conversation.id, clientRequestId);
+        if (existing) {
+          return { message: existing, wakes: [], unresolvedMentions: [], deduplicated: true };
+        }
+      }
+      throw error;
+    }
+
     this.touchConversation(conversation.id);
     this.emit(conversation.id, { type: 'message.created', data: message });
 
@@ -594,6 +670,7 @@ export class TeamService {
       message,
       wakes: plan.wakes,
       unresolvedMentions: plan.unresolvedMentions,
+      deduplicated: false,
     };
   }
 
@@ -633,6 +710,8 @@ export class TeamService {
       senderId: from.id,
       targetMemberId: target.id,
       replyToMessageId: null,
+      // DM 是「发出去就该返回」的一条消息，没有重试语义，也就不需要幂等键
+      clientRequestId: null,
       content,
       executionId: null,
       createdAt: now(),
@@ -652,7 +731,12 @@ export class TeamService {
       });
     }
 
-    return { message, wakes: plan.wakes, unresolvedMentions: plan.unresolvedMentions };
+    return {
+      message,
+      wakes: plan.wakes,
+      unresolvedMentions: plan.unresolvedMentions,
+      deduplicated: false,
+    };
   }
 
   // ------------------------------------------------ Member ↔ Member 私聊
@@ -779,6 +863,9 @@ export class TeamService {
       decision: null,
       triggerMessageSequence: wake.triggerSequence,
       wakeReason: wake.reason,
+      // 快照在 runTurn 里写：它由「当时真的拼出来的 system prompt」决定，
+      // 而那一步在 runtime 锁内。见 buildConfigSnapshot。
+      configSnapshot: null,
       startedAt: null,
       endedAt: null,
       createdAt: now(),
@@ -860,6 +947,54 @@ export class TeamService {
       )
       .get(conversationId, sequence) as unknown as MessageRow | undefined;
     return row ? mapMessage(row) : null;
+  }
+
+  private findMessageByClientRequestId(
+    conversationId: string,
+    clientRequestId: string,
+  ): ConversationMessage | null {
+    const row = this.db
+      .prepare(
+        `
+        SELECT *
+        FROM conversation_message
+        WHERE conversation_id = ?
+          AND client_request_id = ?
+        `,
+      )
+      .get(conversationId, clientRequestId) as unknown as MessageRow | undefined;
+    return row ? mapMessage(row) : null;
+  }
+
+  /**
+   * 校验 `replyToMessageId` 指向的消息就在这个房间里。
+   *
+   * 不校验的后果不是「报错难看」，而是「错得看不出来」：一个指向别的房间（或
+   * 根本不存在）的 id 会被原样落库，之后每个读它的人都只能看到一个悬空引用。
+   * 省略 / 空串 = 不是引用回复，返回 null。
+   */
+  private requireMessageInConversation(
+    conversationId: string,
+    messageId: string | undefined,
+  ): string | null {
+    const id = messageId?.trim();
+    if (!id) return null;
+
+    const row = this.db
+      .prepare(
+        `
+        SELECT conversation_id
+        FROM conversation_message
+        WHERE id = ?
+        `,
+      )
+      .get(id) as unknown as { conversation_id: string } | undefined;
+
+    if (!row) throw badRequest(`replyToMessageId 指向的消息不存在：${id}`);
+    if (row.conversation_id !== conversationId) {
+      throw badRequest('replyToMessageId 指向的消息不属于这个 conversation');
+    }
+    return id;
   }
 
   // ----------------------------------------------------------- Delegation
@@ -951,6 +1086,7 @@ export class TeamService {
       // delegation 没有触发消息、也没有房间讨论语义：它是一道明确的任务。
       triggerMessageSequence: null,
       wakeReason: null,
+      configSnapshot: null,
       startedAt: null,
       endedAt: null,
       createdAt: now(),
@@ -1047,14 +1183,16 @@ export class TeamService {
    * 落在 `.data/members/<id>/memory/MEMORY.md`，不进数据库：记忆是自然语言
    * 文本，用户会想直接看 / 直接改，一个文件比一张两列表更好用。
    * Member 级（跨 conversation 稳定），不是 runtime 级。
+   *
+   * 读写都带 `version`：这条路径有两个人写同一个文件（人在 UI 编辑、Agent 在
+   * turn 里调 remember_member），没有版本校验的全文覆盖会把中间那次写入吃掉。
    */
-  getMemberMemory(memberId: string): string {
+  getMemberMemory(memberId: string): MemberMemory {
     return this.members.getMemory(memberId);
   }
 
-  replaceMemberMemory(memberId: string, content: string): string {
-    this.members.replaceMemory(memberId, content);
-    return this.members.getMemory(memberId);
+  replaceMemberMemory(memberId: string, content: string, expectedVersion?: string): MemberMemory {
+    return this.members.replaceMemory(memberId, content, expectedVersion);
   }
 
   // ------------------------------------------------------------ Skill
@@ -1213,6 +1351,10 @@ export class TeamService {
       // 不是「当成一条新消息」。这样它仍然能看到当时的房间上下文。
       triggerMessageSequence: original.triggerMessageSequence,
       wakeReason: original.wakeReason,
+      // 刻意**不**继承原记录的快照：这一轮的快照必须是它自己开跑那一刻的配置。
+      // 「配置漂移」因此是可查的 —— 把新记录的快照和 retry_of_execution_id
+      // 指回去的那条比一比，就知道这次重跑换掉的是哪一样。
+      configSnapshot: null,
       startedAt: null,
       endedAt: null,
       createdAt: now(),
@@ -1485,6 +1627,9 @@ export class TeamService {
 
     try {
       const systemPrompt = this.buildMemberSystemPrompt(input.conversation, input.member);
+      // 快照写在这里而不是建 execution 时：system prompt 是到这里才拼出来的，
+      // 而 systemPromptHash 是快照的核心。
+      this.recordConfigSnapshot(executionId, input.member, systemPrompt);
 
       const result = await this.copilot.runMemberTurn({
         runtime,
@@ -1658,6 +1803,53 @@ export class TeamService {
    * 分开的理由：身份要跨 conversation 稳定，把房间历史写进 persona 会让同一个
    * Member 在不同房间里表现出不同「人格」。
    */
+  /**
+   * 记录这一轮开跑时的配置，供事后对账。
+   *
+   * 只存指纹不存全文：system prompt 和 memory 都能从 member 行 + 磁盘重算，
+   * 存全文只会制造第二份真相源（而且它和第一份迟早会不一致）。
+   *
+   * `memoryHash` 取的是**整份记忆文件**的指纹，而注入 prompt 的只是尾部
+   * 16000 字符（见 MemberService.readMemory）。两者刻意不同：快照回答的是
+   * 「当时是哪一份记忆」，不是「当时塞进去了哪些字节」。
+   */
+  private buildConfigSnapshot(member: Member, systemPrompt: string): ExecutionConfigSnapshot {
+    return {
+      memberRevision: member.updatedAt,
+      model: member.model ?? config.defaultModel,
+      toolProfile: member.toolProfile,
+      systemPromptHash: hashText(systemPrompt),
+      memoryHash: this.members.getMemory(member.id).version,
+      skillManifestHash: this.members.skillManifestHash(member.id),
+      hostToolsEnabled: config.allowHostCodingTools,
+    };
+  }
+
+  /**
+   * 把快照落到 execution 上。
+   *
+   * 失败只告警不抛出：快照是事后对账用的旁证，不是这一轮的输入，让一轮已经
+   * 准备好的 turn 因为「诊断信息写不进去」而失败是本末倒置。但也不能静默 ——
+   * 否则「这条 execution 为什么没有快照」会变成另一个查不出来的问题。
+   */
+  private recordConfigSnapshot(
+    executionId: string,
+    member: Member,
+    systemPrompt: string,
+  ): void {
+    try {
+      this.updateExecution(executionId, {
+        configSnapshot: this.buildConfigSnapshot(member, systemPrompt),
+      });
+    } catch (error) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[team] 记录 execution ${executionId} 的配置快照失败：`,
+        error instanceof Error ? error.message : error,
+      );
+    }
+  }
+
   private buildMemberSystemPrompt(conversation: Conversation, member: Member): string {
     const otherMembers = conversation.members
       .filter((item) => item.id !== member.id)
@@ -1812,11 +2004,12 @@ export class TeamService {
           sender_id,
           target_member_id,
           reply_to_message_id,
+          client_request_id,
           content,
           execution_id,
           created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `,
       )
       .run(
@@ -1827,6 +2020,7 @@ export class TeamService {
         message.senderId,
         message.targetMemberId,
         message.replyToMessageId,
+        message.clientRequestId,
         message.content,
         message.executionId,
         message.createdAt,
@@ -1848,6 +2042,8 @@ export class TeamService {
       senderId: input.memberId,
       targetMemberId: null,
       replyToMessageId: input.replyToMessageId,
+      // Member 的回复由服务端产生，不存在「同一次发送被重试」的场景
+      clientRequestId: null,
       content: input.content,
       executionId: input.executionId,
       createdAt: now(),
@@ -2071,11 +2267,12 @@ export class TeamService {
           decision,
           trigger_message_sequence,
           wake_reason,
+          config_snapshot,
           started_at,
           ended_at,
           created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `,
       )
       .run(
@@ -2095,6 +2292,7 @@ export class TeamService {
         execution.decision,
         execution.triggerMessageSequence,
         execution.wakeReason,
+        execution.configSnapshot ? JSON.stringify(execution.configSnapshot) : null,
         execution.startedAt,
         execution.endedAt,
         execution.createdAt,
@@ -2122,6 +2320,7 @@ export class TeamService {
       error: string | null;
       waitingForRuntimeId: string | null;
       decision: ExecutionDecision | null;
+      configSnapshot: ExecutionConfigSnapshot | null;
       startedAt: string | null;
       endedAt: string | null;
     }>,
@@ -2138,6 +2337,7 @@ export class TeamService {
           error = ?,
           waiting_for_runtime_id = ?,
           decision = ?,
+          config_snapshot = ?,
           started_at = ?,
           ended_at = ?
         WHERE id = ?
@@ -2152,6 +2352,13 @@ export class TeamService {
           ? patch.waitingForRuntimeId
           : current.waitingForRuntimeId,
         patch.decision !== undefined ? patch.decision : current.decision,
+        patch.configSnapshot !== undefined
+          ? patch.configSnapshot
+            ? JSON.stringify(patch.configSnapshot)
+            : null
+          : current.configSnapshot
+            ? JSON.stringify(current.configSnapshot)
+            : null,
         patch.startedAt !== undefined ? patch.startedAt : current.startedAt,
         patch.endedAt !== undefined ? patch.endedAt : current.endedAt,
         id,
@@ -2250,7 +2457,16 @@ export class TeamService {
       return;
     }
 
-    this.broadcast(conversationId, this.persistEvent(conversationId, event));
+    const stored = this.persistEvent(conversationId, event);
+
+    // 在事务里就攒着。事件本身已经落库（回滚会一起撤掉），但广播必须等到
+    // COMMIT —— 否则一次回滚会留下「前端看到过、DB 不承认」的状态。
+    if (this.inTransaction) {
+      this.deferredEvents.push(stored);
+      return;
+    }
+
+    this.broadcast(conversationId, stored);
   }
 
   private persistEvent(
@@ -2340,18 +2556,46 @@ export class TeamService {
    * `fn` 必须是**同步**的：node:sqlite 是同步 API，一旦里面出现 await，事务就会
    * 跨过事件循环边界，别的请求能挤进同一个连接上的 BEGIN/COMMIT 之间 ——
    * 那不是事务，是陷阱。所以这里对返回值不做 Promise 处理。
+   *
+   * 事务期间产生的事件先落库、攒起来，COMMIT 之后才广播；回滚就把它们一起丢掉。
+   * 支持嵌套调用（内层不再 BEGIN）：recovery 之类的路径会从外面包一层，
+   * 而里面的写又各自想用事务。
    */
   private transaction<T>(fn: () => T): T {
+    if (this.inTransaction) return fn();
+
+    this.inTransaction = true;
     this.db.exec('BEGIN');
     try {
       const result = fn();
       this.db.exec('COMMIT');
+      this.inTransaction = false;
+
+      const pending = this.deferredEvents;
+      this.deferredEvents = [];
+      for (const event of pending) this.broadcast(event.conversationId, event);
+
       return result;
     } catch (error) {
       this.db.exec('ROLLBACK');
+      this.inTransaction = false;
+      this.deferredEvents = [];
       throw error;
     }
   }
+}
+
+/**
+ * 判断一个异常是不是 UNIQUE 约束冲突。
+ *
+ * node:sqlite 把它包成普通 Error，稳定的判据是消息里的
+ * `UNIQUE constraint failed: <table>.<columns>`；errcode 字段的取值在不同
+ * Node 版本间不保证一致，所以作为次选。
+ */
+function isUniqueViolation(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  if (/UNIQUE constraint failed/i.test(error.message)) return true;
+  return (error as { errcode?: number }).errcode === 2067; // SQLITE_CONSTRAINT_UNIQUE
 }
 
 function mapMessage(row: MessageRow): ConversationMessage {
@@ -2363,6 +2607,7 @@ function mapMessage(row: MessageRow): ConversationMessage {
     senderId: row.sender_id,
     targetMemberId: row.target_member_id,
     replyToMessageId: row.reply_to_message_id,
+    clientRequestId: row.client_request_id,
     content: row.content,
     executionId: row.execution_id,
     createdAt: row.created_at,
@@ -2387,6 +2632,7 @@ function mapExecution(row: ExecutionRow): ExecutionRecord {
     decision: row.decision ?? null,
     triggerMessageSequence: row.trigger_message_sequence ?? null,
     wakeReason: (row.wake_reason as WakeReason | null) ?? null,
+    configSnapshot: parseConfigSnapshot(row.config_snapshot),
     startedAt: row.started_at,
     endedAt: row.ended_at,
     createdAt: row.created_at,
@@ -2416,4 +2662,19 @@ function mapEvent(row: EventRow): StoredConversationEvent {
     data: JSON.parse(row.payload) as unknown,
     createdAt: row.created_at,
   };
+}
+
+/**
+ * 读回配置快照。
+ *
+ * 两种「没有」都要按 null 处理：老数据的 NULL，以及内容坏掉的 JSON。
+ * 快照是排查用的旁证，为了它让整个 execution 读不出来是本末倒置。
+ */
+function parseConfigSnapshot(raw: string | null): ExecutionConfigSnapshot | null {
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as ExecutionConfigSnapshot;
+  } catch {
+    return null;
+  }
 }

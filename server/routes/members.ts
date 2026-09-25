@@ -38,6 +38,13 @@ const updateMemberSchema = z.object({
 
 const memorySchema = z.object({
   content: z.string().max(200_000),
+  /**
+   * GET 时拿到的 `version`（全文 sha256）。省略 = 不校验。
+   *
+   * 这条路径有两个人写同一个文件：人在这里编辑，Agent 在 turn 里调
+   * remember_member。带上版本，中间那次写入才不会被一次全文覆盖吃掉。
+   */
+  expectedVersion: z.string().min(1).max(200).optional(),
 });
 
 export function membersRouter(team: TeamService) {
@@ -86,24 +93,33 @@ export function membersRouter(team: TeamService) {
    *
    * 记忆文件在 `.data/members/<id>/memory/MEMORY.md`，同时被
    * buildMemberSystemPrompt 注入到每一轮的 persona 里。
+   *
+   * 返回 `{ content, version }`：version 是 content 的 sha256，保存时要带回去。
    */
   router.get('/:id/memory', (req, res) => {
     try {
-      res.json({ content: team.getMemberMemory(req.params.id) });
+      res.json(team.getMemberMemory(req.params.id));
     } catch (error) {
       sendError(res, error);
     }
   });
 
-  /** 整体覆盖。PUT 而不是 PATCH：调用方提交的就是文件的全部内容。 */
+  /**
+   * 整体覆盖。PUT 而不是 PATCH：调用方提交的就是文件的全部内容。
+   *
+   * 带上 `expectedVersion` 时做乐观并发校验；不一致返回 409 且**不写盘**。
+   * 不带则强制覆盖。
+   */
   router.put('/:id/memory', (req, res) => {
     const parsed = memorySchema.safeParse(req.body ?? {});
     if (!parsed.success) {
-      res.status(400).json({ error: 'content 必须是 string' });
+      res.status(400).json({ error: 'content 必须是 string（expectedVersion 可选）' });
       return;
     }
     try {
-      res.json({ content: team.replaceMemberMemory(req.params.id, parsed.data.content) });
+      res.json(
+        team.replaceMemberMemory(req.params.id, parsed.data.content, parsed.data.expectedVersion),
+      );
     } catch (error) {
       sendError(res, error);
     }

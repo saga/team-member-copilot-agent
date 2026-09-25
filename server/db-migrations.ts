@@ -19,9 +19,13 @@ import type { DatabaseSync } from 'node:sqlite';
  *         execution.decision / trigger_message_sequence
  *   4 — Wake 可重放：
  *         conversation_member_state.pending_wake_trigger_sequence / pending_wake_reason
+ *   5 — 数据正确性：
+ *         conversation_message.client_request_id + UNIQUE(conversation_id, client_request_id)
+ *         execution.config_snapshot
+ *         group conversation 的 default_member_id 一律置 NULL
  */
 
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 /**
  * v1 schema。生产路径不会再创建它，保留的原因有两个：
@@ -405,6 +409,34 @@ ALTER TABLE conversation_member_state ADD COLUMN pending_wake_reason TEXT;
 /** v4 schema，全新库直接建这个。 */
 export const V4_SCHEMA_SQL = `${V3_SCHEMA_SQL}\n${V4_ADDITIONS_SQL}`;
 
+/**
+ * v5 新增部分，被全新库和 v4→v5 迁移共用。
+ *
+ * 同样只加列 / 加索引，不重建表：conversation_message 被 conversation 引用，
+ * execution 还带着两个自引用外键，重建的收益远小于风险。
+ */
+export const V5_ADDITIONS_SQL = `
+-- 调用方为这条消息发的幂等键。同一次「发送」被重试（响应丢了、用户狂点）
+-- 时不会再落一条重复消息，也不会再派一次唤醒。
+--
+-- 允许为 NULL（服务端内部产生的消息、以及没有传幂等键的调用方），
+-- 而 SQLite 的 UNIQUE 索引把 NULL 视为互不相等，所以这些行天然不参与去重。
+ALTER TABLE conversation_message ADD COLUMN client_request_id TEXT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_message_client_request
+  ON conversation_message(conversation_id, client_request_id);
+
+-- 这一轮跑的时候，这个 Member 的配置长什么样。
+--
+-- 配置（system prompt / memory / skills / model / toolProfile）会随时间变，
+-- 而 execution 是「当时真的跑过一轮」的记录。没有这个快照，事后看两条
+-- execution 只能看到不同的行为，看不到不同的输入。
+ALTER TABLE execution ADD COLUMN config_snapshot TEXT;
+`;
+
+/** v5 schema，全新库直接建这个。 */
+export const V5_SCHEMA_SQL = `${V4_SCHEMA_SQL}\n${V5_ADDITIONS_SQL}`;
+
 export function getUserVersion(db: DatabaseSync): number {
   const row = db.prepare('PRAGMA user_version').get() as unknown as
     | { user_version: number }
@@ -443,6 +475,10 @@ export function applySchemaV4(db: DatabaseSync): void {
   db.exec(V4_SCHEMA_SQL);
 }
 
+export function applySchemaV5(db: DatabaseSync): void {
+  db.exec(V5_SCHEMA_SQL);
+}
+
 function hasColumn(db: DatabaseSync, table: string, column: string): boolean {
   const rows = db.prepare(`PRAGMA table_info(${table})`).all() as unknown as Array<{ name: string }>;
   return rows.some((row) => row.name === column);
@@ -472,9 +508,9 @@ export function migrate(db: DatabaseSync): MigrationResult {
       version = 1;
       setUserVersion(db, 1);
     } else {
-      applySchemaV4(db);
+      applySchemaV5(db);
       setUserVersion(db, SCHEMA_VERSION);
-      return { from: 0, to: SCHEMA_VERSION, applied: ['create-schema-v4'], fresh: true };
+      return { from: 0, to: SCHEMA_VERSION, applied: ['create-schema-v5'], fresh: true };
     }
   }
 
@@ -505,6 +541,13 @@ export function migrate(db: DatabaseSync): MigrationResult {
     applied.push('v3-to-v4');
     version = 4;
     setUserVersion(db, 4);
+  }
+
+  if (version < 5) {
+    migrateV4ToV5(db);
+    applied.push('v4-to-v5');
+    version = 5;
+    setUserVersion(db, 5);
   }
 
   return { from, to: version, applied, fresh: false };
@@ -824,6 +867,54 @@ function migrateV3ToV4(db: DatabaseSync): void {
     if (!hasColumn(db, 'conversation_member_state', 'pending_wake_reason')) {
       db.exec(`ALTER TABLE conversation_member_state ADD COLUMN pending_wake_reason TEXT;`);
     }
+
+    const violations = db.prepare('PRAGMA foreign_key_check').all();
+    if (violations.length > 0) {
+      throw new Error(
+        `迁移后外键校验失败（${violations.length} 条），已回滚：${JSON.stringify(violations.slice(0, 5))}`,
+      );
+    }
+
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  } finally {
+    db.exec('PRAGMA foreign_keys = ON');
+  }
+}
+
+/**
+ * v4 → v5：消息幂等键 + execution 配置快照 + group 的 default_member_id 归一。
+ *
+ * 三件事都只加列 / 加索引 / 改数据，不需要重建表：
+ *
+ *   client_request_id      UNIQUE(conversation_id, client_request_id) 是索引不是约束，
+ *                          可以后补。已有行全是 NULL，而 NULL 在唯一索引里互不相等，
+ *                          所以历史消息不会互相冲突。
+ *   config_snapshot        历史 execution 没有这个值 —— 它记录的是「当时用的配置」，
+ *                          事后补不出来，留 NULL 就是诚实的答案（读取时按 null 处理）。
+ *   default_member_id      老数据里 group 房间可能带着一个默认成员。那个字段的语义是
+ *                          「这个房间归谁」，对共享讨论没有意义，而且会诱导调用方把它
+ *                          当成默认收件人 —— 那正是把 group 降级成单人聊天的成因。
+ */
+function migrateV4ToV5(db: DatabaseSync): void {
+  db.exec('PRAGMA foreign_keys = OFF');
+  db.exec('BEGIN');
+  try {
+    if (!hasColumn(db, 'conversation_message', 'client_request_id')) {
+      db.exec(`ALTER TABLE conversation_message ADD COLUMN client_request_id TEXT;`);
+    }
+    db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_message_client_request
+        ON conversation_message(conversation_id, client_request_id);
+    `);
+
+    if (!hasColumn(db, 'execution', 'config_snapshot')) {
+      db.exec(`ALTER TABLE execution ADD COLUMN config_snapshot TEXT;`);
+    }
+
+    db.exec(`UPDATE conversation SET default_member_id = NULL WHERE kind = 'group';`);
 
     const violations = db.prepare('PRAGMA foreign_key_check').all();
     if (violations.length > 0) {

@@ -1,9 +1,27 @@
 const API_BASE = import.meta.env.VITE_API_BASE || '';
 
+/**
+ * 把非 2xx 响应变成 Error。
+ *
+ * 服务端的错误体统一是 `{ error: string }`，而这句文案是后端**故意**写给用户看的
+ * （「Member 还有未完成的工作（1 条未结束的 execution），不能归档」这种）。
+ * 直接 `response.text()` 会把整段 JSON 连同花括号一起塞进 UI，读的人还要自己
+ * 从语法里把话抠出来。所以先试 JSON，取不到才退回原文。
+ */
 async function json<T>(response: Response): Promise<T> {
   if (!response.ok) {
-    const text = await response.text().catch(() => response.statusText);
-    throw new Error(`HTTP ${response.status}: ${text}`);
+    const raw = await response.text().catch(() => response.statusText);
+    let message = raw;
+    try {
+      const parsed = JSON.parse(raw) as { error?: unknown };
+      if (typeof parsed.error === 'string' && parsed.error) message = parsed.error;
+    } catch {
+      // 不是 JSON（代理返回的 HTML 错误页之类），保留原文
+    }
+    // 状态码挂在 error 上：调用方需要区分「409 版本冲突，重新加载再试」
+    // 和「400 我填错了」—— 前者动作是刷新，后者动作是改输入。
+    // 从文案里认出 409 是脆的，服务端改一个字就失效。
+    throw Object.assign(new Error(message), { status: response.status });
   }
   return response.json() as Promise<T>;
 }
@@ -44,6 +62,8 @@ export interface ConversationMessage {
   senderId: string;
   targetMemberId: string | null;
   replyToMessageId: string | null;
+  /** 发送时带的幂等键；null = 这条消息不参与去重。 */
+  clientRequestId: string | null;
   content: string;
   executionId: string | null;
   createdAt: string;
@@ -76,6 +96,25 @@ export type ExecutionStatus =
   /** 进程重启时还停在 running / waiting_for_member，未自动重跑。 */
   | 'interrupted';
 
+/**
+ * 这一轮开跑那一刻，Member 的配置长什么样。
+ *
+ * 配置会随时间变，而 execution 是「当时真的这样跑过一轮」的记录。有它才能回答
+ * 「为什么这条和那条行为不同」，尤其是 retry —— 同一份 prompt 在今天重跑，
+ * 用的可能已经是另一个人格、另一份记忆。
+ *
+ * 只存指纹不存全文：system prompt 和 memory 都能从 member + 磁盘重算。
+ */
+export interface ExecutionConfigSnapshot {
+  memberRevision: string;
+  model: string;
+  toolProfile: 'safe' | 'coding';
+  systemPromptHash: string;
+  memoryHash: string;
+  skillManifestHash: string;
+  hostToolsEnabled: boolean;
+}
+
 export interface ExecutionRecord {
   id: string;
   conversationId: string;
@@ -90,6 +129,8 @@ export interface ExecutionRecord {
   error: string | null;
   waitingForRuntimeId: string | null;
   retryOfExecutionId: string | null;
+  /** 开跑那一刻的配置；历史数据为 null。 */
+  configSnapshot: ExecutionConfigSnapshot | null;
   startedAt: string | null;
   endedAt: string | null;
   createdAt: string;
@@ -124,6 +165,11 @@ export interface SendMessageResult {
   wakes: WakePlan[];
   /** 消息里 @ 了但不属于这个房间的名字；非空时服务端刻意**不**广播给全员。 */
   unresolvedMentions: string[];
+  /**
+   * 命中了幂等键：返回的是**已经存在的**那条消息，`wakes` 因此必为空
+   * （当时的唤醒早就发生过了）。
+   */
+  deduplicated: boolean;
 }
 
 /**
@@ -148,6 +194,29 @@ export interface ConversationMemberState {
   pendingWakeReason: WakeReason | null;
   muted: boolean;
   updatedAt: string;
+}
+
+/**
+ * `conversation_member_state.updated` 事件的 payload。
+ *
+ * 做成 `{ memberId, state }` 而不是直接发 state：状态**消失**也是一次变化
+ * （成员被移出房间），而「消失」表达不出一个 ConversationMemberState。
+ */
+export interface ConversationMemberStateChange {
+  memberId: string;
+  /** null = 这个 Member 在这个房间里的状态已经不存在。 */
+  state: ConversationMemberState | null;
+}
+
+/**
+ * Member 的长期记忆全文 + 版本。
+ *
+ * `version` 是全文的 sha256，不是 schema 版本：记忆没有字段级结构，
+ * 能表达「这份内容和我上次读到的是不是同一份」的最小信息就是它自己的指纹。
+ */
+export interface MemberMemory {
+  content: string;
+  version: string;
 }
 
 /** Member 自己的 skill（`.data/members/<id>/skills/<name>`）。 */
@@ -238,20 +307,31 @@ export const api = {
    *
    * 刻意不是「给 prompt 用的截断版」：编辑器拿到截断内容再整体保存，
    * 会把被截掉的前半段永久丢掉。
+   *
+   * `version` 是全文的 sha256，保存时原样带回去 —— 这个文件同时被 Agent 的
+   * remember_member 写入，没有版本校验的全文覆盖会把中间那次写入吃掉。
    */
-  getMemberMemory(memberId: string): Promise<{ content: string }> {
+  getMemberMemory(memberId: string): Promise<MemberMemory> {
     return fetch(`${API_BASE}/api/members/${encodeURIComponent(memberId)}/memory`).then(
-      json<{ content: string }>,
+      json<MemberMemory>,
     );
   },
 
-  /** 整体覆盖；返回归一化后真正落盘的内容。 */
-  replaceMemberMemory(memberId: string, content: string): Promise<{ content: string }> {
+  /**
+   * 整体覆盖；返回归一化后真正落盘的内容与新版本。
+   *
+   * 版本不匹配时服务端返回 409 且**不写盘**，错误文案会说明原因。
+   */
+  replaceMemberMemory(
+    memberId: string,
+    content: string,
+    expectedVersion?: string,
+  ): Promise<MemberMemory> {
     return fetch(`${API_BASE}/api/members/${encodeURIComponent(memberId)}/memory`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content }),
-    }).then(json<{ content: string }>);
+      body: JSON.stringify(expectedVersion ? { content, expectedVersion } : { content }),
+    }).then(json<MemberMemory>);
   },
 
   listMemberSkills(memberId: string): Promise<{ skills: MemberSkill[] }> {
@@ -418,7 +498,13 @@ export const api = {
    */
   sendMessage(
     conversationId: string,
-    input: { content: string; targetMemberId?: string; replyToMessageId?: string },
+    input: {
+      content: string;
+      targetMemberId?: string;
+      replyToMessageId?: string;
+      /** 幂等键：同一次发送重试（响应丢了、双击）不会变成两条消息。 */
+      clientRequestId?: string;
+    },
   ): Promise<SendMessageResult> {
     return fetch(
       `${API_BASE}/api/conversations/${encodeURIComponent(conversationId)}/messages`,

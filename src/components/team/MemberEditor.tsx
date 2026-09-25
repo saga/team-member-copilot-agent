@@ -57,6 +57,33 @@ export function MemberEditor({ member, onSaved, onCancel }: MemberEditorProps) {
     }
   }
 
+  /**
+   * 归档 = 「不再接活」。
+   *
+   * 不是删除：这个 Member 仍然是房间里发生过的事实的引用方（历史消息、
+   * execution、delegation 都指向它），只是不再作为新的执行目标。
+   *
+   * 归档前必须把它手上的活收干净。这条规则由服务端强制（未完的 execution /
+   * 排队的唤醒都会返回 409），这里只把它的原话显示出来 —— 前端猜不出一条
+   * 「还有活」的确切原因，也不该猜。
+   */
+  async function archive() {
+    if (busy) return;
+    if (!window.confirm(`归档 ${member.name}？它不会再接受新的任务，历史记录保留。`)) return;
+
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await api.updateMember(member.id, { status: 'archived' });
+      onSaved(result.member);
+      onCancel();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div className="member-editor">
       <label className="field">
@@ -147,6 +174,18 @@ export function MemberEditor({ member, onSaved, onCancel }: MemberEditorProps) {
         <button type="button" className="ghost" onClick={onCancel} disabled={busy}>
           Cancel
         </button>
+        {member.status === 'active' && (
+          <button
+            type="button"
+            className="danger"
+            onClick={() => void archive()}
+            disabled={busy}
+            title="归档后不再接受新任务，历史记录保留"
+          >
+            Archive
+          </button>
+        )}
+        {member.status !== 'active' && <span className="tag">已归档</span>}
       </div>
     </div>
   );

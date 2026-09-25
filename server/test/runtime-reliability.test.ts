@@ -140,7 +140,7 @@ describe('schema migration（PRAGMA user_version）', () => {
     return handle;
   }
 
-  it('全新库直接建 v2 并登记 user_version', () => {
+  it('全新库直接建到最新 schema 并登记 user_version', () => {
     const handle = openFixture('fresh');
     try {
       const result = migrate(handle);
@@ -165,6 +165,8 @@ describe('schema migration（PRAGMA user_version）', () => {
         ),
       );
       assert.ok(tableColumns(handle, 'conversation_member_state').includes('pending_wake_reason'));
+      assert.ok(tableColumns(handle, 'conversation_message').includes('client_request_id'));
+      assert.ok(tableColumns(handle, 'execution').includes('config_snapshot'));
 
       // 新状态必须被 CHECK 接受
       handle.exec(`
@@ -175,6 +177,26 @@ describe('schema migration（PRAGMA user_version）', () => {
         INSERT INTO execution (id, conversation_id, member_id, kind, status, prompt, created_at)
         VALUES ('e', 'c', 'm', 'interactive', 'interrupted', 'p', 't');
       `);
+
+      // 幂等键的唯一性真的落在库里，而不是只活在 service 的判断里。
+      //
+      // 这里同时验证 NULL 的语义：SQLite 的唯一索引把 NULL 视为互不相等，
+      // 所以「不带幂等键」的消息可以无限多条 —— 少了这一条，任何一条没带
+      // 幂等键的消息都会把后面所有同类消息堵死。
+      handle.exec(`
+        INSERT INTO conversation_message (id, conversation_id, message_sequence, sender_type, sender_id, client_request_id, content, created_at)
+        VALUES ('a', 'c', 1, 'user', 'u', 'req-1', 'first', 't'),
+               ('b', 'c', 2, 'user', 'u', NULL, 'no key 1', 't'),
+               ('d', 'c', 3, 'user', 'u', NULL, 'no key 2', 't');
+      `);
+      assert.throws(
+        () =>
+          handle.exec(`
+            INSERT INTO conversation_message (id, conversation_id, message_sequence, sender_type, sender_id, client_request_id, content, created_at)
+            VALUES ('dup', 'c', 4, 'user', 'u', 'req-1', 'retry', 't');
+          `),
+        /UNIQUE constraint failed/i,
+      );
     } finally {
       handle.close();
     }
@@ -191,6 +213,11 @@ describe('schema migration（PRAGMA user_version）', () => {
 
         INSERT INTO conversation (id, title, kind, default_member_id, created_by, created_at, updated_at)
         VALUES ('c1', 'Legacy', 'direct', 'm1', 'u', 't', 't');
+
+        -- 老数据里的 group 房间带着一个默认成员。这个字段对共享讨论没有语义，
+        -- 留着只会让调用方误以为「这个房间默认归 m1」。
+        INSERT INTO conversation (id, title, kind, default_member_id, created_by, created_at, updated_at)
+        VALUES ('c2', 'Legacy Group', 'group', 'm1', 'u', 't', 't');
 
         INSERT INTO conversation_member (conversation_id, member_id, joined_at)
         VALUES ('c1', 'm1', 't');
@@ -322,6 +349,38 @@ describe('schema migration（PRAGMA user_version）', () => {
       assert.ok(tableColumns(handle, 'conversation_member_state').includes('pending_wake_reason'));
       assert.equal(state.pending_wake_trigger_sequence, null);
       assert.equal(state.pending_wake_reason, null);
+
+      // 10) v5：消息幂等键 / execution 配置快照默认 NULL，历史行不受影响
+      assert.ok(tableColumns(handle, 'conversation_message').includes('client_request_id'));
+      assert.ok(tableColumns(handle, 'execution').includes('config_snapshot'));
+      const legacyMessages = (
+        handle
+          .prepare(
+            `SELECT client_request_id FROM conversation_message WHERE conversation_id = 'c1' ORDER BY message_sequence`,
+          )
+          .all() as unknown as Array<{ client_request_id: string | null }>
+      ).map((row) => ({ ...row }));
+      assert.deepEqual(legacyMessages, [
+        { client_request_id: null },
+        { client_request_id: null },
+      ]);
+      assert.equal(
+        (handle
+          .prepare(`SELECT config_snapshot FROM execution WHERE id = 'e1'`)
+          .get() as unknown as { config_snapshot: string | null }).config_snapshot,
+        null,
+      );
+
+      // 11) v5：group 房间的 default_member_id 被归一成 NULL；1:1 房间不动
+      const defaults = (
+        handle
+          .prepare(`SELECT id, default_member_id FROM conversation ORDER BY id`)
+          .all() as unknown as Array<{ id: string; default_member_id: string | null }>
+      ).map((row) => ({ ...row }));
+      assert.deepEqual(defaults, [
+        { id: 'c1', default_member_id: 'm1' },
+        { id: 'c2', default_member_id: null },
+      ]);
     } finally {
       handle.close();
     }
@@ -421,7 +480,6 @@ describe('ContextAssembler：增量上下文而不是整段重放', () => {
       kind: 'group',
       title: 'Incremental',
       memberIds: [alice.id, bob.id],
-      defaultMemberId: alice.id,
     });
     // 四轮都由显式 targetMemberId 驱动；自动唤醒只会在中间插进额外的 turn，
     // 让「谁在什么时候读到了什么」没法断言。
@@ -615,7 +673,6 @@ describe('wait-for 环检测（跨 delegation 树的死锁保护）', () => {
       kind: 'group',
       title: 'WaitFor',
       memberIds: [alice.id, bob.id],
-      defaultMemberId: alice.id,
     });
     muteAllMembers(team, conv.id);
 
@@ -677,7 +734,6 @@ describe('wait-for 环检测（跨 delegation 树的死锁保护）', () => {
       kind: 'group',
       title: 'Waiting',
       memberIds: [alice.id, bob.id],
-      defaultMemberId: alice.id,
     });
     muteAllMembers(team, conv.id);
 
@@ -732,6 +788,17 @@ describe('durable conversation_event 与 SSE 回放', () => {
       defaultMemberId: bob.id,
     });
 
+    // 建房间本身也会产生事件（成员状态行是一行真实的状态），所以比较的是
+    // **订阅窗口内**的落库条数 —— 断言的是「落库与广播没有丢一条」，
+    // 而不是「这条房间里一共发生过几件事」。
+    const countEvents = () =>
+      (
+        db
+          .prepare(`SELECT COUNT(*) AS n FROM conversation_event WHERE conversation_id = ?`)
+          .get(conv.id) as unknown as { n: number }
+      ).n;
+    const baseline = countEvents();
+
     const seen: Array<{ type: string; sequence: number | null }> = [];
     const unsubscribe = team.subscribe(conv.id, (event) => {
       seen.push({ type: event.type, sequence: event.sequence });
@@ -754,16 +821,17 @@ describe('durable conversation_event 与 SSE 回放', () => {
       assert.ok(sequences[index] > sequences[index - 1], 'sequence 必须严格递增');
     }
 
-    // 落库的条数与广播到的 durable 条数一致
-    const stored = db
-      .prepare(`SELECT COUNT(*) AS n FROM conversation_event WHERE conversation_id = ?`)
-      .get(conv.id) as unknown as { n: number };
-    assert.equal(stored.n, sequences.length);
+    // 订阅期间落的每一条都广播出来了，且 broadcast 的就是落库的那一串
+    assert.equal(countEvents() - baseline, sequences.length);
+    assert.deepEqual(sequences, Array.from({ length: sequences.length }, (_, i) => baseline + i + 1));
+
+    // event_sequence 计数器必须和落库总条数严格相等：它是 SSE 的 Last-Event-ID，
+    // 差一条就意味着「重连时会漏掉一条」或「会重复回放一条」。
     assert.equal(
       (db.prepare(`SELECT event_sequence AS n FROM conversation WHERE id = ?`).get(conv.id) as {
         n: number;
       }).n,
-      sequences.length,
+      countEvents(),
     );
 
     // message.delta 是 token 级事件：不落库

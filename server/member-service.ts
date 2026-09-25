@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import type { DatabaseSync } from 'node:sqlite';
 import { config } from './config.js';
+import { hashText } from './content-hash.js';
 import { now } from './db.js';
 import type { Member, ToolProfile } from './domain.js';
 
@@ -89,6 +90,17 @@ export interface MemberSkill {
   description: string;
   fileCount: number;
   updatedAt: string;
+}
+
+/**
+ * 长期记忆的全文 + 版本。
+ *
+ * `version` 是全文的 sha256，不是 schema 版本：记忆没有字段级结构，能表达
+ * 「这份内容和我上次读到的是不是同一份」的最小信息就是它自己的指纹。
+ */
+export interface MemberMemory {
+  content: string;
+  version: string;
 }
 
 /** 目录名 / skill 名必须是单个安全路径段。 */
@@ -344,30 +356,47 @@ export class MemberService {
    * 和 readMemory() 的区别是**故意的**：那个是拼进 system prompt 用的，只给
    * 尾部 16000 字符；如果编辑器也用它，用户一保存就会把被截掉的前半段永久
    * 丢掉。改记忆必须看到全文。
+   *
+   * 一并返回 `version`：这是全文的 sha256，保存时带回来做乐观并发校验。
    */
-  getMemory(memberId: string): string {
+  getMemory(memberId: string): MemberMemory {
     this.get(memberId);
     this.ensureHome(memberId);
-    return fs.readFileSync(this.memoryPath(memberId), 'utf8');
+    const content = fs.readFileSync(this.memoryPath(memberId), 'utf8');
+    return { content, version: hashText(content) };
   }
 
   /**
    * 整体覆盖长期记忆。
    *
+   * 两个入口会写同一个文件：人在这里编辑，Agent 在 turn 里调 remember_member。
+   * 所以保存必须能发现「我读到的版本已经被改掉了」—— 否则用户保存的就是一份
+   * 基于旧内容的全文覆盖，中间 Agent 记下的那一句会无声消失。
+   *
+   * `expectedVersion` 省略 = 不做校验（内部调用；以及明确想强制覆盖的场景）。
+   * 不匹配时抛 409，并且**不写盘**。
+   *
    * 文件恒定以 `# Long-term Memory` 开头：appendMemory 与 replaceMemory 都
    * 走这一个归一化，避免出现两个标题（UI 的文本框里显示的就是含标题的全文）。
    */
-  replaceMemory(memberId: string, content: string): void {
+  replaceMemory(memberId: string, content: string, expectedVersion?: string): MemberMemory {
     this.get(memberId);
     this.ensureHome(memberId);
 
-    const body = content.replace(MEMORY_TITLE, '').trim();
+    const current = this.getMemory(memberId);
+    if (expectedVersion !== undefined && expectedVersion !== current.version) {
+      throw Object.assign(
+        new Error(
+          '长期记忆已被其他地方修改（可能是 Agent 在干活时记下的，或另一个页面保存过）。' +
+            '请重新加载后再保存，避免覆盖掉中间写入的内容。',
+        ),
+        { status: 409 },
+      );
+    }
 
-    fs.writeFileSync(
-      this.memoryPath(memberId),
-      body ? `# Long-term Memory\n\n${body}\n` : '# Long-term Memory\n\n',
-      'utf8',
-    );
+    const body = content.replace(MEMORY_TITLE, '').trim();
+    this.writeMemory(memberId, body ? `# Long-term Memory\n\n${body}\n` : '# Long-term Memory\n\n');
+    return this.getMemory(memberId);
   }
 
   appendMemory(memberId: string, content: string): string {
@@ -375,12 +404,39 @@ export class MemberService {
     this.ensureHome(member.id);
     const line = content.trim();
     if (!line) throw new Error('memory 内容不能为空');
-    fs.appendFileSync(
-      this.memoryPath(member.id),
-      `\n\n## ${new Date().toISOString()}\n\n${line}\n`,
-      'utf8',
-    );
+
+    // 读-改-写而不是 appendFileSync：语义上仍然是「追加」，但落盘走同一个
+    // 原子写路径，不会出现「文件被截断了一半」或者和 replaceMemory 的
+    // temp→rename 交错的中间态。
+    const current = fs.readFileSync(this.memoryPath(member.id), 'utf8');
+    this.writeMemory(member.id, `${current}\n\n## ${new Date().toISOString()}\n\n${line}\n`);
     return `已保存到 ${member.name} 的长期记忆。`;
+  }
+
+  /**
+   * 原子写入：先写同目录的临时文件并 fsync，再 rename 覆盖目标。
+   *
+   * 直接 `writeFileSync(target)` 在写到一半时崩溃（或断电）会留下一个被截断的
+   * 文件 —— 对记忆文件来说就是「这个人格的一半记忆没了」，而且没有任何备份。
+   * rename 在同一个目录内是原子的：读到的要么是旧全文，要么是新全文。
+   */
+  private writeMemory(memberId: string, content: string): void {
+    const file = this.memoryPath(memberId);
+    const temp = `${file}.${randomUUID()}.tmp`;
+
+    try {
+      const fd = fs.openSync(temp, 'w');
+      try {
+        fs.writeFileSync(fd, content, 'utf8');
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
+      fs.renameSync(temp, file);
+    } catch (error) {
+      fs.rmSync(temp, { force: true });
+      throw error;
+    }
   }
 
   /**
@@ -478,6 +534,20 @@ export class MemberService {
       throw Object.assign(new Error(`Skill 不存在：${safe}`), { status: 404 });
     }
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+
+  /**
+   * 已安装 skill 清单的指纹（名字 + 各自 SKILL.md 的 mtime）。
+   *
+   * 只用来判断「和上一轮相比，能力集合变了吗」—— 所以名字与 mtime 就够了，
+   * 不需要把每个 skill 的内容都读出来 hash 一遍。
+   */
+  skillManifestHash(memberId: string): string {
+    return hashText(
+      this.listSkills(memberId)
+        .map((skill) => `${skill.name}@${skill.updatedAt}`)
+        .join('\n'),
+    );
   }
 
   private describeSkill(memberId: string, name: string): MemberSkill {
