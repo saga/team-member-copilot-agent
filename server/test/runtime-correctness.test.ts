@@ -196,6 +196,7 @@ function turnInput(
       model: null,
       toolProfile: toolProfile ?? ('safe' as const),
       status: 'active' as const,
+      seedKey: null,
       createdAt: 't',
       updatedAt: 't',
     },

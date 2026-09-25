@@ -23,9 +23,11 @@ import type { DatabaseSync } from 'node:sqlite';
  *         conversation_message.client_request_id + UNIQUE(conversation_id, client_request_id)
  *         execution.config_snapshot
  *         group conversation 的 default_member_id 一律置 NULL
+ *   6 — Member provisioning：
+ *         member.seed_key + 部分唯一索引（WHERE seed_key IS NOT NULL）
  */
 
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 
 /**
  * v1 schema。生产路径不会再创建它，保留的原因有两个：
@@ -437,6 +439,30 @@ ALTER TABLE execution ADD COLUMN config_snapshot TEXT;
 /** v5 schema，全新库直接建这个。 */
 export const V5_SCHEMA_SQL = `${V4_SCHEMA_SQL}\n${V5_ADDITIONS_SQL}`;
 
+/**
+ * v6 新增部分，被全新库和 v5→v6 迁移共用。
+ *
+ * 只加列 + 加索引，不重建表：member 被 conversation_member / member_runtime /
+ * execution / conversation 四张表引用，重建的代价和 v1→v2 那次一样大。
+ */
+export const V6_ADDITIONS_SQL = `
+-- 这个 Member 是由哪份 member template provision 出来的。
+--
+-- 判据不能是 handle / name：那是用户随时会改的显示属性。改了 handle 之后重启，
+-- 按 handle 判断会认为默认 Member 不存在，于是又建一个 —— 团队里出现两个架构师。
+--
+-- 允许为 NULL（手工创建的 Member 没有模板来源），且是**部分**唯一索引：
+-- 全局唯一索引会让所有手工创建的 NULL 行互相冲突。
+ALTER TABLE member ADD COLUMN seed_key TEXT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_member_seed_key
+  ON member(seed_key)
+  WHERE seed_key IS NOT NULL;
+`;
+
+/** v6 schema，全新库直接建这个。 */
+export const V6_SCHEMA_SQL = `${V5_SCHEMA_SQL}\n${V6_ADDITIONS_SQL}`;
+
 export function getUserVersion(db: DatabaseSync): number {
   const row = db.prepare('PRAGMA user_version').get() as unknown as
     | { user_version: number }
@@ -479,6 +505,10 @@ export function applySchemaV5(db: DatabaseSync): void {
   db.exec(V5_SCHEMA_SQL);
 }
 
+export function applySchemaV6(db: DatabaseSync): void {
+  db.exec(V6_SCHEMA_SQL);
+}
+
 function hasColumn(db: DatabaseSync, table: string, column: string): boolean {
   const rows = db.prepare(`PRAGMA table_info(${table})`).all() as unknown as Array<{ name: string }>;
   return rows.some((row) => row.name === column);
@@ -508,9 +538,9 @@ export function migrate(db: DatabaseSync): MigrationResult {
       version = 1;
       setUserVersion(db, 1);
     } else {
-      applySchemaV5(db);
+      applySchemaV6(db);
       setUserVersion(db, SCHEMA_VERSION);
-      return { from: 0, to: SCHEMA_VERSION, applied: ['create-schema-v5'], fresh: true };
+      return { from: 0, to: SCHEMA_VERSION, applied: ['create-schema-v6'], fresh: true };
     }
   }
 
@@ -548,6 +578,13 @@ export function migrate(db: DatabaseSync): MigrationResult {
     applied.push('v4-to-v5');
     version = 5;
     setUserVersion(db, 5);
+  }
+
+  if (version < 6) {
+    migrateV5ToV6(db);
+    applied.push('v5-to-v6');
+    version = 6;
+    setUserVersion(db, 6);
   }
 
   return { from, to: version, applied, fresh: false };
@@ -929,5 +966,36 @@ function migrateV4ToV5(db: DatabaseSync): void {
     throw error;
   } finally {
     db.exec('PRAGMA foreign_keys = ON');
+  }
+}
+
+/**
+ * v5 → v6：Member 的 provisioning identity。
+ *
+ * 这里不需要 `PRAGMA foreign_keys = OFF` —— 那只在重建表时才必要，而这次
+ * 只加一列加一个索引，不碰任何被引用的表的形状。
+ *
+ * 索引是**部分**索引（`WHERE seed_key IS NOT NULL`）：member 表上绝大多数行
+ * 是手工创建的、`seed_key` 为 NULL，而 SQLite 的唯一索引把 NULL 视为互不相等
+ * —— 全局唯一索引虽然也不会误判，但会为每一行 NULL 建一条索引项，白占空间，
+ * 而且让「哪些行来自模板」这件事在 schema 里看不出来。
+ */
+function migrateV5ToV6(db: DatabaseSync): void {
+  db.exec('BEGIN');
+  try {
+    if (!hasColumn(db, 'member', 'seed_key')) {
+      db.exec(`ALTER TABLE member ADD COLUMN seed_key TEXT;`);
+    }
+
+    db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_member_seed_key
+        ON member(seed_key)
+        WHERE seed_key IS NOT NULL;
+    `);
+
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
   }
 }

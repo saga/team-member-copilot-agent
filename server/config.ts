@@ -77,4 +77,22 @@ export const config = {
    * 路由挡在内网 / API gateway 后面 —— 启动日志会提醒。
    */
   internalApiToken: env('INTERNAL_API_TOKEN', ''),
+  /**
+   * 默认 Member 模板目录。
+   *
+   * 这里的文件是 **provisioning baseline**，不是运行时 source of truth：
+   * 只在「这个 Member 还没出现过」时被读取一次，之后 Member 在 SQLite 和
+   * member home 里独立演进。用户改过的 Profile / Memory / Skills 不会被它覆盖。
+   *
+   * 目录可以用环境变量指到别处（ConfigMap / 只读 volume / 配置仓库），
+   * 所以它必须是配置而不是硬编码路径。
+   */
+  memberTemplatesDir: path.resolve(env('MEMBER_TEMPLATES_DIR', 'config/member-templates')),
+  /**
+   * 是否在启动时执行 Member provisioning。
+   *
+   * 关掉它等于「代码带着模板目录，但不要自动建人」—— 生产环境接管已有数据时
+   * 会想这么做（否则模板目录里的每一条都可能在某个空环境下被创建出来）。
+   */
+  seedDefaultMembers: env('SEED_DEFAULT_MEMBERS', 'true') === 'true',
 };

@@ -1,11 +1,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Server } from 'node:http';
-import { app, copilotService, teamService } from './app.js';
+import { app, copilotService, memberService, teamService } from './app.js';
 import { config } from './config.js';
 import { db, migration } from './db.js';
 import { RecoveryService } from './recovery-service.js';
 import { ConversationMemberService } from './conversation-member-service.js';
+import { seedMemberTemplates } from './member-template-seeder.js';
 import { describeApiBoundary } from './middleware/apiScope.js';
 
 // 与 app.ts 用同一个基准，避免两处 DIST_DIR 指向不同目录
@@ -20,9 +21,11 @@ let server: Server | null = null;
 /**
  * 启动顺序很重要：
  *   1. schema 迁移（db.ts 在 import 时已完成）
- *   2. 崩溃恢复 —— 必须在开始接请求之前，否则客户端会看到一个正在被改写的中途状态
- *   3. 重新提交 queued 的 root execution / 重新派发丢失的唤醒（fire-and-forget）
- *   4. listen
+ *   2. Member provisioning —— 默认团队要在 recovery 之前就位，否则恢复出来的
+ *      execution 可能指向一个还没被创建出来的 Member
+ *   3. 崩溃恢复 —— 必须在开始接请求之前，否则客户端会看到一个正在被改写的中途状态
+ *   4. 重新提交 queued 的 root execution / 重新派发丢失的唤醒（fire-and-forget）
+ *   5. listen
  */
 async function bootstrap(): Promise<void> {
   // eslint-disable-next-line no-console
@@ -31,6 +34,18 @@ async function bootstrap(): Promise<void> {
       ? `[server] 新建数据库 schema v${migration.to}`
       : `[server] schema ${migration.from} → ${migration.to}（${migration.applied.join(', ') || '无变更'}）`,
   );
+
+  if (config.seedDefaultMembers) {
+    const seeded = seedMemberTemplates(memberService, config.memberTemplatesDir);
+    // 启动日志里必须能看出「这次是建了人还是只是确认过」：两种都会让 Member 列表
+    // 是满的，但只有 created 非空时才说明模板目录真的被读到了。
+    // eslint-disable-next-line no-console
+    console.log(
+      `[server] member provisioning: created=${seeded.created.length}` +
+        `${seeded.created.length ? ` (${seeded.created.join(', ')})` : ''} ` +
+        `skipped=${seeded.skipped.length}`,
+    );
+  }
 
   if (config.recoverOnStartup) {
     const report = new RecoveryService(db, new ConversationMemberService(db)).recover();

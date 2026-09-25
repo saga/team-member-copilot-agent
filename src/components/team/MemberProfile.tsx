@@ -40,6 +40,13 @@ export function MemberProfile({ member, onSaved, onClose }: MemberProfileProps) 
             <p className="sub">
               @{member.handle} · {member.role}
             </p>
+            {member.seedKey && (
+              // 只读来源标记：改了名字之后仍然看得出「这个人最初是哪份模板建出来的」。
+              // 模板只负责第一次出现，Profile 的修改不会被它覆盖。
+              <p className="sub" title="由 member template provision；修改 Profile 不会回写模板">
+                Provisioned from <code>{member.seedKey}</code>
+              </p>
+            )}
           </div>
           <button type="button" className="ghost" onClick={onClose}>
             Close

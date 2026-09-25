@@ -133,6 +133,7 @@ interface MemberRow {
   model: string | null;
   tool_profile: ToolProfile;
   status: 'active' | 'archived';
+  seed_key: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -2240,6 +2241,7 @@ export class TeamService {
         model: member.model,
         toolProfile: member.tool_profile,
         status: member.status,
+        seedKey: member.seed_key,
         createdAt: member.created_at,
         updatedAt: member.updated_at,
       })),

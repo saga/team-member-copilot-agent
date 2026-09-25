@@ -383,6 +383,78 @@ ExecutionConfigSnapshot {
 前端（`TeamChat.tsx`）按 `updatedAt` 合并而不是直接覆盖：SSE 回放是时间正序，
 但首次连接的 `GET /state` 可能后到，没有守卫会「刚 working 又跳回 idle」。
 
+## Default Member Templates
+
+默认团队**不写死在 TypeScript 里**，也不塞进 migration：
+
+```
+config/member-templates/
+├── financial-solution-architect/
+│   ├── member.json          # profile（key/handle/name/role/style/toolProfile）
+│   ├── SYSTEM_PROMPT.md     # 稳定行为与人格
+│   └── MEMORY.md            # 初始长期记忆
+├── financial-senior-engineer/
+└── financial-security-reviewer/
+```
+
+| Member | Handle | Role | Tool Profile |
+|--------|--------|------|--------------|
+| Senior Solution Architect | `@architect` | Senior Financial Services Solution Architect | `safe` |
+| Senior Software Engineer | `@engineer` | Senior Financial Services Software Engineer | `coding` |
+| Security Reviewer | `@security` | Financial Services Security & Architecture Reviewer | `safe` |
+
+只有 Engineer 默认拿 `coding`：架构师和 Security Reviewer 不该因为「自己是这个角色」
+就获得宿主机代码执行能力。等 sandbox 接进来，再把这两个拆成更细的只读工具。
+
+### 模板不是 source of truth
+
+```
+config/member-templates/     provisioning baseline —— 这个 Member 第一次出现时是什么样
+SQLite member                当前真实配置
+<member home>/memory/        当前长期记忆
+<member home>/skills/        当前能力
+```
+
+启动时执行一次 provisioning：
+
+```
+扫描目录 → 解析 member.json → 校验 → 按 seedKey 查 member 表
+                                        ├── 已存在 → 跳过（不覆盖）
+                                        └── 不存在 → 创建 + 写入初始 memory
+```
+
+四条**不会**发生的事，是这套设计真正的约束：
+
+| 情况 | 行为 |
+|------|------|
+| 第二次启动 | 全部 `skipped`，不重建 |
+| 用户改过 name / handle / system prompt | 不被模板覆盖 |
+| Member 已归档 | **不复活** —— 归档是用户明确表达过的意图 |
+| 模板文件被改了一版 | 不升级已有 Member（升级应该是显式操作，不是启动副作用） |
+
+所以 `member.seed_key` 必须存在且不可编辑：判据不能是 `handle` / `name` ——
+那是用户随时会改的显示属性。按 `handle` 判断的话，用户把 `@architect` 改成
+`@solution-architect`，下次重启就会「发现没有 @architect」，于是团队里出现两个架构师。
+
+索引是**部分**唯一索引（`WHERE seed_key IS NOT NULL`）：手工创建的 Member 没有模板来源，
+它们的 NULL 之间不能互相冲突。
+
+### 加一个角色不需要改代码
+
+新增 `Research Analyst` / `Portfolio Specialist` / `Compliance Reviewer`：
+只加一个目录。`server/member-template-seeder.ts` 里没有一行业务内容 ——
+它只回答「这份模板对应的 Member 是否存在」。
+
+模板目录可以指到别处：
+
+```env
+MEMBER_TEMPLATES_DIR=/etc/team-member/templates
+SEED_DEFAULT_MEMBERS=false    # 代码带着模板，但不要自动建人
+```
+
+配置错误（重复的 key、`systemPromptFile` 指向模板目录之外、`member.json` 非法）
+**直接让启动失败**，不静默跳过 —— 否则症状是「默认团队少两个人但服务照常起来了」。
+
 ## 快速开始
 
 ```bash
@@ -392,6 +464,15 @@ cp .env.example .env   # 按需填 GITHUB_TOKEN（留空则用 copilot CLI 已�
 npm run dev            # 同时启动 client(:5173) + server(:3001)
 # 浏览器打开 http://localhost:5173
 ```
+
+首次启动的日志里会有一行 provisioning：
+
+```
+[server] 新建数据库 schema v6
+[server] member provisioning: created=3 (financial-services.solution-architect, ...) skipped=0
+```
+
+第二次启动 `created=0 skipped=3` —— 默认团队不会被重复创建。
 
 单独启动：`npm run dev:server` / `npm run dev:client`；类型检查：`npm run typecheck`；测试：`npm run test`。
 
@@ -582,6 +663,7 @@ Group Chat：
 | 3 | `conversation_member_state`（Member 在房间里的读游标 + 唤醒状态）、`execution.decision` / `trigger_message_sequence` |
 | 4 | `conversation_member_state.pending_wake_trigger_sequence` / `pending_wake_reason`（唤醒的重放单位） |
 | 5 | `conversation_message.client_request_id` + `UNIQUE(conversation_id, client_request_id)`（消息幂等键）、`execution.config_snapshot`（这一轮用的是哪份配置）；并把历史 `group` 房间的 `default_member_id` 归零 |
+| 6 | `member.seed_key` + 部分唯一索引（`WHERE seed_key IS NOT NULL`）—— Member 的 provisioning identity |
 
 约定：
 
@@ -609,6 +691,12 @@ waiting_for_runtime_id 防：
 ## 目录结构
 
 ```
+config/
+  member-templates/           # 默认 Member 模板（provisioning baseline，不是运行时数据）
+    financial-solution-architect/
+    financial-senior-engineer/
+    financial-security-reviewer/
+
 src/                          # Vite + React 前端
   App.tsx
   index.css
@@ -628,14 +716,15 @@ src/                          # Vite + React 前端
 server/                       # Express + Copilot SDK 后端
   config.ts                   # 环境变量
   db.ts                       # node:sqlite 打开 + 迁移
-  db-migrations.ts            # PRAGMA user_version 迁移（v1 → v5）
+  db-migrations.ts            # PRAGMA user_version 迁移（v1 → v6）
   domain.ts                   # Member / Conversation / Runtime / Execution 类型
   content-hash.ts             # hashText() —— memory version / 各种 snapshot hash 的唯一实现
   copilot.ts                  # MemberRuntime → CopilotSession 执行引擎 + custom tools
   tool-policy.ts              # 工具声明与放行（同一个实例回答两个问题）
   context-assembler.ts        # 增量上下文（message_sequence checkpoint）
   recovery-service.ts         # 启动恢复（保守策略，不自动重跑 running）
-  member-service.ts           # 长期 Member 身份 + member home
+  member-service.ts           # 长期 Member 身份 + member home + seedKey
+  member-template-seeder.ts   # 模板 provisioning（不含任何业务内容）
   conversation-member-service.ts  # 房间内成员状态（读游标 / pending wake / wake_status）
   member-turn-scheduler.ts    # 同一 Member 的 turn 串行化 + 唤醒合并
   team-service.ts             # 核心编排：Conversation / Execution / Delegation / 单写者 / durable event
@@ -660,6 +749,7 @@ server/                       # Express + Copilot SDK 后端
     runtime-reliability.test.ts    # 迁移 / 序号 / 增量上下文 / durable event / 恢复 / 死锁
     runtime-correctness.test.ts    # resume 分类 / 超时 abort / 工具授权接线 / cancel 状态机 / retry
     data-integrity.test.ts         # replyTo 校验 / 消息幂等 / 记忆乐观并发 / 上下文上限 / 配置快照 / state 事件 / mention 精确匹配
+    member-template-seeder.test.ts # provisioning 幂等 / 不覆盖已改 Member / 归档不复活 / 穿越与重复 key
 ```
 
 ## 环境变量
@@ -679,6 +769,8 @@ server/                       # Express + Copilot SDK 后端
 | `MAX_CONTEXT_CHARS` | `60000` | 注入 prompt 的字符数上限（含每条 32 字符的固定开销），与条数上限同时生效 |
 | `HOST_CODING_TOOLS` | `false` | 是否允许 `bash` / `edit` / `grep` / `web_fetch`。**不随 `toolProfile` 打开** |
 | `INTERNAL_API_TOKEN` | 空 | Internal API 门禁；空 = 不校验（仅限本机单用户） |
+| `MEMBER_TEMPLATES_DIR` | `config/member-templates` | 默认 Member 模板目录（provisioning baseline） |
+| `SEED_DEFAULT_MEMBERS` | `true` | 启动时执行 Member provisioning；关闭 = 代码带着模板但不自动建人 |
 
 `HOST_CODING_TOOLS` 默认关闭，原因是这几个工具的工作目录虽然是 conversation workspace，
 runtime 仍然是宿主机上的进程 —— 没有沙箱时 `bash` 能走到 workspace 之外。成员把
@@ -703,5 +795,6 @@ runtime 仍然是宿主机上的进程 —— 没有沙箱时 `bash` 能走到 w
 - **认证**：`local-user` 是占位。接 Entra ID / AD / OIDC 时只改请求上下文，业务数据模型不动。
 - **会话记忆 vs Member 记忆**：`conversation_message` 是会话上下文，`members/<id>/memory/MEMORY.md` 是 Member 长期记忆，两者不要混。
 - **Member 记忆提案**：让模型用 `propose_member_memory` 提议、由应用审核后再落盘，而不是让 `remember_member` 直接写。
+- **Restore to template**：把某个 Member 恢复成模板 baseline（含 preview diff）。provisioning 刻意不做这件事 —— 它必须是显式操作，不能是启动副作用。届时再引入 `templateRevision` / `profileRevision`。
 - 只在真正出现「谁该接这个问题」的规模后，再引入 Member Router（LLM 路由会多一层概率性决策）。
 - `coding` profile 上生产前必须补 sandbox（`RuntimeAdapter`：Local / K8s / Kata / Firecracker）。

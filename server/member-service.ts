@@ -19,6 +19,7 @@ interface MemberRow {
   model: string | null;
   tool_profile: ToolProfile;
   status: 'active' | 'archived';
+  seed_key: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -32,6 +33,18 @@ export interface CreateMemberInput {
   systemPrompt?: string;
   model?: string;
   toolProfile?: ToolProfile;
+}
+
+/**
+ * Provisioning 元数据。**刻意不放进 `CreateMemberInput`** ——
+ * 那个形状是 HTTP create schema 的来源，把 `seedKey` 放进去等于让它可被请求体设置，
+ * 于是任何调用方都能自称「我是模板创建的那条」，把真正的模板行挤掉。
+ */
+export interface ProvisionMemberOptions {
+  /** 这份 Member 来自哪份模板。唯一索引保证一个 key 只会落一次。 */
+  seedKey?: string;
+  /** 初始长期记忆。省略 = 留空（`# Long-term Memory`），与手工创建一致。 */
+  initialMemory?: string;
 }
 
 export interface UpdateMemberInput {
@@ -58,6 +71,7 @@ function mapRow(row: MemberRow): Member {
     model: row.model,
     toolProfile: row.tool_profile,
     status: row.status,
+    seedKey: row.seed_key,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -226,7 +240,21 @@ export class MemberService {
     return mapRow(row);
   }
 
-  create(input: CreateMemberInput): Member {
+  /**
+   * 按模板来源查 Member，**不过滤 status**。
+   *
+   * 归档的也要能找到，这是 provisioning 的关键：归档是用户明确表达过的意图
+   * （「这个人我现在不用了」），如果查询只看 active，下一次启动会理直气壮地
+   * 把它重新建出来 —— 用户每次重启都要再归档一次。
+   */
+  findBySeedKey(seedKey: string): Member | null {
+    const row = this.db.prepare(`SELECT * FROM member WHERE seed_key = ?`).get(seedKey) as unknown as
+      | MemberRow
+      | undefined;
+    return row ? mapRow(row) : null;
+  }
+
+  create(input: CreateMemberInput, options: ProvisionMemberOptions = {}): Member {
     const id = randomUUID();
     const createdAt = now();
 
@@ -248,10 +276,11 @@ export class MemberService {
           model,
           tool_profile,
           status,
+          seed_key,
           created_at,
           updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
         `,
       )
       .run(
@@ -264,11 +293,19 @@ export class MemberService {
         input.systemPrompt?.trim() ?? '',
         input.model?.trim() || null,
         input.toolProfile ?? 'safe',
+        options.seedKey ?? null,
         createdAt,
         createdAt,
       );
 
     this.ensureHome(id);
+
+    // ensureHome 已经写了空的记忆文件；初始记忆必须在这之后覆盖它，
+    // 否则模板里的 MEMORY.md 会被那个默认值无声盖掉。
+    if (options.initialMemory !== undefined) {
+      this.replaceMemory(id, options.initialMemory);
+    }
+
     const member = this.get(id);
     this.writeSoul(member);
     return member;

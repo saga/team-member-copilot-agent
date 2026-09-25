@@ -24,6 +24,15 @@ export interface Member {
   model: string | null;
   toolProfile: ToolProfile;
   status: MemberStatus;
+  /**
+   * 非空表示这个 Member 最初由 member template provision。
+   *
+   * 这是 provisioning identity，不是业务身份 —— 它的唯一用途是回答
+   * 「这份模板是不是已经落地过了」，所以它必须不可编辑：`name` / `handle`
+   * 都是用户随时会改的显示属性，拿它们做判据会在「改了名再重启」时
+   * 又建出一个同名 Member。
+   */
+  seedKey: string | null;
   createdAt: string;
   updatedAt: string;
 }

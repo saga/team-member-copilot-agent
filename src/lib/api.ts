@@ -37,6 +37,14 @@ export interface Member {
   model: string | null;
   toolProfile: 'safe' | 'coding';
   status: 'active' | 'archived';
+  /**
+   * 非空表示这个 Member 由 `config/member-templates` 里的某份模板 provision。
+   *
+   * 只读：它是 provisioning identity，不是业务身份。UI 只用来显示来源
+   * （改了名字之后还能看出「这个人最初是哪份模板建出来的」），
+   * 服务端也刻意不允许通过 create / update 设置它。
+   */
+  seedKey: string | null;
 }
 
 export interface Conversation {
