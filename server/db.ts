@@ -16,8 +16,8 @@ db.exec('PRAGMA journal_mode = WAL;');
 db.exec('PRAGMA foreign_keys = ON;');
 
 /**
- * schema 由 db-migrations.ts 用 `PRAGMA user_version` 管理。
- * db.ts 只负责「打开 + 迁移」，不再内联 CREATE TABLE。
+ * schema 由 db-migrations.ts 管理：库的形状必须与 SCHEMA_SQL 完全一致，
+ * 否则启动就失败。db.ts 只负责「打开 + 确保形状」，不内联 CREATE TABLE。
  */
 export const migration = migrate(db);
 

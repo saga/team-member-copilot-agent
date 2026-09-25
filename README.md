@@ -2,6 +2,8 @@
 
 A server-side AI Team platform built on GitHub Copilot SDK.
 
+> 改这个仓库之前先读 [`AGENTS.md`](AGENTS.md)：**不写兼容层、不留旧版本、改 schema 直接改 `SCHEMA_SQL` 并重建库**。
+
 ```
 User
 │
@@ -177,7 +179,7 @@ hook 认不出 `sessionId` 属于哪个 execution 时也拒绝而不是放行 �
 
 ### 1. 崩溃恢复：宁可漏跑，不可重跑
 
-启动顺序是「迁移 → 恢复 → 重新提交 → listen」。
+启动顺序是「schema 就位 → provisioning → 恢复 → 重新提交 → listen」。
 
 ```
 queued（root）        → 重新提交（它从来没开始跑过）
@@ -652,30 +654,37 @@ Group Chat：
 └── copilot/                           # Copilot session state
 ```
 
-### Schema 版本管理
+### Schema：只有一个形状，没有迁移
 
-用 `PRAGMA user_version`，不引入 migration framework（`server/db-migrations.ts`）。
+用 `PRAGMA user_version` 登记形状，不引入 migration framework（`server/db-migrations.ts`）。
 
-| version | 内容 |
-|---------|------|
-| 1 | 初版六张表（旧代码用 `CREATE TABLE IF NOT EXISTS` 建出来的，没写 `user_version`） |
-| 2 | `conversation.event_sequence` / `message_sequence`、`conversation_message.message_sequence`、`member_runtime.active_execution_id` / `last_context_message_sequence`、`execution.waiting_for_runtime_id` / `retry_of_execution_id`、`execution.status` 增加 `waiting_for_member` / `interrupted`、`conversation_event` |
-| 3 | `conversation_member_state`（Member 在房间里的读游标 + 唤醒状态）、`execution.decision` / `trigger_message_sequence` |
-| 4 | `conversation_member_state.pending_wake_trigger_sequence` / `pending_wake_reason`（唤醒的重放单位） |
-| 5 | `conversation_message.client_request_id` + `UNIQUE(conversation_id, client_request_id)`（消息幂等键）、`execution.config_snapshot`（这一轮用的是哪份配置）；并把历史 `group` 房间的 `default_member_id` 归零 |
-| 6 | `member.seed_key` + 部分唯一索引（`WHERE seed_key IS NOT NULL`）—— Member 的 provisioning identity |
+```
+空库              → 建 SCHEMA_SQL
+user_version 相等  → 什么都不做
+其它              → 拒绝启动
+```
 
-约定：
+`SCHEMA_SQL` 按**最终形状**写一次，没有 `migrateV1ToV2()` 这样的升级链。改 schema 的流程就是：
 
-- `user_version = 0` 且已存在 `member` 表 → 当作 v1（老库），不重建。
-- `user_version = 0` 且库是空的 → 直接建最新版。
-- `user_version > SCHEMA_VERSION` → 拒绝启动，避免新数据被老代码写坏。
-- 加列一律走 `ADD COLUMN`，不重建表 —— 这几张表被 6 张表 FK 引用，SQLite 改不了它们。
-- `execution` 要改 `status` 的 CHECK 约束，而 SQLite 不支持 `ALTER CHECK`，所以按官方 12 步流程重建表；重建期间 `PRAGMA foreign_keys = OFF` 必须放在 `BEGIN` **之前**（该 PRAGMA 在事务内无效），提交前跑 `PRAGMA foreign_key_check`。
-- 升级时会同步计数器与水位线：`conversation.message_sequence` 追上历史最大值（否则下一条消息撞 UNIQUE），`member_runtime.last_context_message_sequence` 推到当前最大序号（否则升级后立刻重复注入一次全量上下文）。
-- 幂等键的 `UNIQUE` 索引**允许 NULL**，而且这是刻意的：SQLite 认为 NULL 互不相等，所以不带 `clientRequestId` 的内部消息（Member 回复、委派结果）天然不参与去重，不需要额外分支。
+```
+改 SCHEMA_SQL  →  rm -rf .data  →  重启（默认 Member 会重新 provision）
+```
 
-v4 → v5 的 `group` 归零是一次**数据修正**：`default_member_id` 在 `group` 上没有语义（收件人由 `GroupDispatcher` 按 @mention 决定），留着一个值只会让「这个房间默认谁接」看起来像个可以依赖的配置。迁移把它清掉，`createConversation()` 也从入口拒绝（`400` 而不是静默忽略 —— 静默忽略会让调用方以为设置成功了）。
+不留迁移代码是有意的：迁移只在升级那一瞬间被走到，是日常测试永远不会覆盖的一小段路径。宁可在启动时明确报错，也不要维护一条没人验证的升级路径。代价是**库的形状一旦不对就只能重建**，所以这个项目不承诺「老库能升上来」。
+
+拒绝启动时两个方向给的建议不一样：
+
+| 情况 | 提示 |
+|---|---|
+| 库比程序旧 | 删掉数据目录重建（默认团队会重新 provision） |
+| 库比程序新 | 换回较新的 build —— **不要**删库，那是用户的数据 |
+
+另外两条约束：
+
+- 空库必须**真的空**。有表却没有 `user_version` 登记 → 拒绝，不当成空库去建表（否则会在别人的库上盖一半 schema）。
+- 建表与登记版本在同一个事务里。中途失败留一个「有表但 version=0」的库，下次启动会走到上面那条分支，而它给出的建议是换目录 —— 明明重建就行。
+
+幂等键的 `UNIQUE` 索引**允许 NULL**，而且这是刻意的：SQLite 认为 NULL 互不相等，所以不带 `clientRequestId` 的内部消息（Member 回复、委派结果）天然不参与去重，不需要额外分支。
 
 ### 两道环检测
 
@@ -715,8 +724,8 @@ src/                          # Vite + React 前端
 
 server/                       # Express + Copilot SDK 后端
   config.ts                   # 环境变量
-  db.ts                       # node:sqlite 打开 + 迁移
-  db-migrations.ts            # PRAGMA user_version 迁移（v1 → v6）
+  db.ts                       # node:sqlite 打开 + 确保形状
+  db-migrations.ts            # 唯一一份 SCHEMA_SQL + 形状检查（无迁移链）
   domain.ts                   # Member / Conversation / Runtime / Execution 类型
   content-hash.ts             # hashText() —— memory version / 各种 snapshot hash 的唯一实现
   copilot.ts                  # MemberRuntime → CopilotSession 执行引擎 + custom tools
@@ -729,7 +738,7 @@ server/                       # Express + Copilot SDK 后端
   member-turn-scheduler.ts    # 同一 Member 的 turn 串行化 + 唤醒合并
   team-service.ts             # 核心编排：Conversation / Execution / Delegation / 单写者 / durable event
   app.ts                      # 依赖装配 + 路由挂载
-  index.ts                    # 迁移 → 恢复 → listen + 优雅退出
+  index.ts                    # schema 就位 → provisioning → 恢复 → listen + 优雅退出
   middleware/
     errorHandler.ts
     apiScope.ts               # Internal API 门禁（三类调用方的边界）
@@ -746,7 +755,7 @@ server/                       # Express + Copilot SDK 后端
     team-service.test.ts           # delegation cycle / depth / runtime 隔离 / kind 形状约束
     member-dm.test.ts              # Member ↔ Member 私聊房间唯一性 + 自动对谈抑制
     member-skills.test.ts          # skill 安装 / 卸载 / zip 校验
-    runtime-reliability.test.ts    # 迁移 / 序号 / 增量上下文 / durable event / 恢复 / 死锁
+    runtime-reliability.test.ts    # schema 形状 / 序号 / 增量上下文 / durable event / 恢复 / 死锁
     runtime-correctness.test.ts    # resume 分类 / 超时 abort / 工具授权接线 / cancel 状态机 / retry
     data-integrity.test.ts         # replyTo 校验 / 消息幂等 / 记忆乐观并发 / 上下文上限 / 配置快照 / state 事件 / mention 精确匹配
     member-template-seeder.test.ts # provisioning 幂等 / 不覆盖已改 Member / 归档不复活 / 穿越与重复 key

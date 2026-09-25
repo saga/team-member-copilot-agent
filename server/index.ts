@@ -20,7 +20,7 @@ let server: Server | null = null;
 
 /**
  * 启动顺序很重要：
- *   1. schema 迁移（db.ts 在 import 时已完成）
+ *   1. schema 就位（db.ts 在 import 时已完成；空库建，形状不符直接让启动失败）
  *   2. Member provisioning —— 默认团队要在 recovery 之前就位，否则恢复出来的
  *      execution 可能指向一个还没被创建出来的 Member
  *   3. 崩溃恢复 —— 必须在开始接请求之前，否则客户端会看到一个正在被改写的中途状态
@@ -30,9 +30,9 @@ let server: Server | null = null;
 async function bootstrap(): Promise<void> {
   // eslint-disable-next-line no-console
   console.log(
-    migration.fresh
+    migration.created
       ? `[server] 新建数据库 schema v${migration.to}`
-      : `[server] schema ${migration.from} → ${migration.to}（${migration.applied.join(', ') || '无变更'}）`,
+      : `[server] schema v${migration.to}（已就绪）`,
   );
 
   if (config.seedDefaultMembers) {

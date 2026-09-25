@@ -122,7 +122,7 @@ function loadTemplate(root: string, directory: string): {
  * 扫描模板目录，把还没出现过的 Member 建出来。
  *
  * 幂等：同一个 `key` 跑多少次都只有第一次会创建。判据落在 `member.seed_key`
- * 上（见 db-migrations.ts v6），不是 handle / name。
+ * 上，不是 handle / name。
  *
  * 配置错误**直接抛**，不静默跳过：模板目录里出现一个坏掉的目录，正确行为是让人
  * 在启动日志里立刻看到它，而不是「默认团队少了两个人但服务照常起来了」。

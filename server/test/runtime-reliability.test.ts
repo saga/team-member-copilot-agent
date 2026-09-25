@@ -32,7 +32,7 @@ const { ContextAssembler } = await import('../context-assembler.js');
 const { RecoveryService } = await import('../recovery-service.js');
 const { ConversationMemberService } = await import('../conversation-member-service.js');
 const { singleExecutionId, muteAllMembers } = await import('./support.js');
-const { migrate, getUserVersion, SCHEMA_VERSION, V1_SCHEMA_SQL } = await import(
+const { migrate, getUserVersion, SCHEMA_VERSION } = await import(
   '../db-migrations.js'
 );
 
@@ -131,42 +131,23 @@ async function waitForConversationIdle(conversationId: string): Promise<void> {
   assert.fail(`conversation ${conversationId} 仍有未完成的 execution`);
 }
 
-// ------------------------------------------------------------- 1. migration
+// ------------------------------------------------------ 1. schema 就位
 
-describe('schema migration（PRAGMA user_version）', () => {
+describe('schema 就位（PRAGMA user_version）', () => {
   function openFixture(name: string): DatabaseSync {
     const handle = new DatabaseSync(path.join(dataDir, `${name}.db`));
     handle.exec('PRAGMA foreign_keys = ON;');
     return handle;
   }
 
-  it('全新库直接建到最新 schema 并登记 user_version', () => {
+  it('空库建出当前 schema 并登记 user_version', () => {
     const handle = openFixture('fresh');
     try {
       const result = migrate(handle);
-      assert.equal(result.fresh, true);
+      assert.equal(result.created, true);
       assert.equal(result.from, 0);
       assert.equal(result.to, SCHEMA_VERSION);
       assert.equal(getUserVersion(handle), SCHEMA_VERSION);
-
-      assert.ok(tableColumns(handle, 'conversation').includes('event_sequence'));
-      assert.ok(tableColumns(handle, 'conversation').includes('message_sequence'));
-      assert.ok(tableColumns(handle, 'conversation_message').includes('message_sequence'));
-      assert.ok(tableColumns(handle, 'member_runtime').includes('active_execution_id'));
-      assert.ok(
-        tableColumns(handle, 'member_runtime').includes('last_context_message_sequence'),
-      );
-      assert.ok(tableColumns(handle, 'execution').includes('waiting_for_runtime_id'));
-      assert.ok(tableColumns(handle, 'execution').includes('retry_of_execution_id'));
-      assert.ok(tableColumns(handle, 'conversation_event').includes('sequence'));
-      assert.ok(
-        tableColumns(handle, 'conversation_member_state').includes(
-          'pending_wake_trigger_sequence',
-        ),
-      );
-      assert.ok(tableColumns(handle, 'conversation_member_state').includes('pending_wake_reason'));
-      assert.ok(tableColumns(handle, 'conversation_message').includes('client_request_id'));
-      assert.ok(tableColumns(handle, 'execution').includes('config_snapshot'));
 
       // 新状态必须被 CHECK 接受
       handle.exec(`
@@ -197,214 +178,274 @@ describe('schema migration（PRAGMA user_version）', () => {
           `),
         /UNIQUE constraint failed/i,
       );
-    } finally {
-      handle.close();
-    }
-  });
 
-  it('v1 旧库升级到最新 schema：历史数据保留、序号回填、水位线同步', () => {
-    const handle = openFixture('upgrade');
-    try {
-      handle.exec(V1_SCHEMA_SQL);
-      // 两条历史消息刻意用**同一个 created_at**：验证序号回填不依赖时间精度
-      handle.exec(`
-        INSERT INTO member (id, handle, name, role, created_at, updated_at)
-        VALUES ('m1', 'alice', 'Alice', 'Analyst', 't', 't');
-
-        INSERT INTO conversation (id, title, kind, default_member_id, created_by, created_at, updated_at)
-        VALUES ('c1', 'Legacy', 'direct', 'm1', 'u', 't', 't');
-
-        -- 老数据里的 group 房间带着一个默认成员。这个字段对共享讨论没有语义，
-        -- 留着只会让调用方误以为「这个房间默认归 m1」。
-        INSERT INTO conversation (id, title, kind, default_member_id, created_by, created_at, updated_at)
-        VALUES ('c2', 'Legacy Group', 'group', 'm1', 'u', 't', 't');
-
-        INSERT INTO conversation_member (conversation_id, member_id, joined_at)
-        VALUES ('c1', 'm1', 't');
-
-        INSERT INTO member_runtime (id, conversation_id, member_id, copilot_session_id, workspace_path, status)
-        VALUES ('r1', 'c1', 'm1', 'sess-1', '/tmp/ws', 'idle');
-
-        INSERT INTO conversation_message (id, conversation_id, sender_type, sender_id, content, created_at)
-        VALUES ('msg1', 'c1', 'user', 'u', 'first', '2026-01-01T00:00:00.000Z'),
-               ('msg2', 'c1', 'member', 'm1', 'second', '2026-01-01T00:00:00.000Z');
-
-        INSERT INTO execution (id, conversation_id, member_id, runtime_id, delegation_path, kind, status, prompt, created_at)
-        VALUES ('e1', 'c1', 'm1', 'r1', '["m1"]', 'interactive', 'completed', 'hello', 't'),
-               ('e2', 'c1', 'm1', 'r1', '["m1","m1"]', 'member_delegate', 'failed', 'child', 't');
-      `);
-
-      const result = migrate(handle);
-      assert.equal(result.fresh, false);
-      assert.equal(result.from, 1);
-      // 断言的是「升到最新」而不是某个具体版本号：这条用例保护的是
-      // 「老库能一路升上来」，加一版 schema 不该让它变红。
-      assert.equal(result.to, SCHEMA_VERSION);
-      // 每一步迁移各一个名字：不写死清单，加一版 schema 不该让这条用例变红
-      assert.deepEqual(
-        result.applied,
-        Array.from({ length: SCHEMA_VERSION - 1 }, (_, index) => `v${index + 1}-to-v${index + 2}`),
+      // 同一房间内 message_sequence 唯一
+      assert.throws(
+        () =>
+          handle.exec(`
+            INSERT INTO conversation_message (id, conversation_id, message_sequence, sender_type, sender_id, content, created_at)
+            VALUES ('dup-seq', 'c', 1, 'user', 'u', 'again', 't');
+          `),
+        /UNIQUE constraint failed/i,
       );
 
-      // 1) 消息序号按 (created_at, rowid) 回填成 1..N
-      // 注意：node:sqlite 返回的是 null-prototype 对象，断言前要先摊平成普通对象
-      const messages = (
-        handle
-          .prepare(
-            `SELECT id, message_sequence FROM conversation_message WHERE conversation_id = 'c1' ORDER BY message_sequence`,
-          )
-          .all() as unknown as Array<{ id: string; message_sequence: number }>
-      ).map((row) => ({ ...row }));
-      assert.deepEqual(messages, [
-        { id: 'msg1', message_sequence: 1 },
-        { id: 'msg2', message_sequence: 2 },
-      ]);
-
-      // 2) conversation 计数器追上历史消息，否则下一条会撞 UNIQUE
-      const conversation = handle
-        .prepare(`SELECT message_sequence FROM conversation WHERE id = 'c1'`)
-        .get() as unknown as { message_sequence: number };
-      assert.equal(conversation.message_sequence, 2);
-
-      // 3) runtime 水位线推到最大序号：旧实现每轮都注入最近 24 条，
-      //    升级后立刻再注入一次全量会造成重复
-      const runtime = handle
-        .prepare(`SELECT last_context_message_sequence FROM member_runtime WHERE id = 'r1'`)
-        .get() as unknown as { last_context_message_sequence: number };
-      assert.equal(runtime.last_context_message_sequence, 2);
-
-      // 4) execution 行原样保留，新列默认 NULL
-      const executions = (
-        handle
-          .prepare(
-            `SELECT id, status, waiting_for_runtime_id, retry_of_execution_id FROM execution ORDER BY id`,
-          )
-          .all() as unknown as Array<{
-          id: string;
-          status: string;
-          waiting_for_runtime_id: string | null;
-          retry_of_execution_id: string | null;
-        }>
-      ).map((row) => ({ ...row }));
-      assert.deepEqual(executions, [
-        {
-          id: 'e1',
-          status: 'completed',
-          waiting_for_runtime_id: null,
-          retry_of_execution_id: null,
-        },
-        {
-          id: 'e2',
-          status: 'failed',
-          waiting_for_runtime_id: null,
-          retry_of_execution_id: null,
-        },
-      ]);
-
-      // 5) 重建 execution 后自引用外键仍然生效
+      // 自引用外键真的生效（execution.parent_execution_id）
       assert.throws(
         () =>
           handle.exec(`
             INSERT INTO execution (id, conversation_id, member_id, parent_execution_id, kind, status, prompt, created_at)
-            VALUES ('bad', 'c1', 'm1', 'does-not-exist', 'member_delegate', 'queued', 'p', 't');
+            VALUES ('bad', 'c', 'm', 'does-not-exist', 'member_delegate', 'queued', 'p', 't');
           `),
         /FOREIGN KEY/i,
       );
 
-      // 6) 整体外键完整
       assert.deepEqual(handle.prepare('PRAGMA foreign_key_check').all(), []);
-
-      // 7) v3：给已有 roster 补房间状态行，last_seen 直接推到当前水位
-      //    （推 0 的话，升级后第一条新消息会让每个 Member 的「未读」变成整个历史）
-      assert.ok(tableColumns(handle, 'conversation_member_state').includes('wake_status'));
-      const state = handle
-        .prepare(
-          `SELECT last_seen_message_sequence, muted, pending_wake_trigger_sequence, pending_wake_reason
-           FROM conversation_member_state
-           WHERE conversation_id = 'c1' AND member_id = 'm1'`,
-        )
-        .get() as unknown as
-        | {
-            last_seen_message_sequence: number;
-            muted: number;
-            pending_wake_trigger_sequence: number | null;
-            pending_wake_reason: string | null;
-          }
-        | undefined;
-      assert.ok(state, '已有 roster 必须补上房间状态行');
-      assert.equal(state.last_seen_message_sequence, 2);
-      assert.equal(state.muted, 0);
-
-      // 8) v3：execution 新列默认 NULL
-      assert.ok(tableColumns(handle, 'execution').includes('decision'));
-      assert.ok(tableColumns(handle, 'execution').includes('trigger_message_sequence'));
-      assert.ok(tableColumns(handle, 'execution').includes('wake_reason'));
-
-      // 9) v4：排队唤醒的元数据列，历史行默认 NULL（= 没有排队，语义一致）
-      assert.ok(
-        tableColumns(handle, 'conversation_member_state').includes(
-          'pending_wake_trigger_sequence',
-        ),
-      );
-      assert.ok(tableColumns(handle, 'conversation_member_state').includes('pending_wake_reason'));
-      assert.equal(state.pending_wake_trigger_sequence, null);
-      assert.equal(state.pending_wake_reason, null);
-
-      // 10) v5：消息幂等键 / execution 配置快照默认 NULL，历史行不受影响
-      assert.ok(tableColumns(handle, 'conversation_message').includes('client_request_id'));
-      assert.ok(tableColumns(handle, 'execution').includes('config_snapshot'));
-      const legacyMessages = (
-        handle
-          .prepare(
-            `SELECT client_request_id FROM conversation_message WHERE conversation_id = 'c1' ORDER BY message_sequence`,
-          )
-          .all() as unknown as Array<{ client_request_id: string | null }>
-      ).map((row) => ({ ...row }));
-      assert.deepEqual(legacyMessages, [
-        { client_request_id: null },
-        { client_request_id: null },
-      ]);
-      assert.equal(
-        (handle
-          .prepare(`SELECT config_snapshot FROM execution WHERE id = 'e1'`)
-          .get() as unknown as { config_snapshot: string | null }).config_snapshot,
-        null,
-      );
-
-      // 11) v5：group 房间的 default_member_id 被归一成 NULL；1:1 房间不动
-      const defaults = (
-        handle
-          .prepare(`SELECT id, default_member_id FROM conversation ORDER BY id`)
-          .all() as unknown as Array<{ id: string; default_member_id: string | null }>
-      ).map((row) => ({ ...row }));
-      assert.deepEqual(defaults, [
-        { id: 'c1', default_member_id: 'm1' },
-        { id: 'c2', default_member_id: null },
-      ]);
     } finally {
       handle.close();
     }
   });
 
-  it('迁移幂等：重复执行不会重复施加', () => {
-    const handle = openFixture('idempotent');
+  /**
+   * SCHEMA_SQL 现在是唯一一份形状定义，没有任何迁移代码在别处再描述一遍它。
+   * 所以「形状本身就是契约」这件事只能靠这条用例守住 —— 改 SCHEMA_SQL 时
+   * 如果忘了同步域模型，这里必须变红。
+   */
+  it('schema 形状（列清单 + 索引清单）', () => {
+    const handle = openFixture('shape');
     try {
       migrate(handle);
-      const second = migrate(handle);
-      assert.equal(second.from, SCHEMA_VERSION);
-      assert.equal(second.to, SCHEMA_VERSION);
-      assert.deepEqual(second.applied, []);
+
+      const tables = [
+        'member',
+        'conversation',
+        'conversation_member',
+        'conversation_member_state',
+        'conversation_message',
+        'conversation_event',
+        'member_runtime',
+        'execution',
+      ];
+      assert.deepEqual(
+        Object.fromEntries(tables.map((table) => [table, tableColumns(handle, table)])),
+        {
+          member: [
+            'id',
+            'handle',
+            'name',
+            'role',
+            'description',
+            'style',
+            'system_prompt',
+            'model',
+            'tool_profile',
+            'status',
+            'seed_key',
+            'created_at',
+            'updated_at',
+          ],
+          conversation: [
+            'id',
+            'title',
+            'kind',
+            'default_member_id',
+            'created_by',
+            'event_sequence',
+            'message_sequence',
+            'created_at',
+            'updated_at',
+          ],
+          conversation_member: ['conversation_id', 'member_id', 'joined_at'],
+          conversation_member_state: [
+            'conversation_id',
+            'member_id',
+            'last_seen_message_sequence',
+            'last_replied_message_sequence',
+            'wake_status',
+            'pending_wake',
+            'pending_wake_trigger_sequence',
+            'pending_wake_reason',
+            'muted',
+            'updated_at',
+          ],
+          conversation_message: [
+            'id',
+            'conversation_id',
+            'message_sequence',
+            'sender_type',
+            'sender_id',
+            'target_member_id',
+            'reply_to_message_id',
+            'content',
+            'execution_id',
+            'client_request_id',
+            'created_at',
+          ],
+          conversation_event: [
+            'id',
+            'conversation_id',
+            'sequence',
+            'event_type',
+            'payload',
+            'created_at',
+          ],
+          member_runtime: [
+            'id',
+            'conversation_id',
+            'member_id',
+            'copilot_session_id',
+            'workspace_path',
+            'status',
+            'active_execution_id',
+            'last_context_message_sequence',
+            'last_used_at',
+          ],
+          execution: [
+            'id',
+            'conversation_id',
+            'member_id',
+            'runtime_id',
+            'parent_execution_id',
+            'delegation_path',
+            'kind',
+            'status',
+            'prompt',
+            'response',
+            'error',
+            'waiting_for_runtime_id',
+            'retry_of_execution_id',
+            'decision',
+            'trigger_message_sequence',
+            'wake_reason',
+            'config_snapshot',
+            'started_at',
+            'ended_at',
+            'created_at',
+          ],
+        },
+      );
+
+      const indexes = (
+        handle
+          .prepare(
+            `SELECT name FROM sqlite_master
+             WHERE type = 'index' AND name NOT LIKE 'sqlite_%' ORDER BY name`,
+          )
+          .all() as unknown as Array<{ name: string }>
+      ).map((row) => row.name);
+      assert.deepEqual(indexes, [
+        'idx_conversation_event_replay',
+        'idx_conversation_member_state_wake',
+        'idx_execution_conversation_created',
+        'idx_execution_parent',
+        'idx_execution_status',
+        'idx_member_seed_key',
+        'idx_message_client_request',
+        'idx_message_conversation_created',
+        'idx_message_conversation_sequence',
+      ]);
     } finally {
       handle.close();
     }
   });
 
-  it('拒绝打开比本程序更新的 schema', () => {
+  it('已经是对的库：再跑一次什么都不做', () => {
+    const handle = openFixture('idempotent');
+    try {
+      assert.equal(migrate(handle).created, true);
+      const second = migrate(handle);
+      assert.equal(second.created, false);
+      assert.equal(second.from, SCHEMA_VERSION);
+      assert.equal(second.to, SCHEMA_VERSION);
+    } finally {
+      handle.close();
+    }
+  });
+
+  it('拒绝打开更旧的 schema，并且不假装能升上来', () => {
+    const handle = openFixture('older');
+    try {
+      migrate(handle);
+      handle.exec(`PRAGMA user_version = ${SCHEMA_VERSION - 1}`);
+      assert.throws(() => migrate(handle), /没有升级代码/);
+    } finally {
+      handle.close();
+    }
+  });
+
+  /**
+   * 库比程序新时**不能**建议删库重建 —— 那是用户的数据，而且换回新 build 就好了。
+   * 两个方向的错都指向同一个动作是最省事的写法，也是最容易毁数据的那种。
+   */
+  it('拒绝打开更新的 schema，且不给「删库重建」这种建议', () => {
     const handle = openFixture('future');
     try {
       migrate(handle);
       handle.exec(`PRAGMA user_version = ${SCHEMA_VERSION + 1}`);
-      assert.throws(() => migrate(handle), /高于本程序支持/);
+
+      let message = '';
+      assert.throws(
+        () => migrate(handle),
+        (error: Error) => {
+          message = error.message;
+          return true;
+        },
+      );
+      assert.match(message, /比本程序支持的/);
+      assert.doesNotMatch(message, /删掉数据目录/);
+    } finally {
+      handle.close();
+    }
+  });
+
+  it('有表但没有 user_version 登记：拒绝，不当成空库建表', () => {
+    const handle = openFixture('untracked');
+    try {
+      handle.exec('CREATE TABLE something (id TEXT PRIMARY KEY);');
+
+      assert.throws(() => migrate(handle), /没有 user_version 登记/);
+
+      // 拒绝必须是「什么都没做」：既没有加新表，也没有登记版本
+      const tables = (
+        handle
+          .prepare(
+            `SELECT name FROM sqlite_master
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name`,
+          )
+          .all() as unknown as Array<{ name: string }>
+      ).map((row) => row.name);
+      assert.deepEqual(tables, ['something']);
+      assert.equal(getUserVersion(handle), 0);
+    } finally {
+      handle.close();
+    }
+  });
+
+  /**
+   * SCHEMA_SQL 执行到一半失败时必须什么都不留下。
+   *
+   * 刻意让失败发生在最后一张表上：前面 7 张表和 4 个索引都已经建好了，
+   * 所以「整段回滚」和「建到一半留在那儿」是能区分开的。
+   */
+  it('建表中途失败：整段回滚，不留半成品，也不登记版本', () => {
+    const handle = openFixture('partial');
+    try {
+      // 一个同名 view 就够：它在 sqlite_master 里是 type='view'，不会触发
+      // 「有表但没有 user_version 登记」那道闸门，但最后的
+      // CREATE TABLE execution 会撞名失败。
+      handle.exec('CREATE VIEW execution AS SELECT 1 AS x');
+
+      assert.throws(() => migrate(handle), /already exists/i);
+
+      const left = (
+        handle
+          .prepare(
+            `SELECT name FROM sqlite_master
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`,
+          )
+          .all() as unknown as Array<{ name: string }>
+      ).map((row) => row.name);
+      assert.deepEqual(left, [], '回滚之后不该留下任何表');
+      assert.equal(getUserVersion(handle), 0);
     } finally {
       handle.close();
     }

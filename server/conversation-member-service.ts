@@ -408,8 +408,9 @@ export class ConversationMemberService {
 /**
  * 把落库的 reason 收窄回联合类型。
  *
- * 数据库里是自由 TEXT（加 CHECK 要重建表，见 db-migrations 的 v4 注释），所以
- * 读回来必须过这一层：认不出来的一律按最宽松的 open_discussion 处理。
+ * 数据库里是自由 TEXT（加 CHECK 只能重建表，而这张表被 conversation / member
+ * 两张表引用），取值由 domain.ts 的封闭联合守住，写入口只有 scheduler 一处，
+ * 所以读回来必须过这一层：认不出来的一律按最宽松的 open_discussion 处理。
  * RecoveryService 也用它，两处读同一列不能有两套判据。
  */
 export function asWakeReason(value: string | null): WakeReason {
