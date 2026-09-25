@@ -416,6 +416,133 @@ button:disabled {
   min-width: 200px;
 }
 
+/* ------------------------------------------------------- member profile */
+
+.member-row {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  cursor: default;
+}
+
+.member-row-ident {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.member-row-ident span {
+  color: #777;
+  font-size: 12px;
+}
+
+.member-row-actions {
+  display: flex;
+  gap: 4px;
+  flex: none;
+}
+
+.member-row-actions button {
+  font-size: 12px;
+  padding: 3px 8px;
+  border: 1px solid #d5d9de;
+  border-radius: 6px;
+  background: #fff;
+  cursor: pointer;
+}
+
+.member-row-actions button:hover {
+  background: #f2f4f7;
+}
+
+.profile-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(24, 28, 34, 0.32);
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  z-index: 20;
+}
+
+.profile-panel {
+  width: min(680px, 100%);
+  max-height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: #fff;
+  border-radius: 12px;
+  box-shadow: 0 18px 48px rgba(20, 24, 30, 0.24);
+  overflow: hidden;
+}
+
+.profile-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 14px 18px;
+  border-bottom: 1px solid #eee;
+}
+
+.profile-head h2 {
+  margin: 0 0 4px;
+  font-size: 18px;
+}
+
+.profile-head .sub {
+  margin: 0;
+}
+
+.tab-bar {
+  display: flex;
+  gap: 4px;
+  padding: 8px 12px 0;
+  border-bottom: 1px solid #eee;
+}
+
+.tab {
+  border: 0;
+  background: transparent;
+  padding: 8px 12px;
+  border-radius: 8px 8px 0 0;
+  cursor: pointer;
+  font-size: 13px;
+  color: #555;
+  border-bottom: 2px solid transparent;
+}
+
+.tab.selected {
+  color: #111;
+  font-weight: 700;
+  border-bottom-color: #3b7ddd;
+}
+
+.profile-body {
+  overflow-y: auto;
+  padding: 16px 18px 20px;
+}
+
+.radio-row {
+  display: flex;
+  gap: 16px;
+}
+
+.radio {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.field > textarea.tall {
+  min-height: 130px;
+}
+
+
 
 .runtime-strip {
   display: flex;

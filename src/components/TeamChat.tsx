@@ -12,6 +12,7 @@ import {
 } from '../lib/api';
 import { GroupCreator } from './team/GroupCreator';
 import { GroupMemberManager } from './team/GroupMemberManager';
+import { MemberProfile } from './team/MemberProfile';
 
 interface StreamState {
   executionId: string;
@@ -97,6 +98,14 @@ export function TeamChat() {
   const [newMemberRole, setNewMemberRole] = useState('');
   const [showGroupCreator, setShowGroupCreator] = useState(false);
   const [showMemberManager, setShowMemberManager] = useState(false);
+  /**
+   * 正在编辑档案的 Member。
+   *
+   * 刻意和「进入单聊」分开：member row 上 Chat / Edit 是两个独立动作。
+   * 把二者塞进同一个 handler，会让「想改一下它的 system prompt」变成
+   * 「顺手开了一个新会话」。
+   */
+  const [editingMemberId, setEditingMemberId] = useState<string | null>(null);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   // 供只依赖 conversationId 的 effect 读取最新 conversations，避免每次刷新都重连 SSE
@@ -115,6 +124,8 @@ export function TeamChat() {
     for (const member of members) map.set(member.id, member);
     return map;
   }, [members]);
+
+  const editingMember = editingMemberId ? (memberById.get(editingMemberId) ?? null) : null;
 
   function memberLabel(id: string): string {
     return memberById.get(id)?.name ?? `${id.slice(0, 8)}…`;
@@ -147,6 +158,31 @@ export function TeamChat() {
   function applyConversationChanged(next: Conversation) {
     setConversations((current) =>
       current.map((conversation) => (conversation.id === next.id ? next : conversation)),
+    );
+  }
+
+  /**
+   * Member 身份改完之后，两个地方都持有它的副本，必须一起更新：
+   *   members                     —— 侧栏、mention 解析、选择器
+   *   conversation.members        —— header 的成员 chip、recipient 下拉
+   * 漏掉后者会出现「名字改了但群里的 chip 还是旧的」。
+   *
+   * 归档的 Member 直接从侧栏移除（listMembers 只返回 active），但保留在
+   * conversation roster 里 —— 那是历史事实。
+   */
+  function applyMemberSaved(next: Member) {
+    setMembers((current) =>
+      next.status === 'active'
+        ? current.map((member) => (member.id === next.id ? next : member))
+        : current.filter((member) => member.id !== next.id),
+    );
+    setConversations((current) =>
+      current.map((conversation) => ({
+        ...conversation,
+        members: conversation.members.map((member) =>
+          member.id === next.id ? next : member,
+        ),
+      })),
     );
   }
 
@@ -427,7 +463,9 @@ export function TeamChat() {
     setNewMemberName('');
     setNewMemberRole('');
     setShowNewMember(false);
-    await createDirect(result.member);
+    // 新建只拿到 name + role，personality / system prompt / model 还是空的。
+    // 直接开一个单聊等于让一个空壳人格开始干活，所以先把档案页打开。
+    setEditingMemberId(result.member.id);
   }
 
   async function send() {
@@ -495,15 +533,24 @@ export function TeamChat() {
           {members.length === 0 && <p className="sidebar-hint">还没有 Member，点 + 创建一个。</p>}
 
           {members.map((member) => (
-            <button
-              key={member.id}
-              type="button"
-              className="member-row"
-              onClick={() => void createDirect(member)}
-            >
-              <strong>{member.name}</strong>
-              <span>{member.role}</span>
-            </button>
+            <div key={member.id} className="member-row">
+              <div className="member-row-ident">
+                <strong>{member.name}</strong>
+                <span>{member.role}</span>
+              </div>
+              <div className="member-row-actions">
+                <button type="button" onClick={() => void createDirect(member)}>
+                  Chat
+                </button>
+                <button
+                  type="button"
+                  className="ghost"
+                  onClick={() => setEditingMemberId(member.id)}
+                >
+                  Edit
+                </button>
+              </div>
+            </div>
           ))}
 
           {showGroupCreator ? (
@@ -719,6 +766,14 @@ export function TeamChat() {
           </>
         )}
       </section>
+
+      {editingMember && (
+        <MemberProfile
+          member={editingMember}
+          onSaved={applyMemberSaved}
+          onClose={() => setEditingMemberId(null)}
+        />
+      )}
     </div>
   );
 }
