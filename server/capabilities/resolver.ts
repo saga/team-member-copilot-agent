@@ -30,7 +30,7 @@ export class CapabilityResolver {
 
   /** 校验 Provider ID 都存在（写能力组成之前调用，把错误挡在落库之前）。 */
   validate(capabilities: MemberCapabilities): void {
-    this.registry.validateMemberCapabilities(capabilities);
+    this.registry.validateCapabilities(capabilities);
   }
 
   /**
@@ -44,7 +44,7 @@ export class CapabilityResolver {
     context: CapabilityContext,
     capabilities: MemberCapabilities,
   ): Promise<RuntimeCapabilities> {
-    this.registry.validateMemberCapabilities(capabilities);
+    this.registry.validateCapabilities(capabilities);
 
     const skillEntries: ResolvedSkill[] = [];
     for (const binding of capabilities.skills) {

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import path from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { config } from '../config.js';
 import type { CopilotService, RunMemberTurnInput } from '../copilot.js';
@@ -54,19 +55,27 @@ export interface TestStack extends CapabilityStack {
  */
 export function createCapabilityStack(
   db: DatabaseSync,
-  members: MemberService,
+  _members: MemberService,
   resolveTeam: () => TeamService,
 ): CapabilityStack {
   const capabilities = new CapabilityService(db);
   const knowledge = new LocalFilesystemKnowledgeProvider(db, capabilities);
 
   const registry = new CapabilityRegistry();
+  // 三个 scope 都要注册，顺序与 app.ts 一致：global / team / member 三层 skill。
+  // 只注册后两个的话，能力模板里引用的 `global.filesystem-skills` 在测试里
+  // 会变成「未注册 Provider」—— 而它在生产里是存在的。
   registry.registerSkillProvider(
-    new FilesystemSkillProvider('team.filesystem-skills', config.teamSkillRoot),
+    new FilesystemSkillProvider('global.filesystem-skills', config.globalSkillRoot),
+  );
+  registry.registerSkillProvider(
+    new FilesystemSkillProvider('team.filesystem-skills', (context) =>
+      path.join(config.teamSkillRoot, context.teamId),
+    ),
   );
   registry.registerSkillProvider(
     new FilesystemSkillProvider('member.filesystem-skills', (context) =>
-      members.skillsPath(context.memberId),
+      path.join(config.memberHomeRoot, context.memberId, 'skills'),
     ),
   );
   registry.registerKnowledgeProvider(knowledge);
@@ -111,9 +120,22 @@ export function createTestStack(
   return { ...stack, team, structure };
 }
 
-/** 直接调 Provider 时用的最小上下文。 */
-export function capabilityContext(memberId: string): CapabilityContext {
-  return { memberId, conversationId: 'test-conversation', executionId: 'test-execution', userId: 'test-user' };
+/**
+ * 直接调 Provider 时用的最小上下文。
+ *
+ * `teamId` 有默认值，因为绝大多数用例只关心「这个 Member 拿到什么」而不关心
+ * 是哪个 Team。但 Provider 侧会用它去校验 Team 级能力（skill 根目录、knowledge
+ * binding），所以需要真 Team 的用例必须显式传 —— 编造的 teamId 会在
+ * `assertTeamExists` 那里变成 404。
+ */
+export function capabilityContext(memberId: string, teamId = 'test-team'): CapabilityContext {
+  return {
+    teamId,
+    memberId,
+    conversationId: 'test-conversation',
+    executionId: 'test-execution',
+    userId: 'test-user',
+  };
 }
 
 /**

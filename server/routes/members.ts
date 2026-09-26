@@ -1,4 +1,4 @@
-import express, { Router } from 'express';
+import { Router } from 'express';
 import { z } from 'zod';
 import type { TeamService } from '../team-service.js';
 import { sendError } from '../middleware/errorHandler.js';
@@ -168,65 +168,8 @@ export function membersRouter(team: TeamService) {
     }
   });
 
-  // --------------------------------------------------------------- skills
-
-  router.get('/:id/skills', (req, res) => {
-    try {
-      res.json({ skills: team.listMemberSkills(req.params.id) });
-    } catch (error) {
-      sendError(res, error);
-    }
-  });
-
-  /**
-   * 上传安装一个 skill（zip）。
-   *
-   * 用 raw body 而不是 multipart：只需要一个文件，引入 multipart parser 只会
-   * 多一层依赖和一个临时目录。文件名走 query —— `X-` 头在部分代理上会被吃掉。
-   *
-   * Content-Type 必须落在下面的白名单里，否则 express.raw 不会解析，body 会是
-   * 一个普通对象而不是 Buffer（这时按 400 处理，而不是让 Buffer.isBuffer 静默失败）。
-   */
-  router.post(
-    '/:id/skills',
-    express.raw({
-      type: ['application/zip', 'application/x-zip-compressed', 'application/octet-stream'],
-      limit: '25mb',
-    }),
-    (req, res) => {
-      if (!canAdmin(req)) {
-        res.status(403).json({ error: '需要 Team owner/admin（或有效的 ADMIN_API_TOKEN）' });
-        return;
-      }
-      if (!Buffer.isBuffer(req.body)) {
-        res.status(400).json({
-          error: '请以 application/zip（或 application/octet-stream）上传 skill 压缩包',
-        });
-        return;
-      }
-
-      const filename = typeof req.query.filename === 'string' ? req.query.filename : 'skill.zip';
-
-      try {
-        res.status(201).json({ skill: team.installMemberSkill(req.params.id, req.body, filename) });
-      } catch (error) {
-        sendError(res, error);
-      }
-    },
-  );
-
-  router.delete('/:id/skills/:name', (req, res) => {
-    if (!canAdmin(req)) {
-      res.status(403).json({ error: '需要 Team owner/admin（或有效的 ADMIN_API_TOKEN）' });
-      return;
-    }
-    try {
-      team.removeMemberSkill(req.params.id, req.params.name);
-      res.json({ skills: team.listMemberSkills(req.params.id) });
-    } catch (error) {
-      sendError(res, error);
-    }
-  });
+  // Skill 的安装 / 列举 / 删除不在这里：skill 内容投放有三个 scope
+  // （global / team / member），见 routes/skills.ts 的 /api/capabilities/skills/*。
 
   return router;
 }

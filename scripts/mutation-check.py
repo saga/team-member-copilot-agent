@@ -1,7 +1,8 @@
 """变异验证：把关键实现改回错误写法，确认对应的断言真的变红。
 
 每个变异只改一处，跑一个定向测试文件，断言它失败，然后按内存里的原文还原
-（不走 git —— 这些文件里可能有尚未提交的改动）。
+（不走 git —— 这些文件里可能有尚未提交的改动）。开跑之前先做一次基线预检：
+测试文件本身就是红的就直接停，否则「上一次被中断留下的变异」会被误读成锚点写错。
 
 **超时算「捕获」**：有些变异会把系统推进死循环（例如拿掉「已经有人回答过就不再兜底」
 这一关，兜底会自我循环），测试不会红，而是一直跑下去。挂死也是一种失败 ——
@@ -140,13 +141,13 @@ MUTATIONS = [
         "steps": [
             (
                 "server/member-template-seeder.ts",
-                "    const templateCapabilities: MemberCapabilities = template.capabilities;\n    resolver.validate(templateCapabilities);\n\n    const member = memberService.create(",
-                "    const templateCapabilities: MemberCapabilities = template.capabilities;\n\n    const member = memberService.create(",
+                "    const memberCapabilities: MemberCapabilities = template.capabilities;\n    resolver.validate(memberCapabilities);\n\n    const member = memberService.create(",
+                "    const memberCapabilities: MemberCapabilities = template.capabilities;\n\n    const member = memberService.create(",
             ),
             (
                 "server/member-template-seeder.ts",
-                "    capabilities.replace(member.id, templateCapabilities);\n",
-                "    capabilities.replace(member.id, templateCapabilities);\n    resolver.validate(templateCapabilities);\n",
+                "    capabilities.replaceMember(member.id, memberCapabilities);\n",
+                "    capabilities.replaceMember(member.id, memberCapabilities);\n    resolver.validate(memberCapabilities);\n",
             ),
         ],
     },
@@ -154,7 +155,7 @@ MUTATIONS = [
         "name": "模板能力完全不校验",
         "test": "server/test/member-template-seeder.test.ts",
         "steps": [
-            ("server/member-template-seeder.ts", "    resolver.validate(templateCapabilities);\n", "")
+            ("server/member-template-seeder.ts", "    resolver.validate(memberCapabilities);\n", "")
         ],
     },
     {
@@ -507,6 +508,93 @@ MUTATIONS = [
             )
         ],
     },
+    # ── Capability 三层（global + team + member）────────────────────────────
+    {
+        "name": "三层合并顺序反了（member 被 global 盖住）",
+        "test": "server/test/capabilities.test.ts",
+        "steps": [
+            (
+                "server/capabilities/service.ts",
+                "    return mergeCapabilities(this.getGlobal(), this.getTeam(teamId), this.getMember(memberId));",
+                "    return mergeCapabilities(this.getMember(memberId), this.getTeam(teamId), this.getGlobal());",
+            )
+        ],
+    },
+    {
+        "name": "跨层不去重（同一个资料源被解析两次）",
+        "test": "server/test/capabilities.test.ts",
+        "steps": [
+            (
+                "server/capabilities/service.ts",
+                "      const key = `${binding.providerId}\\u0000${binding.selector ?? ''}`;\n      if (seen.has(key)) continue;\n      seen.add(key);\n",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "改 Team 能力时顺带 touch 所有 Member（memberRevision 全体失真）",
+        "test": "server/test/capabilities.test.ts",
+        "steps": [
+            (
+                "server/capabilities/service.ts",
+                "      this.deleteScope(scope);\n      this.insertBindings(scope, capabilities, timestamp);\n",
+                "      this.deleteScope(scope);\n      this.insertBindings(scope, capabilities, timestamp);\n      this.db.prepare(`UPDATE member SET updated_at = ?`).run(timestamp);\n",
+            )
+        ],
+    },
+    # ── guard 是授权第一道闸（P0）──────────────────────────────────────────
+    {
+        "name": "guard 定义了但不执行（Policy 放行就能跑）",
+        "test": "server/test/capabilities.test.ts",
+        "steps": [
+            (
+                "server/capabilities/copilot-adapter.ts",
+                "    if (tool.guard) {\n      const guardDecision = await tool.guard({ ...context, toolName: tool.name }, args);\n      if (!guardDecision.allowed) {\n        return { allowed: false, reason: guardDecision.reason };\n      }\n    }\n\n",
+                "",
+            )
+        ],
+    },
+    # ── skill zip 的三道闸（P0）────────────────────────────────────────────
+    {
+        "name": "skill zip 不拒绝 symlink（把 workspace 外的东西带进来）",
+        "test": "server/test/member-skills.test.ts",
+        "steps": [
+            (
+                "server/skill-service.ts",
+                "      if (stat.isSymbolicLink()) {\n        throw Object.assign(\n          new Error(`skill zip 不允许 symbolic link：${entry.name}`),\n          { status: 400 },\n        );\n      }\n\n",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "skill zip 不限制解压后文件数（zip bomb）",
+        "test": "server/test/member-skills.test.ts",
+        "steps": [
+            (
+                "server/skill-service.ts",
+                "      if (fileCount > MAX_EXTRACTED_FILES) {\n        throw Object.assign(\n          new Error(`skill zip 解压后文件数超过 ${MAX_EXTRACTED_FILES}`),\n          { status: 400 },\n        );\n      }\n\n",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "解压前不校验 zip 条目（路径穿越写得出去）",
+        "test": "server/test/member-skills.test.ts",
+        "steps": [
+            ("server/skill-service.ts", "      assertZipEntriesSafe(zipPath);\n", "")
+        ],
+    },
+    {
+        "name": "同名 skill 静默覆盖（丢掉已经装好的那一份）",
+        "test": "server/test/member-skills.test.ts",
+        "steps": [
+            (
+                "server/skill-service.ts",
+                "      if (fs.existsSync(target)) {\n        throw Object.assign(new Error(`Skill ${name} 已存在`), { status: 409 });\n      }\n\n",
+                "",
+            )
+        ],
+    },
 ]
 
 
@@ -527,7 +615,28 @@ def mutate(mutation):
     return originals, mutated
 
 
+def preflight(test_files: list[str]) -> bool:
+    """先跑一遍基线：任何一个测试文件自己就是红的，就不该开始做变异验证。
+
+    这不只是「省得白跑」。还原靠的是内存里的原文，所以上一次运行被杀掉会留下一个
+    停在某个变异上的源文件 —— 那种状态下继续跑，那条变异会报「变异没打上」，
+    看起来像脚本的锚点写错了，实际是工作区不干净。基线红了就直接停，把话说清楚。
+    """
+    broken = [rel for rel in test_files if not run_test(rel)]
+    if not broken:
+        return True
+
+    print("基线不干净：以下测试文件本身是红的，先修好再跑变异验证。")
+    for rel in broken:
+        print(f"  - {rel}")
+    print("（若上次运行被中断，源文件可能还停在某个变异上 —— 看 git diff。）")
+    return False
+
+
 def main() -> int:
+    if not preflight(sorted({mutation["test"] for mutation in MUTATIONS})):
+        return 1
+
     failures = []
     for index, mutation in enumerate(MUTATIONS, start=1):
         print(f"[{index:>2}] {mutation['name']}")

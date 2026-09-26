@@ -1,0 +1,16 @@
+{
+  "skills": [
+    {
+      "providerId": "global.filesystem-skills"
+    }
+  ],
+  "knowledge": [],
+  "tools": [
+    {
+      "providerId": "team.core-tools"
+    },
+    {
+      "providerId": "knowledge.tools"
+    }
+  ]
+}

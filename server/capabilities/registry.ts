@@ -114,8 +114,12 @@ export class CapabilityRegistry {
    * 只校验「这个 Provider 有没有」，不校验 selector 指向的资料源存不存在 ——
    * 那是 Provider 自己的语义（三类 Provider 的 selector 含义完全不同），
    * 注册表没有资格解释它。
+   *
+   * 名字不带 Member：它校验的是任意一层（global / team / member）的能力组成，
+   * 而这三层用的是同一份契约。带 Member 会让「校验 global 层」读起来像是在
+   * 校验某个人的东西。
    */
-  validateMemberCapabilities(capabilities: MemberCapabilities): void {
+  validateCapabilities(capabilities: MemberCapabilities): void {
     for (const binding of capabilities.skills) this.skillProvider(binding.providerId);
     for (const binding of capabilities.knowledge) this.knowledgeProvider(binding.providerId);
     for (const binding of capabilities.tools) this.toolProvider(binding.providerId);

@@ -11,7 +11,22 @@ import { execFileSync } from 'node:child_process';
 export interface ZipEntry {
   path: string;
   content: string;
+  /**
+   * Unix mode（含类型位）。省略 = 普通文件 `0o644`。
+   *
+   * 需要它才能造出**符号链接条目**：zip 里没有独立的「这是链接」标记，
+   * 链接是靠 central directory 的 external attributes 高位上的 `S_IFLNK`
+   * 表达的，内容则是链接目标路径。没有这个字段就测不了「拒绝 symlink」。
+   */
+  mode?: number;
 }
+
+/** `version made by` 的 UNIX 标记（高字节 3 = Unix，低字节是版本号 30）。 */
+const MADE_BY_UNIX = 0x031e;
+const MODE_FILE = 0o644;
+
+/** 一个指向 `target` 的符号链接条目（`S_IFLNK | 0777`）。 */
+export const SYMLINK_MODE = 0o120777;
 
 /** 标准 CRC-32（IEEE 802.3），表和 zip 规范附录里的那张一致。 */
 const CRC_TABLE = (() => {
@@ -65,7 +80,8 @@ export function buildZip(entries: ZipEntry[]): Buffer {
 
     const central = Buffer.alloc(46 + name.length);
     central.writeUInt32LE(0x02014b50, 0);
-    central.writeUInt16LE(20, 4);
+    // UNIX 才能让 unzip 按 external attributes 还原权限 / 符号链接
+    central.writeUInt16LE(MADE_BY_UNIX, 4);
     central.writeUInt16LE(20, 6);
     central.writeUInt16LE(0, 8);
     central.writeUInt16LE(0, 10);
@@ -79,7 +95,7 @@ export function buildZip(entries: ZipEntry[]): Buffer {
     central.writeUInt16LE(0, 32);
     central.writeUInt16LE(0, 34);
     central.writeUInt16LE(0, 36);
-    central.writeUInt32LE(0, 38);
+    central.writeUInt32LE(((entry.mode ?? MODE_FILE) << 16) >>> 0, 38);
     central.writeUInt32LE(offset, 42);
     name.copy(central, 46);
     centrals.push(central);

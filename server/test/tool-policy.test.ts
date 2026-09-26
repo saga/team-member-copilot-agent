@@ -65,6 +65,7 @@ function tool(overrides: Partial<RuntimeTool> = {}): RuntimeTool {
 
 function context(toolName: string): ToolExecutionContext {
   return {
+    teamId: 't1',
     memberId: 'm1',
     conversationId: 'c1',
     executionId: 'e1',

@@ -28,7 +28,7 @@ const { MemberService } = await import('../member-service.js');
 const { CopilotService, isSessionNotFound, isTurnTimeout } = await import('../copilot.js');
 const { DefaultToolPolicy } = await import('../tool-policy.js');
 import type { PolicyService } from '../policy.js';
-const { defaultMemberCapabilities } = await import('../capabilities/defaults.js');
+import type { MemberCapabilities } from '../domain.js';
 const { createTestStack, capabilityContext, singleExecutionId, muteAllMembers } = await import(
   './support.js'
 );
@@ -98,10 +98,31 @@ const { team, resolver: capabilityResolver } = stack;
 const alice = team.createMember({ name: 'Alice', role: 'Analyst' });
 const bob = team.createMember({ name: 'Bob', role: 'Reviewer' });
 
-/** 默认能力（团队 skill + 个人 skill + 个人资料库 + 协作/检索工具，无宿主工具）。 */
+/** 当前部署的唯一 Team（建人时会自动建出来）。 */
+const defaultTeam = stack.structure.ensureDefaultTeam();
+
+/**
+ * 一个普通 Member 的 **Member 层增量**。
+ *
+ * 这里手工写一份而不是从模板 provision：本文件考的是 runtime 机制（resume
+ * 降级、超时 abort、execution 状态机），不是能力组合。但必须真的写进 member
+ * 层 —— Provider 侧的 ACL 判据会按 (teamId, memberId) 回查 binding，光有一份
+ * 字面量会在 `assertMemberCanAccess` 那里变成 403。
+ */
+function memberCapabilities(): MemberCapabilities {
+  return {
+    skills: [{ providerId: 'team.filesystem-skills' }, { providerId: 'member.filesystem-skills' }],
+    knowledge: [{ providerId: 'local.filesystem-knowledge', selector: '$personal' }],
+    tools: [{ providerId: 'team.core-tools' }, { providerId: 'knowledge.tools' }],
+  };
+}
+
+stack.capabilities.replaceMember(alice.id, memberCapabilities());
+
+/** 这一轮生效的能力（无宿主工具）。 */
 const defaultCapabilities = await capabilityResolver.resolve(
-  capabilityContext(alice.id),
-  defaultMemberCapabilities(),
+  capabilityContext(alice.id, defaultTeam.id),
+  memberCapabilities(),
 );
 
 /**
@@ -111,12 +132,9 @@ const defaultCapabilities = await capabilityResolver.resolve(
  * （`ToolPolicy.allowHostTools`）。两个开关是独立的，所以下面把「声明」与
  * 「放行」分开断言 —— 只测其中一个会漏掉一半。
  */
-const hostCapabilities = await capabilityResolver.resolve(capabilityContext(alice.id), {
-  ...defaultMemberCapabilities(),
-  tools: [
-    ...defaultMemberCapabilities().tools,
-    { providerId: 'runtime.host-coding-tools' },
-  ],
+const hostCapabilities = await capabilityResolver.resolve(capabilityContext(alice.id, defaultTeam.id), {
+  ...memberCapabilities(),
+  tools: [...memberCapabilities().tools, { providerId: 'runtime.host-coding-tools' }],
 });
 
 // ═══════════════════════════════════════════ 1. 错误分类（纯函数）
@@ -292,6 +310,7 @@ function turnInput(
     prompt: 'hello',
     executionId: 'exec-1',
     conversationId: 'conv-1',
+    teamId: defaultTeam.id,
     capabilities: capabilities ?? defaultCapabilities,
     ...rest,
   };

@@ -28,6 +28,7 @@ const { MAX_DOCUMENT_BYTES } = await import(
   '../capabilities/providers/knowledge-document-limits.js'
 );
 const { createCapabilityStack, capabilityContext } = await import('./support.js');
+const { TeamStructureService } = await import('../team-structure-service.js');
 const { PERSONAL_SELECTOR } = await import(
   '../capabilities/providers/filesystem-knowledge.js'
 );
@@ -44,6 +45,15 @@ const stack = createCapabilityStack(db, memberService, () => {
 const knowledge = stack.knowledge;
 const capabilities = stack.capabilities;
 
+/**
+ * 真实 Team 行。
+ *
+ * Team 级 knowledge 的 ACL 判据是 `hasEffectiveKnowledgeBinding(teamId, ...)`，
+ * 而它会先确认 Team 存在 —— 编造的 teamId 会变成 404，把「未绑定」和「没有这个
+ * Team」两件事混成同一个错误。
+ */
+const team = new TeamStructureService(db).ensureDefaultTeam();
+
 const PROVIDER = knowledge.id;
 
 function makeMember(name: string, handle: string) {
@@ -52,8 +62,8 @@ function makeMember(name: string, handle: string) {
 
 /** 只改 knowledge 一类绑定，skills / tools 保持原样。 */
 function bindKnowledge(memberId: string, selectors: string[]): void {
-  capabilities.replace(memberId, {
-    ...capabilities.get(memberId),
+  capabilities.replaceMember(memberId, {
+    ...capabilities.getMember(memberId),
     knowledge: selectors.map((selector) => ({ providerId: PROVIDER, selector })),
   });
 }
@@ -61,11 +71,11 @@ function bindKnowledge(memberId: string, selectors: string[]): void {
 const binding = (selector: string) => ({ providerId: PROVIDER, selector });
 
 function search(memberId: string, selector: string, query: string, limit = 8) {
-  return knowledge.search(capabilityContext(memberId), binding(selector), query, limit);
+  return knowledge.search(capabilityContext(memberId, team.id), binding(selector), query, limit);
 }
 
 function open(memberId: string, documentRef: string) {
-  return knowledge.open(capabilityContext(memberId), documentRef);
+  return knowledge.open(capabilityContext(memberId, team.id), documentRef);
 }
 
 describe('knowledge base 基本流', () => {
@@ -109,7 +119,10 @@ describe('knowledge base 基本流', () => {
 
     // 模板开箱即引用 selector，资料目录可能还没有：解析必须照常工作，
     // 而不是沿 resolver → turn 抛 404 把整个 Member 的对话废掉。
-    const sources = await knowledge.listSources(capabilityContext(member.id), binding('financial-core'));
+    const sources = await knowledge.listSources(
+      capabilityContext(member.id, team.id),
+      binding('financial-core'),
+    );
     assert.equal(sources.length, 1);
     assert.equal(sources[0].scope, 'team');
 

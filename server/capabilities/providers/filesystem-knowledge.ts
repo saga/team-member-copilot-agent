@@ -36,8 +36,8 @@ import type {
  *
  * ── 权限 ──────────────────────────────────────────────────────────────
  *
- * ACL 的判据是 **member_capability_binding**（`hasKnowledgeBinding`），不是
- * 「这个库存不存在」。两处必须分别成立：
+ * ACL 的判据是 **capability_binding**（`hasEffectiveKnowledgeBinding`），三层都算
+ * （global / team / member），不是「这个库存不存在」。两处必须分别成立：
  *
  *   search   —— 检索被**限定在**这一个已授权的 KB 上（WHERE d.knowledge_base_id = ?），
  *               而不是搜完全库再过滤；两者的区别是后者会让未授权文档的 snippet
@@ -59,7 +59,7 @@ export class LocalFilesystemKnowledgeProvider implements KnowledgeProvider {
   // ------------------------------------------------------------- Provider
 
   async listSources(context: CapabilityContext, binding: CapabilityBinding): Promise<KnowledgeSource[]> {
-    const kb = this.baseForBinding(context.memberId, binding.selector ?? '');
+    const kb = this.baseForBinding(context.teamId, context.memberId, binding.selector ?? '');
     return [
       {
         providerId: this.id,
@@ -80,7 +80,7 @@ export class LocalFilesystemKnowledgeProvider implements KnowledgeProvider {
     const normalized = query.trim();
     if (!normalized) return [];
 
-    const kb = this.baseForBinding(context.memberId, binding.selector ?? '');
+    const kb = this.baseForBinding(context.teamId, context.memberId, binding.selector ?? '');
     const safeLimit = Math.min(Math.max(Math.trunc(limit) || 8, 1), 12);
 
     const rows = this.db
@@ -159,7 +159,7 @@ export class LocalFilesystemKnowledgeProvider implements KnowledgeProvider {
       updatedAt: '',
     };
 
-    this.assertMemberCanAccess(context.memberId, kb);
+    this.assertMemberCanAccess(context.teamId, context.memberId, kb);
 
     // DB 里存的 relative_path 当初写入时已过 safeSegment，读的时候仍走同一条
     // 校验路径 —— 双保险的成本是一行代码，收益是「DB 被手工改过」也不成立。
@@ -348,8 +348,13 @@ export class LocalFilesystemKnowledgeProvider implements KnowledgeProvider {
 
   // ------------------------------------------------------------------ 内部
 
-  /** selector → 能访问的 KB 行。所有检索/打开路径都必须先过这里。 */
-  private baseForBinding(memberId: string, selector: string): KnowledgeBase {
+  /**
+   * selector → 能访问的 KB 行。所有检索/打开路径都必须先过这里。
+   *
+   * `teamId` 是必需的：授权判据（hasEffectiveKnowledgeBinding）要覆盖
+   * global / team / member 三层，而「这个 Member 属于哪个 Team」只有调用方知道。
+   */
+  private baseForBinding(teamId: string, memberId: string, selector: string): KnowledgeBase {
     if (!selector) {
       throw badRequest(
         `knowledge binding 缺少 selector：不知道要指向哪个资料源（本地后端用 KB key 或 ${PERSONAL_SELECTOR}）`,
@@ -362,12 +367,12 @@ export class LocalFilesystemKnowledgeProvider implements KnowledgeProvider {
         .get(memberId) as unknown as { name: string } | undefined;
       if (!member) throw notFound(`Member 不存在：${memberId}`);
       const kb = this.ensurePersonalKnowledgeBase(memberId, member.name);
-      this.assertMemberCanAccess(memberId, kb);
+      this.assertMemberCanAccess(teamId, memberId, kb);
       return kb;
     }
 
-    const kb = this.ensureBoundTeamKnowledgeBase(memberId, selector);
-    this.assertMemberCanAccess(memberId, kb);
+    const kb = this.ensureBoundTeamKnowledgeBase(teamId, memberId, selector);
+    this.assertMemberCanAccess(teamId, memberId, kb);
     return kb;
   }
 
@@ -383,16 +388,20 @@ export class LocalFilesystemKnowledgeProvider implements KnowledgeProvider {
    * 只有**不存在**的库才看 binding：已授权 → 补建，未授权 → 404，
    * 模型编造的 selector 或越权探测不会凭空留下 KB 行。
    */
-  private ensureBoundTeamKnowledgeBase(memberId: string, selector: string): KnowledgeBase {
+  private ensureBoundTeamKnowledgeBase(
+    teamId: string,
+    memberId: string,
+    selector: string,
+  ): KnowledgeBase {
     const existing = this.findByKey('team', selector);
     if (existing) return existing;
-    if (!this.capabilities.hasKnowledgeBinding(memberId, this.id, selector)) {
+    if (!this.capabilities.hasEffectiveKnowledgeBinding(teamId, memberId, this.id, selector)) {
       throw notFound(`Knowledge source 不存在：${selector}`);
     }
     return this.createTeamKnowledgeBase({ key: selector, name: selector });
   }
 
-  private assertMemberCanAccess(memberId: string, kb: KnowledgeBase): void {
+  private assertMemberCanAccess(teamId: string, memberId: string, kb: KnowledgeBase): void {
     // personal 的属主判断不能省：`$personal` 这条 binding 每个 Member 都有，
     // 光看 binding 会让 A 打开 B 的个人资料。
     if (kb.scope === 'personal' && kb.memberId !== memberId) {
@@ -400,7 +409,7 @@ export class LocalFilesystemKnowledgeProvider implements KnowledgeProvider {
     }
 
     const selector = kb.scope === 'personal' ? PERSONAL_SELECTOR : kb.key;
-    if (!this.capabilities.hasKnowledgeBinding(memberId, this.id, selector)) {
+    if (!this.capabilities.hasEffectiveKnowledgeBinding(teamId, memberId, this.id, selector)) {
       throw forbidden(`该 Member 未绑定 Knowledge source：${selector}`);
     }
   }

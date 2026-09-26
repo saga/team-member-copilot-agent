@@ -17,11 +17,9 @@ import {
   MemberService,
   type CreateMemberInput,
   type MemberMemory,
-  type MemberSkill,
   type UpdateMemberInput,
 } from './member-service.js';
 import type { CopilotService } from './copilot.js';
-import { defaultMemberCapabilities } from './capabilities/defaults.js';
 import type { CapabilityResolver } from './capabilities/resolver.js';
 import type { CapabilityService } from './capabilities/service.js';
 import type { TeamStructureService } from './team-structure-service.js';
@@ -37,6 +35,7 @@ import {
   type ExternalWorkSnapshot,
 } from './work-management/types.js';
 import type {
+  CapabilityConfig,
   Conversation,
   ConversationEvent,
   ConversationEventType,
@@ -389,18 +388,21 @@ export class TeamService {
     return this.members.get(id);
   }
 
+  /**
+   * 手工创建 Member。
+   *
+   * 刻意**不写任何能力绑定**：能力现在是 global + team + member 三层叠加，
+   * 新建的人自动继承前两层。给它写一份「默认能力」等于把公司级/团队级的
+   * 基线复制到这个人的私有层 —— 之后管理员改 Team 能力，这个人不会跟着变，
+   * 而且没有任何地方看得出原因。
+   */
   createMember(input: CreateMemberInput): Member {
     const member = this.members.create(input);
-    // 手工建出来的人也要有一组能跑起来的默认能力：skill 来源、个人资料库、
-    // 协作与检索工具。缺了它的症状是「新同事像是不会用工具」。
-    this.capabilities.replace(member.id, defaultMemberCapabilities());
     // 新 Agent 自动加入默认 Team。membership 是组织状态，不是 persona 的一部分。
-    try {
+    if (this.structure) {
       const team = this.defaultTeam();
-      this.structure?.ensureAgentMembership(team.id, member.id);
-      this.structure?.touchPresence(team.id, 'agent', member.id);
-    } catch {
-      // structure 尚未装配（测试只建 TeamService 时）则跳过，membership 由上层补。
+      this.structure.ensureAgentMembership(team.id, member.id);
+      this.structure.touchPresence(team.id, 'agent', member.id);
     }
     return member;
   }
@@ -412,22 +414,61 @@ export class TeamService {
 
   // --------------------------------------------------------------- 能力
 
+  /** 这个 Member 的**私有增量**能力。不是 effective —— 要那一份用 getCapabilityConfig。 */
   getMemberCapabilities(memberId: string): MemberCapabilities {
     this.members.get(memberId);
-    return this.capabilities.get(memberId);
+    return this.capabilities.getMember(memberId);
   }
 
   /**
-   * 全量替换某个 Member 的能力组成。
+   * 三层声明 + 解析结果。
+   *
+   * 管理界面靠它同时回答两个问题：「这个人最终能用什么」（effective）和
+   * 「这些能力分别是哪一层给的」（global / team / member）。
+   */
+  getCapabilityConfig(teamId: string, memberId: string): CapabilityConfig {
+    this.members.get(memberId);
+    if (this.structure) {
+      this.structure.getTeam(teamId);
+    }
+    return this.capabilities.getConfig(teamId, memberId);
+  }
+
+  getGlobalCapabilities(): MemberCapabilities {
+    return this.capabilities.getGlobal();
+  }
+
+  getTeamCapabilities(teamId: string): MemberCapabilities {
+    return this.capabilities.getTeam(teamId);
+  }
+
+  /**
+   * 全量替换 global 层能力。
    *
    * 先校验再落库：一个拼错的 Provider ID 必须在这里就失败，而不是等到下一轮
-   * turn 才发现「这个 Member 少了检索能力」—— 那时错误会表现为一个奇怪的回答，
+   * turn 才发现「所有人的能力都少了一块」—— 那时错误会表现为一个奇怪的回答，
    * 而不是一条错误。
+   */
+  updateGlobalCapabilities(capabilities: MemberCapabilities): MemberCapabilities {
+    this.capabilityResolver.validate(capabilities);
+    return this.capabilities.replaceGlobal(capabilities);
+  }
+
+  updateTeamCapabilities(teamId: string, capabilities: MemberCapabilities): MemberCapabilities {
+    this.capabilityResolver.validate(capabilities);
+    return this.capabilities.replaceTeam(teamId, capabilities);
+  }
+
+  /**
+   * 全量替换某个 Member 的**增量**能力。
+   *
+   * 只动 member 层：global / team 两层是继承来的，不属于这个人。所以「把某人
+   * 的能力清空」= 它退回团队基线，而不是变成一个什么都不会的人。
    */
   updateMemberCapabilities(memberId: string, capabilities: MemberCapabilities): MemberCapabilities {
     this.members.get(memberId);
     this.capabilityResolver.validate(capabilities);
-    return this.capabilities.replace(memberId, capabilities);
+    return this.capabilities.replaceMember(memberId, capabilities);
   }
 
   updateMember(id: string, input: UpdateMemberInput): Member {
@@ -1443,26 +1484,6 @@ export class TeamService {
     return this.members.replaceMemory(memberId, content, expectedVersion);
   }
 
-  // ------------------------------------------------------------ Skill
-
-  /**
-   * Member 自己的 skill 目录（`.data/members/<id>/skills/`）。
-   *
-   * 这些目录会通过 Copilot SDK 的 `skillDirectories` 挂进该 Member 的每一个
-   * session，所以它是**能力**，不是附件。
-   */
-  listMemberSkills(memberId: string): MemberSkill[] {
-    return this.members.listSkills(memberId);
-  }
-
-  installMemberSkill(memberId: string, archive: Buffer, filename: string): MemberSkill {
-    return this.members.installSkill(memberId, archive, filename);
-  }
-
-  removeMemberSkill(memberId: string, name: string): void {
-    this.members.removeSkill(memberId, name);
-  }
-
   // ------------------------------------------------------------- Execution
 
   getExecution(id: string): ExecutionRecord {
@@ -2075,7 +2096,12 @@ export class TeamService {
       // 能力解析必须在拼 system prompt 之前：prompt 里的资料源清单就是解析结果
       // （Provider 说这个 Member 能看哪些源），两者共用一次解析，模型被明确告知
       // 的源与它实际搜得到的源因此永远一致。
-      const runtimeCapabilities = await this.resolveCapabilities(input.member, executionId, input.conversation.id);
+      const runtimeCapabilities = await this.resolveCapabilities(
+        input.member,
+        executionId,
+        input.conversation.id,
+        input.conversation.teamId,
+      );
       const systemPrompt = this.buildMemberSystemPrompt(
         input.conversation,
         input.member,
@@ -2093,6 +2119,7 @@ export class TeamService {
         sourceMemberId: input.sourceMemberId,
         executionId,
         conversationId: input.conversation.id,
+        teamId: input.conversation.teamId,
         capabilities: runtimeCapabilities,
         onDelta: (delta) => {
           const visible = streamGate.push(delta);
@@ -2450,25 +2477,34 @@ export class TeamService {
   }
 
   /**
-   * 把 Member 的能力引用解析成这一轮真正生效的能力。
+   * 把 Member 的 effective 能力（global + team + member）解析成这一轮真正生效的能力。
    *
    * 执行路径上**唯一**的解析入口。任何地方重新去读 `config.teamSkillRoot`、或
    * 直接调某个 Knowledge 实现，都会让 `manifestHash` 不再描述这一轮的真实组成 ——
    * 而那正是事后回答「这轮到底用了哪个能力实现」的唯一依据。
+   *
+   * 用 `getEffective(teamId, memberId)` 而不是 `getMember(memberId)`：后者只
+   * 返回这个人私有的一层，会让 global / team 的能力在这一轮里静默消失 ——
+   * 症状是「明明给大家配了检索工具，它却调不出来」。
+   *
+   * `teamId` 从 conversation 上取，不是从别处推：Team 级能力是「这个房间所属
+   * 的 Team 给的」，而 conversation 是唯一知道自己在哪个 Team 的地方。
    */
   private async resolveCapabilities(
     member: Member,
     executionId: string,
     conversationId: string,
+    teamId: string,
   ): Promise<RuntimeCapabilities> {
     return this.capabilityResolver.resolve(
       {
+        teamId,
         memberId: member.id,
         conversationId,
         executionId,
         userId: config.localUserId,
       },
-      this.capabilities.get(member.id),
+      this.capabilities.getEffective(teamId, member.id),
     );
   }
 

@@ -84,12 +84,31 @@ user_version 相等  → 什么都不做
 - Member 的身份判据是 `seed_key`，**不是** `handle` / `name` —— 后两个是用户随时会改的显示属性。
 - 业务内容（角色定义、system prompt、初始记忆）只放 `config/member-templates/`。
   `server/*.ts` 只负责「怎么加载 Member」，不负责「谁是 Architect」。
-- **能力引用只写 Provider ID**（`member_capability_binding`），不写实现。
+- **能力引用只写 Provider ID**（`capability_binding`），不写实现。
   「换 KB 后端」= 注册一个新 Provider（或替换同 ID 的实现），不是改调用方。
+- **能力是三层叠加**：`effective = global + team + member`，按 `providerId\0selector`
+  去重、先出现的赢（global 是基线，member 是增量，member **不覆盖** global）。
+  执行路径上唯一合法的读入口是 `CapabilityService.getEffective(teamId, memberId)` ——
+  出现 `getMember(id)` 当「这个人能用什么」就是回退：global / team 两层会静默消失。
+- **Member 模板只写这个人的增量**。把 global / team 的基线复制进每个人的私有层不是
+  「多几行数据」，而是**静默的复制**：之后管理员改 Team 能力，这些人不变，而且没有
+  任何地方看得出原因。基线放 `config/capability-templates/`。
+- **只有 Member 层推进 `member.updated_at`**。global / team 层变化不能 touch 任何
+  Member：否则改一次 Team 能力，所有 execution 快照里的 `memberRevision` 集体漂移，
+  「这个人改过没有」从此答不出来。
+- **`RuntimeTool.guard` 必须在 Policy 之前执行**（`CopilotCapabilityAdapter.evaluateToolUse`）。
+  guard 是 Provider 对自己的输入边界的判定，Policy 是部署对风险等级的判定；前者说了不行
+  就是不行。它放在适配器里而不是只依赖注入进来的 `ToolPolicy` —— 授权判定的第一道闸
+  不该取决于「装配时传了哪个 policy 实现」。因此 guard **必须无副作用**：它可能被求值
+  一次以上，而「检查两次」和「执行两次」是完全不同的后果。
 - **`CopilotService` 不认识任何具体 Provider**。它只接受一份解析好的
   `RuntimeCapabilities`；`TeamService` 里也不允许出现直接读 `config.teamSkillRoot`
   或直接调某个 Knowledge 实现的路径 —— 有了旁路，`capabilityManifestHash`
   就不再反映这一轮真的用了什么。
+- **skill 内容投放只有一个入口**（`server/skill-service.ts`），三个 scope 共用同一套
+  安全闸：解压前校验条目（绝对路径 / `..` 穿越）、解压后体检（文件数 / 总字节数 /
+  拒绝 symlink）、先解到暂存目录再 rename。只看「压缩包 ≤ 25MB」是不够的 —— 压缩比
+  可以极高，而一个指向 workspace 之外的 symlink 会把宿主机文件带进运行环境。
 - **工具授权不看工具名**。新工具只需要在 Provider 里声明 `risk` /
   `requiresHostAccess`，`tool-policy.ts` 不动。出现 `if (toolName === '...')`
   就是回退。

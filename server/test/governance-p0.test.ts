@@ -81,6 +81,7 @@ describe('Knowledge 网关：providerId 直接路由', () => {
     const sameRef = 'doc-123';
     const tools = await provider.resolve(
       {
+        teamId: 't1',
         memberId: 'm1',
         conversationId: 'c1',
         executionId: 'e1',
@@ -105,7 +106,7 @@ describe('Knowledge 网关：providerId 直接路由', () => {
     );
     const open = tools.find((t) => t.name === 'open_knowledge_document');
     assert.ok(open?.execute);
-    const ctx = { memberId: 'm1', conversationId: 'c1', executionId: 'e1', userId: 'u1', toolName: 'open_knowledge_document' };
+    const ctx = { teamId: 't1', memberId: 'm1', conversationId: 'c1', executionId: 'e1', userId: 'u1', toolName: 'open_knowledge_document' };
 
     const a = JSON.parse(String(await open.execute(ctx, { documentRef: sameRef, providerId: 'a.provider' })));
     assert.equal(a.content, 'from-A');

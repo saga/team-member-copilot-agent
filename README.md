@@ -21,31 +21,47 @@ User
                     └───────────────────────────────────────┘
 ```
 
-Member 的「能用什么」是一组**能力引用**，不是代码里的清单：
+Member 的「能用什么」不是代码里的清单，而是**三层能力叠加**的结果：
 
 ```
-Member
+effective = global + team + member
+```
+
+```
+Capability
 │
-├── Persona（name / role / style / system prompt / model）
-├── Memory（长期记忆，全文进 prompt）
+├── global     公司级基线，所有 Agent 默认继承
+│   ├── global.filesystem-skills      公司共用的程序化方法论
+│   ├── team.core-tools               ask_member / message_member / remember_member
+│   └── knowledge.tools               search_knowledge / open_knowledge_document
 │
-└── Capabilities（member_capability_binding）
-    │
-    ├── Skill Providers
-    │   ├── team.filesystem-skills      团队共用的程序化方法论
-    │   └── member.filesystem-skills    这个 Member 自己的专长
-    │
-    ├── Knowledge Providers
-    │   └── local.filesystem-knowledge  本地文件系统 + FTS（selector = KB key / $personal）
-    │
-    └── Tool Providers
-        ├── team.core-tools             ask_member / message_member / remember_member
-        ├── knowledge.tools             search_knowledge / open_knowledge_document
-        └── runtime.host-coding-tools   bash / edit / grep / web_fetch（需部署放行）
+├── team       Team 级基线，Team 内所有 Agent 继承
+│   ├── team.filesystem-skills        团队共用的程序化方法论
+│   └── local.filesystem-knowledge    团队资料源（selector = KB key）
+│
+└── member     Member 专属**增量**能力
+    ├── member.filesystem-skills      这个 Member 自己的专长
+    ├── local.filesystem-knowledge    个人资料库（selector = $personal）
+    └── runtime.host-coding-tools     bash / edit / grep / web_fetch（需部署放行）
+```
+
+三层按顺序合并，按 `providerId\0selector` 去重，**先出现的赢**：global 是基线，
+member 是增量 —— member 不会覆盖 global，它只往上加。
+
+Member 模板里**只写这个人独有的东西**。把基线复制进每个人的私有层不是多几行数据，
+而是**静默的复制**：之后管理员改 Team 能力，这些人不变，而且没有任何地方看得出原因。
+
+skill 内容也按同一棵树落盘，`SkillService` 是唯一的读写入口：
+
+```
+.data/
+├── global/skills/              公司级 skill
+├── team/skills/<teamId>/       Team 级 skill
+└── members/<memberId>/skills/  Member 级 skill
 ```
 
 Provider ID 是稳定契约，实现可以替换：把 `local.filesystem-knowledge` 换成企业搜索，
-Member 的 binding 一行都不用改。**CopilotService 不认识任何具体 Provider** ——
+三层 binding 一行都不用改。**CopilotService 不认识任何具体 Provider** ——
 它只接受一份解析好的 `RuntimeCapabilities`。
 
 ## Core model
@@ -53,7 +69,7 @@ Member 的 binding 一行都不用改。**CopilotService 不认识任何具体 P
 | 概念 | 含义 |
 |------|------|
 | **Member** | 业务上的长期 AI 同事。持久身份 + role + style + system prompt + model + 能力组成 + long-term memory。跨 conversation 稳定。 |
-| **Capability** | Member 引用哪些 Skill / Knowledge / Tool Provider（`member_capability_binding`）。它是「能用什么」的唯一答案。 |
+| **Capability** | 三层能力引用：`global` / `team` / `member`，存在同一张 `capability_binding` 表里（`scope_type` + `scope_id`）。**`effective = global + team + member` 才是「能用什么」的唯一答案**，任何单层都不是。 |
 | **Conversation** | 聊天/协作空间。`direct`（一个 Member）/ `group`（多个 Member）/ `work`（独立工作会话）。 |
 | **RoomLead** | 某 Member 在**某个 group 房间**里的负责人（`conversation_member_state.is_lead`）。**房间维度**：同一个人可以在 A 房间是负责人、在 B 房间只是普通成员。一个房间至多一个（偏索引强制），且不参与日常轮转 —— 只在「用户对着房间说话、而全体沉默」时兜底回答。 |
 | **MemberRuntime** | 某 Member 在某 Conversation 中的运行实例。一个 runtime 拥有一个稳定的 Copilot Session 和一个独立 workspace。 |
@@ -148,7 +164,13 @@ Member       = 应用层业务身份（跨 Conversation 稳定）
 ### 能力解析：一条单向链路
 
 ```
-MemberCapabilities（binding 列表）
+global capability binding
+          +
+team   capability binding
+          +
+member capability binding
+          ↓  CapabilityService.getEffective(conversation.teamId, member.id)
+MemberCapabilities（三层合并、跨层去重）
         ↓  CapabilityResolver.resolve(context, capabilities)
 RuntimeCapabilities { skills, knowledge, tools, toolIndex, manifestHash }
         ↓  CopilotCapabilityAdapter.build(...)
@@ -156,23 +178,37 @@ Copilot SDK session 配置（tools / availableTools / onPreToolUse）
 ```
 
 链路只有这一条：`TeamService.executeMemberTurn()` 里出现 `resolveCapabilities()` 之后，
-引擎拿到的就只有解析结果。任何地方重新去读 `config.teamSkillRoot`、或直接调某个
-Knowledge 实现，都会让 `manifestHash` 不再反映这一轮真的用了什么 —— 而那正是事后
-回答「这一轮到底用了哪个能力实现」的唯一依据。
+引擎拿到的就只有解析结果。**执行路径上不允许再出现 `capabilities.getMember(id)`** ——
+那会让 global / team 两层能力在这一轮里静默消失，而且从 `manifestHash` 上看不出来。
+任何地方重新去读 `config.teamSkillRoot`、或直接调某个 Knowledge 实现，都会让
+`manifestHash` 不再反映这一轮真的用了什么 —— 而那正是事后回答「这一轮到底用了哪个
+能力实现」的唯一依据。
+
+`context.teamId` 是必需的：Team 级 skill 根目录与 Team 级 knowledge ACL 都要靠它定位，
+所以它随 turn 一路传下来，Provider 侧不现查。
 
 解析本身与引擎无关：换掉最后一层（Copilot → DeepAgents / OpenCode / Claude Agent SDK）
 只需要重写 `server/capabilities/copilot-adapter.ts`。
 
-### 工具授权：只看声明的性质，不看工具名
+### 工具授权：guard → Policy → execute
 
 「引擎看得见什么」和「这一次调用放不放行」是两件事，很容易各自漂移成两套判据 ——
 模型看得见一个它其实用不了的工具，或者更糟：看不见却在某条路径上被放行。
 两者都出自**同一份解析结果**（`RuntimeCapabilities`）：
 
 ```
-availableTools                         声明给引擎（它有什么）
-hooks.onPreToolUse → ToolPolicy.check  每次调用重新判一遍（这次能不能用）
+availableTools                                 声明给引擎（它有什么）
+hooks.onPreToolUse
+  → CopilotCapabilityAdapter.evaluateToolUse   每次调用重新判一遍（这次能不能用）
+        1. RuntimeTool.guard   Provider 对自己的输入边界的判定
+        2. ToolPolicy.check    部署对风险等级 / 宿主开关的判定
+  → execute
 ```
+
+**guard 必须执行，而且必须在 Policy 之前。** 它放在适配器里而不是只依赖注入进来的
+`ToolPolicy`：授权判定的第一道闸不该取决于「装配时传了哪个 policy 实现」。这样即使
+换了一个忘了跑 guard 的 policy，guard 仍然生效。因此 guard **必须无副作用** ——
+它可能被求值一次以上，而「检查两次」和「执行两次」是完全不同的后果。
 
 `DefaultToolPolicy.check()` 的判据只有三个，全部来自 `RuntimeTool` 的声明：
 
@@ -492,27 +528,47 @@ config/member-templates/
 └── financial-security-reviewer/
 ```
 
-| Member | Handle | Role | 能力上的差别 |
+| Member | Handle | Role | Member 层增量 |
 |--------|--------|------|--------------|
-| Senior Solution Architect | `@architect` | Senior Financial Services Solution Architect | `financial-core` + `architecture-standards` |
-| Senior Software Engineer | `@engineer` | Senior Financial Services Software Engineer | `financial-core` + `architecture-standards` + **`runtime.host-coding-tools`** |
-| Security Reviewer | `@security` | Financial Services Security & Architecture Reviewer | `financial-core` + `security-controls` |
+| Senior Solution Architect | `@architect` | Senior Financial Services Solution Architect | `$personal` |
+| Senior Software Engineer | `@engineer` | Senior Financial Services Software Engineer | `$personal` + **`runtime.host-coding-tools`** |
+| Security Reviewer | `@security` | Financial Services Security & Architecture Reviewer | `security-controls` + `$personal` |
 
-三个角色共用同一组 skill / tool Provider（`team.filesystem-skills`、`member.filesystem-skills`、
-`local.filesystem-knowledge`、`team.core-tools`、`knowledge.tools`），差别只在 knowledge 的
-selector 和 Engineer 额外绑定了宿主工具 Provider。
+模板里**只写这个人独有的东西**：`member.filesystem-skills`（个人 skill 目录）、
+`local.filesystem-knowledge`（个人 / 专属资料源）、以及它真的需要的宿主工具。
+`global.filesystem-skills`、`team.filesystem-skills`、`team.core-tools`、
+`knowledge.tools` 这些基线能力**一律不写** —— 它们由 `config/capability-templates/`
+provisioning 到 global / team 两层，改一次全员生效。
 
 只有 Engineer 默认绑定 `runtime.host-coding-tools`：架构师和 Security Reviewer 不该因为
 「自己是这个角色」就获得宿主机代码执行能力。而且绑定本身不等于放行 —— 没有
 `HOST_CODING_TOOLS=true` 时，这一组工具既不声明给引擎也不被授权层放行。
 
+## Capability Templates（global / team 两层基线）
+
+```
+config/capability-templates/
+├── global.json   公司级基线（所有 Agent 默认继承）
+└── team.json     Team 级基线（Team 内所有 Agent 继承）
+```
+
+和 member 模板是同一套机制，区别只是 scope。启动时按 global → team → member 的顺序
+provisioning，**顺序不能反**：反了的话第一轮 turn 会跑在一个还没有任何基线能力的
+Member 上。
+
+provisioning 是幂等的，判据落在 `capability_scope` 表：`INSERT OR IGNORE` 写进去了才
+说明「这一次是我初始化的」，随后才灌 binding。所以管理员把某一层**清空**之后，重启
+不会再灌回来 —— 「清空」因此是一个能被表达、能被保持的状态，而不是一个会被启动流程
+悄悄撤销的操作。
+
 ### 模板不是 source of truth
 
 ```
-config/member-templates/     provisioning baseline —— 这个 Member 第一次出现时是什么样
-SQLite member                当前真实配置（人格字段）
-member_capability_binding    当前能力组成
-<member home>/memory/        当前长期记忆
+config/capability-templates/  global / team 两层的 provisioning baseline
+config/member-templates/      Member 层的 provisioning baseline（第一次出现时是什么样）
+SQLite member                 当前真实配置（人格字段）
+SQLite capability_binding     当前能力组成（三层各存各的，scope_type + scope_id）
+<member home>/memory/         当前长期记忆
 ```
 
 启动时执行一次 provisioning：
@@ -557,13 +613,14 @@ SEED_DEFAULT_MEMBERS=false    # 代码带着模板，但不要自动建人
 引用了未注册的 Provider）**直接让启动失败**，不静默跳过 ——
 否则症状是「默认团队少两个人但服务照常起来了」。
 
-模板的 `member.json` 用 `capabilities` 声明能力组成，它**只描述引用，不描述实现**：
+模板的 `member.json` 用 `capabilities` 声明**这个人独有的增量**，它**只描述引用，
+不描述实现**，也**不重复 global / team 的基线**：
 
 ```json
 "capabilities": {
-  "skills":    [{ "providerId": "team.filesystem-skills" }],
-  "knowledge": [{ "providerId": "local.filesystem-knowledge", "selector": "financial-core" }],
-  "tools":     [{ "providerId": "team.core-tools" }]
+  "skills":    [{ "providerId": "member.filesystem-skills" }],
+  "knowledge": [{ "providerId": "local.filesystem-knowledge", "selector": "$personal" }],
+  "tools":     [{ "providerId": "runtime.host-coding-tools" }]
 }
 ```
 
@@ -626,7 +683,7 @@ npm run dev            # 同时启动 client(:5173) + server(:3001)
 首次启动的日志里会有一行 provisioning：
 
 ```
-[server] 新建数据库 schema v14
+[server] 新建数据库 schema v15
 [server] knowledge sync: team+3 personal+0 indexed=3
 [server] member provisioning: created=3 (financial-services.solution-architect, ...) skipped=0
 ```
@@ -667,8 +724,13 @@ npm run dev            # 同时启动 client(:5173) + server(:3001)
 | PATCH | `/api/conversations/:id/members/:memberId/state` | `{ muted?, isLead? }` —— 至少给一个字段（都不给 `400`）。设 `isLead: true` 会同时顶掉旧的负责人，返回的是被改的那个 Member 的状态 |
 | GET | `/api/members/:id/direct-messages` | 该 Member 参与的全部私聊（只读） |
 | GET | `/api/members/:id/memory` · `PUT` | 该 Member 的长期记忆 → `{ content, version }`；`PUT` 可带 `expectedVersion`，不匹配 `409` |
-| GET | `/api/members/:id/skills` · `POST` · `DELETE` | 该 Member 的 skill（zip 上传 / 卸载）—— 「磁盘上装了什么」，不是「启用了哪个能力来源」 |
-| GET | `/api/capabilities/members/:memberId` · `PUT` | 该 Member 的能力组成（skill / knowledge / tool 的 Provider 引用）。**「能用什么」的唯一写入口** |
+| GET · POST · DELETE | `/api/capabilities/skills/global[/:name]` | global skill 文件（zip 上传 / 卸载）。**owner/admin** |
+| GET · POST · DELETE | `/api/capabilities/skills/team[/:name]` | team skill 文件。**owner/admin** |
+| GET · POST · DELETE | `/api/capabilities/skills/members/:memberId[/:name]` | member skill 文件。**owner/admin** |
+| GET | `/api/capabilities/global` · `PUT` | 公司级能力基线（`PUT` 需 owner/admin） |
+| GET · PUT | `/api/capabilities/team` | Team 级能力基线（`PUT` 需 owner/admin）。返回 `{ teamId, capabilities }` |
+| GET · PUT | `/api/capabilities/members/:memberId` | 该 Member 的**增量**能力（skill / knowledge / tool 的 Provider 引用） |
+| GET | `/api/capabilities/members/:memberId/effective` | `{ teamId, config }`，`config = { global, team, member, effective }` —— 管理界面靠它回答「最终能用什么」和「是哪一层给的」 |
 | GET | `/api/capabilities/providers` | 平台已注册的 Provider 清单（`{ kind, id, version }`，owner/admin）—— 管理界面列选项用 |
 | GET | `/api/knowledge/team` · `POST` | team KB 清单 / 新建（`{ key, name, description }`）—— `local.filesystem-knowledge` 的管理面 |
 | POST | `/api/knowledge/bases/:kbId/documents` | 写文档（落盘 + FTS 索引） |
@@ -706,8 +768,9 @@ INTERNAL_API_TOKEN 已配置  要求 Authorization: Bearer <token> 或 X-Interna
 普通 `/api` 路径没有任何中间件写它，所以「请求头塞个 agent id 就变成 Agent」
 在这条边界上不存在（Agent 身份一律由 Internal API token + 路径身份一致性校验，伪造不了）。
 
-Admin 写入（`PUT /api/capabilities/members/:id`、`POST /api/knowledge/team`、
-`POST /api/knowledge/bases/:id/documents`、`POST/DELETE /api/members/:id/skills`、
+Admin 写入（`PUT /api/capabilities/global` · `/team` · `/members/:id`、
+`POST/DELETE /api/capabilities/skills/**`、`POST /api/knowledge/team`、
+`POST /api/knowledge/bases/:id/documents`、
 `POST /api/members`、`PATCH /api/members/:id` 带 `status`）走 `ADMIN_API_TOKEN`：
 
 ```
@@ -843,12 +906,14 @@ Group Chat：
 
 ```
 .data/
-├── team-member.db                     # member / member_capability_binding / conversation /
-│                                      # conversation_member / conversation_message /
-│                                      # member_runtime / execution / conversation_event /
-│                                      # knowledge_base / knowledge_document(+fts) /
-│                                      # team / team_membership / team_event /
-│                                      # team_presence / scheduled_wake(+run)
+├── team-member.db                     # member / capability_scope / capability_binding /
+│                                      # conversation / conversation_member /
+│                                      # conversation_message / member_runtime / execution /
+│                                      # conversation_event / knowledge_base /
+│                                      # knowledge_document(+fts) / team / team_membership /
+│                                      # team_event / team_presence / scheduled_wake(+run)
+├── global/
+│   └── skills/                        # global.filesystem-skills 的根目录
 ├── members/
 │   └── <member-id>/
 │       ├── SOUL.md                    # role / description / style / system prompt
@@ -856,13 +921,18 @@ Group Chat：
 │       ├── skills/                    # member.filesystem-skills 的根目录
 │       └── knowledge/                 # 该 Member 的 personal KB（$personal）
 ├── team/
-│   ├── skills/                        # team.filesystem-skills 的根目录
+│   ├── skills/<team-id>/              # team.filesystem-skills 的根目录
 │   └── knowledge/<kb-key>/**          # team KB 的正文
 ├── workspaces/
 │   └── <conversation-id>/
 │       └── <member-id>/AGENTS.md      # 每个 runtime 独立 workspace
 └── copilot/                           # Copilot session state
 ```
+
+skill 的三棵树（`global/skills/`、`team/skills/<teamId>/`、`members/<id>/skills/`）全部由
+`server/skill-service.ts` 读写，安装是「解压前校验条目 → 解压到暂存目录 → 解压后体检
+（文件数 / 总字节数 / 拒绝 symlink）→ rename 进目标」。只看「压缩包 ≤ 25MB」是不够的：
+压缩比可以极高，而一个指向 workspace 之外的 symlink 会把宿主机文件带进运行环境。
 
 ### Schema：只有一个形状，没有迁移
 
@@ -923,14 +993,17 @@ src/                          # Vite + React + Ant Design 前端
     HealthBadge.tsx           # antd Badge（success/warning/error）
     TeamChat.tsx              # 编排：conversation / SSE / 状态合并（Layout Sider/Content + Alert/Tag）
     team/                     # TeamChat 的拆分：list / messages / composer / 各编辑面板
-      TeamSidebar.tsx         # Collapse 四分区：Members/Current Work/Schedules/Conversations
+      TeamSidebar.tsx         # Collapse 五分区：Members/Capabilities/Current Work/Schedules/Conversations
+      CapabilityManager.tsx   # 三层能力（global / team / member）+ effective 结果
+      CapabilityBindingEditor.tsx  # 一层 binding 的编辑（providerId + selector）
+      ScopedSkillLibrary.tsx  # skill 文件库（global / team / member 共用同一个组件）
       TeamSections.tsx        # CurrentWorkSection（active execution → Jira key）
       ConversationList.tsx    # antd List（Tag 区分 private/group/work/direct）
       ConversationMessages.tsx  # @ant-design/x Bubble.List + Timeline（delegation）
       MessageComposer.tsx     # @ant-design/x Sender
       ConversationHeader.tsx  # Avatar.Group + Tag + Select
       GroupMemberManager.tsx  # antd Table（有未完成工作时禁止 Remove）
-      MemberEditor.tsx        # antd Form + Collapse（Capabilities 只读）+ Popconfirm Archive
+      MemberEditor.tsx        # antd Form + Popconfirm Archive（能力已移到 Team → Capabilities）
       MemberMemory.tsx        # 乐观并发（409 → Save anyway）
       MemberProfile.tsx       # antd Modal + Tabs
       ...
@@ -947,16 +1020,17 @@ server/                       # Express + Copilot SDK 后端
   context-assembler.ts        # 增量上下文（message_sequence checkpoint）
   recovery-service.ts         # 启动恢复（保守策略，不自动重跑 running）
   member-service.ts           # 长期 Member 身份 + member home + seedKey
-  member-template-seeder.ts   # 模板 provisioning（不含任何业务内容，也不认识任何后端）
-  capabilities/               # 能力层：Member 引用哪些 Provider
+  member-template-seeder.ts   # Member 层模板 provisioning（不含任何业务内容，也不认识任何后端）
+  skill-service.ts            # skill 内容投放的唯一入口（三个 scope + zip 安全闸）
+  capabilities/               # 能力层：三层 binding → RuntimeCapabilities
     types.ts                  #   SkillProvider / KnowledgeProvider / ToolProvider 契约
     registry.ts               #   Provider 注册表（重复注册 / 未注册都直接抛）
-    service.ts                #   member_capability_binding 读写 + hasKnowledgeBinding（ACL 判据）
+    service.ts                #   capability_binding 读写（global/team/member 三层）+ getEffective + ACL 判据
+    provisioner.ts            #   config/capability-templates → global / team 两层 baseline
     resolver.ts               #   binding → RuntimeCapabilities（含 manifestHash）
-    defaults.ts               #   新建 Member 的默认能力组成
     copilot-adapter.ts        #   RuntimeCapabilities → SDK session 配置（唯一认识 SDK 的地方）
     providers/
-      filesystem-skill.ts     #     team / member 两级 skill 目录
+      filesystem-skill.ts     #     global / team / member 三级 skill 目录
       filesystem-knowledge.ts #     本地 KB：FTS5 检索 + 磁盘同步 + ACL（原 knowledge-service.ts）
       knowledge-document-limits.ts  # 什么算「一份可索引的资料」（扫目录与 API 写入共用）
       core-tools.ts           #     ask_member / message_member / remember_member
@@ -973,19 +1047,20 @@ server/                       # Express + Copilot SDK 后端
   routes/
     health.ts
     members.ts
-    capabilities.ts             # 能力组成（skill / knowledge / tool 的 Provider 引用）
+    capabilities.ts             # 三层能力组成（global / team / member + effective）
+    skills.ts                   # skill 内容投放（三个 scope 的 zip 上传 / 卸载）
     conversations.ts
     executions.ts               # 单条 / 列表 / retry / cancel
     internal.ts                 # 以 Member 身份说话（token 门禁）
     knowledge.ts                # local.filesystem-knowledge 的管理面（建库 / 写文档）
   test/
     schemas.test.ts
-    capabilities.test.ts           # Provider 隔离 / 未知 Provider / 同名冲突 / manifest hash / open 二次 ACL
+    capabilities.test.ts           # Provider 隔离 / 未知 Provider / 同名冲突 / manifest hash / 三层合并与去重 / tool guard / open 二次 ACL
     tool-policy.test.ts            # 只看 risk 与部署许可，不看工具名 / 声明与放行不允许漂移
     internal-api.test.ts           # 路径归属 + token 门禁
     team-service.test.ts           # delegation cycle / depth / runtime 隔离 / kind 形状约束
     member-dm.test.ts              # Member ↔ Member 私聊房间唯一性 + 自动对谈抑制
-    member-skills.test.ts          # skill 安装 / 卸载 / zip 校验
+    member-skills.test.ts          # 三个 scope 的 skill 安装 / 卸载 / zip 安全闸（穿越、symlink、体积、同名覆盖）
     runtime-reliability.test.ts    # schema 形状 / 序号 / 增量上下文 / durable event / 恢复 / 死锁
     runtime-correctness.test.ts    # resume 分类 / 超时 abort / 工具授权接线 / cancel 状态机 / retry
     team-chat.test.ts              # 产品行为：direct / group / @mention / NO_REPLY / 应答者与负责人兜底 / 唤醒原因读回 / persona 与 memory 隔离
@@ -1023,7 +1098,8 @@ scripts/
 | `TEAM_NAME` | `AI Team` | 默认 Team 名，启动 ensure，不提供新建入口 |
 | `LOCAL_ACTOR_ID` | `local-user` | 无用户系统时 human actor 占位 |
 | `SCHEDULER_INTERVAL_MS` | `2000` | Scheduler tick 间隔（once + interval，不做 Calendar/RRULE） |
-| `MEMBER_TEMPLATES_DIR` | `config/member-templates` | 默认 Member 模板目录（provisioning baseline） |
+| `MEMBER_TEMPLATES_DIR` | `config/member-templates` | 默认 Member 模板目录（Member 层 provisioning baseline） |
+| `CAPABILITY_TEMPLATES_DIR` | `config/capability-templates` | global / team 两层能力 baseline 目录 |
 | `SEED_DEFAULT_MEMBERS` | `true` | 启动时执行 Member provisioning；关闭 = 代码带着模板但不自动建人 |
 
 `HOST_CODING_TOOLS` 默认关闭，原因是这几个工具的工作目录虽然是 conversation workspace，
@@ -1041,9 +1117,10 @@ runtime 仍然是宿主机上的进程 —— 没有沙箱时 `bash` 能走到 w
 > 清单（逗号/空白分隔，如 `research, security-review`），只加载点名的。Skill 版本是
 > 整个目录（相对路径 + 文件内容）的指纹，`scripts/` / `references/` 变化也换版本。
 >
-> 启动时除模板校验外，还对已有 DB 里全部 Member 的 capability binding 做一次
-> `validateAllMemberCapabilities()`：库里留着当前 build 未注册的 Provider 会直接
-> 拒绝启动，不等到 turn 才炸。
+> 启动时除模板校验外，还对已有 DB 里全部 Member 的 effective 能力（三层叠加）做一次
+> `capabilityResolver.validate()`：库里留着当前 build 未注册的 Provider 会直接
+> 拒绝启动，不等到 turn 才炸。校验的是 effective 而不是单层 —— 任何一层里有一个
+> 未注册的 Provider，这个 Member 的下一轮 turn 就会炸。
 
 ## 前提
 

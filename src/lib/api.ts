@@ -64,6 +64,29 @@ export interface MemberCapabilities {
   tools: CapabilityBinding[];
 }
 
+/** 平台注册了哪些能力 Provider（管理界面用它列可选项）。 */
+export interface CapabilityProvider {
+  kind: 'skill' | 'knowledge' | 'tool';
+  id: string;
+  version: string;
+}
+
+/**
+ * 一个 Member 的能力全景：三层声明 + 合并结果。
+ *
+ * `effective` 是「这个人最终能用什么」的唯一答案。只显示 `member` 层会让界面
+ * 呈现出一个「什么都不会的人」—— 而它其实继承了公司级和团队级的能力。
+ */
+export interface CapabilityConfig {
+  global: MemberCapabilities;
+  team: MemberCapabilities;
+  member: MemberCapabilities;
+  effective: MemberCapabilities;
+}
+
+/** skill 内容投放的三个 scope。 */
+export type SkillScope = 'global' | 'team' | 'member';
+
 export interface Team {
   id: string;
   name: string;
@@ -388,6 +411,19 @@ export interface DeltaEvent {
   delta: string;
 }
 
+/**
+ * scope → skill 接口路径。
+ *
+ * member 那一层刻意是复数 `members`：它需要一个 id，形状是
+ * `/api/capabilities/skills/members/<memberId>`，而 global / team 是单段的。
+ * 把这条映射收在一个函数里，是因为「三个 scope 只有一个是复数」这种不一致
+ * 一旦散落在三个方法里，改一处漏两处。
+ */
+function scopedSkillPath(scope: SkillScope, memberId?: string): string {
+  if (scope !== 'member') return `/api/capabilities/skills/${scope}`;
+  return `/api/capabilities/skills/members/${encodeURIComponent(memberId ?? '')}`;
+}
+
 export const api = {
   health(): Promise<Health> {
     return fetch(`${API_BASE}/api/health`).then(json<Health>);
@@ -461,6 +497,65 @@ export const api = {
     }).then(json<{ capabilities: MemberCapabilities }>);
   },
 
+  /** 平台装了哪些 Provider。列选项用 —— 前端不该硬编码 provider id。 */
+  listCapabilityProviders(): Promise<{ providers: CapabilityProvider[] }> {
+    return fetch(`${API_BASE}/api/capabilities/providers`).then(
+      json<{ providers: CapabilityProvider[] }>,
+    );
+  },
+
+  /**
+   * 公司级能力基线。
+   *
+   * 它不属于任何 Team：改一次，**所有** Agent 都跟着变。所以这个入口在界面上
+   * 必须与 Team / Member 层分开呈现。
+   */
+  getGlobalCapabilities(): Promise<{ capabilities: MemberCapabilities }> {
+    return fetch(`${API_BASE}/api/capabilities/global`).then(
+      json<{ capabilities: MemberCapabilities }>,
+    );
+  },
+
+  updateGlobalCapabilities(
+    capabilities: MemberCapabilities,
+  ): Promise<{ capabilities: MemberCapabilities }> {
+    return fetch(`${API_BASE}/api/capabilities/global`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(capabilities),
+    }).then(json<{ capabilities: MemberCapabilities }>);
+  },
+
+  /** Team 级能力基线。teamId 由服务端解析（当前部署只有一个 Team）。 */
+  getTeamCapabilities(): Promise<{ teamId: string; capabilities: MemberCapabilities }> {
+    return fetch(`${API_BASE}/api/capabilities/team`).then(
+      json<{ teamId: string; capabilities: MemberCapabilities }>,
+    );
+  },
+
+  updateTeamCapabilities(
+    capabilities: MemberCapabilities,
+  ): Promise<{ teamId: string; capabilities: MemberCapabilities }> {
+    return fetch(`${API_BASE}/api/capabilities/team`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(capabilities),
+    }).then(json<{ teamId: string; capabilities: MemberCapabilities }>);
+  },
+
+  /**
+   * 三层声明 + 合并结果。
+   *
+   * 放在 `.../effective` 而不是复用 `getMemberCapabilities`：后者回答的是
+   * 「这个人的私有增量」，而界面要回答的是「它最终能用什么」以及「这些能力
+   * 分别是哪一层给的」。
+   */
+  getCapabilityConfig(memberId: string): Promise<{ teamId: string; config: CapabilityConfig }> {
+    return fetch(
+      `${API_BASE}/api/capabilities/members/${encodeURIComponent(memberId)}/effective`,
+    ).then(json<{ teamId: string; config: CapabilityConfig }>);
+  },
+
   /**
    * Member 的长期记忆全文。
    *
@@ -493,8 +588,8 @@ export const api = {
     }).then(json<MemberMemory>);
   },
 
-  listMemberSkills(memberId: string): Promise<{ skills: MemberSkill[] }> {
-    return fetch(`${API_BASE}/api/members/${encodeURIComponent(memberId)}/skills`).then(
+  listScopedSkills(scope: SkillScope, memberId?: string): Promise<{ skills: MemberSkill[] }> {
+    return fetch(`${API_BASE}${scopedSkillPath(scope, memberId)}`).then(
       json<{ skills: MemberSkill[] }>,
     );
   },
@@ -505,9 +600,13 @@ export const api = {
    * 直接把 File 当 body（raw），不走 multipart —— 只有一个文件，
    * 多一层 parser 只会多一个依赖和一个临时目录。文件名走 query。
    */
-  uploadMemberSkill(memberId: string, file: File): Promise<{ skill: MemberSkill }> {
+  uploadScopedSkill(
+    scope: SkillScope,
+    file: File,
+    memberId?: string,
+  ): Promise<{ skill: MemberSkill }> {
     return fetch(
-      `${API_BASE}/api/members/${encodeURIComponent(memberId)}/skills?filename=${encodeURIComponent(file.name)}`,
+      `${API_BASE}${scopedSkillPath(scope, memberId)}?filename=${encodeURIComponent(file.name)}`,
       {
         method: 'POST',
         headers: { 'Content-Type': file.type || 'application/zip' },
@@ -516,9 +615,13 @@ export const api = {
     ).then(json<{ skill: MemberSkill }>);
   },
 
-  deleteMemberSkill(memberId: string, name: string): Promise<{ skills: MemberSkill[] }> {
+  deleteScopedSkill(
+    scope: SkillScope,
+    name: string,
+    memberId?: string,
+  ): Promise<{ skills: MemberSkill[] }> {
     return fetch(
-      `${API_BASE}/api/members/${encodeURIComponent(memberId)}/skills/${encodeURIComponent(name)}`,
+      `${API_BASE}${scopedSkillPath(scope, memberId)}/${encodeURIComponent(name)}`,
       { method: 'DELETE' },
     ).then(json<{ skills: MemberSkill[] }>);
   },

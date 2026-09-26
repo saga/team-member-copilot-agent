@@ -48,6 +48,33 @@ export interface MemberCapabilities {
   tools: CapabilityBinding[];
 }
 
+/**
+ * 能力的作用域。三层叠加，顺序固定：
+ *
+ *   global   公司级，所有 Agent 默认继承
+ *   team     Team 级，Team 内所有 Agent 继承
+ *   member   Member 专属增量能力
+ *
+ * `effective = global + team + member`，按此顺序合并、按
+ * `providerId\u0000selector` 去重（先出现的赢）。所以 global 是基线，
+ * member 只补增量 —— 而不是覆盖。
+ */
+export type CapabilityScopeType = 'global' | 'team' | 'member';
+
+/**
+ * 某个 Member 在某个 Team 里的能力全景。
+ *
+ * 前三个是**声明**（各层各存了什么），`effective` 是**解析结果**（这一轮真正
+ * 生效的那一份）。管理界面要同时看到两者：只给 effective，管理员没法知道
+ * 「这条能力是哪一层给的」，改起来只能靠猜。
+ */
+export interface CapabilityConfig {
+  global: MemberCapabilities;
+  team: MemberCapabilities;
+  member: MemberCapabilities;
+  effective: MemberCapabilities;
+}
+
 export interface Member {
   id: string;
   handle: string;

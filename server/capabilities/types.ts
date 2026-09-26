@@ -27,8 +27,16 @@ import type { CapabilityBinding, MemberCapabilities } from '../domain.js';
  * 与 Resolver —— 那正是这一层要消灭的事情。所以签名从一开始就是 Promise。
  */
 
-/** 一次 capability 解析所处的上下文。全部字段在一轮 turn 开始时就已确定。 */
+/**
+ * 一次 capability 解析所处的上下文。全部字段在一轮 turn 开始时就已确定。
+ *
+ * `teamId` 是必需的：能力分 global / team / member 三层，Team 级 Provider
+ * （比如 `team.filesystem-skills` 的根目录）必须知道「当前是哪个 Team」，
+ * 只靠 memberId 表达不出这一层 —— 同一个 Member 可以属于多个 Team，而它在
+ * 每个 Team 里继承到的 Team 级能力是不同的。
+ */
 export interface CapabilityContext {
+  teamId: string;
   memberId: string;
   conversationId: string;
   executionId: string;

@@ -1,0 +1,18 @@
+{
+  "skills": [
+    {
+      "providerId": "team.filesystem-skills"
+    }
+  ],
+  "knowledge": [
+    {
+      "providerId": "local.filesystem-knowledge",
+      "selector": "financial-core"
+    },
+    {
+      "providerId": "local.filesystem-knowledge",
+      "selector": "architecture-standards"
+    }
+  ],
+  "tools": []
+}

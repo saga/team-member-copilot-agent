@@ -1,7 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
 import type { DatabaseSync } from 'node:sqlite';
 import { config } from './config.js';
 import { hashText } from './content-hash.js';
@@ -85,23 +84,6 @@ function normalizeHandle(value: string): string {
 /** 记忆文件的一级标题；replaceMemory 用它保证文件里只有一个标题。 */
 const MEMORY_TITLE = /^\s*#\s*Long-?term Memory\s*/i;
 
-/** Skill 目录里必须有这个文件，Copilot SDK 靠它发现并加载 skill。 */
-const SKILL_FILE = 'SKILL.md';
-
-/**
- * 一个 Member 自己的 skill。
- *
- * skill 是**目录**，不是数据库行：Copilot SDK 的 `skillDirectories` 直接扫
- * 文件系统，`<member home>/skills/<name>/SKILL.md` 就是它的全部契约。
- * 所以这里既没有表也没有同步逻辑 —— 磁盘就是 source of truth。
- */
-export interface MemberSkill {
-  name: string;
-  description: string;
-  fileCount: number;
-  updatedAt: string;
-}
-
 /**
  * 长期记忆的全文 + 版本。
  *
@@ -113,101 +95,13 @@ export interface MemberMemory {
   version: string;
 }
 
-/** 目录名 / skill 名必须是单个安全路径段。 */
-function assertSafeSkillName(value: string): string {
-  const name = value.trim().replace(/\.zip$/i, '');
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) {
-    throw Object.assign(new Error(`非法的 skill 名：${value}`), { status: 400 });
-  }
-  return name;
-}
-
-/**
- * 解压前先看条目列表，拦掉绝对路径与 `..` 穿越。
- *
- * 现代 unzip 自己也会拦，但不能依赖实现版本：这是一次「把远端来的压缩包写进
- * 用户 home」的操作，越界的后果是往 skills 目录外面写文件。
- */
-function assertZipEntriesSafe(zipPath: string): void {
-  const listing = execFileSync('unzip', ['-Z1', zipPath], { encoding: 'utf8' });
-
-  for (const raw of listing.split('\n')) {
-    const entry = raw.trim();
-    if (!entry) continue;
-
-    if (entry.startsWith('/') || entry.includes('\\') || /^[A-Za-z]:/.test(entry)) {
-      throw Object.assign(new Error(`zip 里有绝对路径条目：${entry}`), { status: 400 });
-    }
-    if (entry.split('/').includes('..')) {
-      throw Object.assign(new Error(`zip 里有路径穿越条目：${entry}`), { status: 400 });
-    }
-  }
-}
-
-let unzipChecked = false;
-
-/** 安装 skill 依赖系统 unzip；缺失时给一个能看懂的 501，而不是 ENOENT。 */
-function requireUnzip(): void {
-  if (unzipChecked) return;
-  try {
-    execFileSync('unzip', ['-v'], { stdio: 'ignore' });
-  } catch {
-    throw Object.assign(
-      new Error('安装 skill 需要系统提供 unzip，当前环境找不到该命令'),
-      { status: 501 },
-    );
-  }
-  unzipChecked = true;
-}
-
-function countFiles(dir: string): number {
-  let count = 0;
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (entry.isDirectory()) {
-      count += countFiles(path.join(dir, entry.name));
-    } else {
-      count += 1;
-    }
-  }
-  return count;
-}
-
-/**
- * 从 SKILL.md 里取一句描述。
- *
- * 优先 YAML frontmatter 的 `description:`（skill 的标准写法），否则退回到
- * 一级标题之后的第一段正文。都是纯文本启发式 —— 它只是列表里的一行说明，
- * 不值得为它引入一个 YAML parser。
- */
-function readSkillDescription(skillFile: string): string {
-  const text = fs.readFileSync(skillFile, 'utf8');
-
-  const frontmatter = text.match(/^---\r?\n([\s\S]*?)\r?\n---/);
-  if (frontmatter) {
-    const line = frontmatter[1]
-      .split(/\r?\n/)
-      .find((row) => /^\s*description\s*:/i.test(row));
-    if (line) {
-      return line
-        .replace(/^\s*description\s*:/i, '')
-        .trim()
-        .replace(/^["']|["']$/g, '')
-        .slice(0, 200);
-    }
-  }
-
-  const body = frontmatter ? text.slice(frontmatter[0].length) : text;
-  const paragraph = body
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .find((line) => line.length > 0 && !line.startsWith('#'));
-
-  return (paragraph ?? '').slice(0, 200);
-}
-
 /**
  * 长期 Member 身份。Member 是跨 conversation 稳定的业务对象，
  * 它的 SOUL / memory / skills 落在 member home，而不是任何 conversation 里。
+ *
+ * Skill 的安装 / 列举 / 删除**不在这里** —— 见 `skill-service.ts`。skill 内容
+ * 投放有三个 scope（global / team / member），把它挂在「某个 Member」的服务上
+ * 会让读代码的人以为 skill 是 Member 的属性。
  */
 export class MemberService {
   constructor(private readonly db: DatabaseSync) {}
@@ -366,10 +260,6 @@ export class MemberService {
     return path.join(this.homePath(memberId), 'memory', 'MEMORY.md');
   }
 
-  skillsPath(memberId: string): string {
-    return path.join(this.homePath(memberId), 'skills');
-  }
-
   readMemory(memberId: string): string {
     this.ensureHome(memberId);
     const file = this.memoryPath(memberId);
@@ -479,109 +369,13 @@ export class MemberService {
     return clash ? `${base}-${selfId.slice(0, 6)}` : base;
   }
 
-  // ----------------------------------------------------------------- skills
-
-  /**
-   * 列出这个 Member 已安装的 skill。
-   *
-   * 只认目录，且跳过 `.` 开头的（包括安装过程中的 staging 目录）。
-   */
-  listSkills(memberId: string): MemberSkill[] {
-    this.get(memberId);
-    this.ensureHome(memberId);
-
-    return fs
-      .readdirSync(this.skillsPath(memberId), { withFileTypes: true })
-      .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.'))
-      .map((entry) => this.describeSkill(memberId, entry.name))
-      .sort((a, b) => a.name.localeCompare(b.name));
-  }
-
-  /**
-   * 安装 skill（zip）。
-   *
-   * 流程刻意是「先解到暂存目录 → 校验 → 再 rename 进 skills/」：
-   * 直接解到目标目录的话，中途失败会留下半个 skill，而 `skillDirectories`
-   * 会把它当成一个真的 skill 加载进 Copilot session。
-   */
-  installSkill(memberId: string, archive: Buffer, filename: string): MemberSkill {
-    this.get(memberId);
-    this.ensureHome(memberId);
-    requireUnzip();
-
-    // zip 的本地文件头是 PK\x03\x04（空归档是 PK\x05\x06），先挡掉明显不是 zip 的
-    if (archive.length < 4 || archive[0] !== 0x50 || archive[1] !== 0x4b) {
-      throw Object.assign(new Error('不是合法的 zip 文件（缺少 PK 头）'), { status: 400 });
-    }
-
-    const root = this.skillsPath(memberId);
-    const staging = path.join(root, `.install-${randomUUID()}`);
-    const zipPath = `${staging}.zip`;
-
-    try {
-      fs.writeFileSync(zipPath, archive);
-      assertZipEntriesSafe(zipPath);
-      fs.mkdirSync(staging, { recursive: true });
-      execFileSync('unzip', ['-q', '-o', zipPath, '-d', staging]);
-
-      // 习惯上 zip 里包一层同名目录；只有一层目录时就用它，否则以压缩包名兜底
-      const entries = fs.readdirSync(staging, { withFileTypes: true });
-      const only = entries.length === 1 && entries[0].isDirectory() ? entries[0].name : null;
-
-      const name = assertSafeSkillName(only ?? filename);
-      const source = only ? path.join(staging, only) : staging;
-
-      if (!fs.existsSync(path.join(source, SKILL_FILE))) {
-        throw Object.assign(
-          new Error(`zip 里没有 ${SKILL_FILE}，这不是一份有效的 skill`),
-          { status: 400 },
-        );
-      }
-
-      const target = path.join(root, name);
-      if (fs.existsSync(target)) {
-        throw Object.assign(new Error(`Skill ${name} 已存在`), { status: 409 });
-      }
-
-      fs.renameSync(source, target);
-      return this.describeSkill(memberId, name);
-    } finally {
-      // 成功后 source 已经被 rename 走，这里只是清掉暂存与压缩包
-      fs.rmSync(staging, { recursive: true, force: true });
-      fs.rmSync(zipPath, { force: true });
-    }
-  }
-
-  removeSkill(memberId: string, name: string): void {
-    this.get(memberId);
-    this.ensureHome(memberId);
-
-    const safe = assertSafeSkillName(name);
-    const dir = path.join(this.skillsPath(memberId), safe);
-    if (!fs.existsSync(dir)) {
-      throw Object.assign(new Error(`Skill 不存在：${safe}`), { status: 404 });
-    }
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
-
-  private describeSkill(memberId: string, name: string): MemberSkill {
-    const dir = path.join(this.skillsPath(memberId), name);
-    const skillFile = path.join(dir, SKILL_FILE);
-    const hasSkillFile = fs.existsSync(skillFile);
-
-    return {
-      name,
-      description: hasSkillFile ? readSkillDescription(skillFile) : '',
-      fileCount: countFiles(dir),
-      updatedAt: (hasSkillFile ? fs.statSync(skillFile) : fs.statSync(dir)).mtime.toISOString(),
-    };
-  }
-
   private ensureHome(memberId: string): void {
     const home = this.homePath(memberId);
     fs.mkdirSync(home, { recursive: true });
     fs.mkdirSync(path.dirname(this.memoryPath(memberId)), { recursive: true });
-    fs.mkdirSync(this.skillsPath(memberId), { recursive: true });
+    // skill 目录仍在这里兜底建：member home 的形状是 MemberService 的契约，
+    // 即使 skill 的读写已经搬去 SkillService（见 skill-service.ts）。
+    fs.mkdirSync(path.join(home, 'skills'), { recursive: true });
 
     const memoryFile = this.memoryPath(memberId);
     if (!fs.existsSync(memoryFile)) {

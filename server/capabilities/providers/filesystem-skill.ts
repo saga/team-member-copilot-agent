@@ -7,14 +7,17 @@ import type { CapabilityContext, SkillArtifact, SkillProvider } from '../types.j
 /**
  * 磁盘目录即 skill 的 Provider。
  *
- * 两个实例共用这一个类，只是 root 不同：
+ * 三个实例共用这一个类，只是 root 不同（对应能力的三层）：
  *
- *   team.filesystem-skills     <teamSkillRoot>              全员都该会的程序化方法论
- *   member.filesystem-skills   <member home>/<id>/skills/   这个 Member 自己的专长
+ *   global.filesystem-skills   <globalSkillRoot>            公司级，所有 Agent 默认继承
+ *   team.filesystem-skills     <teamSkillRoot>/<teamId>     Team 级，Team 内所有 Agent 继承
+ *   member.filesystem-skills   <memberHomeRoot>/<id>/skills 这个 Member 自己的专长
  *
- * 为什么 root 是 `string | (context) => string` 而不是两个类：唯一的差别就是
- * 「目录怎么算」，而个人目录要跟着 context 走。复制一个类出来，只会让两边开始
- * 各自漂移（比如一边加了 frontmatter 解析，另一边没有）。
+ * selector 为空 = 当前 scope 下的全部 skill；selector 有值 = 只加载点名的那些。
+ *
+ * 为什么 root 是 `string | (context) => string` 而不是三个类：唯一的差别就是
+ * 「目录怎么算」，而 team / member 目录要跟着 context 走。复制三个类出来，只会
+ * 让它们开始各自漂移（比如一个加了 frontmatter 解析，另一个没有）。
  *
  * ── 缺文件时跳过而不是抛 ──────────────────────────────────────────────
  *

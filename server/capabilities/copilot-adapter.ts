@@ -4,6 +4,7 @@ import type {
   CapabilityContext,
   RuntimeCapabilities,
   RuntimeTool,
+  ToolDecision,
   ToolExecutionContext,
 } from './types.js';
 
@@ -76,17 +77,54 @@ export class CopilotCapabilityAdapter {
       description: tool.description,
       parameters: tool.parameters,
       // app-owned 工具不需要人点「同意」：没有终端可以点。真正的判定在
-      // policy.check 里，下面是唯一执行入口。
+      // evaluateToolUse 里，下面是唯一执行入口。
+      //
+      // `skipPermission: true` 的含义是「不必弹权限提示」，也就是**无条件执行**
+      // —— 它省掉的是一次交互，不是一次授权。所以授权判定必须在每次调用时重新
+      // 算一遍，而不是在装配 session 时算完就完。
       skipPermission: true,
       handler: async (args: unknown, _invocation: ToolInvocation) => {
         const current: ToolExecutionContext = { ...context, toolName: tool.name };
-        const decision = await this.policy.check(tool, current, normalizeArgs(args));
+        const normalized = normalizeArgs(args);
+        const decision = await this.evaluateToolUse(tool, context, normalized);
         if (!decision.allowed) {
           throw new Error(`Tool ${tool.name} 被拒绝：${decision.reason}`);
         }
-        return tool.execute!(current, normalizeArgs(args));
+        return tool.execute!(current, normalized);
       },
     });
+  }
+
+  /**
+   * 一次工具调用的完整判定：**先 guard，再 Policy**。
+   *
+   * guard 是 Provider 对「这一次调用的输入边界」的判定（这条路径在不在
+   * workspace 内、参数格式对不对）。它必须在这里被执行，而且必须在 Policy 之前：
+   *
+   *   guard 说不行 → 一定不行（Provider 最清楚自己的输入约束）
+   *   guard 说行   → 只对低风险工具有效，external-write / privileged 的放行权
+   *                  在 PolicyService（「执行动作的人」不能同时当「批准动作的人」）
+   *
+   * 放在适配器里、而不是只依赖注入进来的 ToolPolicy：授权判定的第一道闸不该
+   * 取决于「装配时传了哪个 policy 实现」。这样即使换了一个忘了跑 guard 的
+   * policy，guard 仍然生效。
+   *
+   * 因此 guard **必须保持无副作用**，只做输入 / 边界检查 —— 它可能被求值一次
+   * 以上，而「检查两次」和「执行两次」是完全不同的后果。
+   */
+  private async evaluateToolUse(
+    tool: RuntimeTool,
+    context: CapabilityContext,
+    args: Record<string, unknown>,
+  ): Promise<ToolDecision> {
+    if (tool.guard) {
+      const guardDecision = await tool.guard({ ...context, toolName: tool.name }, args);
+      if (!guardDecision.allowed) {
+        return { allowed: false, reason: guardDecision.reason };
+      }
+    }
+
+    return this.policy.check(tool, { ...context, toolName: tool.name }, args);
   }
 
   private async check(
@@ -106,7 +144,7 @@ export class CopilotCapabilityAdapter {
       return { allowed: false, reason: `未为该工具定义策略（${toolName}），授权层默认拒绝` };
     }
 
-    return this.policy.check(tool, { ...context, toolName }, normalizeArgs(args));
+    return this.evaluateToolUse(tool, context, normalizeArgs(args));
   }
 }
 

@@ -10,6 +10,7 @@ import { TeamService } from './team-service.js';
 import { CapabilityRegistry } from './capabilities/registry.js';
 import { CapabilityService } from './capabilities/service.js';
 import { CapabilityResolver } from './capabilities/resolver.js';
+import { SkillService } from './skill-service.js';
 import { FilesystemSkillProvider } from './capabilities/providers/filesystem-skill.js';
 import { LocalFilesystemKnowledgeProvider } from './capabilities/providers/filesystem-knowledge.js';
 import { CoreTeamToolProvider } from './capabilities/providers/core-tools.js';
@@ -27,6 +28,7 @@ import { TeamEventService } from './team-event-service.js';
 import { healthRouter } from './routes/health.js';
 import { membersRouter } from './routes/members.js';
 import { capabilitiesRouter } from './routes/capabilities.js';
+import { skillsRouter } from './routes/skills.js';
 import { knowledgeRouter } from './routes/knowledge.js';
 import { internalRouter } from './routes/internal.js';
 import { conversationsRouter } from './routes/conversations.js';
@@ -69,12 +71,20 @@ const localKnowledgeProvider = new LocalFilesystemKnowledgeProvider(db, capabili
 
 const registry = new CapabilityRegistry();
 
+// 三个 scope 各一个实例，只有 root 不同。skill 内容落盘位置与能力的三层一一
+// 对应：global/team/member。team / member 的 root 要跟着 context 走 —— Team 级
+// 能力必须知道是哪个 Team，Member 级要知道是哪个 Member。
 registry.registerSkillProvider(
-  new FilesystemSkillProvider('team.filesystem-skills', config.teamSkillRoot),
+  new FilesystemSkillProvider('global.filesystem-skills', config.globalSkillRoot),
+);
+registry.registerSkillProvider(
+  new FilesystemSkillProvider('team.filesystem-skills', (context) =>
+    path.join(config.teamSkillRoot, context.teamId),
+  ),
 );
 registry.registerSkillProvider(
   new FilesystemSkillProvider('member.filesystem-skills', (context) =>
-    memberService.skillsPath(context.memberId),
+    path.join(config.memberHomeRoot, context.memberId, 'skills'),
   ),
 );
 
@@ -117,6 +127,10 @@ if (jiraConfigured) {
 
 const capabilityResolver = new CapabilityResolver(registry);
 
+// Skill 内容的统一存储与安装。三个 scope（global / team / member）共用这一个
+// 服务 —— 它按 scope 决定落盘位置，并在这里统一执行 zip 的三道安全闸。
+const skillService = new SkillService(db);
+
 const copilotService = new CopilotService({
   toolPolicy: new DefaultToolPolicy(
     { allowHostTools: config.allowHostCodingTools },
@@ -143,6 +157,9 @@ schedulerService = new SchedulerService(structureService, () => teamService);
 
 // Skill / KB 的目录是「放进去就生效」的磁盘约定，必须先存在。
 // KB 行本身由启动时的 syncFromDisk 按 directory 建，这里只兜目录。
+// team 级 skill 的实际根是 <teamSkillRoot>/<teamId>，由 Provider 在解析时拼；
+// 这里兜的是它们的父目录。
+fs.mkdirSync(config.globalSkillRoot, { recursive: true });
 fs.mkdirSync(config.teamSkillRoot, { recursive: true });
 fs.mkdirSync(config.teamKnowledgeRoot, { recursive: true });
 
@@ -153,6 +170,9 @@ app.use(express.json({ limit: '1mb' }));
 
 app.use('/api/health', healthRouter);
 app.use('/api/members', membersRouter(teamService));
+// 更具体的先挂：/api/capabilities/skills/* 是「磁盘上装了哪些 skill」，
+// /api/capabilities/* 是「启用了哪些能力来源」。两者刻意分开。
+app.use('/api/capabilities/skills', skillsRouter(skillService));
 app.use('/api/capabilities', capabilitiesRouter(teamService, registry));
 app.use('/api/knowledge', knowledgeRouter(localKnowledgeProvider));
 app.use('/api/team', teamRouter(structureService, teamEvents));
@@ -190,6 +210,7 @@ export {
   capabilityResolver,
   localKnowledgeProvider,
   registry,
+  skillService,
   teamService,
   structureService,
   schedulerService,

@@ -84,14 +84,15 @@ interface TemplateFiles {
 }
 
 /**
- * 默认能力组成：与 `defaultMemberCapabilities()` 同形。
+ * fixture 用的 Member 层能力组成。
  *
- * 模板里的 `capabilities` 现在是**必填**——「这个 Member 能用什么」不该有一个
- * 隐式默认（隐式默认会让漏配的模板安静地拿到一些能力）。所以 fixture 也得显式
- * 写出来，而不是靠 seeder 兜底。
+ * 刻意写成一份「Member 特有的增量」：global / team 两层由
+ * `config/capability-templates` 提供，模板只描述这个人**多出来**什么。写成
+ * 「把基线复制一份」的话，测出来的就是「模板会写什么就写什么」——
+ * 而真正要锁的是「模板里写的那一份原样落到了 member 层」。
  */
 const FIXTURE_CAPABILITIES = {
-  skills: [{ providerId: 'team.filesystem-skills' }, { providerId: 'member.filesystem-skills' }],
+  skills: [{ providerId: 'member.filesystem-skills' }],
   knowledge: [{ providerId: 'local.filesystem-knowledge', selector: '$personal' }],
   tools: [{ providerId: 'team.core-tools' }, { providerId: 'knowledge.tools' }],
 };
@@ -138,26 +139,38 @@ describe('真实模板目录：三个默认 Member', () => {
     assert.equal(engineer.handle, 'engineer');
     assert.equal(security.handle, 'security');
 
-    // 只有 Engineer 绑定了宿主工具：架构师和 Security Reviewer 不该因为
-    // 「自己是这个角色」就获得宿主机代码执行能力。
+    // Member 层只写「这个人**多出来**什么」。宿主工具是唯一一个必须显式绑定的
+    // 能力：`runtime.host-coding-tools` 会触达宿主机，只有明确需要它的角色
+    // （Engineer）才绑 —— 架构师和 Security Reviewer 不该因为「自己是这个角色」
+    // 就获得宿主机代码执行能力。
     //
     // 注意这只代表它们**想要**：能不能真的用还要部署层放行
     // （HOST_CODING_TOOLS），两件事刻意分开。
     assert.deepEqual(
-      stack.capabilities.get(engineer.id).tools,
-      [
-        { providerId: 'knowledge.tools' },
-        { providerId: 'runtime.host-coding-tools' },
-        { providerId: 'team.core-tools' },
-      ],
-      'Engineer 应该多绑定一条宿主工具',
+      stack.capabilities.getMember(engineer.id).tools,
+      [{ providerId: 'runtime.host-coding-tools' }],
+      'Engineer 的 Member 层应该多一条宿主工具',
     );
     for (const member of [architect, security]) {
       assert.ok(
         !stack.capabilities
-          .get(member.id)
+          .getMember(member.id)
           .tools.some((binding) => binding.providerId === 'runtime.host-coding-tools'),
         `${member.handle} 不该绑定宿主工具`,
+      );
+    }
+
+    // 基线能力（team.core-tools / knowledge.tools / *.filesystem-skills）不该
+    // 出现在任何人的 Member 层里 —— 它们在 global / team 模板里，改一次全员生效。
+    // 复制一份到每个人的私有层，等于让「管理员改 Team 能力」对这些人失效，
+    // 而且看不出原因。
+    for (const member of [architect, engineer, security]) {
+      assert.deepEqual(
+        stack.capabilities
+          .getMember(member.id)
+          .tools.filter((binding) => binding.providerId !== 'runtime.host-coding-tools'),
+        [],
+        `${member.handle} 的 Member 层不该复制 global/team 基线`,
       );
     }
 

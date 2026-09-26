@@ -1,5 +1,6 @@
 import { Collapse } from 'antd';
 import type { Conversation, Member } from '../../lib/api';
+import { CapabilityManager } from './CapabilityManager';
 import { ConversationList } from './ConversationList';
 import { MemberList } from './MemberList';
 import { CurrentWorkSection } from './TeamSections';
@@ -29,7 +30,7 @@ interface TeamSidebarProps {
   }) => Promise<void>;
 }
 
-/** 左栏：Members / Projects / Work / Schedules / Conversations 五个分区。只负责排布与转发。 */
+/** 左栏 Team 管理、Capabilities、Current Work、Schedules、Conversations。只负责排布与转发。 */
 export function TeamSidebar(props: TeamSidebarProps) {
   const {
     members,
@@ -68,6 +69,11 @@ export function TeamSidebar(props: TeamSidebarProps) {
               onEdit={onEditMember}
             />
           ),
+        },
+        {
+          key: 'capabilities',
+          label: 'Capabilities',
+          children: <CapabilityManager members={members} />,
         },
         {
           key: 'current-work',

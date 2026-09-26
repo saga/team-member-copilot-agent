@@ -21,14 +21,29 @@ import type { CapabilityService } from './capabilities/service.js';
  *
  * 边界要分清：
  *
- *   config/member-templates/   provisioning baseline（第一次出现时是什么样）
- *   SQLite member              当前真实配置
- *   member_capability_binding  当前能力组成
- *   <member home>/memory/      当前长期记忆
+ *   config/capability-templates/  global / team 两层的 provisioning baseline
+ *   config/member-templates/      Member 层的 provisioning baseline（第一次出现时是什么样）
+ *   SQLite member                 当前真实配置
+ *   SQLite capability_binding     当前能力组成（三层各存各的）
+ *   <member home>/memory/         当前长期记忆
  *
  * 所以**已存在就跳过，且不覆盖**。模板改了一版也不会自动升级已经建好的 Member：
  * 那会把用户手工改过的人设静默换掉。「恢复成模板」是一个需要显式触发的独立功能，
  * 不是启动副作用。
+ *
+ * ── 模板里的 capabilities 只写 Member 层的增量 ────────────────────────
+ *
+ * 不应该重复写这些 —— 它们由 global / team capability scope 提供：
+ *
+ *   global.filesystem-skills
+ *   team.filesystem-skills
+ *   team.core-tools
+ *   knowledge.tools
+ *
+ * 写进去的后果不是报错，而是**静默的复制**：这个人从此不再跟随团队基线 ——
+ * 管理员改 Team 能力时它不变，而且没有任何地方看得出原因。模板里应该只出现
+ * 「这个人独有的东西」（个人 skill 目录、个人资料库、它专属的资料源、
+ * 它需要的宿主工具）。
  *
  * ── 为什么这里不再 import 任何 Knowledge 实现 ─────────────────────────
  *
@@ -197,8 +212,8 @@ export function seedMemberTemplates(
       continue;
     }
 
-    const templateCapabilities: MemberCapabilities = template.capabilities;
-    resolver.validate(templateCapabilities);
+    const memberCapabilities: MemberCapabilities = template.capabilities;
+    resolver.validate(memberCapabilities);
 
     const member = memberService.create(
       {
@@ -213,7 +228,7 @@ export function seedMemberTemplates(
       { seedKey: template.key, initialMemory: memory },
     );
 
-    capabilities.replace(member.id, templateCapabilities);
+    capabilities.replaceMember(member.id, memberCapabilities);
 
     created.push(template.key);
   }

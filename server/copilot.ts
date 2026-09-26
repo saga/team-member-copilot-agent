@@ -61,6 +61,12 @@ export interface RunMemberTurnInput {
   onDelta?: (delta: string) => void;
   executionId: string;
   conversationId: string;
+  /**
+   * 这一轮所属的 Team。能力是三层组合（global + team + member），
+   * 而 Provider 需要知道 teamId 才能定位 Team 级 skill / knowledge 根目录，
+   * 所以它必须随 turn 一起传进来，不能在 Provider 里现查。
+   */
+  teamId: string;
   /** 这一轮生效的能力。冻结在这里而不是在 hook 里现查 Member，见下。 */
   capabilities: RuntimeCapabilities;
 }
@@ -228,6 +234,7 @@ export class CopilotService {
       // 不该让正在跑的这一轮突然多出（或少掉）一个工具。解析在 team-service
       // 里完成，这里只消费结果。
       const runtimeContext: CapabilityContext = {
+        teamId: input.teamId,
         memberId: input.member.id,
         conversationId: input.conversationId,
         executionId: input.executionId,

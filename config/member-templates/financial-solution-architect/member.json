@@ -10,18 +10,12 @@
   "memoryFile": "MEMORY.md",
   "capabilities": {
     "skills": [
-      { "providerId": "team.filesystem-skills" },
       { "providerId": "member.filesystem-skills" }
     ],
     "knowledge": [
-      { "providerId": "local.filesystem-knowledge", "selector": "financial-core" },
-      { "providerId": "local.filesystem-knowledge", "selector": "architecture-standards" },
       { "providerId": "local.filesystem-knowledge", "selector": "$personal" }
     ],
-    "tools": [
-      { "providerId": "team.core-tools" },
-      { "providerId": "knowledge.tools" }
-    ]
+    "tools": []
   },
   "enabled": true
 }

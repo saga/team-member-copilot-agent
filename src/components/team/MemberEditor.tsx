@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react';
-import { Alert, Button, Collapse, Form, Input, Popconfirm, Space, Tag } from 'antd';
-import { api, type Member, type MemberCapabilities } from '../../lib/api';
+import { useState } from 'react';
+import { Alert, Button, Form, Input, Popconfirm, Space, Tag } from 'antd';
+import { api, type Member } from '../../lib/api';
 
 interface MemberEditorProps {
   member: Member;
@@ -19,31 +19,15 @@ interface MemberEditorProps {
  * 所以它们是**人格定义**，不是元数据装饰。`model` 支持留空 = 显式回落
  * COPILOT_MODEL，所以提交时要用 null 而不是空串。
  *
- * 「能用什么」不在这里编辑，而是单独显示：它属于
- * `/api/capabilities/members/:id`。把能力和身份混在一个表单里，会让「改个名字」
- * 和「给它开 bash」变成同一个保存动作。
+ * 「能用什么」**不在这里**：能力现在是三层继承的（global + team + member），
+ * 而这个表单只描述一个人。把能力和身份混在一个表单里，会让「改个名字」和
+ * 「给它开 bash」变成同一个保存动作 —— 而且这里只看得见 member 那一层，
+ * 会显示成一个「什么能力都没有的人」。
  */
 export function MemberEditor({ member, onSaved, onCancel }: MemberEditorProps) {
   const [form] = Form.useForm();
-  const [capabilities, setCapabilities] = useState<MemberCapabilities | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  // 能力是只读视图：它由模板 / 运维决定，不跟着这个表单一起保存。
-  useEffect(() => {
-    let cancelled = false;
-    api
-      .getMemberCapabilities(member.id)
-      .then((result) => {
-        if (!cancelled) setCapabilities(result.capabilities);
-      })
-      .catch(() => {
-        if (!cancelled) setCapabilities(null);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [member.id]);
 
   async function save(values: Record<string, string>) {
     setBusy(true);
@@ -130,38 +114,16 @@ export function MemberEditor({ member, onSaved, onCancel }: MemberEditorProps) {
         <Input placeholder="gpt-5" />
       </Form.Item>
 
-      <Collapse
-        size="small"
-        style={{ marginBottom: 16 }}
-        items={[
-          {
-            key: 'capabilities',
-            label: 'Capabilities（只读）',
-            children: capabilities ? (
-              <Space direction="vertical" style={{ width: '100%' }}>
-                {(['skills', 'knowledge', 'tools'] as const).map((key) => (
-                  <div key={key}>
-                    <strong>{key}</strong>{' '}
-                    {capabilities[key].length === 0 && <span style={{ color: '#999' }}>(none)</span>}
-                    {capabilities[key].map((binding) => (
-                      <Tag key={`${binding.providerId}#${binding.selector ?? ''}`} style={{ margin: 2 }}>
-                        {binding.providerId}
-                        {binding.selector ? ` · ${binding.selector}` : null}
-                      </Tag>
-                    ))}
-                  </div>
-                ))}
-                <span style={{ color: '#999', fontSize: 12 }}>
-                  能力组成决定这个 Member 能用哪些 skill 来源、知识源和工具。它由模板或运维配置，
-                  不在这个表单里修改；上面存的是 Provider ID，所以换掉后端实现时这里不变。
-                </span>
-              </Space>
-            ) : (
-              <span style={{ color: '#999' }}>读取中…</span>
-            ),
-          },
-        ]}
-      />
+      <span
+        style={{
+          color: '#999',
+          fontSize: 12,
+          display: 'block',
+          marginBottom: 16,
+        }}
+      >
+        Capabilities 在 Team → Capabilities 中配置。Global / Team 能力会自动继承到这个 Member。
+      </span>
 
       {error && <Alert type="error" showIcon message={error} style={{ marginBottom: 12 }} />}
 

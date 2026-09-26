@@ -20,7 +20,7 @@ import type { DatabaseSync } from 'node:sqlite';
  *
  * 程序不认识任何别的编号 —— 没有升级代码，认出来也无从下手。
  */
-export const SCHEMA_VERSION = 14;
+export const SCHEMA_VERSION = 15;
 
 /**
  * 当前 schema 的完整定义，按最终形状写。
@@ -55,39 +55,88 @@ CREATE UNIQUE INDEX idx_member_seed_key
   ON member(seed_key)
   WHERE seed_key IS NOT NULL;
 
--- ─────────────────────────────────────────────── Member Capabilities ──────
+-- ─────────────────────────────────────────────── Capability Scope ───────
 --
--- Member 的「能力组成」：它引用哪些 Skill / Knowledge / Tool Provider。
+-- 能力分三层，叠加生效：
 --
--- 这里存的是 Provider ID（稳定契约）+ selector（Provider 自己解释的选择子），
--- 不是实现。所以「本地 SQLite 资料库」换成「企业搜索服务」时，Member 这一行
--- 不用动 —— 换的是注册表里那个 ID 背后的实现。
+--   global   全平台，所有 Agent 默认继承
+--   team     某个 Team 内所有 Agent 继承
+--   member   某个 Member 的专属增量能力
 --
--- 表形状刻意的三合一（一张表 + capability_type）而不是三张表：三类能力在存储
--- 这一层的形状完全一样，拆开只会让「列出这个 Member 的全部能力」变成三次查询
--- 加一次手工合并。
+-- capability_scope 只记录 global/team 是否已经完成 provisioning。它存在是为了
+-- 区分两件从 binding 上看不出区别的事：
+--
+--   1. 从来没有初始化过            → 应该灌默认值
+--   2. 初始化过，但管理员明确清空了 → 不能再灌
+--
+-- 没有它的话，管理员把 global 清空后重启，服务又会把默认值补回来 ——
+-- 「清空」这个操作变得无法表达。provisioning 用 INSERT OR IGNORE：写进去了
+-- 才代表「这一次是我初始化的」，之后无论 binding 被改成什么样都不再重灌。
+
+CREATE TABLE capability_scope (
+  scope_type TEXT NOT NULL
+    CHECK (scope_type IN ('global', 'team')),
+  scope_id TEXT NOT NULL,
+  -- 是哪一份 provisioning 配置种下了这一层（'capability.global.v1' 这种）。
+  -- 便于将来「模板升级了要不要重灌」这件事有据可查，而不是靠猜。
+  seed_key TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (scope_type, scope_id)
+);
+
+-- ─────────────────────────────────────────────── Capability Binding ────
+--
+-- scope_type/scope_id 决定这条能力属于谁：
+--
+--   global / ''          → 全平台
+--   team   / <team-id>   → 某个 Team
+--   member / <member-id> → 某个 Member
+--
+-- capability_type 决定能力种类（skill / knowledge / tool）。
+--
+-- 一张表装三层，而不是三层各一张表：三者在存储这一层的形状完全一样，拆开只会
+-- 让「解析这个 Member 的 effective 能力」变成三次查询加一次手工合并。scope 是
+-- 一个**列**，不是一个**表**。
 --
 -- selector 用 '' 而不是 NULL：它参与主键，而 SQLite 把 NULL 视为互不相等 ——
--- 用 NULL 会让同一个 (member, type, provider) 能插进无限多行。
+-- 用 NULL 会让同一个 (scope, type, provider) 能插进无限多行。
+--
+-- scope_id 的 CHECK 把「global 没有 id、team/member 必须有 id」钉死在数据库上：
+-- 一个 scope_id 为空的 team 行永远不会被任何查询命中，却会一直占着位置。
 
-CREATE TABLE member_capability_binding (
-  member_id TEXT NOT NULL,
+CREATE TABLE capability_binding (
+  scope_type TEXT NOT NULL
+    CHECK (scope_type IN ('global', 'team', 'member')),
+  scope_id TEXT NOT NULL,
   capability_type TEXT NOT NULL
     CHECK (capability_type IN ('skill', 'knowledge', 'tool')),
   provider_id TEXT NOT NULL,
   selector TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
-  PRIMARY KEY (member_id, capability_type, provider_id, selector),
-  FOREIGN KEY (member_id)
-    REFERENCES member(id)
-    ON DELETE CASCADE
+
+  PRIMARY KEY (
+    scope_type,
+    scope_id,
+    capability_type,
+    provider_id,
+    selector
+  ),
+
+  CHECK (
+    (scope_type = 'global' AND scope_id = '')
+    OR
+    (scope_type IN ('team', 'member') AND length(trim(scope_id)) > 0)
+  )
 );
 
-CREATE INDEX idx_member_capability_provider
-  ON member_capability_binding(capability_type, provider_id);
+-- 按 scope 取「这一层存了什么」。effective 解析每次要查三遍（global/team/member），
+-- 这个索引就是那三遍的入口。
+CREATE INDEX idx_capability_binding_scope
+  ON capability_binding(scope_type, scope_id);
 
-CREATE INDEX idx_member_capability_member
-  ON member_capability_binding(member_id);
+-- 「谁绑定了这个 Provider」—— 管理界面与影响面分析用。
+CREATE INDEX idx_capability_binding_provider
+  ON capability_binding(capability_type, provider_id);
 
 -- ─────────────────────────────────────────────── Team 业务模型 v1 ─────
 --
@@ -517,9 +566,10 @@ CREATE INDEX idx_execution_external_work_key
 -- 级的 Knowledge 模型：正文在磁盘上（<teamKnowledgeRoot>/<key> 与
 -- <memberHomeRoot>/<id>/knowledge），这里只放元数据与 FTS 索引。
 --
--- 因此「谁能看哪个库」不在这里表达 —— 那是 member_capability_binding 的事
--- （knowledge + provider_id + selector）。这里只表达「有哪些库、哪个 Member 拥有
--- 它」，两条 CHECK 把 scope 和属主绑死，不存在「team KB 却有属主」这种中间态。
+-- 因此「谁能看哪个库」不在这里表达 —— 那是 capability_binding 的事
+-- （knowledge + provider_id + selector，在 global/team/member 任一层）。这里只
+-- 表达「有哪些库、哪个 Member 拥有它」，两条 CHECK 把 scope 和属主绑死，
+-- 不存在「team KB 却有属主」这种中间态。
 
 CREATE TABLE knowledge_base (
   id TEXT PRIMARY KEY,

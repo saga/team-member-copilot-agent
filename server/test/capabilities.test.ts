@@ -21,6 +21,8 @@ import { CapabilityRegistry } from '../capabilities/registry.js';
  *   声明与授权同源            availableTools 与 toolIndex 出自同一份解析结果
  *   skipPermission 不是授权   策略拒绝时 execute 一次都不能跑
  *   检索范围只由 binding 定   模型的 query 不能扩大它
+ *   三层按序合并              global + team + member，且跨层去重
+ *   guard 是授权第一道闸      适配器自己跑 guard（不依赖 policy 实现），在 Policy 之前
  */
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tmca-capabilities-'));
@@ -34,13 +36,13 @@ const { MemberService } = await import('../member-service.js');
 const { DefaultToolPolicy } = await import('../tool-policy.js');
 const { CapabilityResolver } = await import('../capabilities/resolver.js');
 const { CopilotCapabilityAdapter } = await import('../capabilities/copilot-adapter.js');
-const { defaultMemberCapabilities } = await import('../capabilities/defaults.js');
 const { PERSONAL_SELECTOR } = await import('../capabilities/providers/filesystem-knowledge.js');
 const { createTestStack, capabilityContext, singleExecutionId, muteAllMembers, StubCopilot } =
   await import('./support.js');
 
 import type { MemberCapabilities } from '../domain.js';
 import type { PolicyService } from '../policy.js';
+import type { ToolPolicy } from '../tool-policy.js';
 import type { ToolExecutionContext } from '../capabilities/types.js';
 
 /** 高风险拒绝桩：与生产 DenyHighRiskPolicyService 同语义，理由可断言。 */
@@ -48,7 +50,6 @@ function denyHighRisk(): PolicyService {
   return { decide: (input) => ({ allowed: false, reason: `risk=${input.tool.risk} 需要独立 Policy 决策` }) };
 }
 import type {
-  CapabilityContext,
   KnowledgeProvider,
   RuntimeCapabilities,
   RuntimeTool,
@@ -67,22 +68,40 @@ const stub = new StubCopilot();
 const stack = createTestStack(db, memberService, stub.asCopilot);
 const capabilities = stack.capabilities;
 
+/** 当前部署的唯一 Team。三层能力里的 team 层挂在它上面。 */
+const defaultTeam = stack.structure.ensureDefaultTeam();
+
 const KNOWLEDGE_PROVIDER = 'local.filesystem-knowledge';
 
 /**
  * 直接建 member 行，**不写**能力绑定。
  *
- * 绑定表本身的用例要自己控制那一行，所以走 member-service。想拿到默认能力
- * 的用例用下面的 `memberWithDefaults()` —— 写默认绑定的是 TeamService 的编排，
- * 不是建表本身，这个区别正是「能力不是 Member 的固有属性」的体现。
+ * 绑定表本身的用例要自己控制那一行，所以走 member-service。
  */
 function rawMember(name: string) {
   return memberService.create({ name, handle: name.toLowerCase(), role: 'T' });
 }
 
-/** 走 TeamService 建人，顺带写入默认能力。 */
+/**
+ * 一个普通 Member 的**Member 层增量**。
+ *
+ * 注意它不再包含 `team.filesystem-skills` / `team.core-tools` 这类基线能力：
+ * 那些是 global / team 层的事（见 `config/capability-templates`）。把基线写进
+ * 每个人的私有层，等于让「管理员改 Team 能力」对这些人失效 —— 而且看不出原因。
+ */
+function memberLayerDefaults(): MemberCapabilities {
+  return {
+    skills: [{ providerId: 'member.filesystem-skills' }],
+    knowledge: [{ providerId: KNOWLEDGE_PROVIDER, selector: PERSONAL_SELECTOR }],
+    tools: [{ providerId: 'team.core-tools' }, { providerId: 'knowledge.tools' }],
+  };
+}
+
+/** 建人并写入 Member 层增量，给只关心单层的用例一个起点。 */
 function memberWithDefaults(name: string) {
-  return stack.team.createMember({ name, role: 'T' });
+  const member = stack.team.createMember({ name, role: 'T' });
+  capabilities.replaceMember(member.id, memberLayerDefaults());
+  return member;
 }
 
 /** 绑定读回来是按 (类型, provider, selector) 排序的 —— 顺序不是契约，比较前先归一。 */
@@ -96,9 +115,14 @@ function normalized(value: MemberCapabilities): MemberCapabilities {
   };
 }
 
-/** 工具 execute 拿到的上下文比能力解析多一个工具名。 */
+/**
+ * 工具 execute 拿到的上下文比能力解析多一个工具名。
+ *
+ * `teamId` 用真实 Team：本地 knowledge Provider 会拿它去校验 Team 级 binding
+ * （`assertTeamExists`），编造的 teamId 会变成 404 而不是「未绑定」。
+ */
 function toolContext(memberId: string, toolName: string): ToolExecutionContext {
-  return { ...capabilityContext(memberId), toolName };
+  return { ...capabilityContext(memberId, defaultTeam.id), toolName };
 }
 
 // ------------------------------------------------------------------ stubs
@@ -187,13 +211,7 @@ function manifestRegistry(overrides: {
 }
 
 function resolveWith(registry: CapabilityRegistry, value: MemberCapabilities, memberId = 'member-a') {
-  const context: CapabilityContext = {
-    memberId,
-    conversationId: 'c1',
-    executionId: 'e1',
-    userId: 'u1',
-  };
-  return new CapabilityResolver(registry).resolve(context, value);
+  return new CapabilityResolver(registry).resolve(capabilityContext(memberId), value);
 }
 
 async function manifestHash(
@@ -225,7 +243,6 @@ describe('Registry：Provider ID 是稳定契约', () => {
     );
     assert.throws(() => registry.registerToolProvider(toolProvider('foo', '1', [])), /已被 skill Provider 占用/);
   });
-
 });
 
 // ═══════════════════════════════════════════════ 2. Resolver / manifest
@@ -340,54 +357,75 @@ describe('manifest：描述能力组成，不描述是谁', () => {
 
 // ═══════════════════════════════════════════════ 3. CapabilityService
 
-describe('CapabilityService：一张表装三类绑定', () => {
-  it('replace 是全量替换，空数组就是解绑', () => {
+describe('CapabilityService：一张表装三层绑定', () => {
+  it('replaceMember 是全量替换 Member 层，空数组就是解绑', () => {
     const member = rawMember('Binder');
 
-    capabilities.replace(member.id, {
+    capabilities.replaceMember(member.id, {
       skills: [{ providerId: 'team.filesystem-skills' }],
       knowledge: [{ providerId: KNOWLEDGE_PROVIDER, selector: PERSONAL_SELECTOR }],
       tools: [{ providerId: 'knowledge.tools' }],
     });
-    assert.deepEqual(capabilities.get(member.id), {
+    assert.deepEqual(capabilities.getMember(member.id), {
       skills: [{ providerId: 'team.filesystem-skills' }],
       knowledge: [{ providerId: KNOWLEDGE_PROVIDER, selector: PERSONAL_SELECTOR }],
       tools: [{ providerId: 'knowledge.tools' }],
     });
 
-    assert.deepEqual(capabilities.replace(member.id, { skills: [], knowledge: [], tools: [] }), {
+    assert.deepEqual(capabilities.replaceMember(member.id, { skills: [], knowledge: [], tools: [] }), {
       skills: [],
       knowledge: [],
       tools: [],
     });
   });
 
-  it('replace 推进 member.updated_at —— 能力是 Member 配置的一部分', () => {
+  it('replaceMember 推进 member.updated_at —— 能力是 Member 配置的一部分', () => {
     // execution 快照用 `memberRevision`（= updated_at）回答「当时是哪个版本的人」。
     // 只写 binding 不动 updated_at，事后对账会看到「同一个 revision、两组能力」。
     const member = rawMember('Revised');
     db.prepare(`UPDATE member SET updated_at = ? WHERE id = ?`).run('1970-01-01T00:00:00.000Z', member.id);
 
-    capabilities.replace(member.id, defaultMemberCapabilities());
+    capabilities.replaceMember(member.id, memberLayerDefaults());
 
     assert.notEqual(memberService.get(member.id).updatedAt, '1970-01-01T00:00:00.000Z');
   });
 
+  it('replaceGlobal / replaceTeam 不推进任何 Member 的 updated_at', () => {
+    // 反过来的错误更隐蔽：改一次 Team 能力就批量 touch 所有 Member 的
+    // updated_at，于是每个 execution 快照里的 memberRevision 都变了 ——
+    // 「这个人改过没有」这个问题从此答不出来。
+    const member = rawMember('Untouched');
+    db.prepare(`UPDATE member SET updated_at = ? WHERE id = ?`).run('1970-01-01T00:00:00.000Z', member.id);
+
+    capabilities.replaceGlobal({ skills: [], knowledge: [], tools: [{ providerId: 'team.core-tools' }] });
+    capabilities.replaceTeam(defaultTeam.id, {
+      skills: [],
+      knowledge: [],
+      tools: [{ providerId: 'knowledge.tools' }],
+    });
+
+    assert.equal(memberService.get(member.id).updatedAt, '1970-01-01T00:00:00.000Z');
+
+    // 清干净，别把这两层留给后面的用例
+    capabilities.replaceGlobal({ skills: [], knowledge: [], tools: [] });
+    capabilities.replaceTeam(defaultTeam.id, { skills: [], knowledge: [], tools: [] });
+  });
+
   it("空 selector 只可能存一行（NULL 在主键里互不相等，所以落库用的是 ''）", () => {
     const member = rawMember('Unique');
-    capabilities.replace(member.id, {
-      skills: [{ providerId: 'team.filesystem-skills' }],
+    capabilities.replaceMember(member.id, {
+      skills: [{ providerId: 'member.filesystem-skills' }],
       knowledge: [],
       tools: [],
     });
 
     // 落库的必须是 ''，不是 NULL：主键里带 selector，而 SQLite 把 NULL 视为
-    // 互不相等 —— 用 NULL 表示「空」会让同一个 (member, type, provider) 能插进
+    // 互不相等 —— 用 NULL 表示「空」会让同一个 (scope, type, provider) 能插进
     // 无限多行，唯一性约束形同不存在。
     const stored = db
       .prepare(
-        `SELECT selector FROM member_capability_binding
-         WHERE member_id = ? AND capability_type = 'skill'`,
+        `SELECT selector FROM capability_binding
+         WHERE scope_type = 'member' AND scope_id = ? AND capability_type = 'skill'`,
       )
       .get(member.id) as unknown as { selector: string | null } | undefined;
     assert.ok(stored);
@@ -397,26 +435,123 @@ describe('CapabilityService：一张表装三类绑定', () => {
     assert.throws(() =>
       db
         .prepare(
-          `INSERT INTO member_capability_binding
-             (member_id, capability_type, provider_id, selector, created_at)
-           VALUES (?, 'skill', 'team.filesystem-skills', '', 't')`,
+          `INSERT INTO capability_binding
+             (scope_type, scope_id, capability_type, provider_id, selector, created_at)
+           VALUES ('member', ?, 'skill', 'member.filesystem-skills', '', 't')`,
         )
         .run(member.id),
     );
   });
 
-  it('selector 是 ACL 的一部分：hasKnowledgeBinding 精确匹配', () => {
+  it('selector 是 ACL 的一部分：hasEffectiveKnowledgeBinding 精确匹配', () => {
     const member = rawMember('Scoped');
-    capabilities.replace(member.id, {
+    capabilities.replaceMember(member.id, {
       skills: [],
       knowledge: [{ providerId: KNOWLEDGE_PROVIDER, selector: 'financial-core' }],
       tools: [],
     });
 
-    assert.equal(capabilities.hasKnowledgeBinding(member.id, KNOWLEDGE_PROVIDER, 'financial-core'), true);
-    assert.equal(capabilities.hasKnowledgeBinding(member.id, KNOWLEDGE_PROVIDER, 'security-controls'), false);
-    assert.equal(capabilities.hasKnowledgeBinding(member.id, KNOWLEDGE_PROVIDER, ''), false);
-    assert.equal(capabilities.hasKnowledgeBinding(member.id, 'other.provider', 'financial-core'), false);
+    const has = (providerId: string, selector: string) =>
+      capabilities.hasEffectiveKnowledgeBinding(defaultTeam.id, member.id, providerId, selector);
+
+    assert.equal(has(KNOWLEDGE_PROVIDER, 'financial-core'), true);
+    assert.equal(has(KNOWLEDGE_PROVIDER, 'security-controls'), false);
+    assert.equal(has(KNOWLEDGE_PROVIDER, ''), false);
+    assert.equal(has('other.provider', 'financial-core'), false);
+  });
+});
+
+// ═══════════════════════════════════════════════ 4. 三层组合
+
+describe('Capability scope layering', () => {
+  it('global + team + member 按层合并', () => {
+    const member = memberWithDefaults('Layered');
+
+    capabilities.replaceGlobal({
+      skills: [{ providerId: 'global.filesystem-skills' }],
+      knowledge: [],
+      tools: [{ providerId: 'team.core-tools' }],
+    });
+
+    capabilities.replaceTeam(defaultTeam.id, {
+      skills: [{ providerId: 'team.filesystem-skills' }],
+      knowledge: [{ providerId: KNOWLEDGE_PROVIDER, selector: 'financial-core' }],
+      tools: [{ providerId: 'knowledge.tools' }],
+    });
+
+    capabilities.replaceMember(member.id, {
+      skills: [{ providerId: 'member.filesystem-skills' }],
+      knowledge: [{ providerId: KNOWLEDGE_PROVIDER, selector: PERSONAL_SELECTOR }],
+      tools: [],
+    });
+
+    const effective = capabilities.getEffective(defaultTeam.id, member.id);
+
+    // 顺序是契约：global 是基线，member 是增量。反过来会让「这个能力是哪一层
+    // 给的」在 UI 上呈现成随机顺序。
+    assert.deepEqual(
+      effective.skills.map((item) => item.providerId),
+      ['global.filesystem-skills', 'team.filesystem-skills', 'member.filesystem-skills'],
+    );
+
+    assert.deepEqual(
+      normalized(effective).knowledge,
+      normalized({
+        skills: [],
+        tools: [],
+        knowledge: [
+          { providerId: KNOWLEDGE_PROVIDER, selector: 'financial-core' },
+          { providerId: KNOWLEDGE_PROVIDER, selector: PERSONAL_SELECTOR },
+        ],
+      }).knowledge,
+    );
+
+    assert.deepEqual(
+      effective.tools.map((item) => item.providerId),
+      ['team.core-tools', 'knowledge.tools'],
+    );
+
+    // 清干净，别把这三层留给后面的用例
+    capabilities.replaceGlobal({ skills: [], knowledge: [], tools: [] });
+    capabilities.replaceTeam(defaultTeam.id, { skills: [], knowledge: [], tools: [] });
+    capabilities.replaceMember(member.id, { skills: [], knowledge: [], tools: [] });
+  });
+
+  it('相同 binding 在不同 scope 出现时只解析一次', () => {
+    // 三层去重的键是 (providerId, selector)：同一个资料源同时挂在公司级和
+    // Team 级时，Agent 不该拿到两条一模一样的引用 —— 那会让「一次检索覆盖
+    // 两个源」变成「同一个源被检索两次」。
+    const member = memberWithDefaults('DuplicateLayer');
+    const sameKnowledge = { providerId: KNOWLEDGE_PROVIDER, selector: 'financial-core' };
+
+    capabilities.replaceGlobal({ skills: [], knowledge: [sameKnowledge], tools: [] });
+    capabilities.replaceTeam(defaultTeam.id, { skills: [], knowledge: [sameKnowledge], tools: [] });
+    capabilities.replaceMember(member.id, { skills: [], knowledge: [sameKnowledge], tools: [] });
+
+    const effective = capabilities.getEffective(defaultTeam.id, member.id);
+
+    assert.equal(effective.knowledge.length, 1);
+
+    capabilities.replaceGlobal({ skills: [], knowledge: [], tools: [] });
+    capabilities.replaceTeam(defaultTeam.id, { skills: [], knowledge: [], tools: [] });
+    capabilities.replaceMember(member.id, { skills: [], knowledge: [], tools: [] });
+  });
+
+  it('getConfig 同时给出三层声明与合并结果（界面靠它回答「谁给的」）', () => {
+    const member = memberWithDefaults('Configured');
+    capabilities.replaceGlobal({ skills: [], knowledge: [], tools: [{ providerId: 'team.core-tools' }] });
+
+    const config = capabilities.getConfig(defaultTeam.id, member.id);
+
+    assert.deepEqual(config.global.tools, [{ providerId: 'team.core-tools' }]);
+    assert.deepEqual(config.team, { skills: [], knowledge: [], tools: [] });
+    assert.deepEqual(config.member.skills, [{ providerId: 'member.filesystem-skills' }]);
+    assert.deepEqual(
+      config.effective.tools.map((item) => item.providerId),
+      ['team.core-tools', 'knowledge.tools'],
+    );
+
+    capabilities.replaceGlobal({ skills: [], knowledge: [], tools: [] });
   });
 });
 
@@ -429,11 +564,14 @@ describe('Adapter：声明与授权同源', () => {
 
   it('声明出来的集合 = 解析出来的工具集合（同源，不会自己漂移）', async () => {
     const member = memberWithDefaults('Adapter');
-    const withHost = defaultMemberCapabilities();
+    const withHost = capabilities.getMember(member.id);
     withHost.tools.push({ providerId: 'runtime.host-coding-tools' });
-    capabilities.replace(member.id, withHost);
+    capabilities.replaceMember(member.id, withHost);
 
-    const runtime = await stack.resolver.resolve(capabilityContext(member.id), capabilities.get(member.id));
+    const runtime = await stack.resolver.resolve(
+      capabilityContext(member.id, defaultTeam.id),
+      capabilities.getMember(member.id),
+    );
     const declared = new Set(adapter.build(runtime, context).availableTools.toArray());
 
     assert.ok(runtime.tools.length > 0);
@@ -497,7 +635,117 @@ describe('Adapter：声明与授权同源', () => {
   });
 });
 
-// ═══════════════════════════════════════════════ 6. 工具契约
+// ═══════════════════════════════════════════════ 6. Tool guard
+
+describe('Tool guard', () => {
+  /**
+   * 一个**自己不跑 guard** 的 policy。
+   *
+   * 授权层不只有 `DefaultToolPolicy` 一个实现，而 `DefaultToolPolicy.check()` 内部
+   * 恰好也会跑一遍 guard。如果测试用它，「guard 由适配器执行」这条性质就测不出来
+   * —— 把适配器里那一段整块删掉，测试照样全绿（变异验证第 50 条正是这么发现的）。
+   * 所以这里必须用一个「忘了跑 guard」的 policy，让 guard 成为唯一能拒绝它的东西。
+   */
+  const guardBlindPolicy: ToolPolicy = {
+    check: () => ({ allowed: true, reason: 'policy 放行（这个桩不跑 guard）' }),
+    hostToolWithheld: () => false,
+  };
+
+  it('guard 拒绝时 execute 不执行 —— 即使 Policy 放行', async () => {
+    // guard 是**工具自己**的边界（workspace 越界、参数合法性），Policy 是**部署**
+    // 的边界（风险等级、宿主开关）。两者独立：Policy 放行不代表这个工具该跑。
+    let executed = false;
+
+    const guardedRegistry = registryOf({
+      tools: [
+        toolProvider('guarded.tools', '1', [
+          {
+            providerId: 'guarded.tools',
+            implementation: 'app',
+            kind: 'custom',
+            name: 'guarded',
+            description: 'guarded',
+            risk: 'read',
+            parameters: {},
+            guard: () => ({ allowed: false, reason: 'workspace boundary' }),
+            execute: () => {
+              executed = true;
+              return 'bad';
+            },
+          },
+        ]),
+      ],
+    });
+
+    const runtime = await resolveWith(guardedRegistry, {
+      skills: [],
+      knowledge: [],
+      tools: [{ providerId: 'guarded.tools' }],
+    });
+
+    const adapter = new CopilotCapabilityAdapter(guardBlindPolicy);
+
+    const built = adapter.build(runtime, capabilityContext('guarded-member'));
+    const tool = built.tools.find((item) => item.name === 'guarded');
+    assert.ok(tool);
+
+    await assert.rejects(async () => tool!.handler!({}, {} as ToolInvocation), /workspace boundary/);
+    assert.equal(executed, false, 'guard 拒绝时 execute 一次都不能跑');
+
+    // check() 走同一条判定：guard 先于 Policy，所以 Policy 说 ok 也没用。
+    const decision = await built.checkToolUse('guarded', {});
+    assert.equal(decision.allowed, false);
+    assert.match(decision.reason, /workspace boundary/);
+  });
+
+  it('guard 放行时照常交给 Policy 决定', async () => {
+    // 反向的一半：guard 说「行」只对低风险工具有效，放行权不在 Provider 手里。
+    // 一个 Provider 不能靠 `guard: () => ({ allowed: true })` 把自己升级成无限制工具。
+    let executed = 0;
+    const registry = registryOf({
+      tools: [
+        toolProvider('guarded.tools', '1', [
+          {
+            providerId: 'guarded.tools',
+            implementation: 'app',
+            kind: 'custom',
+            name: 'allowed',
+            description: 'stub',
+            risk: 'read',
+            parameters: {},
+            guard: () => ({ allowed: true, reason: 'workspace ok' }),
+            execute: () => {
+              executed += 1;
+              return 'ok';
+            },
+          },
+        ]),
+      ],
+    });
+
+    const runtime = await resolveWith(registry, { skills: [], knowledge: [], tools: [{ providerId: 'guarded.tools' }] });
+    const context = capabilityContext('guarded-member');
+
+    const denying = new CopilotCapabilityAdapter({
+      check: () => ({ allowed: false, reason: 'policy 拒绝' }),
+      hostToolWithheld: () => false,
+    }).build(runtime, context);
+    const deniedTool = denying.tools.find((item) => item.name === 'allowed');
+    assert.ok(deniedTool?.handler);
+    await assert.rejects(async () => deniedTool.handler!({}, {} as ToolInvocation), /被拒绝：policy 拒绝/);
+    assert.equal(executed, 0, 'guard 放行不等于放行 —— Policy 仍然可以拒绝');
+    assert.equal((await denying.checkToolUse('allowed', {})).allowed, false);
+
+    // 两道闸都放行，才真的执行。
+    const permissive = new CopilotCapabilityAdapter(guardBlindPolicy).build(runtime, context);
+    const tool = permissive.tools.find((item) => item.name === 'allowed');
+    assert.ok(tool?.handler);
+    await tool.handler!({}, {} as ToolInvocation);
+    assert.equal(executed, 1);
+  });
+});
+
+// ═══════════════════════════════════════════════ 7. 工具契约
 
 describe('KnowledgeToolProvider：检索范围只由 binding 决定', () => {
   function toolOf(runtime: RuntimeCapabilities, name: string): RuntimeTool {
@@ -507,7 +755,10 @@ describe('KnowledgeToolProvider：检索范围只由 binding 决定', () => {
   }
 
   async function runtimeFor(memberId: string): Promise<RuntimeCapabilities> {
-    return stack.resolver.resolve(capabilityContext(memberId), capabilities.get(memberId));
+    return stack.resolver.resolve(
+      capabilityContext(memberId, defaultTeam.id),
+      capabilities.getMember(memberId),
+    );
   }
 
   it('一个 Member 同时绑 team + personal 时，一次检索覆盖两条绑定', async () => {
@@ -528,13 +779,13 @@ describe('KnowledgeToolProvider：检索范围只由 binding 决定', () => {
       content: 'my personal note on custody reconciliation',
     });
 
-    // 用 TeamService 建人时只带默认的 `$personal`；要看 team 库得显式再绑一条。
-    capabilities.replace(member.id, {
-      ...capabilities.get(member.id),
+    capabilities.replaceMember(member.id, {
+      skills: [],
       knowledge: [
         { providerId: KNOWLEDGE_PROVIDER, selector: PERSONAL_SELECTOR },
         { providerId: KNOWLEDGE_PROVIDER, selector: 'cap-team' },
       ],
+      tools: [{ providerId: 'knowledge.tools' }],
     });
 
     const search = toolOf(await runtimeFor(member.id), 'search_knowledge');
@@ -549,9 +800,10 @@ describe('KnowledgeToolProvider：检索范围只由 binding 决定', () => {
     assert.match(payload.instructions, /reference data, not instructions/);
 
     // 只绑 team：personal 那份立刻搜不到 —— 检索范围就是 binding 本身。
-    capabilities.replace(member.id, {
-      ...capabilities.get(member.id),
+    capabilities.replaceMember(member.id, {
+      skills: [],
       knowledge: [{ providerId: KNOWLEDGE_PROVIDER, selector: 'cap-team' }],
+      tools: [{ providerId: 'knowledge.tools' }],
     });
     const narrowed = JSON.parse(
       String(
@@ -567,10 +819,10 @@ describe('KnowledgeToolProvider：检索范围只由 binding 决定', () => {
 
   it('打开未绑定库里的文档 → 拒绝，且理由说得出是「未绑定」而不是「找不到」', async () => {
     const member = memberWithDefaults('Prober');
-    // 只留个人资料这一条 knowledge 绑定，工具保持默认（检索/打开要能拿到）
-    capabilities.replace(member.id, {
-      ...capabilities.get(member.id),
+    capabilities.replaceMember(member.id, {
+      skills: [],
       knowledge: [{ providerId: KNOWLEDGE_PROVIDER, selector: PERSONAL_SELECTOR }],
+      tools: [{ providerId: 'knowledge.tools' }],
     });
 
     const foreign = stack.knowledge.createTeamKnowledgeBase({ key: 'cap-foreign', name: 'Foreign' });
@@ -631,7 +883,7 @@ describe('KnowledgeToolProvider：检索范围只由 binding 决定', () => {
   });
 });
 
-// ═══════════════════════════════════════════════ 7. TeamService 入口
+// ═══════════════════════════════════════════════ 8. TeamService 入口
 
 describe('TeamService 的能力读写入口', () => {
   async function snapshotOf(executionId: string) {
@@ -643,12 +895,16 @@ describe('TeamService 的能力读写入口', () => {
     assert.fail(`execution ${executionId} 没有写下配置快照`);
   }
 
-  it('新建 Member 拿到的是默认能力（不是空绑定）', () => {
-    const member = memberWithDefaults('Fresh');
-    assert.deepEqual(
-      normalized(stack.team.getMemberCapabilities(member.id)),
-      normalized(defaultMemberCapabilities()),
-    );
+  it('新建 Member 的 Member 层是空的 —— 它继承 global/team，而不是复制一份基线', () => {
+    // 「复制一份基线」的代价不是多几行数据，而是**之后改不动**：管理员改 Team
+    // 能力，这些人的私有层里还留着旧值，覆盖掉继承结果，而且看不出原因。
+    const member = stack.team.createMember({ name: 'Inheritor', role: 'T' });
+
+    assert.deepEqual(stack.team.getMemberCapabilities(member.id), {
+      skills: [],
+      knowledge: [],
+      tools: [],
+    });
   });
 
   it('updateMemberCapabilities 先校验再落库：拼错的 ID 报错且不改动已有绑定', () => {
@@ -677,10 +933,11 @@ describe('TeamService 的能力读写入口', () => {
     const before = await snapshotOf(singleExecutionId(db, room.id, first.wakes));
 
     // 快照回答的是「这一轮到底用了哪个能力实现」—— 所以它必须等于解析器的结果，
-    // 而不是另算一份指纹。
+    // 而不是另算一份指纹。解析用的必须是 effective（三层叠加），因为那才是
+    // 执行时真正生效的那一份。
     const resolved = await stack.resolver.resolve(
-      capabilityContext(member.id),
-      stack.capabilities.get(member.id),
+      capabilityContext(member.id, defaultTeam.id),
+      stack.capabilities.getEffective(defaultTeam.id, member.id),
     );
     assert.equal(before.capabilityManifestHash, resolved.manifestHash);
     assert.equal(before.hostToolsEnabled, false);

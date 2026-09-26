@@ -230,7 +230,8 @@ describe('schema 就位（PRAGMA user_version）', () => {
         'member_runtime',
         'execution',
         'knowledge_base',
-        'member_capability_binding',
+        'capability_scope',
+        'capability_binding',
         'knowledge_document',
         'knowledge_document_fts',
       ];
@@ -391,8 +392,10 @@ describe('schema 就位（PRAGMA user_version）', () => {
           'created_at',
           'updated_at',
         ],
-        member_capability_binding: [
-          'member_id',
+        capability_scope: ['scope_type', 'scope_id', 'seed_key', 'created_at'],
+        capability_binding: [
+          'scope_type',
+          'scope_id',
           'capability_type',
           'provider_id',
           'selector',
@@ -420,6 +423,8 @@ describe('schema 就位（PRAGMA user_version）', () => {
           .all() as unknown as Array<{ name: string }>
       ).map((row) => row.name);
       assert.deepEqual(indexes, [
+        'idx_capability_binding_provider',
+        'idx_capability_binding_scope',
         'idx_conversation_event_replay',
         'idx_conversation_external_work_key',
         'idx_conversation_member_state_lead',
@@ -430,8 +435,6 @@ describe('schema 就位（PRAGMA user_version）', () => {
         'idx_execution_parent',
         'idx_execution_status',
         'idx_knowledge_document_kb',
-        'idx_member_capability_member',
-        'idx_member_capability_provider',
         'idx_member_seed_key',
         'idx_message_client_request',
         'idx_message_conversation_created',

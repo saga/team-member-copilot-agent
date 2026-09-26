@@ -22,9 +22,20 @@ export const config = {
   dbPath: path.join(dataDir, 'team-member.db'),
   memberHomeRoot: path.join(dataDir, 'members'),
   /**
+   * 公司级 Skill 目录。它是 `global.filesystem-skills` 这个 Provider 的根目录，
+   * 绑定它的每一层（global → 所有 Agent）都会加载这些 skill。
+   *
+   * 三层 skill 目录的形状是统一的：
+   *   .data/global/skills/            公司级
+   *   .data/team/skills/<teamId>/     Team 级
+   *   .data/members/<memberId>/skills/  Member 级
+   */
+  globalSkillRoot: path.join(dataDir, 'global', 'skills'),
+  /**
    * 团队统一 Skill 目录。它是 `team.filesystem-skills` 这个 Provider 的根目录，
-   * 绑定它的 Member 都会加载这些 skill。每个 Member 的专长留在各自的
-   * <memberHome>/<id>/skills/（`member.filesystem-skills`）。
+   * 实际根是 <teamSkillRoot>/<teamId> —— Team 级能力要能区分是哪个 Team。
+   * 每个 Member 的专长留在各自的 <memberHome>/<id>/skills/
+   * （`member.filesystem-skills`）。
    */
   teamSkillRoot: path.join(dataDir, 'team', 'skills'),
   /**
@@ -35,6 +46,16 @@ export const config = {
    */
   teamKnowledgeRoot: path.join(dataDir, 'team', 'knowledge'),
   workspaceRoot: path.join(dataDir, 'workspaces'),
+  /**
+   * global / team 两层默认能力的配置目录（global.json / team.json）。
+   *
+   * 和 member template 一样是 **provisioning baseline**：只在对应 scope 第一次
+   * 出现时被读一次，之后那两层在 SQLite 里独立演进，配置改了也不会回头覆盖。
+   *
+   * 可以用环境变量指到别处（ConfigMap / 只读 volume / 配置仓库），所以它必须是
+   * 配置而不是硬编码路径。
+   */
+  capabilityTemplatesDir: path.resolve(env('CAPABILITY_TEMPLATES_DIR', 'config/capability-templates')),
   copilotBaseDirectory: path.join(dataDir, 'copilot'),
   localUserId: env('LOCAL_USER_ID', 'local-user'),
   maxDelegationDepth: intEnv('MAX_DELEGATION_DEPTH', 4),

@@ -19,6 +19,7 @@ import { config } from './config.js';
 import { db, migration } from './db.js';
 import { RecoveryService } from './recovery-service.js';
 import { ConversationMemberService } from './conversation-member-service.js';
+import { CapabilityProvisioner } from './capabilities/provisioner.js';
 import { seedMemberTemplates } from './member-template-seeder.js';
 import { describeApiBoundary } from './middleware/apiScope.js';
 
@@ -60,6 +61,26 @@ async function bootstrap(): Promise<void> {
   initTeamScope(structureService, team.id);
   // eslint-disable-next-line no-console
   console.log(`[server] team: ${team.name} (${team.id})`);
+
+  // global / team 两层能力的 provisioning 必须在 Member 之前：它们决定
+  // 「所有人 / 这个团队默认能用什么」，而 Member 的能力只是增量。顺序反过来的话，
+  // 第一轮 turn 会跑在一个还没有任何基线能力的 Member 上。
+  //
+  // 幂等靠 capability_scope 的 INSERT OR IGNORE：只有第一次会真的写入。
+  // 管理员把某一层清空之后，重启不会再灌回来。
+  const capabilityProvisioner = new CapabilityProvisioner(
+    capabilityService,
+    capabilityResolver,
+    config.capabilityTemplatesDir,
+  );
+  const seededGlobal = capabilityProvisioner.seedGlobal();
+  const seededTeam = capabilityProvisioner.seedTeam(team.id);
+  // eslint-disable-next-line no-console
+  console.log(
+    `[server] capability provisioning: global=${seededGlobal ? 'seeded' : 'existing'} ` +
+      `team=${seededTeam ? 'seeded' : 'existing'}`,
+  );
+
   for (const member of memberService.list()) {
     structureService.ensureAgentMembership(team.id, member.id);
   }
@@ -103,8 +124,11 @@ async function bootstrap(): Promise<void> {
   // 已有 DB 里的坏 binding 必须在接请求前挡掉：模板只校验新创建的 Member，
   // 而旧库里可能留着当前 build 已不注册的 Provider（比如换了构建、删了插件）。
   // 等到真正执行 turn 才炸，症状是「回答变奇怪」而不是一条错误。
+  //
+  // 校验的是 **effective**（三层叠加）而不是 member 层：真正下发给引擎的就是
+  // 叠加后的那一份，只校验增量会让 global / team 层里的坏 ID 溜过去。
   for (const member of memberService.list()) {
-    capabilityResolver.validate(capabilityService.get(member.id));
+    capabilityResolver.validate(capabilityService.getEffective(team.id, member.id));
   }
 
   if (config.recoverOnStartup) {
