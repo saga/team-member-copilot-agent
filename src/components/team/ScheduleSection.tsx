@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Button, Card, List, Space, Tag } from 'antd';
 import { api, type Conversation, type Member, type ScheduledWake } from '../../lib/api';
+import { useTeamEvents } from '../../lib/useTeamEvents';
 import { ScheduleForm } from './ScheduleForm';
 
 const STATUS_COLORS: Record<ScheduledWake['status'], string> = {
@@ -35,9 +36,12 @@ export function ScheduleSection({
 
   useEffect(() => {
     void refresh();
-    const timer = setInterval(() => void refresh(), 30000);
-    return () => clearInterval(timer);
   }, []);
+
+  // 到期触发 / pause / resume / cancel 都会推 schedule.changed，不用手工刷新。
+  useTeamEvents((type) => {
+    if (type === 'schedule.changed') void refresh();
+  });
 
   function act(id: string, action: 'pause' | 'resume' | 'cancel') {
     const fn = action === 'pause' ? api.pauseSchedule : action === 'resume' ? api.resumeSchedule : api.cancelSchedule;

@@ -219,6 +219,7 @@ describe('schema 就位（PRAGMA user_version）', () => {
       const tables = [
         'member',
         'team',
+        'team_event',
         'team_membership',
         'project',
         'work_item',
@@ -255,7 +256,8 @@ describe('schema 就位（PRAGMA user_version）', () => {
             'created_at',
             'updated_at',
           ],
-          team: ['id', 'name', 'description', 'created_by', 'created_at', 'updated_at'],
+          team: ['id', 'name', 'description', 'created_by', 'event_sequence', 'created_at', 'updated_at'],
+          team_event: ['id', 'team_id', 'sequence', 'event_type', 'payload', 'created_at'],
           team_membership: [
             'team_id',
             'kind',
@@ -486,6 +488,7 @@ describe('schema 就位（PRAGMA user_version）', () => {
         'idx_scheduled_wake_due',
         'idx_scheduled_wake_member',
         'idx_scheduled_wake_run_execution',
+        'idx_team_event_team_sequence',
         'idx_team_membership_principal',
         'idx_team_membership_team',
         'idx_work_item_assignee',

@@ -1,8 +1,10 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import type { TeamStructureService } from '../team-structure-service.js';
+import type { StoredTeamEvent, TeamEventService } from '../team-event-service.js';
 import { sendError } from '../middleware/errorHandler.js';
 import { isAdminAuthorized } from '../middleware/apiScope.js';
+import { parseSince } from './conversations.js';
 import {
   currentTeamId,
   requireTeamMember,
@@ -71,8 +73,49 @@ function actorTeamRole(
   }
 }
 
-export function teamRouter(structure: TeamStructureService) {
+export function teamRouter(structure: TeamStructureService, teamEvents: TeamEventService) {
   const router = Router();
+
+  /**
+   * Team 级实时事件（WorkItem / Schedule / Presence / Project / Membership）。
+   *
+   * 语义与 Conversation SSE 相同：事件先落 team_event 再广播，SSE 帧带
+   * `id: <sequence>`，断线重连由浏览器自动带 Last-Event-ID 补发。当前部署
+   * 只有一个 Team，所以端点不带 teamId —— teamScope 的默认 Team 即目标。
+   */
+  router.get('/events', requireTeamMember(), (req, res) => {
+    const teamId = currentTeamId();
+    const since = parseSince(req.headers['last-event-id'], req.query.since);
+
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+    res.socket?.setNoDelay(true);
+    res.write('retry: 3000\n\n');
+    res.write(`event: connected\ndata: ${JSON.stringify({ teamId, since })}\n\n`);
+
+    const send = (event: StoredTeamEvent) => {
+      res.write(
+        [`id: ${event.sequence}`, `event: ${event.type}`, `data: ${JSON.stringify(event.data)}`].join('\n') +
+          '\n\n',
+      );
+    };
+
+    const unsubscribe = teamEvents.replayAndSubscribe(teamId, since, send);
+
+    const heartbeat = setInterval(() => {
+      res.write(': ping\n\n');
+    }, 15000);
+
+    req.on('close', () => {
+      clearInterval(heartbeat);
+      unsubscribe();
+      res.end();
+    });
+  });
 
   router.get('/', requireTeamMember(), (_req, res) => {
     try {

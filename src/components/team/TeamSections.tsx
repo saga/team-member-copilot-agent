@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { Button, Card, Input, List, Space, Tag } from 'antd';
 import { PlusOutlined } from '@ant-design/icons';
 import { api, type Project, type WorkItem } from '../../lib/api';
+import { useTeamEvents } from '../../lib/useTeamEvents';
 import { WorkItemRow } from './WorkItemRow';
 
 /** Projects：只有列表 + 新建，不做完整 Project 页。 */
@@ -77,9 +78,13 @@ export function WorkSection({ members }: { members: { id: string; name: string }
 
   useEffect(() => {
     void refresh();
-    const timer = setInterval(() => void refresh(), 10000);
-    return () => clearInterval(timer);
   }, []);
+
+  // Team SSE 替掉 10 秒轮询：WorkItem 的任何变化（含 Agent 的 claim/release）
+  // 都实时到达。
+  useTeamEvents((type) => {
+    if (type === 'work_item.changed') void refresh();
+  });
 
   async function create() {
     if (!title.trim()) return;

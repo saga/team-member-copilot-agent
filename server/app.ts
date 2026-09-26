@@ -18,6 +18,7 @@ import { HostCodingToolProvider } from './capabilities/providers/host-tools.js';
 import { DefaultToolPolicy } from './tool-policy.js';
 import { TeamStructureService } from './team-structure-service.js';
 import { SchedulerService } from './scheduler-service.js';
+import { TeamEventService } from './team-event-service.js';
 import { healthRouter } from './routes/health.js';
 import { membersRouter } from './routes/members.js';
 import { capabilitiesRouter } from './routes/capabilities.js';
@@ -49,7 +50,14 @@ let schedulerService!: SchedulerService;
 
 const memberService = new MemberService(db);
 const capabilityService = new CapabilityService(db);
-const structureService = new TeamStructureService(db);
+
+// Team SSE 的事件源。结构服务的每次业务变更都会回调到这里：append 与业务行
+// 同事务落库，广播由 commit hook 保证在 COMMIT 之后 —— 先落库、后广播的纪律
+// 在 Team 层与 Conversation 层是同一条。
+const teamEvents = new TeamEventService(db);
+const structureService = new TeamStructureService(db, (teamId, type, payload) => {
+  teamEvents.append(teamId, type, payload);
+});
 
 const localKnowledgeProvider = new LocalFilesystemKnowledgeProvider(db, capabilityService);
 
@@ -113,7 +121,7 @@ app.use('/api/health', healthRouter);
 app.use('/api/members', membersRouter(teamService));
 app.use('/api/capabilities', capabilitiesRouter(teamService));
 app.use('/api/knowledge', knowledgeRouter(localKnowledgeProvider));
-app.use('/api/team', teamRouter(structureService));
+app.use('/api/team', teamRouter(structureService, teamEvents));
 app.use('/api/conversations', conversationsRouter(teamService));
 app.use('/api/executions', executionsRouter(teamService));
 // 以某个 Member 的身份说话 —— 独立的命名空间 + token 门禁，见 middleware/apiScope.ts
@@ -150,6 +158,7 @@ export {
   teamService,
   structureService,
   schedulerService,
+  teamEvents,
 };
 
 export { initTeamScope };

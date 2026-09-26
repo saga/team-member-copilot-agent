@@ -230,9 +230,9 @@ export function conversationsRouter(team: TeamService) {
  *
  * 自动重连时浏览器会带上 Last-Event-ID，它比 URL 里的 `?since=` 新（后者是
  * 首次连接时写死的），所以必须让 header 赢，否则每次重连都会重复回放一段。
- * 非法值一律当作从头回放（0）。
+ * 非法值一律当作从头回放（0）。Team SSE 用同一套语义。
  */
-function parseSince(header: unknown, query: unknown): number {
+export function parseSince(header: unknown, query: unknown): number {
   const raw = header ?? query;
   const value = Number(Array.isArray(raw) ? raw[0] : raw);
   return Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0;

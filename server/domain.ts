@@ -218,6 +218,30 @@ export interface ScheduledWakeRun {
   error: string | null;
 }
 
+/** Team 级实时事件（/api/team/events 的 SSE 帧类型）。 */
+export type TeamEventType =
+  | 'work_item.changed'
+  | 'schedule.changed'
+  | 'presence.changed'
+  | 'project.changed'
+  | 'membership.changed';
+
+/**
+ * 结构服务的变更出口：mutation 在业务行落库的同时回调，广播由 commit hook 保证在 COMMIT 之后。
+ * teamId 由结构服务显式给出 —— append 落库需要它，且调用方不应从 payload 里反推归属。
+ */
+export type TeamChangeSink = (teamId: string, type: TeamEventType, payload: unknown) => void;
+
+/** 落库后的 Team 级事件（SSE 帧的内容）。 */
+export interface StoredTeamEvent {
+  id: string;
+  teamId: string;
+  sequence: number;
+  type: TeamEventType;
+  data: unknown;
+  createdAt: string;
+}
+
 export interface Conversation {
   id: string;
   teamId: string;

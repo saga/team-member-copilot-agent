@@ -156,6 +156,26 @@ export interface TeamPresence {
   updatedAt: string;
 }
 
+export type TeamEventType =
+  | 'work_item.changed'
+  | 'schedule.changed'
+  | 'presence.changed'
+  | 'project.changed'
+  | 'membership.changed';
+
+/**
+ * Team 级实时事件（server TeamEventService 的镜像）。
+ * payload 是变化后的业务对象；消费方通常只需要按 type 刷新对应的列表。
+ */
+export interface StoredTeamEvent {
+  id: string;
+  teamId: string;
+  sequence: number;
+  type: TeamEventType;
+  data: unknown;
+  createdAt: string;
+}
+
 export interface ScheduledWake {
   id: string;
   teamId: string;
@@ -839,5 +859,14 @@ export const api = {
       `${API_BASE}/api/team/schedules/${encodeURIComponent(id)}/${action}`,
       { method: 'POST' },
     ).then(json<{ schedule: ScheduledWake }>);
+  },
+
+  /**
+   * Team 级 SSE：work_item / schedule / presence / project / membership 的变更。
+   * 机制与 conversations.eventsUrl 相同（Last-Event-ID 补发）。
+   */
+  teamEventsUrl(since?: number): string {
+    const base = `${API_BASE}/api/team/events`;
+    return since && since > 0 ? `${base}?since=${since}` : base;
   },
 };

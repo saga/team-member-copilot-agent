@@ -23,6 +23,7 @@ const { db } = await import('../db.js');
 const { MemberService } = await import('../member-service.js');
 const { TeamStructureService } = await import('../team-structure-service.js');
 const { SchedulerService } = await import('../scheduler-service.js');
+const { TeamEventService } = await import('../team-event-service.js');
 const { createTestStack, muteAllMembers, singleExecutionId, StubCopilot } = await import('./support.js');
 const { teamRouter } = await import('../routes/team.js');
 const { internalRouter } = await import('../routes/internal.js');
@@ -942,7 +943,7 @@ describe('HTTP actor 边界', () => {
     initTeamScope(structure, team.id);
     const app = express();
     app.use(express.json({ limit: '1mb' }));
-    app.use('/api/team', teamRouter(structure));
+    app.use('/api/team', teamRouter(structure, new TeamEventService(db)));
     app.use('/api/internal', internalRouter(stack.team));
     server = app.listen(0);
     await new Promise<void>((resolve) => server.once('listening', resolve));
@@ -1016,6 +1017,104 @@ describe('HTTP actor 边界', () => {
     } finally {
       release();
       stub.hold = null;
+    }
+  });
+});
+
+describe('Team SSE', () => {
+  it('mutation → 同事务落 team_event → commit 后广播；sequence 严格递增', () => {
+    const events = new TeamEventService(db);
+    // 带 sink 的结构服务实例：真实链路是结构服务回调 → append → commit 后广播。
+    const emitting = new TeamStructureService(db, (teamId, type, payload) => events.append(teamId, type, payload));
+    const agent = makeAgent('SseAgent');
+
+    const seen: Array<{ type: string; sequence: number }> = [];
+    const unsubscribe = events.subscribe(team.id, (event) => {
+      seen.push({ type: event.type, sequence: event.sequence });
+    });
+
+    try {
+      const item = emitting.createWorkItem(team.id, { title: 'Sse item' }, HUMAN);
+      emitting.assignWorkItem(item.id, { kind: 'agent', principalId: agent.id }, HUMAN);
+      emitting.claimWorkItem(item.id, { memberId: agent.id });
+
+      assert.deepEqual(
+        seen.map((e) => e.type),
+        ['work_item.changed', 'work_item.changed', 'work_item.changed'],
+        '每次 mutation 恰好一条事件',
+      );
+      for (let i = 1; i < seen.length; i += 1) {
+        assert.ok(seen[i].sequence > seen[i - 1].sequence, 'sequence 严格递增');
+      }
+      // sequence 由 team.event_sequence 分配：与落库行严格一致
+      assert.equal(
+        (db.prepare(`SELECT event_sequence AS n FROM team WHERE id = ?`).get(team.id) as { n: number }).n,
+        (db.prepare(`SELECT COUNT(*) AS n FROM team_event WHERE team_id = ?`).get(team.id) as { n: number }).n,
+      );
+
+      // 回放窗口：从 0 回放包含刚才全部事件，不重不漏
+      const replayed = events.listSince(team.id, 0);
+      assert.equal(replayed.length, seen.length);
+      assert.deepEqual(replayed.map((e) => e.sequence), seen.map((e) => e.sequence));
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it('mutation 回滚时 team_event 一起回滚：广播的永远是 DB 承认过的', () => {
+    const events = new TeamEventService(db);
+    const emitting = new TeamStructureService(db, (teamId, type, payload) => events.append(teamId, type, payload));
+    const agent = makeAgent('SseRollback');
+
+    const before = (db.prepare(`SELECT COUNT(*) AS n FROM team_event WHERE team_id = ?`).get(team.id) as { n: number }).n;
+    const item = emitting.createWorkItem(team.id, { title: 'Rollback probe' }, HUMAN);
+    emitting.claimWorkItem(item.id, { memberId: agent.id });
+    // 这个 assign 会 409（已 claim）→ 整个事务回滚 → 不得留下事件行
+    assert.throws(() => emitting.assignWorkItem(item.id, { kind: 'agent', principalId: agent.id }, HUMAN));
+
+    const after = (db.prepare(`SELECT COUNT(*) AS n FROM team_event WHERE team_id = ?`).get(team.id) as { n: number }).n;
+    // create 与 claim 各落一条事件；409 的 assign 整个事务回滚，不得留下事件行。
+    assert.equal(after - before, 2, 'create + claim 各留一条事件，回滚的 assign 没有');
+    assert.equal(
+      (db.prepare(`SELECT event_sequence AS n FROM team WHERE id = ?`).get(team.id) as { n: number }).n,
+      after,
+      '游标与行数严格一致 —— 差一条就是 replay 会重放或漏发一条',
+    );
+  });
+
+  it('HTTP：GET /api/team/events 按 SSE 帧推送（id 带 sequence）', async () => {
+    const events = new TeamEventService(db);
+    const emitting = new TeamStructureService(db, (teamId, type, payload) => events.append(teamId, type, payload));
+    const app = express();
+    app.use(express.json({ limit: '1mb' }));
+    app.use('/api/team', teamRouter(emitting, events));
+    const server = app.listen(0);
+    await new Promise<void>((resolve) => server.once('listening', resolve));
+    const base = `http://127.0.0.1:${(server.address() as import('node:net').AddressInfo).port}`;
+
+    try {
+      const response = await fetch(`${base}/api/team/events`);
+      assert.equal(response.status, 200);
+      const reader = response.body!.getReader();
+      const decoder = new TextDecoder();
+
+      // 订阅就绪后触发一次 mutation，读到的帧里应包含 work_item.changed + id
+      const firstChunk = decoder.decode((await reader.read()).value);
+      assert.match(firstChunk, /retry: 3000/);
+      assert.match(firstChunk, /event: connected/);
+
+      const item = emitting.createWorkItem(team.id, { title: 'Sse over http' }, HUMAN);
+      void item;
+
+      let buffer = firstChunk;
+      for (let i = 0; i < 50 && !buffer.includes('work_item.changed'); i += 1) {
+        const chunk = await reader.read();
+        buffer += decoder.decode(chunk.value);
+      }
+      assert.match(buffer, /id: \d+\nevent: work_item\.changed/);
+      await reader.cancel();
+    } finally {
+      server.close();
     }
   });
 });

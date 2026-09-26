@@ -20,7 +20,7 @@ import type { DatabaseSync } from 'node:sqlite';
  *
  * 程序不认识任何别的编号 —— 没有升级代码，认出来也无从下手。
  */
-export const SCHEMA_VERSION = 10;
+export const SCHEMA_VERSION = 11;
 
 /**
  * 当前 schema 的完整定义，按最终形状写。
@@ -101,9 +101,32 @@ CREATE TABLE team (
   name TEXT NOT NULL,
   description TEXT NOT NULL DEFAULT '',
   created_by TEXT NOT NULL,
+  -- Team 级实时事件的游标，语义与 conversation.event_sequence 相同（SSE replay）
+  event_sequence INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+-- Team 级实时事件：WorkItem / Schedule / Presence / Project / Membership 的
+-- 状态变化先落库再广播。与 conversation_event 同一套纪律 —— 落库是 source of
+-- truth，SSE 帧带 id: <sequence>，断线重连靠 Last-Event-ID 补发。
+-- payload 是 JSON：这里是通知层，不是审计层（WorkItem 的审计在 work_item_event，
+-- 列式可查询），消费方只需要「什么变了」然后决定刷哪块 UI。
+CREATE TABLE team_event (
+  id TEXT PRIMARY KEY,
+  team_id TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  event_type TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE (team_id, sequence),
+  FOREIGN KEY (team_id)
+    REFERENCES team(id)
+    ON DELETE CASCADE
+);
+
+CREATE INDEX idx_team_event_team_sequence
+  ON team_event(team_id, sequence);
 
 CREATE TABLE team_membership (
   team_id TEXT NOT NULL,

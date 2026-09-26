@@ -14,6 +14,7 @@ import type {
   ScheduledWakeRun,
   ScheduledWakeStatus,
   Team,
+  TeamChangeSink,
   TeamMembership,
   TeamParticipantKind,
   TeamPresence,
@@ -32,7 +33,23 @@ import type {
  * Scheduler 的执行入口在 scheduler-service，真正跑 turn 仍走 TeamService。
  */
 export class TeamStructureService {
-  constructor(private readonly db: DatabaseSync) {}
+  /**
+   * Team 级变更出口（Team SSE 的数据源）。结构服务只管「在正确的时机喊一声」，
+   * 落库与广播由 TeamEventService 做：回调发生在业务写入的同一个事务里，
+   * 广播由 db-tx 的 commit hook 保证在 COMMIT 之后。
+   */
+  constructor(
+    private readonly db: DatabaseSync,
+    private readonly onTeamChange?: TeamChangeSink,
+  ) {}
+
+  private emitChange(
+    teamId: string,
+    type: Parameters<TeamChangeSink>[1],
+    payload: unknown,
+  ): void {
+    this.onTeamChange?.(teamId, type, payload);
+  }
 
   /**
    * 把跨表写入收成一个原子块。嵌套安全：深度由 db-tx 统一追踪，
@@ -151,7 +168,9 @@ export class TeamStructureService {
         `UPDATE team_membership SET role = ?, status = ?, updated_at = ? WHERE team_id = ? AND kind = ? AND principal_id = ?`,
       )
       .run(role, status, now(), teamId, kind, principalId);
-    return this.getMembership(teamId, kind, principalId);
+    const membership = this.getMembership(teamId, kind, principalId);
+    this.emitChange(teamId, 'membership.changed', membership);
+    return membership;
   }
 
   private upsertMembership(
@@ -186,7 +205,9 @@ export class TeamStructureService {
          VALUES (?, ?, ?, ?, 'active', ?, ?, ?)`,
       )
       .run(id, teamId, name.slice(0, 200), (input.description ?? '').slice(0, 2000), createdBy, timestamp, timestamp);
-    return this.getProject(id);
+    const project = this.getProject(id);
+    this.emitChange(teamId, 'project.changed', project);
+    return project;
   }
 
   listProjects(teamId: string): Project[] {
@@ -216,7 +237,9 @@ export class TeamStructureService {
         now(),
         id,
       );
-    return this.getProject(id);
+    const project = this.getProject(id);
+    this.emitChange(current.teamId, 'project.changed', project);
+    return project;
   }
 
   // --------------------------------------------------------------- WorkItem
@@ -251,6 +274,7 @@ export class TeamStructureService {
         actor,
         toStatus: 'todo',
       });
+      this.emitChange(teamId, 'work_item.changed', this.getWorkItem(id));
     });
     return this.getWorkItem(id);
   }
@@ -372,6 +396,7 @@ export class TeamStructureService {
           fromClaimedByMemberId: current.claimedByMemberId,
         });
       }
+      this.emitChange(current.teamId, 'work_item.changed', this.getWorkItem(id));
     });
     return this.getWorkItem(id);
   }
@@ -422,6 +447,7 @@ export class TeamStructureService {
           toAssigneeId: assignee?.principalId ?? null,
         });
       }
+      this.emitChange(current.teamId, 'work_item.changed', this.getWorkItem(id));
     });
     return this.getWorkItem(id);
   }
@@ -557,6 +583,7 @@ export class TeamStructureService {
         fromClaimedByMemberId: current.claimedByMemberId,
         toClaimedByMemberId: input.memberId,
       });
+      this.emitChange(current.teamId, 'work_item.changed', this.getWorkItem(id));
       return this.getWorkItem(id);
     });
   }
@@ -584,6 +611,7 @@ export class TeamStructureService {
         executionId: current.claimedExecutionId,
         fromClaimedByMemberId: current.claimedByMemberId,
       });
+      this.emitChange(current.teamId, 'work_item.changed', this.getWorkItem(id));
     });
     return this.getWorkItem(id);
   }
@@ -631,6 +659,7 @@ export class TeamStructureService {
         executionId,
         fromClaimedByMemberId: claimed.claimed_by_member_id,
       });
+      this.emitChange(claimed.team_id, 'work_item.changed', this.getWorkItem(claimed.id));
     });
   }
 
@@ -736,7 +765,9 @@ export class TeamStructureService {
          DO UPDATE SET availability = excluded.availability, updated_at = excluded.updated_at`,
       )
       .run(teamId, kind, principalId, availability, timestamp, timestamp);
-    return this.getPresence(teamId, kind, principalId);
+    const presence = this.getPresence(teamId, kind, principalId);
+    this.emitChange(teamId, 'presence.changed', presence);
+    return presence;
   }
 
   touchPresence(teamId: string, kind: TeamParticipantKind, principalId: string): void {
@@ -862,7 +893,9 @@ export class TeamStructureService {
         timestamp,
         timestamp,
       );
-    return this.getSchedule(id);
+    const schedule = this.getSchedule(id);
+    this.emitChange(teamId, 'schedule.changed', schedule);
+    return schedule;
   }
 
   listSchedules(teamId: string): ScheduledWake[] {
@@ -887,7 +920,9 @@ export class TeamStructureService {
       throw conflict('已完成的 once schedule 不能 resume');
     }
     this.db.prepare(`UPDATE scheduled_wake SET status = ?, updated_at = ? WHERE id = ?`).run(status, now(), id);
-    return this.getSchedule(id);
+    const schedule = this.getSchedule(id);
+    this.emitChange(current.teamId, 'schedule.changed', schedule);
+    return schedule;
   }
 
   dueSchedules(nowIso: string, limit = 20): ScheduledWake[] {
@@ -910,7 +945,9 @@ export class TeamStructureService {
     this.db
       .prepare(`UPDATE scheduled_wake SET next_run_at = ?, status = ?, last_fired_at = ?, last_error = ?, updated_at = ? WHERE id = ?`)
       .run(nextRunAt, nextStatus, firedFor, error ?? null, now(), schedule.id);
-    return this.getSchedule(schedule.id);
+    const updated = this.getSchedule(schedule.id);
+    this.emitChange(schedule.teamId, 'schedule.changed', updated);
+    return updated;
   }
 
   insertScheduleRun(scheduleId: string, scheduledFor: string): ScheduledWakeRun {
