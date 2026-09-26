@@ -122,7 +122,8 @@ export function MemberEditor({ member, onSaved, onCancel }: MemberEditorProps) {
           marginBottom: 16,
         }}
       >
-        Capabilities 在 Team → Capabilities 中配置。Global / Team 能力会自动继承到这个 Member。
+        Capabilities 在顶栏的 Capabilities 配置窗口里配（Member 页签）。Global / Team
+        两层能力会自动继承到这个 Member。
       </span>
 
       {error && <Alert type="error" showIcon message={error} style={{ marginBottom: 12 }} />}

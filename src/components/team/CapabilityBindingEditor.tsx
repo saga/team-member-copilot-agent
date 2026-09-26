@@ -34,7 +34,7 @@ interface Props {
  * 一层能力声明的编辑器：一行一条 binding（providerId + 可选 selector）。
  *
  * 只负责「这一层写了什么」，不知道自己在 global / team / member 哪一层 ——
- * 三层的编辑体验是同一件事，层与层的差别由调用方（`CapabilityManager`）决定。
+ * 三层的编辑体验是同一件事，层与层的差别由调用方（`CapabilitySettings`）决定。
  *
  * 下拉选项来自平台注册表，不是硬编码的 provider id：写死的列表会在换实现时
  * 悄悄过期，而界面是唯一会让人发现「这个 id 已经不存在了」的地方。
@@ -53,7 +53,13 @@ export function CapabilityBindingEditor({ kind, value, providers, onChange }: Pr
   }
 
   function add() {
-    const provider = options[0]?.value;
+    // 挑第一个**这一层还没绑过**的 Provider。
+    //
+    // 直接取 options[0] 的话，第二次点 Add 会造出一条重复声明 —— 而重复声明在
+    // effective 里什么都不改变（同层同键会被去重）。用户会以为自己加了东西，
+    // 实际没有，然后去找「为什么没生效」。
+    const used = new Set(value.map((item) => item.providerId));
+    const provider = options.find((option) => !used.has(option.value))?.value ?? options[0]?.value;
     if (!provider) return;
     onChange([...value, { providerId: provider }]);
   }

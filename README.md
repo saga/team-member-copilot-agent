@@ -987,14 +987,15 @@ config/
     financial-security-reviewer/
 
 src/                          # Vite + React + Ant Design 前端
-  App.tsx                     # ConfigProvider + Layout（Header/Content）
-  index.css                   # 仅保留布局级覆盖，组件样式走 antd token
+  App.tsx                     # ConfigProvider + Layout（Header 上有 Capabilities 入口）
+  index.css                   # 布局级覆盖（含可拖拽左栏、配置窗口页签滚动）
   components/
     HealthBadge.tsx           # antd Badge（success/warning/error）
-    TeamChat.tsx              # 编排：conversation / SSE / 状态合并（Layout Sider/Content + Alert/Tag）
+    ResizableSider.tsx        # 可拖拽调宽度的左栏（Pointer Events，宽度落 localStorage）
+    TeamChat.tsx              # 编排：conversation / SSE / 状态合并（Layout Content + Alert/Tag）
     team/                     # TeamChat 的拆分：list / messages / composer / 各编辑面板
-      TeamSidebar.tsx         # Collapse 五分区：Members/Capabilities/Current Work/Schedules/Conversations
-      CapabilityManager.tsx   # 三层能力（global / team / member）+ effective 结果
+      TeamSidebar.tsx         # Collapse 四分区：Members/Current Work/Schedules/Conversations
+      CapabilitySettings.tsx  # 能力配置**窗口**：Modal + 三页签（global / team / member）
       CapabilityBindingEditor.tsx  # 一层 binding 的编辑（providerId + selector）
       ScopedSkillLibrary.tsx  # skill 文件库（global / team / member 共用同一个组件）
       TeamSections.tsx        # CurrentWorkSection（active execution → Jira key）
@@ -1003,7 +1004,7 @@ src/                          # Vite + React + Ant Design 前端
       MessageComposer.tsx     # @ant-design/x Sender
       ConversationHeader.tsx  # Avatar.Group + Tag + Select
       GroupMemberManager.tsx  # antd Table（有未完成工作时禁止 Remove）
-      MemberEditor.tsx        # antd Form + Popconfirm Archive（能力已移到 Team → Capabilities）
+      MemberEditor.tsx        # antd Form + Popconfirm Archive（能力已移到 Capabilities 窗口）
       MemberMemory.tsx        # 乐观并发（409 → Save anyway）
       MemberProfile.tsx       # antd Modal + Tabs
       ...

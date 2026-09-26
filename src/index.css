@@ -30,9 +30,99 @@ body {
   font-weight: 400;
 }
 
-.team-sider {
-  overflow-y: auto;
+/*
+ * 顶栏上的动作按钮。
+ *
+ * 用 CSS 而不是 antd 的 `ghost` / `variant`：Header 是深色底，按钮要跟着反白，
+ * 而 `ghost` 在不同大版本里的名字和语义都变过（v6 换成了 variant/color）。
+ * 一行 CSS 比绑一个会过期的 prop 稳。`!important` 是因为 antd 的 hover 选择器
+ * 带了两个 `:not(...)`，特异性比这里高。
+ */
+.app-header-action,
+.app-header-action:hover,
+.app-header-action:focus {
+  color: rgba(255, 255, 255, 0.85) !important;
+  border-color: rgba(255, 255, 255, 0.35) !important;
+  background: transparent !important;
+}
+
+.app-header-action:hover {
+  color: #fff !important;
+  border-color: #fff !important;
+  background: rgba(255, 255, 255, 0.12) !important;
+}
+
+/* ── 可拖拽左栏 ─────────────────────────────────────────────────────── */
+
+/*
+ * 滚动**不能**放在 Sider 自己身上：拖拽条是 `position: absolute`，
+ * 滚动容器里的绝对定位元素会跟着内容一起滚走 —— 滚到下面时拖拽条就没了。
+ * 所以 Sider 只当定位上下文，滚动交给 body。
+ *
+ * 选择器写成两个类是为了压过 `.ant-layout-sider`（同为单类，胜负只看加载顺序，
+ * 而 antd 的样式是运行时注入的，顺序不由这里决定）。
+ */
+.resizable-sider.ant-layout-sider {
+  position: relative;
   height: 100%;
+  overflow: hidden;
+  /*
+   * antd 给 Sider 挂了 `transition: all 0.2s`。拖动时宽度每帧都在变，
+   * 带着过渡会变成「宽度追着鼠标走」的延迟感 —— 手感上像是卡了。
+   */
+  transition: none;
+}
+
+.resizable-sider-body {
+  height: 100%;
+  overflow-y: auto;
+}
+
+.resizable-sider-handle {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 6px;
+  z-index: 10;
+  cursor: col-resize;
+  background: transparent;
+  /* 触屏上不要把拖拽当成滚动手势抢走 */
+  touch-action: none;
+}
+
+/* 命中区 6px，但视觉上只有 2px —— 太粗会切到正文的字。 */
+.resizable-sider-handle::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 2px;
+  width: 2px;
+  background: transparent;
+  transition: background 0.15s;
+}
+
+.resizable-sider-handle:hover::after,
+.resizable-sider-handle:focus-visible::after,
+.resizable-sider-handle--active::after {
+  background: #1677ff;
+}
+
+.resizable-sider-handle:focus-visible {
+  outline: none;
+}
+
+/* ── Capabilities 配置窗口 ──────────────────────────────────────────── */
+
+/*
+ * 每个页签自己的滚动容器。放在这里而不是 modal body 上，是为了让页签栏
+ * 始终留在视野里 —— 翻到下面看 Effective 时，仍然看得见自己在配哪一层。
+ */
+.capability-pane {
+  max-height: 58vh;
+  overflow-y: auto;
+  padding-right: 4px;
 }
 
 .chat-scroll {

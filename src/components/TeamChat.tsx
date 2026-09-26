@@ -21,9 +21,10 @@ import {
 import { MessageComposer } from './team/MessageComposer';
 import { MemberProfile } from './team/MemberProfile';
 import { TeamSidebar } from './team/TeamSidebar';
+import { ResizableSider } from './ResizableSider';
 import { EVERYONE, type MemberStatus, type MemberStatusLookup } from './team/constants';
 
-const { Content, Sider } = Layout;
+const { Content } = Layout;
 
 /** 还在推进中的 execution 状态；到了其它状态就说明这条 execution 已经收尾。 */
 const ACTIVE_STATUSES: ExecutionStatus[] = ['queued', 'running', 'waiting_for_member'];
@@ -560,7 +561,7 @@ export function TeamChat() {
 
   return (
     <Layout style={{ height: '100%' }}>
-      <Sider width={320} theme="light" className="team-sider">
+      <ResizableSider>
         <TeamSidebar
           members={members}
           conversations={conversations}
@@ -583,7 +584,7 @@ export function TeamChat() {
           onCancelGroupCreator={() => setShowGroupCreator(false)}
           onCreateGroup={createGroup}
         />
-      </Sider>
+      </ResizableSider>
 
       <Layout>
         {!selectedConversation && (
