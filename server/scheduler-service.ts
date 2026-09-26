@@ -62,8 +62,6 @@ export class SchedulerService {
             conversationId: schedule.conversationId,
             memberId: schedule.memberId,
             prompt: schedule.prompt,
-            workItemId: schedule.workItemId,
-            projectId: schedule.projectId,
           });
           // 顺序固定：run 标 running、schedule 推进到下一次，**之后**才启动
           // execution。反过来（enqueue 内部就启动）会让一轮极快的 execution 在
@@ -146,8 +144,6 @@ export class SchedulerService {
           conversationId: schedule.conversationId,
           memberId: schedule.memberId,
           prompt: schedule.prompt,
-          workItemId: schedule.workItemId,
-          projectId: schedule.projectId,
         })
         .then((executionId) => {
           this.structure.updateScheduleRun(run.id, { status: 'running', executionId });

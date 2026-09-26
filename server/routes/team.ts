@@ -11,43 +11,15 @@ import {
   isTeamAdmin,
   resolveActor,
 } from '../middleware/teamScope.js';
-import type { TeamParticipantKind, TeamRole } from '../domain.js';
+import type { TeamParticipantKind } from '../domain.js';
 
 /**
- * Team 领域路由：Team / Membership / Project / WorkItem / Presence / Schedule。
+ * Team 领域路由：Team / Membership / Presence / Schedule / Current Activity。
  * 一个 Router 承载整个领域，不拆几十个文件。
  */
-const projectSchema = z.object({
-  name: z.string().trim().min(1).max(200),
-  description: z.string().max(2000).optional(),
-});
-
-const workItemSchema = z.object({
-  title: z.string().trim().min(1).max(300),
-  description: z.string().max(8000).optional(),
-  projectId: z.string().min(1).nullable().optional(),
-});
-
-const updateWorkItemSchema = z.object({
-  title: z.string().trim().min(1).max(300).optional(),
-  description: z.string().max(8000).optional(),
-  status: z.enum(['todo', 'in_progress', 'blocked', 'done', 'cancelled']).optional(),
-});
-
-const assignSchema = z.object({
-  kind: z.enum(['human', 'agent']).nullable().optional(),
-  principalId: z.string().min(1).nullable().optional(),
-});
-
-const claimSchema = z.object({
-  expectedVersion: z.number().int().positive().optional(),
-});
-
 const scheduleSchema = z.object({
   memberId: z.string().min(1),
   conversationId: z.string().min(1),
-  projectId: z.string().min(1).nullable().optional(),
-  workItemId: z.string().min(1).nullable().optional(),
   prompt: z.string().trim().min(1).max(8000),
   type: z.enum(['once', 'interval']),
   runAt: z.string().min(1),
@@ -62,16 +34,6 @@ function adminOrRole(req: { headers: unknown; query: unknown } & { [k: string]: 
   return isTeamAdmin(asRequest, 'owner', 'admin');
 }
 
-function actorTeamRole(
-  structure: TeamStructureService,
-  actor: { kind: TeamParticipantKind; principalId: string },
-): TeamRole | undefined {
-  try {
-    return structure.getMembership(currentTeamId(), actor.kind, actor.principalId).role;
-  } catch {
-    return undefined;
-  }
-}
 
 export function teamRouter(structure: TeamStructureService, teamEvents: TeamEventService) {
   const router = Router();
@@ -152,172 +114,10 @@ export function teamRouter(structure: TeamStructureService, teamEvents: TeamEven
     }
   });
 
-  router.get('/projects', requireTeamMember(), (_req, res) => {
+  /** Current Work：谁在干什么。挂了 Jira 工单的给出引用，明细在 Jira。 */
+  router.get('/activity', requireTeamMember(), (_req, res) => {
     try {
-      res.json({ projects: structure.listProjects(currentTeamId()) });
-    } catch (error) {
-      sendError(res, error);
-    }
-  });
-
-  router.post('/projects', (req, res) => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    if (!adminOrRole(req as any)) {
-      res.status(403).json({ error: '需要 Team owner/admin' });
-      return;
-    }
-    const parsed = projectSchema.safeParse(req.body ?? {});
-    if (!parsed.success) {
-      res.status(400).json({ error: 'name 必填' });
-      return;
-    }
-    try {
-      const actor = resolveActor(req);
-      res.status(201).json({ project: structure.createProject(currentTeamId(), parsed.data, actor.principalId) });
-    } catch (error) {
-      sendError(res, error);
-    }
-  });
-
-  router.patch('/projects/:id', (req, res) => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    if (!adminOrRole(req as any)) {
-      res.status(403).json({ error: '需要 Team owner/admin' });
-      return;
-    }
-    const parsed = z.object({ name: z.string().trim().min(1).max(200).optional(), description: z.string().max(2000).optional(), status: z.enum(['active', 'archived']).optional() }).safeParse(req.body ?? {});
-    if (!parsed.success) {
-      res.status(400).json({ error: '参数不合法' });
-      return;
-    }
-    try {
-      res.json({ project: structure.updateProject((req.params.id as string), parsed.data) });
-    } catch (error) {
-      sendError(res, error);
-    }
-  });
-
-  router.get('/work-items', requireTeamMember(), (req, res) => {
-    try {
-      const query = req.query as Record<string, string>;
-      res.json({
-        workItems: structure.listWorkItems(currentTeamId(), {
-          ...(query.projectId ? { projectId: query.projectId } : {}),
-          ...(query.status ? { status: query.status as 'todo' } : {}),
-        }),
-      });
-    } catch (error) {
-      sendError(res, error);
-    }
-  });
-
-  router.post('/work-items', requireTeamMember(), (req, res) => {
-    const parsed = workItemSchema.safeParse(req.body ?? {});
-    if (!parsed.success) {
-      res.status(400).json({ error: 'title 必填' });
-      return;
-    }
-    try {
-      const actor = resolveActor(req);
-      res.status(201).json({ workItem: structure.createWorkItem(currentTeamId(), parsed.data, actor) });
-    } catch (error) {
-      sendError(res, error);
-    }
-  });
-
-  router.get('/work-items/:id', requireTeamMember(), (req, res) => {
-    try {
-      res.json({ workItem: structure.getWorkItem((req.params.id as string)) });
-    } catch (error) {
-      sendError(res, error);
-    }
-  });
-
-  /** Activity History：先验证 WorkItem 归属，再返回审计流水（时间正序）。 */
-  router.get('/work-items/:id/events', requireTeamMember(), (req, res) => {
-    try {
-      const limit = Number((req.query as Record<string, string | undefined>).limit ?? 100);
-      res.json({
-        events: structure.listWorkItemEvents(
-          currentTeamId(),
-          req.params.id as string,
-          Number.isFinite(limit) && limit > 0 ? Math.min(Math.floor(limit), 500) : 100,
-        ),
-      });
-    } catch (error) {
-      sendError(res, error);
-    }
-  });
-
-  router.patch('/work-items/:id', requireTeamMember(), (req, res) => {
-    const parsed = updateWorkItemSchema.safeParse(req.body ?? {});
-    if (!parsed.success) {
-      res.status(400).json({ error: '参数不合法' });
-      return;
-    }
-    try {
-      const actor = resolveActor(req);
-      const teamRole = actorTeamRole(structure, actor);
-      res.json({ workItem: structure.updateWorkItem((req.params.id as string), parsed.data, { ...actor, teamRole }) });
-    } catch (error) {
-      sendError(res, error);
-    }
-  });
-
-  router.post('/work-items/:id/assign', requireTeamMember(), (req, res) => {
-    const parsed = assignSchema.safeParse(req.body ?? {});
-    if (!parsed.success) {
-      res.status(400).json({ error: 'assignee 不合法' });
-      return;
-    }
-    try {
-      // Assignment 是协调动作，必须知道是谁在协调：actor 进授权判断，
-      // 也进 Activity History（audit 不能只有「被指派了」，没有「谁指派的」）。
-      const actor = resolveActor(req);
-      const teamRole = actorTeamRole(structure, actor);
-      const assignee =
-        parsed.data.kind && parsed.data.principalId
-          ? { kind: parsed.data.kind, principalId: parsed.data.principalId }
-          : null;
-      res.json({
-        workItem: structure.assignWorkItem((req.params.id as string), assignee, { ...actor, teamRole }),
-      });
-    } catch (error) {
-      sendError(res, error);
-    }
-  });
-
-  router.post('/work-items/:id/claim', requireTeamMember(), (req, res) => {
-    const parsed = claimSchema.safeParse(req.body ?? {});
-    if (!parsed.success) {
-      res.status(400).json({ error: '参数不合法' });
-      return;
-    }
-    try {
-      const actor = resolveActor(req);
-      // HTTP claim 只接受 Agent 身份：body 里的 memberId 不再被信任。
-      if (actor.kind !== 'agent') {
-        res.status(403).json({ error: '只有 Agent 可以 claim WorkItem' });
-        return;
-      }
-      res.json({
-        workItem: structure.claimWorkItem((req.params.id as string), {
-          memberId: actor.principalId,
-          expectedVersion: parsed.data.expectedVersion,
-        }),
-      });
-    } catch (error) {
-      sendError(res, error);
-    }
-  });
-
-  router.post('/work-items/:id/release', requireTeamMember(), (req, res) => {
-    try {
-      const actor = resolveActor(req);
-      const teamRole = actorTeamRole(structure, actor);
-      res.json({
-        workItem: structure.releaseWorkItem((req.params.id as string), { ...actor, teamRole }),
-      });
+      res.json({ activity: structure.listCurrentActivity(currentTeamId()) });
     } catch (error) {
       sendError(res, error);
     }

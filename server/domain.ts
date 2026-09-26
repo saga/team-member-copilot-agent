@@ -97,78 +97,6 @@ export interface PrincipalRef {
   principalId: string;
 }
 
-export type ProjectStatus = 'active' | 'archived';
-
-export interface Project {
-  id: string;
-  teamId: string;
-  name: string;
-  description: string;
-  status: ProjectStatus;
-  createdBy: string;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export type WorkItemStatus = 'todo' | 'in_progress' | 'blocked' | 'done' | 'cancelled';
-
-export interface WorkItem {
-  id: string;
-  teamId: string;
-  projectId: string | null;
-  title: string;
-  description: string;
-  status: WorkItemStatus;
-  assigneeKind: TeamParticipantKind | null;
-  assigneeId: string | null;
-  claimedByMemberId: string | null;
-  claimedExecutionId: string | null;
-  claimedAt: string | null;
-  version: number;
-  createdBy: string;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export type WorkItemEventType =
-  | 'created'
-  | 'updated'
-  | 'assigned'
-  | 'unassigned'
-  | 'claimed'
-  | 'released'
-  | 'status_changed';
-
-/** 谁做的这次变更。system = 引擎自动行为（如 execution 被取消时释放 claim）。 */
-export type WorkItemActorKind = 'human' | 'agent' | 'system';
-
-/**
- * WorkItem 的一条审计记录。
- *
- * 只记「什么变了」不记业务快照：from/to 成对出现，按时间重放可以还原
- * 任意时刻的状态。没有 History 的 WorkItem 只能看到当前状态 —— 谁指派的、
- * 什么时候被谁 claim、哪条 execution 在驱动、为什么结束，全部无从查证。
- */
-export interface WorkItemEvent {
-  id: string;
-  teamId: string;
-  workItemId: string;
-  eventType: WorkItemEventType;
-  actorKind: WorkItemActorKind;
-  actorId: string;
-  /** claimed 事件记录发起 claim 的那一轮 execution。 */
-  executionId: string | null;
-  fromStatus: WorkItemStatus | null;
-  toStatus: WorkItemStatus | null;
-  fromAssigneeKind: TeamParticipantKind | null;
-  fromAssigneeId: string | null;
-  toAssigneeKind: TeamParticipantKind | null;
-  toAssigneeId: string | null;
-  fromClaimedByMemberId: string | null;
-  toClaimedByMemberId: string | null;
-  createdAt: string;
-}
-
 export type PresenceAvailability = 'available' | 'away' | 'paused';
 
 export interface TeamPresence {
@@ -189,8 +117,6 @@ export interface ScheduledWake {
   teamId: string;
   memberId: string;
   conversationId: string;
-  projectId: string | null;
-  workItemId: string | null;
   prompt: string;
   type: ScheduledWakeType;
   runAt: string;
@@ -220,10 +146,9 @@ export interface ScheduledWakeRun {
 
 /** Team 级实时事件（/api/team/events 的 SSE 帧类型）。 */
 export type TeamEventType =
-  | 'work_item.changed'
+  | 'member.activity.changed'
   | 'schedule.changed'
   | 'presence.changed'
-  | 'project.changed'
   | 'membership.changed';
 
 /**
@@ -245,7 +170,8 @@ export interface StoredTeamEvent {
 export interface Conversation {
   id: string;
   teamId: string;
-  projectId: string | null;
+  /** 这间会话围绕哪张 Jira 工单。业务状态在 Jira，这里只是引用。 */
+  jiraIssueKey: string | null;
   title: string;
   kind: ConversationKind;
   defaultMemberId: string | null;
@@ -361,7 +287,8 @@ export interface ExecutionRecord {
   id: string;
   conversationId: string;
   memberId: string;
-  workItemId: string | null;
+  /** 开始时快照的 Jira 工单 key（取自 conversation），历史事实不随后续改动漂移。 */
+  jiraIssueKey: string | null;
   runtimeId: string | null;
   parentExecutionId: string | null;
   /** 从根到当前的 Member 链，用来防 A→B→C→A 和无限深链。 */

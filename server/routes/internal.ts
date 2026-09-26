@@ -3,7 +3,6 @@ import { z } from 'zod';
 import type { TeamService } from '../team-service.js';
 import { sendError } from '../middleware/errorHandler.js';
 import { requireInternalToken } from '../middleware/apiScope.js';
-import { resolveActor } from '../middleware/teamScope.js';
 
 /**
  * Internal Member runtime API。
@@ -24,11 +23,6 @@ import { resolveActor } from '../middleware/teamScope.js';
 const directMessageSchema = z.object({
   toMemberId: z.string().min(1),
   content: z.string().trim().min(1).max(20000),
-});
-
-const workItemClaimSchema = z.object({
-  workItemId: z.string().min(1),
-  executionId: z.string().min(1),
 });
 
 export function internalRouter(team: TeamService) {
@@ -68,39 +62,6 @@ export function internalRouter(team: TeamService) {
     }
   });
 
-  /**
-   * 以 `:id` 这个 Member 的身份 claim 一个 WorkItem。
-   *
-   * 走 `claimWorkItemForAgent`（与 tool 路径同一个服务方法）：execution 必须属于
-   * 这个 Member 且正在跑，claim 成功后 execution.work_item_id 双向回写 ——
-   * HTTP 路径不提供任何绕过审计绑定的捷径。
-   */
-  router.post('/members/:id/work-item-claims', async (req, res) => {
-    const parsed = workItemClaimSchema.safeParse(req.body ?? {});
-    if (!parsed.success) {
-      res.status(400).json({ error: 'workItemId / executionId 必填' });
-      return;
-    }
-    try {
-      // 身份一致性：token 授权的是「这个 runtime」，路径 :id 是「替谁说话」，
-      // resolveActor 注入的身份必须与路径一致，防止用 A 的 token 替 B claim。
-      const actor = resolveActor(req);
-      if (actor.kind !== 'agent' || actor.principalId !== req.params.id) {
-        res.status(403).json({ error: '调用方身份与路径中的 Member 不一致' });
-        return;
-      }
-      const result = JSON.parse(
-        await team.claimWorkItemForAgent({
-          memberId: req.params.id,
-          executionId: parsed.data.executionId,
-          workItemId: parsed.data.workItemId,
-        }),
-      ) as unknown;
-      res.json(result);
-    } catch (error) {
-      sendError(res, error);
-    }
-  });
 
   return router;
 }

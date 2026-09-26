@@ -20,7 +20,7 @@ import type { DatabaseSync } from 'node:sqlite';
  *
  * 程序不认识任何别的编号 —— 没有升级代码，认出来也无从下手。
  */
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 12;
 
 /**
  * 当前 schema 的完整定义，按最终形状写。
@@ -91,10 +91,8 @@ CREATE INDEX idx_member_capability_member
 
 -- ─────────────────────────────────────────────── Team 业务模型 v1 ─────
 --
--- Team 是顶层协作边界：Membership / Project / WorkItem / Presence / Schedule
--- 都挂在它下面。当前部署只有一个 Team，但形状上带 team_id，为以后多 Team 留结构。
--- Project 只是工作组织单元，不做第二层 ACL；Assignment/Claim 是 work_item 的字段，
--- 不是独立的表。
+-- Team 是顶层协作边界：Membership / Presence / Schedule / Conversation 都挂在
+-- 它下面。当前部署只有一个 Team，但形状上带 team_id，为以后多 Team 留结构。
 
 CREATE TABLE team (
   id TEXT PRIMARY KEY,
@@ -107,11 +105,11 @@ CREATE TABLE team (
   updated_at TEXT NOT NULL
 );
 
--- Team 级实时事件：WorkItem / Schedule / Presence / Project / Membership 的
+-- Team 级实时事件：Membership / Presence / Schedule / Member Activity 的
 -- 状态变化先落库再广播。与 conversation_event 同一套纪律 —— 落库是 source of
 -- truth，SSE 帧带 id: <sequence>，断线重连靠 Last-Event-ID 补发。
--- payload 是 JSON：这里是通知层，不是审计层（WorkItem 的审计在 work_item_event，
--- 列式可查询），消费方只需要「什么变了」然后决定刷哪块 UI。
+-- payload 是 JSON：这里是通知层，不是审计层，消费方只需要「什么变了」然后决定
+-- 刷哪块 UI。业务工作（工单、状态、负责人、工作流）以 Jira 为准，不在这里复制。
 CREATE TABLE team_event (
   id TEXT PRIMARY KEY,
   team_id TEXT NOT NULL,
@@ -153,130 +151,6 @@ CREATE INDEX idx_team_membership_team
 CREATE INDEX idx_team_membership_principal
   ON team_membership(kind, principal_id, status);
 
-CREATE TABLE project (
-  id TEXT PRIMARY KEY,
-  team_id TEXT NOT NULL,
-  name TEXT NOT NULL,
-  description TEXT NOT NULL DEFAULT '',
-  status TEXT NOT NULL DEFAULT 'active'
-    CHECK (status IN ('active', 'archived')),
-  created_by TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  FOREIGN KEY (team_id)
-    REFERENCES team(id)
-    ON DELETE CASCADE
-);
-
-CREATE INDEX idx_project_team_status
-  ON project(team_id, status);
-
-CREATE TABLE work_item (
-  id TEXT PRIMARY KEY,
-  team_id TEXT NOT NULL,
-  project_id TEXT,
-  title TEXT NOT NULL,
-  description TEXT NOT NULL DEFAULT '',
-  status TEXT NOT NULL DEFAULT 'todo'
-    CHECK (
-      status IN (
-        'todo',
-        'in_progress',
-        'blocked',
-        'done',
-        'cancelled'
-      )
-    ),
-  assignee_kind TEXT
-    CHECK (
-      assignee_kind IS NULL
-      OR assignee_kind IN ('human', 'agent')
-    ),
-  assignee_id TEXT,
-  claimed_by_member_id TEXT,
-  claimed_execution_id TEXT,
-  claimed_at TEXT,
-  version INTEGER NOT NULL DEFAULT 1,
-  created_by TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  CHECK (
-    (assignee_kind IS NULL AND assignee_id IS NULL)
-    OR
-    (assignee_kind IS NOT NULL AND assignee_id IS NOT NULL)
-  ),
-  FOREIGN KEY (team_id)
-    REFERENCES team(id)
-    ON DELETE CASCADE,
-  FOREIGN KEY (project_id)
-    REFERENCES project(id)
-    ON DELETE SET NULL,
-  FOREIGN KEY (claimed_by_member_id)
-    REFERENCES member(id)
-);
-
-CREATE INDEX idx_work_item_team_status
-  ON work_item(team_id, status);
-
-CREATE INDEX idx_work_item_project_status
-  ON work_item(project_id, status);
-
-CREATE INDEX idx_work_item_assignee
-  ON work_item(assignee_kind, assignee_id, status);
-
-CREATE INDEX idx_work_item_claim
-  ON work_item(claimed_by_member_id);
-
--- WorkItem 的审计流水：每次 mutation 一行。全部列式存储、不做 JSON 大字段 ——
--- 这个项目最看重可查询性：「谁在什么时候、用哪条 execution claim 了它」
--- 必须能直接 WHERE event_type + actor_kind 出来，而不是解析一堆 JSON。
--- from/to 成对出现：事后能还原任意时刻的完整状态。
-CREATE TABLE work_item_event (
-  id TEXT PRIMARY KEY,
-  team_id TEXT NOT NULL,
-  work_item_id TEXT NOT NULL,
-  event_type TEXT NOT NULL
-    CHECK (
-      event_type IN (
-        'created',
-        'updated',
-        'assigned',
-        'unassigned',
-        'claimed',
-        'released',
-        'status_changed'
-      )
-    ),
-  actor_kind TEXT NOT NULL
-    CHECK (actor_kind IN ('human', 'agent', 'system')),
-  actor_id TEXT NOT NULL,
-  -- claimed 事件记录发起 claim 的那一轮 execution。
-  execution_id TEXT,
-  from_status TEXT,
-  to_status TEXT,
-  from_assignee_kind TEXT,
-  from_assignee_id TEXT,
-  to_assignee_kind TEXT,
-  to_assignee_id TEXT,
-  from_claimed_by_member_id TEXT,
-  to_claimed_by_member_id TEXT,
-  created_at TEXT NOT NULL,
-  FOREIGN KEY (team_id)
-    REFERENCES team(id)
-    ON DELETE CASCADE,
-  FOREIGN KEY (work_item_id)
-    REFERENCES work_item(id)
-    ON DELETE CASCADE,
-  FOREIGN KEY (execution_id)
-    REFERENCES execution(id)
-);
-
-CREATE INDEX idx_work_item_event_item
-  ON work_item_event(work_item_id, created_at);
-
-CREATE INDEX idx_work_item_event_team
-  ON work_item_event(team_id, created_at);
-
 -- Presence 只存可配置的 availability（available/away/paused），busy/offline 由系统
 -- 按 active execution 与 lastSeen 计算，不落库，否则三边打架。
 CREATE TABLE team_presence (
@@ -301,8 +175,6 @@ CREATE TABLE scheduled_wake (
   team_id TEXT NOT NULL,
   member_id TEXT NOT NULL,
   conversation_id TEXT NOT NULL,
-  project_id TEXT,
-  work_item_id TEXT,
   prompt TEXT NOT NULL,
   type TEXT NOT NULL
     CHECK (type IN ('once', 'interval')),
@@ -335,13 +207,7 @@ CREATE TABLE scheduled_wake (
     REFERENCES member(id),
   FOREIGN KEY (conversation_id)
     REFERENCES conversation(id)
-    ON DELETE CASCADE,
-  FOREIGN KEY (project_id)
-    REFERENCES project(id)
-    ON DELETE SET NULL,
-  FOREIGN KEY (work_item_id)
-    REFERENCES work_item(id)
-    ON DELETE SET NULL
+    ON DELETE CASCADE
 );
 
 CREATE INDEX idx_scheduled_wake_due
@@ -384,7 +250,9 @@ CREATE INDEX idx_scheduled_wake_run_execution
 CREATE TABLE conversation (
   id TEXT PRIMARY KEY,
   team_id TEXT NOT NULL,
-  project_id TEXT,
+  -- 业务工作以 Jira 为唯一事实源；这里只存「这间会话围绕哪张工单」的引用。
+  -- NULL = 不挂钩业务的普通会话。工单的标题/状态/负责人不落本地，查 Jira。
+  jira_issue_key TEXT,
   title TEXT NOT NULL,
   kind TEXT NOT NULL
     CHECK (kind IN ('direct', 'group', 'work')),
@@ -399,9 +267,6 @@ CREATE TABLE conversation (
   FOREIGN KEY (team_id)
     REFERENCES team(id)
     ON DELETE CASCADE,
-  FOREIGN KEY (project_id)
-    REFERENCES project(id)
-    ON DELETE SET NULL,
   FOREIGN KEY (default_member_id)
     REFERENCES member(id)
     ON DELETE SET NULL
@@ -536,7 +401,9 @@ CREATE TABLE execution (
   id TEXT PRIMARY KEY,
   conversation_id TEXT NOT NULL,
   member_id TEXT NOT NULL,
-  work_item_id TEXT,
+  -- 开始时快照的 Jira 工单 key（取自 conversation）。execution 是历史事实：
+  -- conversation 的 Jira context 后来被改了，这条记录仍然知道当时在干哪张工单。
+  jira_issue_key TEXT,
   runtime_id TEXT,
   parent_execution_id TEXT,
   delegation_path TEXT NOT NULL DEFAULT '[]',
@@ -581,9 +448,6 @@ CREATE TABLE execution (
     ON DELETE CASCADE,
   FOREIGN KEY (member_id)
     REFERENCES member(id),
-  FOREIGN KEY (work_item_id)
-    REFERENCES work_item(id)
-    ON DELETE SET NULL,
   FOREIGN KEY (runtime_id)
     REFERENCES member_runtime(id),
   FOREIGN KEY (parent_execution_id)
@@ -601,8 +465,8 @@ CREATE INDEX idx_execution_parent
 CREATE INDEX idx_execution_status
   ON execution(status);
 
-CREATE INDEX idx_execution_work_item
-  ON execution(work_item_id);
+CREATE INDEX idx_execution_jira_issue
+  ON execution(jira_issue_key);
 
 -- ─────────────────────────────────────────────── Knowledge Base ───────────
 --

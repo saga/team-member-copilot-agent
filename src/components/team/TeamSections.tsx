@@ -1,19 +1,21 @@
 import { useEffect, useState } from 'react';
-import { Button, Card, Input, List, Space, Tag } from 'antd';
-import { PlusOutlined } from '@ant-design/icons';
-import { api, type Project, type WorkItem } from '../../lib/api';
+import { Card, Empty, List, Tag } from 'antd';
+import { api, type CurrentActivity } from '../../lib/api';
 import { useTeamEvents } from '../../lib/useTeamEvents';
-import { WorkItemRow } from './WorkItemRow';
 
-/** Projects：只有列表 + 新建，不做完整 Project 页。 */
-export function ProjectSection({ onChanged }: { onChanged?: () => void }) {
-  const [projects, setProjects] = useState<Project[]>([]);
-  const [name, setName] = useState('');
-  const [busy, setBusy] = useState(false);
+/**
+ * Current Work：谁在干什么。
+ *
+ * 业务工作以 Jira 为唯一事实源 —— 这里只展示「哪个 Member 正在跑哪张工单的
+ * 哪一轮」，工单的标题 / 状态 / 负责人在 Jira 上看（本地不复制，也就不会腐烂）。
+ * 数据 = active execution；没有独立的 activity 存储。
+ */
+export function CurrentWorkSection() {
+  const [activity, setCurrentWork] = useState<CurrentActivity[]>([]);
 
   async function refresh() {
     try {
-      setProjects((await api.listProjects()).projects);
+      setCurrentWork((await api.listCurrentActivity()).activity);
     } catch {
       // Team 未初始化时保持空列表，不挡主界面
     }
@@ -23,109 +25,33 @@ export function ProjectSection({ onChanged }: { onChanged?: () => void }) {
     void refresh();
   }, []);
 
-  async function create() {
-    if (!name.trim()) return;
-    setBusy(true);
-    try {
-      await api.createProject({ name: name.trim() });
-      setName('');
-      await refresh();
-      onChanged?.();
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <Card size="small" bordered={false} style={{ marginBottom: 8 }}>
-      <List
-        size="small"
-        dataSource={projects}
-        locale={{ emptyText: '还没有 Project。' }}
-        renderItem={(project) => (
-          <List.Item>
-            <List.Item.Meta
-              title={project.name}
-              description={project.status !== 'active' ? project.status : project.description || undefined}
-            />
-            {project.status !== 'active' && <Tag color="default">{project.status}</Tag>}
-          </List.Item>
-        )}
-      />
-      <Space.Compact block>
-        <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="New project" size="small" />
-        <Button type="primary" size="small" icon={<PlusOutlined />} onClick={() => void create()} disabled={!name.trim()} loading={busy}>
-          Add
-        </Button>
-      </Space.Compact>
-    </Card>
-  );
-}
-
-/** Work：按 status 分组的最简列表，不做拖拽 Kanban。行的操作在 WorkItemRow。 */
-export function WorkSection({ members }: { members: { id: string; name: string }[] }) {
-  const [items, setItems] = useState<WorkItem[]>([]);
-  const [title, setTitle] = useState('');
-  const [busy, setBusy] = useState(false);
-
-  async function refresh() {
-    try {
-      setItems((await api.listWorkItems()).workItems);
-    } catch {
-      // Team 未初始化时保持空列表，不挡主界面
-    }
-  }
-
-  useEffect(() => {
-    void refresh();
-  }, []);
-
-  // Team SSE 替掉 10 秒轮询：WorkItem 的任何变化（含 Agent 的 claim/release）
-  // 都实时到达。
   useTeamEvents((type) => {
-    if (type === 'work_item.changed') void refresh();
+    if (type === 'member.activity.changed') void refresh();
   });
 
-  async function create() {
-    if (!title.trim()) return;
-    setBusy(true);
-    try {
-      await api.createWorkItem({ title: title.trim() });
-      setTitle('');
-      await refresh();
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  const groups: { key: string; label: string; color: string; items: WorkItem[] }[] = [
-    { key: 'todo', label: 'Todo', color: 'default', items: items.filter((i) => i.status === 'todo') },
-    { key: 'in_progress', label: 'In Progress', color: 'processing', items: items.filter((i) => i.status === 'in_progress') },
-    { key: 'blocked', label: 'Blocked', color: 'warning', items: items.filter((i) => i.status === 'blocked') },
-    { key: 'done', label: 'Done', color: 'success', items: items.filter((i) => i.status === 'done') },
-  ];
-
   return (
-    <Card size="small" bordered={false} style={{ marginBottom: 8 }}>
-      {groups.map((group) => (
-        <div key={group.key} style={{ marginBottom: 8 }}>
-          <Tag color={group.color}>
-            {group.label} {group.items.length}
-          </Tag>
-          <List
-            size="small"
-            dataSource={group.items.slice(0, 8)}
-            locale={{ emptyText: undefined }}
-            renderItem={(item) => <WorkItemRow item={item} members={members} onChanged={() => void refresh()} />}
-          />
-        </div>
-      ))}
-      <Space.Compact block>
-        <Input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="New work item" size="small" />
-        <Button type="primary" size="small" icon={<PlusOutlined />} onClick={() => void create()} disabled={!title.trim()} loading={busy}>
-          Add
-        </Button>
-      </Space.Compact>
+    <Card size="small" bordered={false} style={{ marginBottom: 8 }} title="Current Work">
+      {activity.length === 0 ? (
+        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="No member is working right now" />
+      ) : (
+        <List
+          size="small"
+          dataSource={activity}
+          renderItem={(item) => (
+            <List.Item>
+              <div style={{ minWidth: 0, flex: 1 }}>
+                <div style={{ fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {item.jiraIssueKey ? <Tag color="blue">{item.jiraIssueKey}</Tag> : null}
+                  <span>{item.memberName}</span>
+                </div>
+                <div style={{ fontSize: 12, color: 'var(--ant-color-text-tertiary, #999)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {item.conversationTitle} · {item.status}
+                </div>
+              </div>
+            </List.Item>
+          )}
+        />
+      )}
     </Card>
   );
 }

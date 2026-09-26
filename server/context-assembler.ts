@@ -84,8 +84,8 @@ export class ContextAssembler {
     wakeReason: WakeReason | null;
     /** 本次要处理的内容（direct = 用户那条消息；discussion 只是提示；delegation = 任务）。 */
     currentPrompt: string;
-    /** 有 workItemId 时才带的最小工作上下文，不全量塞 Project。 */
-    work?: { projectName: string | null; title: string; status: string; assignee: string | null } | null;
+    /** conversation 挂了 Jira 工单时才带的引用；工单元数据本身在 Jira。 */
+    work?: { issueKey: string } | null;
   }): MemberContext {
     const rows = this.db
       .prepare(
@@ -147,24 +147,15 @@ export class ContextAssembler {
       turnMode: TurnMode;
       wakeReason: WakeReason | null;
       currentPrompt: string;
-      work?: { projectName: string | null; title: string; status: string; assignee: string | null } | null;
+      work?: { issueKey: string } | null;
     },
   ): string {
     const sections: string[] = [];
 
-    // 最小工作上下文：只在有 workItemId 时出现，不塞整个 Project。
+    // 最小工作上下文：只给工单引用。标题/状态/负责人是 Jira 的数据，不复制，
+    // Agent 要细节就调 jira_get_issue。
     if (input.work) {
-      sections.push(
-        [
-          'Current Work Item',
-          input.work.projectName ? `Project: ${input.work.projectName}` : null,
-          `Task: ${input.work.title}`,
-          `Status: ${input.work.status}`,
-          input.work.assignee ? `Assignee: ${input.work.assignee}` : null,
-        ]
-          .filter(Boolean)
-          .join('\n'),
-      );
+      sections.push(`Current Jira Issue: ${input.work.issueKey}`);
     }
 
     if (input.turnMode === 'discussion') {

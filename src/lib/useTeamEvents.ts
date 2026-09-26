@@ -2,10 +2,9 @@ import { useEffect, useRef } from 'react';
 import { api, type TeamEventType } from './api';
 
 const TEAM_EVENT_TYPES: TeamEventType[] = [
-  'work_item.changed',
+  'member.activity.changed',
   'schedule.changed',
   'presence.changed',
-  'project.changed',
   'membership.changed',
 ];
 

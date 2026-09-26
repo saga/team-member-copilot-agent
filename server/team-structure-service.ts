@@ -1,15 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { config } from './config.js';
-import { runInTransaction } from './db-tx.js';
 import { now } from './db.js';
 import { badRequest, conflict, forbidden, notFound } from './http-error.js';
 import type {
-  ExecutionStatus,
   PresenceAvailability,
-  PrincipalRef,
-  Project,
-  ProjectStatus,
   ScheduledWake,
   ScheduledWakeRun,
   ScheduledWakeStatus,
@@ -19,15 +14,10 @@ import type {
   TeamParticipantKind,
   TeamPresence,
   TeamRole,
-  WorkItem,
-  WorkItemActorKind,
-  WorkItemEvent,
-  WorkItemEventType,
-  WorkItemStatus,
 } from './domain.js';
 
 /**
- * Team 业务对象：Team / Membership / Project / WorkItem / Presence。
+ * Team 业务对象：Team / Membership / Presence / Schedule。
  *
  * 只管业务对象，不管 Copilot / Execution / Runtime / SSE / scheduler loop。
  * Scheduler 的执行入口在 scheduler-service，真正跑 turn 仍走 TeamService。
@@ -55,10 +45,6 @@ export class TeamStructureService {
    * 把跨表写入收成一个原子块。嵌套安全：深度由 db-tx 统一追踪，
    * COMMIT 只由最外层负责，onCommit hook 在 COMMIT 之后才执行。
    */
-  private transaction<T>(fn: () => T, onCommit?: () => void): T {
-    return runInTransaction(this.db, fn, onCommit);
-  }
-
   // ------------------------------------------------------------------ Team
 
   /** 当前部署的唯一 Team，不存在则建。启动时调用，不提供新建 Team 入口。 */
@@ -191,547 +177,6 @@ export class TeamStructureService {
     return this.getMembership(teamId, kind, principalId);
   }
 
-  // ---------------------------------------------------------------- Project
-
-  createProject(teamId: string, input: { name: string; description?: string }, createdBy: string): Project {
-    const name = input.name.trim();
-    if (!name) throw badRequest('Project 名称不能为空');
-    this.getTeam(teamId);
-    const id = randomUUID();
-    const timestamp = now();
-    this.db
-      .prepare(
-        `INSERT INTO project (id, team_id, name, description, status, created_by, created_at, updated_at)
-         VALUES (?, ?, ?, ?, 'active', ?, ?, ?)`,
-      )
-      .run(id, teamId, name.slice(0, 200), (input.description ?? '').slice(0, 2000), createdBy, timestamp, timestamp);
-    const project = this.getProject(id);
-    this.emitChange(teamId, 'project.changed', project);
-    return project;
-  }
-
-  listProjects(teamId: string): Project[] {
-    const rows = this.db
-      .prepare(`SELECT * FROM project WHERE team_id = ? ORDER BY created_at`)
-      .all(teamId) as unknown as ProjectRow[];
-    return rows.map(mapProject);
-  }
-
-  getProject(id: string): Project {
-    const row = this.db.prepare(`SELECT * FROM project WHERE id = ?`).get(id) as unknown as
-      | ProjectRow
-      | undefined;
-    if (!row) throw notFound(`Project 不存在：${id}`);
-    return mapProject(row);
-  }
-
-  updateProject(id: string, patch: { name?: string; description?: string; status?: ProjectStatus }): Project {
-    const current = this.getProject(id);
-    const name = patch.name?.trim() || current.name;
-    this.db
-      .prepare(`UPDATE project SET name = ?, description = ?, status = ?, updated_at = ? WHERE id = ?`)
-      .run(
-        name.slice(0, 200),
-        (patch.description ?? current.description).slice(0, 2000),
-        patch.status ?? current.status,
-        now(),
-        id,
-      );
-    const project = this.getProject(id);
-    this.emitChange(current.teamId, 'project.changed', project);
-    return project;
-  }
-
-  // --------------------------------------------------------------- WorkItem
-
-  createWorkItem(
-    teamId: string,
-    input: { title: string; description?: string; projectId?: string | null },
-    actor: PrincipalRef,
-  ): WorkItem {
-    const title = input.title.trim();
-    if (!title) throw badRequest('WorkItem 标题不能为空');
-    this.getTeam(teamId);
-    const projectId = input.projectId?.trim() || null;
-    if (projectId) {
-      const project = this.getProject(projectId);
-      if (project.teamId !== teamId) throw badRequest('Project 不属于这个 Team');
-      if (project.status !== 'active') throw badRequest('已归档的 Project 不能建 WorkItem');
-    }
-    const id = randomUUID();
-    const timestamp = now();
-    this.transaction(() => {
-      this.db
-        .prepare(
-          `INSERT INTO work_item (id, team_id, project_id, title, description, status, version, created_by, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, 'todo', 1, ?, ?, ?)`,
-        )
-        .run(id, teamId, projectId, title.slice(0, 300), (input.description ?? '').slice(0, 8000), actor.principalId, timestamp, timestamp);
-      this.appendWorkItemEvent({
-        workItemId: id,
-        teamId,
-        eventType: 'created',
-        actor,
-        toStatus: 'todo',
-      });
-      this.emitChange(teamId, 'work_item.changed', this.getWorkItem(id));
-    });
-    return this.getWorkItem(id);
-  }
-
-  listWorkItems(
-    teamId: string,
-    filter: { projectId?: string; status?: WorkItemStatus; assigneeId?: string; claimedBy?: string } = {},
-  ): WorkItem[] {
-    const clauses = [`team_id = ?`];
-    const params: Array<string | number> = [teamId];
-    if (filter.projectId) {
-      clauses.push(`project_id = ?`);
-      params.push(filter.projectId);
-    }
-    if (filter.status) {
-      clauses.push(`status = ?`);
-      params.push(filter.status);
-    }
-    if (filter.assigneeId) {
-      clauses.push(`assignee_id = ?`);
-      params.push(filter.assigneeId);
-    }
-    if (filter.claimedBy) {
-      clauses.push(`claimed_by_member_id = ?`);
-      params.push(filter.claimedBy);
-    }
-    const rows = this.db
-      .prepare(`SELECT * FROM work_item WHERE ${clauses.join(' AND ')} ORDER BY updated_at DESC LIMIT 200`)
-      .all(...params) as unknown as WorkItemRow[];
-    return rows.map(mapWorkItem);
-  }
-
-  getWorkItem(id: string): WorkItem {
-    const row = this.db.prepare(`SELECT * FROM work_item WHERE id = ?`).get(id) as unknown as
-      | WorkItemRow
-      | undefined;
-    if (!row) throw notFound(`WorkItem 不存在：${id}`);
-    return mapWorkItem(row);
-  }
-
-  updateWorkItem(
-    id: string,
-    patch: { title?: string; description?: string; status?: WorkItemStatus },
-    actor: PrincipalRef & { teamRole?: TeamRole },
-  ): WorkItem {
-    const current = this.getWorkItem(id);
-    // 对象级授权：admin、当前 claimer、未被 claim 时的人类创建者，三者之外一律拒绝。
-    const isAdmin = actor.teamRole === 'owner' || actor.teamRole === 'admin';
-    const isAgentClaimer =
-      actor.kind === 'agent' && current.claimedByMemberId === actor.principalId;
-    const isHumanCreator =
-      actor.kind === 'human' && current.createdBy === actor.principalId;
-    if (!isAdmin && !isAgentClaimer && !isHumanCreator) {
-      throw forbidden('没有修改这个 WorkItem 的权限');
-    }
-    if (patch.status) {
-      // 工作状态流转只属于 claimer 与 admin：路过不能把别人的任务改成 blocked。
-      if (
-        ['in_progress', 'blocked', 'done', 'cancelled'].includes(patch.status) &&
-        !isAdmin &&
-        !isAgentClaimer
-      ) {
-        throw forbidden('只有当前 claimer 或 Team admin/owner 可以改变工作状态');
-      }
-      // 已被 claim 的任务不能由其他人退回 todo。
-      if (
-        patch.status === 'todo' &&
-        current.claimedByMemberId &&
-        !isAdmin &&
-        !isAgentClaimer
-      ) {
-        throw forbidden('已被 claim 的 WorkItem 不能由其他人退回 todo');
-      }
-    }
-    const title = patch.title?.trim() || current.title;
-    const description = patch.description ?? current.description;
-    const status = patch.status ?? current.status;
-    const contentChanged = title !== current.title || description !== current.description;
-    const statusChanged = status !== current.status;
-    this.transaction(() => {
-      this.db
-        .prepare(`UPDATE work_item SET title = ?, description = ?, status = ?, version = version + 1, updated_at = ? WHERE id = ?`)
-        .run(title.slice(0, 300), description.slice(0, 8000), status, now(), id);
-      // done/cancelled 后 claim 自动清空：业务结束，锁不应继续占着。
-      // 必须和状态变更同事务：中间崩进程会留下「已结束却仍被 claim」的行。
-      const claimCleared =
-        (patch.status === 'done' || patch.status === 'cancelled') && !!current.claimedByMemberId;
-      if (claimCleared) {
-        this.db
-          .prepare(`UPDATE work_item SET claimed_by_member_id = NULL, claimed_execution_id = NULL, claimed_at = NULL WHERE id = ?`)
-          .run(id);
-      }
-      // 内容与状态分开记：审计里「改了标题」和「todo → blocked」是两类事实。
-      if (contentChanged) {
-        this.appendWorkItemEvent({
-          workItemId: id,
-          teamId: current.teamId,
-          eventType: 'updated',
-          actor,
-        });
-      }
-      if (statusChanged) {
-        this.appendWorkItemEvent({
-          workItemId: id,
-          teamId: current.teamId,
-          eventType: 'status_changed',
-          actor,
-          fromStatus: current.status,
-          toStatus: status,
-        });
-      }
-      if (claimCleared) {
-        this.appendWorkItemEvent({
-          workItemId: id,
-          teamId: current.teamId,
-          eventType: 'released',
-          actor,
-          executionId: current.claimedExecutionId,
-          fromClaimedByMemberId: current.claimedByMemberId,
-        });
-      }
-      this.emitChange(current.teamId, 'work_item.changed', this.getWorkItem(id));
-    });
-    return this.getWorkItem(id);
-  }
-
-  assignWorkItem(
-    id: string,
-    assignee: { kind: TeamParticipantKind; principalId: string } | null,
-    actor: PrincipalRef & { teamRole?: TeamRole },
-  ): WorkItem {
-    // Assignment 是协调动作：Human = Coordinator，Agent = Worker。
-    // Agent 想接活走 claim（Execution → Claim），不能把工作指给别人。
-    if (actor.kind === 'agent') {
-      throw forbidden('Agent 不能 assign WorkItem；接活请使用 claim');
-    }
-    const current = this.getWorkItem(id);
-    if (current.status === 'done' || current.status === 'cancelled') {
-      throw conflict(`WorkItem 已经结束：${current.status}`);
-    }
-    if (current.claimedByMemberId) {
-      throw conflict('WorkItem 已被 claim，先 release 再重新 assign');
-    }
-    if (assignee) {
-      // assignee 必须是同 Team 的 active 成员（agent 要查 member 行，human 查 membership）。
-      this.requireActiveMembership(current.teamId, assignee.kind, assignee.principalId);
-      if (assignee.kind === 'agent') {
-        const member = this.db.prepare(`SELECT status FROM member WHERE id = ?`).get(assignee.principalId) as unknown as
-          | { status: string }
-          | undefined;
-        if (!member || member.status !== 'active') throw badRequest('不能指派给已归档的 Member');
-      }
-    }
-    this.transaction(() => {
-      this.db
-        .prepare(
-          `UPDATE work_item SET assignee_kind = ?, assignee_id = ?, version = version + 1, updated_at = ? WHERE id = ?`,
-        )
-        .run(assignee?.kind ?? null, assignee?.principalId ?? null, now(), id);
-      // 取消一个本来就没有 assignee 的指派是 no-op，不记流水。
-      if (assignee || current.assigneeId) {
-        this.appendWorkItemEvent({
-          workItemId: id,
-          teamId: current.teamId,
-          eventType: assignee ? 'assigned' : 'unassigned',
-          actor,
-          fromAssigneeKind: current.assigneeKind,
-          fromAssigneeId: current.assigneeId,
-          toAssigneeKind: assignee?.kind ?? null,
-          toAssigneeId: assignee?.principalId ?? null,
-        });
-      }
-      this.emitChange(current.teamId, 'work_item.changed', this.getWorkItem(id));
-    });
-    return this.getWorkItem(id);
-  }
-
-  /**
-   * 原子 claim：UPDATE … WHERE version=? AND claimed_by IS NULL，不先读再写。
-   * 成功返回新行；0 行 = 被抢先 / 状态不允许 / 版本过期，抛 409。
-   */
-  claimWorkItem(
-    id: string,
-    input: { memberId: string; executionId?: string | null; expectedVersion?: number },
-  ): WorkItem {
-    const current = this.getWorkItem(id);
-    this.requireActiveMembership(current.teamId, 'agent', input.memberId);
-    const member = this.db.prepare(`SELECT status FROM member WHERE id = ?`).get(input.memberId) as unknown as
-      | { status: string }
-      | undefined;
-    if (!member || member.status !== 'active') throw forbidden('已归档的 Member 不能 claim');
-
-    // 有明确 assignee 时只有它能 claim；未指定时任何 active agent 可 claim。
-    if (current.assigneeKind === 'agent' && current.assigneeId !== input.memberId) {
-      throw forbidden('这项工作已指派给别人，只有 assignee 能 claim');
-    }
-    if (current.assigneeKind === 'human') {
-      throw forbidden('这项工作已指派给 Human，Agent 不能 claim');
-    }
-
-    // execution 绑定校验：claim 必须由一条真实、可执行的 execution 发起，
-    // 且一条 execution 不能同时绑两个 WorkItem。
-    if (input.executionId) {
-      const execution = this.db
-        .prepare(
-          `
-          SELECT id, member_id, status, work_item_id
-          FROM execution
-          WHERE id = ?
-          `,
-        )
-        .get(input.executionId) as
-        | { id: string; member_id: string; status: ExecutionStatus; work_item_id: string | null }
-        | undefined;
-      if (!execution) {
-        throw notFound(`Execution 不存在：${input.executionId}`);
-      }
-      if (execution.member_id !== input.memberId) {
-        throw forbidden('Execution 不属于当前 Member');
-      }
-      if (!['queued', 'running'].includes(execution.status)) {
-        throw conflict('当前 Execution 不能 claim WorkItem');
-      }
-      if (execution.work_item_id && execution.work_item_id !== id) {
-        throw conflict('Execution 已绑定另一个 WorkItem');
-      }
-    }
-
-    const expectedVersion = input.expectedVersion ?? current.version;
-    // claim 是跨表写入（work_item + execution.work_item_id），必须同事务：
-    // 中间崩进程会留下「WorkItem 已被 claim、execution 却不知道自己在干哪项工作」的断链。
-    return this.transaction(() => {
-      const timestamp = now();
-
-      if (current.claimedByMemberId) {
-        // 已被 claim。语义是「谁负责」+「这一轮谁在驱动」，所以同一 Member
-        // 换一轮 Execution 允许重绑（retry：Execution 1 failed → Execution 2 接着驱动），
-        // 其他 Member 则一律 409 —— 那是抢别人的活。
-        if (current.claimedByMemberId !== input.memberId) {
-          throw conflict('WorkItem 已被其他 Member claim');
-        }
-        const previousExecutionId = current.claimedExecutionId;
-        const previous = previousExecutionId
-          ? (this.db.prepare(`SELECT status FROM execution WHERE id = ?`).get(previousExecutionId) as unknown as
-              | { status: ExecutionStatus }
-              | undefined)
-          : undefined;
-        // 旧轮已到任意终态（completed / failed / cancelled / interrupted）才允许重绑：
-        // 多轮工作（completed）与 retry（failed）都要把锁交给新的一轮。
-        const previousEnded =
-          !previousExecutionId ||
-          (previous !== undefined &&
-            ['completed', 'failed', 'cancelled', 'interrupted'].includes(previous.status));
-        if (!previousEnded) {
-          throw conflict('WorkItem 已被当前 Member 一条未结束的 Execution claim');
-        }
-        const rebind = this.db
-          .prepare(
-            `UPDATE work_item
-             SET claimed_execution_id = ?,
-                 claimed_at = ?,
-                 version = version + 1,
-                 updated_at = ?
-             WHERE id = ?
-               AND claimed_by_member_id = ?
-               AND version = ?`,
-          )
-          .run(input.executionId ?? null, timestamp, timestamp, id, input.memberId, expectedVersion);
-        if (Number(rebind.changes) !== 1) {
-          throw conflict('Claim 重绑失败：状态已变化，请重新读取后重试');
-        }
-      } else {
-        const result = this.db
-          .prepare(
-            `UPDATE work_item
-             SET claimed_by_member_id = ?,
-                 claimed_at = ?,
-                 claimed_execution_id = ?,
-                 version = version + 1,
-                 status = 'in_progress',
-                 updated_at = ?
-             WHERE id = ?
-               AND version = ?
-               AND claimed_by_member_id IS NULL
-               AND status IN ('todo', 'in_progress')`,
-          )
-          .run(input.memberId, timestamp, input.executionId ?? null, timestamp, id, expectedVersion);
-        if (Number(result.changes) !== 1) {
-          throw conflict('Claim 失败：已被抢先、状态不允许或版本过期');
-        }
-      }
-
-      // 双向绑定：execution.work_item_id 与 work_item.claimed_execution_id 保持一致。
-      if (input.executionId) {
-        this.db
-          .prepare(`UPDATE execution SET work_item_id = ? WHERE id = ? AND work_item_id IS NULL`)
-          .run(id, input.executionId);
-      }
-      // 重绑时 from = to = 同一个 Member：流水上仍是一次 claim（换了驱动它的一轮）。
-      this.appendWorkItemEvent({
-        workItemId: id,
-        teamId: current.teamId,
-        eventType: 'claimed',
-        actor: { kind: 'agent', principalId: input.memberId },
-        executionId: input.executionId ?? null,
-        fromClaimedByMemberId: current.claimedByMemberId,
-        toClaimedByMemberId: input.memberId,
-      });
-      this.emitChange(current.teamId, 'work_item.changed', this.getWorkItem(id));
-      return this.getWorkItem(id);
-    });
-  }
-
-  releaseWorkItem(id: string, actor: PrincipalRef & { teamRole?: TeamRole }): WorkItem {
-    const current = this.getWorkItem(id);
-    if (!current.claimedByMemberId) return current;
-    const isClaimer =
-      actor.kind === 'agent' && current.claimedByMemberId === actor.principalId;
-    const isAdmin = actor.teamRole === 'owner' || actor.teamRole === 'admin';
-    if (!isClaimer && !isAdmin) {
-      throw forbidden('只有 claimer 或 Team admin/owner 能 release WorkItem');
-    }
-    this.transaction(() => {
-      this.db
-        .prepare(
-          `UPDATE work_item SET claimed_by_member_id = NULL, claimed_execution_id = NULL, claimed_at = NULL, version = version + 1, updated_at = ? WHERE id = ?`,
-        )
-        .run(now(), id);
-      this.appendWorkItemEvent({
-        workItemId: id,
-        teamId: current.teamId,
-        eventType: 'released',
-        actor,
-        executionId: current.claimedExecutionId,
-        fromClaimedByMemberId: current.claimedByMemberId,
-      });
-      this.emitChange(current.teamId, 'work_item.changed', this.getWorkItem(id));
-    });
-    return this.getWorkItem(id);
-  }
-
-  /**
-   * Execution 收口为 cancelled / interrupted 时释放它 claim 的 WorkItem。
-   *
-   * 这两种终态意味着这一轮执行已不再拥有业务执行权，锁继续占着只会挡住 retry。
-   * failed 保留 claim（retry 由同一 Member 继续）；completed 也不自动释放 ——
-   * 完成一轮执行不等于业务工作结束（WorkItem ≠ Execution）。
-   *
-   * 守卫是 `claimed_execution_id = ?`：它只清「这一轮亲手 claim 的」记录，
-   * 不碰 Member 重新 claim 到别的 Execution 上的新锁。没有匹配行时是 no-op，
-   * 重复调用安全。
-   */
-  releaseClaimForExecution(executionId: string): void {
-    // 先读再清：流水里要记「释放的是谁的锁」。
-    const claimed = this.db
-      .prepare(
-        `SELECT id, team_id, claimed_by_member_id FROM work_item
-         WHERE claimed_execution_id = ? AND claimed_by_member_id IS NOT NULL`,
-      )
-      .get(executionId) as unknown as
-      | { id: string; team_id: string; claimed_by_member_id: string }
-      | undefined;
-    if (!claimed) return;
-    this.transaction(() => {
-      this.db
-        .prepare(
-          `UPDATE work_item
-           SET claimed_by_member_id = NULL,
-               claimed_execution_id = NULL,
-               claimed_at = NULL,
-               version = version + 1,
-               updated_at = ?
-           WHERE claimed_execution_id = ?
-             AND claimed_by_member_id IS NOT NULL`,
-        )
-        .run(now(), executionId);
-      this.appendWorkItemEvent({
-        workItemId: claimed.id,
-        teamId: claimed.team_id,
-        eventType: 'released',
-        actor: { kind: 'system', principalId: 'system' },
-        executionId,
-        fromClaimedByMemberId: claimed.claimed_by_member_id,
-      });
-      this.emitChange(claimed.team_id, 'work_item.changed', this.getWorkItem(claimed.id));
-    });
-  }
-
-  /**
-   * WorkItem 的审计流水，时间正序（最新 limit 条）。
-   *
-   * 必须先验证 WorkItem 属于这个 Team 再查：直接按 work_item_id 查会把
-   * 跨 Team 的 id 当成合法输入，权限过滤就绕过去了。
-   */
-  listWorkItemEvents(teamId: string, workItemId: string, limit = 100): WorkItemEvent[] {
-    const item = this.getWorkItem(workItemId);
-    if (item.teamId !== teamId) throw notFound(`WorkItem 不存在：${workItemId}`);
-    const rows = this.db
-      .prepare(
-        `SELECT * FROM work_item_event WHERE work_item_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?`,
-      )
-      .all(workItemId, limit) as unknown as WorkItemEventRow[];
-    return rows.reverse().map(mapWorkItemEvent);
-  }
-
-  /**
-   * WorkItem 审计流水的唯一写入口：所有 mutation 都从这里进。
-   * 必须在调用方的事务里执行（业务行与流水同生共死，拆开就会留下
-   * 「状态变了但没有流水」或反过来的半截事实）。
-   */
-  private appendWorkItemEvent(input: {
-    workItemId: string;
-    teamId: string;
-    eventType: WorkItemEventType;
-    actor: { kind: WorkItemActorKind; principalId: string };
-    executionId?: string | null;
-    fromStatus?: WorkItemStatus | null;
-    toStatus?: WorkItemStatus | null;
-    fromAssigneeKind?: TeamParticipantKind | null;
-    fromAssigneeId?: string | null;
-    toAssigneeKind?: TeamParticipantKind | null;
-    toAssigneeId?: string | null;
-    fromClaimedByMemberId?: string | null;
-    toClaimedByMemberId?: string | null;
-  }): void {
-    this.db
-      .prepare(
-        `INSERT INTO work_item_event (
-           id, team_id, work_item_id, event_type, actor_kind, actor_id, execution_id,
-           from_status, to_status, from_assignee_kind, from_assignee_id,
-           to_assignee_kind, to_assignee_id, from_claimed_by_member_id, to_claimed_by_member_id,
-           created_at
-         )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        randomUUID(),
-        input.teamId,
-        input.workItemId,
-        input.eventType,
-        input.actor.kind,
-        input.actor.principalId,
-        input.executionId ?? null,
-        input.fromStatus ?? null,
-        input.toStatus ?? null,
-        input.fromAssigneeKind ?? null,
-        input.fromAssigneeId ?? null,
-        input.toAssigneeKind ?? null,
-        input.toAssigneeId ?? null,
-        input.fromClaimedByMemberId ?? null,
-        input.toClaimedByMemberId ?? null,
-        now(),
-      );
-  }
-
-  // --------------------------------------------------------------- Presence
-
   getPresence(teamId: string, kind: TeamParticipantKind, principalId: string): TeamPresence {
     const row = this.db
       .prepare(`SELECT * FROM team_presence WHERE team_id = ? AND kind = ? AND principal_id = ?`)
@@ -797,6 +242,63 @@ export class TeamStructureService {
     return stored.availability;
   }
 
+  /**
+   * Member 正在干什么 = active execution；挂了 Jira 工单的带上引用。
+   * 没有独立的 activity 表：execution 本身就是「此刻在跑什么」的记录，
+   * 再建一张就是在第二个地方记同一件事。
+   */
+  listCurrentActivity(
+    teamId: string,
+  ): Array<{
+    executionId: string;
+    conversationId: string;
+    conversationTitle: string;
+    memberId: string;
+    memberName: string;
+    jiraIssueKey: string | null;
+    kind: string;
+    status: string;
+    startedAt: string | null;
+  }> {
+    this.getTeam(teamId);
+    const rows = this.db
+      .prepare(
+        `
+        SELECT e.id AS execution_id, e.conversation_id, e.member_id, e.jira_issue_key,
+               e.kind, e.status, e.started_at,
+               c.title AS conversation_title, m.name AS member_name
+        FROM execution e
+        JOIN conversation c ON c.id = e.conversation_id
+        JOIN member m ON m.id = e.member_id
+        WHERE c.team_id = ?
+          AND e.status IN ('queued', 'running', 'waiting_for_member')
+        ORDER BY (e.started_at IS NULL), e.started_at DESC
+        `,
+      )
+      .all(teamId) as unknown as Array<{
+        execution_id: string;
+        conversation_id: string;
+        member_id: string;
+        jira_issue_key: string | null;
+        kind: string;
+        status: string;
+        started_at: string | null;
+        conversation_title: string;
+        member_name: string;
+      }>;
+    return rows.map((row) => ({
+      executionId: row.execution_id,
+      conversationId: row.conversation_id,
+      conversationTitle: row.conversation_title,
+      memberId: row.member_id,
+      memberName: row.member_name,
+      jiraIssueKey: row.jira_issue_key,
+      kind: row.kind,
+      status: row.status,
+      startedAt: row.started_at,
+    }));
+  }
+
   // --------------------------------------------------------------- Schedule
 
   createSchedule(
@@ -804,8 +306,6 @@ export class TeamStructureService {
     input: {
       memberId: string;
       conversationId: string;
-      projectId?: string | null;
-      workItemId?: string | null;
       prompt: string;
       type: 'once' | 'interval';
       runAt: string;
@@ -851,39 +351,18 @@ export class TeamStructureService {
     if (runAtMs <= Date.now()) {
       throw badRequest('runAt 必须是未来时间');
     }
-    const projectId = input.projectId?.trim() || null;
-    if (projectId) {
-      const project = this.getProject(projectId);
-      if (project.teamId !== teamId) throw badRequest('Project 不属于这个 Team');
-    }
-    const workItemId = input.workItemId?.trim() || null;
-    if (workItemId) {
-      const work = this.getWorkItem(workItemId);
-      if (work.teamId !== teamId) throw badRequest('WorkItem 不属于这个 Team');
-      if (work.status === 'done' || work.status === 'cancelled') {
-        throw badRequest('已结束的 WorkItem 不能建立自动任务');
-      }
-      // Schedule 明确属于某个 Project 时，绑定的 WorkItem 必须同属那个 Project。
-      // WorkItem 没有 projectId（游离任务）也不行：自动任务产出的工作落在哪个
-      // Project 必须无歧义，不能靠「WorkItem 恰好没填」混进另一个 Project。
-      if (projectId && work.projectId !== projectId) {
-        throw badRequest('Schedule 的 projectId 必须与 WorkItem 的 projectId 一致');
-      }
-    }
     const id = randomUUID();
     const timestamp = now();
     this.db
       .prepare(
-        `INSERT INTO scheduled_wake (id, team_id, member_id, conversation_id, project_id, work_item_id, prompt, type, run_at, interval_seconds, next_run_at, status, created_by, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
+        `INSERT INTO scheduled_wake (id, team_id, member_id, conversation_id, prompt, type, run_at, interval_seconds, next_run_at, status, created_by, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
       )
       .run(
         id,
         teamId,
         input.memberId,
         input.conversationId,
-        projectId,
-        workItemId,
         prompt,
         input.type,
         input.runAt,
@@ -1027,11 +506,8 @@ export function nextSlot(fromIso: string, intervalSeconds: number, nowIso: strin
 
 interface TeamRow { id: string; name: string; description: string; created_by: string; created_at: string; updated_at: string }
 interface MembershipRow { team_id: string; kind: TeamParticipantKind; principal_id: string; role: TeamRole; status: 'active' | 'inactive'; joined_at: string; updated_at: string }
-interface ProjectRow { id: string; team_id: string; name: string; description: string; status: Project['status']; created_by: string; created_at: string; updated_at: string }
-interface WorkItemRow { id: string; team_id: string; project_id: string | null; title: string; description: string; status: WorkItemStatus; assignee_kind: TeamParticipantKind | null; assignee_id: string | null; claimed_by_member_id: string | null; claimed_execution_id: string | null; claimed_at: string | null; version: number; created_by: string; created_at: string; updated_at: string }
-interface WorkItemEventRow { id: string; team_id: string; work_item_id: string; event_type: WorkItemEventType; actor_kind: WorkItemActorKind; actor_id: string; execution_id: string | null; from_status: WorkItemStatus | null; to_status: WorkItemStatus | null; from_assignee_kind: TeamParticipantKind | null; from_assignee_id: string | null; to_assignee_kind: TeamParticipantKind | null; to_assignee_id: string | null; from_claimed_by_member_id: string | null; to_claimed_by_member_id: string | null; created_at: string }
 interface PresenceRow { team_id: string; kind: TeamParticipantKind; principal_id: string; availability: PresenceAvailability; last_seen_at: string; updated_at: string }
-interface ScheduledWakeRow { id: string; team_id: string; member_id: string; conversation_id: string; project_id: string | null; work_item_id: string | null; prompt: string; type: 'once' | 'interval'; run_at: string; interval_seconds: number | null; next_run_at: string; status: ScheduledWakeStatus; last_fired_at: string | null; last_error: string | null; created_by: string; created_at: string; updated_at: string }
+interface ScheduledWakeRow { id: string; team_id: string; member_id: string; conversation_id: string; prompt: string; type: 'once' | 'interval'; run_at: string; interval_seconds: number | null; next_run_at: string; status: ScheduledWakeStatus; last_fired_at: string | null; last_error: string | null; created_by: string; created_at: string; updated_at: string }
 interface ScheduledWakeRunRow { id: string; schedule_id: string; scheduled_for: string; status: ScheduledWakeRun['status']; execution_id: string | null; created_at: string; started_at: string | null; ended_at: string | null; error: string | null }
 
 function mapTeam(row: TeamRow): Team {
@@ -1040,20 +516,11 @@ function mapTeam(row: TeamRow): Team {
 function mapMembership(row: MembershipRow): TeamMembership {
   return { teamId: row.team_id, kind: row.kind, principalId: row.principal_id, role: row.role, status: row.status, joinedAt: row.joined_at, updatedAt: row.updated_at };
 }
-function mapProject(row: ProjectRow): Project {
-  return { id: row.id, teamId: row.team_id, name: row.name, description: row.description, status: row.status, createdBy: row.created_by, createdAt: row.created_at, updatedAt: row.updated_at };
-}
-function mapWorkItem(row: WorkItemRow): WorkItem {
-  return { id: row.id, teamId: row.team_id, projectId: row.project_id, title: row.title, description: row.description, status: row.status, assigneeKind: row.assignee_kind, assigneeId: row.assignee_id, claimedByMemberId: row.claimed_by_member_id, claimedExecutionId: row.claimed_execution_id, claimedAt: row.claimed_at, version: row.version, createdBy: row.created_by, createdAt: row.created_at, updatedAt: row.updated_at };
-}
-function mapWorkItemEvent(row: WorkItemEventRow): WorkItemEvent {
-  return { id: row.id, teamId: row.team_id, workItemId: row.work_item_id, eventType: row.event_type, actorKind: row.actor_kind, actorId: row.actor_id, executionId: row.execution_id, fromStatus: row.from_status, toStatus: row.to_status, fromAssigneeKind: row.from_assignee_kind, fromAssigneeId: row.from_assignee_id, toAssigneeKind: row.to_assignee_kind, toAssigneeId: row.to_assignee_id, fromClaimedByMemberId: row.from_claimed_by_member_id, toClaimedByMemberId: row.to_claimed_by_member_id, createdAt: row.created_at };
-}
 function mapPresence(row: PresenceRow): TeamPresence {
   return { teamId: row.team_id, kind: row.kind, principalId: row.principal_id, availability: row.availability, lastSeenAt: row.last_seen_at, updatedAt: row.updated_at };
 }
 function mapSchedule(row: ScheduledWakeRow): ScheduledWake {
-  return { id: row.id, teamId: row.team_id, memberId: row.member_id, conversationId: row.conversation_id, projectId: row.project_id, workItemId: row.work_item_id, prompt: row.prompt, type: row.type, runAt: row.run_at, intervalSeconds: row.interval_seconds, nextRunAt: row.next_run_at, status: row.status, lastFiredAt: row.last_fired_at, lastError: row.last_error, createdBy: row.created_by, createdAt: row.created_at, updatedAt: row.updated_at };
+  return { id: row.id, teamId: row.team_id, memberId: row.member_id, conversationId: row.conversation_id, prompt: row.prompt, type: row.type, runAt: row.run_at, intervalSeconds: row.interval_seconds, nextRunAt: row.next_run_at, status: row.status, lastFiredAt: row.last_fired_at, lastError: row.last_error, createdBy: row.created_by, createdAt: row.created_at, updatedAt: row.updated_at };
 }
 function mapScheduleRun(row: ScheduledWakeRunRow): ScheduledWakeRun {
   return { id: row.id, scheduleId: row.schedule_id, scheduledFor: row.scheduled_for, status: row.status, executionId: row.execution_id, createdAt: row.created_at, startedAt: row.started_at, endedAt: row.ended_at, error: row.error };

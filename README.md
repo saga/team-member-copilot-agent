@@ -57,11 +57,10 @@ Member 的 binding 一行都不用改。**CopilotService 不认识任何具体 P
 | **Conversation** | 聊天/协作空间。`direct`（一个 Member）/ `group`（多个 Member）/ `work`（独立工作会话）。 |
 | **MemberRuntime** | 某 Member 在某 Conversation 中的运行实例。一个 runtime 拥有一个稳定的 Copilot Session 和一个独立 workspace。 |
 | **CopilotSession** | Runtime 的执行引擎状态。**内部实现细节，不是业务对象。** |
-| **Execution** | Agent 实际跑了一轮。记录 `parent_execution_id` / `delegation_path` / `work_item_id`，构成完整审计链。状态：`queued` / `running` / `waiting_for_member` / `completed` / `failed` / `cancelled` / `interrupted`。`completed` 不自动把 WorkItem 置 done。 |
+| **Execution** | Agent 实际跑了一轮。记录 `parent_execution_id` / `delegation_path` / `jira_issue_key`（开始时从 conversation 快照），构成完整审计链。状态：`queued` / `running` / `waiting_for_member` / `completed` / `failed` / `cancelled` / `interrupted`。 |
 | **Team** | 顶层协作边界（单 Team 部署，`team_id` 为以后多 Team 留结构）。 |
 | **TeamMembership** | 谁属于 Team：`human`（`principalId=user id`，单机为 `LOCAL_ACTOR_ID`）/ `agent`（`principalId=member.id`），`role=owner/admin/member`。`Member.role` 是职业角色，两者绝不合并。 |
-| **Project** | 工作组织单元，不做第二层 ACL：同 Team 默认可见。`Conversation` / `WorkItem` 可挂 `projectId`（nullable）。 |
-| **WorkItem** | 团队真正要完成的业务工作：`todo/in_progress/blocked/done/cancelled`。`Assignment`（交给谁）与 `Claim`（谁在做，`claimed_by` 原子锁）是两个概念。 |
+| **Jira（外部事实源）** | 业务工作（工单、状态、负责人、工作流）以 Jira 为准，本地不复制。`Conversation` 挂 `jiraIssueKey`（nullable），`Current Work` = active execution → Jira key 的引用；Agent 通过 `atlassian.jira-tools` 读写工单。 |
 | **Presence** | Team 层可接工作状态：落库只有 `available/away/paused`，`busy/offline` 由 active execution / lastSeen 计算。`paused` 只拦自动唤醒，不拦 @ 点名。 |
 | **ScheduledWake** | `once` / `interval` 定时唤醒，必须绑定 `work` conversation，且被调度的 Member 必须在该 conversation 里；`UNIQUE(schedule_id, scheduled_for)` 幂等，周期不补历史。执行链固定为 `ScheduledWake → ScheduledWakeRun → Execution → executeMemberTurn`，**不经过 MemberTurnScheduler**（聊天 wake 与 schedule wake 不是同一种 wake，不能 coalesce）；run 的终态随 execution 收口（completed/failed），不停在 running 上没有下文。 |
 
@@ -615,17 +614,11 @@ npm run dev            # 同时启动 client(:5173) + server(:3001)
 | GET | `/api/team` | 当前 Team |
 | GET | `/api/team/members` | Team 成员（human/agent，`role/status`） |
 | PATCH | `/api/team/members/:kind/:id` | 改 Team role/status（owner/admin） |
-| GET · POST | `/api/team/projects` | Project 列表 / 新建（owner/admin） |
-| PATCH | `/api/team/projects/:id` | 改 Project（含归档，owner/admin） |
-| GET · POST | `/api/team/work-items` | WorkItem 列表（`?projectId&status`，须 Team 成员）/ 新建（须 Team 成员） |
-| GET · PATCH | `/api/team/work-items/:id` | 单条（须 Team 成员）/ 改标题描述状态（须 Team 成员 + 对象级授权：admin、claimer、人类创建者；工作状态流转只属于 claimer/admin） |
-| POST | `/api/team/work-items/:id/assign` | 指派（须 Team 成员；已结束 409；claimed 时 409，先 release） |
-| POST | `/api/team/work-items/:id/claim` | 原子 claim（仅 Agent；`UPDATE … WHERE version=? AND claimed_by IS NULL`，抢输 409；tool 路径绑定真实 execution） |
-| POST | `/api/team/work-items/:id/release` | 释放 claim（仅 claimer 或 admin/owner） |
+| GET | `/api/team/activity` | Current Work：active execution → member / Jira key / conversation（须 Team 成员） |
 | GET · PATCH | `/api/team/presence` | Presence 列表（须 Team 成员）/ 改 availability（本人改本人，Admin 改别人） |
 | GET · POST | `/api/team/schedules` | Schedule 列表 / 新建（owner/admin，只能绑 work 房间） |
 | PATCH · POST | `/api/team/schedules/:id` | 改状态 / pause/resume/cancel（owner/admin） |
-| POST | `/api/conversations` | 创建 Direct / Group / Work（可选 `projectId`，归档 Project 拒绝） |
+| POST | `/api/conversations` | 创建 Direct / Group / Work（可选 `jiraIssueKey`，业务状态在 Jira） |
 | GET | `/api/conversations/:id` | 单个 Conversation |
 | GET | `/api/conversations/:id/messages?limit=` | 最近 N 条消息（按 `messageSequence` 正序） |
 | POST | `/api/conversations/:id/messages` | 发送消息 → `202 { message, wakes, unresolvedMentions, deduplicated }`。可选 `clientRequestId`（幂等键）、`replyToMessageId`（必须属于本房间） |
@@ -643,7 +636,6 @@ npm run dev            # 同时启动 client(:5173) + server(:3001)
 | GET | `/api/knowledge/team` · `POST` | team KB 清单 / 新建（`{ key, name, description }`）—— `local.filesystem-knowledge` 的管理面 |
 | POST | `/api/knowledge/bases/:kbId/documents` | 写文档（落盘 + FTS 索引） |
 | POST | `/api/internal/members/:id/direct-messages` | **以 `:id` 的身份**发私聊 —— Internal API，见下 |
-| POST | `/api/internal/members/:id/work-item-claims` | **以 `:id` 的身份** claim WorkItem（复用 tool 路径的 `claimWorkItemForAgent`：execution 归属校验 + 双向回写）—— Internal API |
 | GET | `/api/executions/:id` | 单条 execution |
 | POST | `/api/executions/:id/retry` | `202 { executionId, execution }` —— 新建一条并指回原记录 |
 | POST | `/api/executions/:id/cancel` | 等引擎真的停下来才返回最终状态 |
@@ -654,8 +646,8 @@ npm run dev            # 同时启动 client(:5173) + server(:3001)
 
 | 边界 | 前缀 | `:id` 的含义 | 调用方 |
 |------|------|--------------|--------|
-| Human API | `/api/conversations`、`/api/members`（读）、`/api/team`（读）、work-items 读写 | 我在看谁 | 浏览器里的用户 |
-| Admin API | `/api/members`（写）、memory、skills、capabilities、knowledge、projects、schedules、membership | 我在改谁 | Team owner/admin（或 `ADMIN_API_TOKEN`，Agent 永不直接授 admin） |
+| Human API | `/api/conversations`、`/api/members`（读）、`/api/team`（读） | 我在看谁 | 浏览器里的用户 |
+| Admin API | `/api/members`（写）、memory、skills、capabilities、knowledge、schedules、membership、activity | 我在改谁 | Team owner/admin（或 `ADMIN_API_TOKEN`，Agent 永不直接授 admin） |
 | Internal API | `/api/internal` | **我代表谁** | 另一个 runtime |
 
 `POST /api/internal/members/:id/direct-messages` 里的 `:id` 是调用方自己填的 ——
@@ -673,7 +665,7 @@ INTERNAL_API_TOKEN 已配置  要求 Authorization: Bearer <token> 或 X-Interna
 **Agent 身份只有这一个注入点**：`/api/internal/members/:id/**` 的请求由路由把
 `:id` 写进 `req.agentMemberId`，Team API 的 `resolveActor` 只认这个字段。
 普通 `/api` 路径没有任何中间件写它，所以「请求头塞个 agent id 就变成 Agent」
-在这条边界上不存在（`/api/team/work-items/:id/claim` 对 human 一律 403）。
+在这条边界上不存在（Agent 身份一律由 Internal API token + 路径身份一致性校验，伪造不了）。
 
 Admin 写入（`PUT /api/capabilities/members/:id`、`POST /api/knowledge/team`、
 `POST /api/knowledge/bases/:id/documents`、`POST/DELETE /api/members/:id/skills`、
@@ -816,7 +808,7 @@ Group Chat：
 │                                      # conversation_member / conversation_message /
 │                                      # member_runtime / execution / conversation_event /
 │                                      # knowledge_base / knowledge_document(+fts) /
-│                                      # team / team_membership / project / work_item /
+│                                      # team / team_membership / team_event /
 │                                      # team_presence / scheduled_wake(+run)
 ├── members/
 │   └── <member-id>/
@@ -892,8 +884,8 @@ src/                          # Vite + React + Ant Design 前端
     HealthBadge.tsx           # antd Badge（success/warning/error）
     TeamChat.tsx              # 编排：conversation / SSE / 状态合并（Layout Sider/Content + Alert/Tag）
     team/                     # TeamChat 的拆分：list / messages / composer / 各编辑面板
-      TeamSidebar.tsx         # Collapse 五分区：Members/Projects/Work/Schedules/Conversations
-      TeamSections.tsx        # Projects/Work/Schedules（Card + List + Tag）
+      TeamSidebar.tsx         # Collapse 四分区：Members/Current Work/Schedules/Conversations
+      TeamSections.tsx        # CurrentWorkSection（active execution → Jira key）
       ConversationList.tsx    # antd List（Tag 区分 private/group/work/direct）
       ConversationMessages.tsx  # @ant-design/x Bubble.List + Timeline（delegation）
       MessageComposer.tsx     # @ant-design/x Sender
@@ -961,7 +953,7 @@ server/                       # Express + Copilot SDK 后端
     data-integrity.test.ts         # replyTo 校验 / 消息幂等 / 记忆乐观并发 / 上下文上限 / 配置快照 / state 事件 / mention 精确匹配
     member-template-seeder.test.ts # provisioning 幂等 / 不覆盖已改 Member / 归档不复活 / 穿越与重复 key / 能力绑定
     knowledge-provider.test.ts     # 检索范围限定在授权的 KB / personal 隔离 / 路径与 FTS 注入 / 索引幂等 / 磁盘同步
-    team-v1.test.ts                # Team/Membership/Project/WorkItem(claim 原子+execution 绑定)/Presence/Scheduler(prompt 保真+单 execution+run 收口+恢复)/HTTP actor 边界
+    team-v1.test.ts                # Team/Membership/Presence/Scheduler(prompt 保真+单 execution+run 收口+恢复)/Jira 引用与 Current Activity
 
 scripts/
   mutation-check.py           # 变异验证：把跨层不变量改回错误写法，确认断言真的变红（AGENTS.md §7）
@@ -983,6 +975,7 @@ scripts/
 | `MAX_CONTEXT_MESSAGES` | `100` | 注入 prompt 的 shared message 条数上限（从最新往前取，至少 1 条） |
 | `MAX_CONTEXT_CHARS` | `60000` | 注入 prompt 的字符数上限（含每条 32 字符的固定开销），与条数上限同时生效 |
 | `HOST_CODING_TOOLS` | `false` | 是否允许 `bash` / `edit` / `grep` / `web_fetch`。**不随能力绑定打开** |
+| `JIRA_BASE_URL` / `JIRA_EMAIL` / `JIRA_API_TOKEN` | 空 | Jira Cloud 连接。三项齐了才注册 `atlassian.jira-tools`（jira_search / jira_get_issue / jira_add_comment / jira_transition_issue）；不配置则本地只有 Jira 引用、没有工单工具 |
 | `INTERNAL_API_TOKEN` | 空 | Internal API 门禁；空 = 不校验（仅限本机单用户） |
 | `ADMIN_API_TOKEN` | 空 | Admin 写入（capabilities / knowledge 管理 / skills 安装 / 建 Member / 归档）门禁；空 = 不校验（仅限本机单用户）。Team owner/admin 与 token 任一通过 |
 | `TEAM_NAME` | `AI Team` | 默认 Team 名，启动 ensure，不提供新建入口 |

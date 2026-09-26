@@ -487,12 +487,11 @@ export function TeamChat() {
    * 新建 Team。**不传 defaultMemberId** —— 收件人集合是全部成员，
    * 由服务端 GroupDispatcher 决定每一轮唤醒谁。
    */
-  async function createGroup(input: { title: string; memberIds: string[]; projectId?: string | null }) {
+  async function createGroup(input: { title: string; memberIds: string[] }) {
     const result = await api.createConversation({
       kind: 'group',
       title: input.title,
       memberIds: input.memberIds,
-      ...(input.projectId ? { projectId: input.projectId } : {}),
     });
     setConversations((current) => [
       result.conversation,

@@ -83,68 +83,16 @@ export interface TeamMembership {
   updatedAt: string;
 }
 
-export interface Project {
-  id: string;
-  teamId: string;
-  name: string;
-  description: string;
-  status: 'active' | 'archived';
-  createdBy: string;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export type WorkItemStatus = 'todo' | 'in_progress' | 'blocked' | 'done' | 'cancelled';
-
-export type WorkItemEventType =
-  | 'created'
-  | 'updated'
-  | 'assigned'
-  | 'unassigned'
-  | 'claimed'
-  | 'released'
-  | 'status_changed';
-
-/**
- * WorkItem 的一条审计记录（server/domain.ts 的镜像）。
- * from/to 成对出现，按时间重放可以还原任意时刻的状态。
- */
-export interface WorkItemEvent {
-  id: string;
-  teamId: string;
-  workItemId: string;
-  eventType: WorkItemEventType;
-  actorKind: 'human' | 'agent' | 'system';
-  actorId: string;
-  /** claimed 事件记录发起 claim 的那一轮 execution。 */
-  executionId: string | null;
-  fromStatus: WorkItemStatus | null;
-  toStatus: WorkItemStatus | null;
-  fromAssigneeKind: 'human' | 'agent' | null;
-  fromAssigneeId: string | null;
-  toAssigneeKind: 'human' | 'agent' | null;
-  toAssigneeId: string | null;
-  fromClaimedByMemberId: string | null;
-  toClaimedByMemberId: string | null;
-  createdAt: string;
-}
-
-export interface WorkItem {
-  id: string;
-  teamId: string;
-  projectId: string | null;
-  title: string;
-  description: string;
-  status: WorkItemStatus;
-  assigneeKind: 'human' | 'agent' | null;
-  assigneeId: string | null;
-  claimedByMemberId: string | null;
-  claimedExecutionId: string | null;
-  claimedAt: string | null;
-  version: number;
-  createdBy: string;
-  createdAt: string;
-  updatedAt: string;
+export interface CurrentActivity {
+  executionId: string;
+  conversationId: string;
+  conversationTitle: string;
+  memberId: string;
+  memberName: string;
+  jiraIssueKey: string | null;
+  kind: string;
+  status: string;
+  startedAt: string | null;
 }
 
 export interface TeamPresence {
@@ -157,10 +105,9 @@ export interface TeamPresence {
 }
 
 export type TeamEventType =
-  | 'work_item.changed'
+  | 'member.activity.changed'
   | 'schedule.changed'
   | 'presence.changed'
-  | 'project.changed'
   | 'membership.changed';
 
 /**
@@ -199,7 +146,8 @@ export interface ScheduledWake {
 export interface Conversation {
   id: string;
   teamId: string;
-  projectId: string | null;
+  /** 这间会话围绕哪张 Jira 工单。业务状态在 Jira，这里只是引用。 */
+  jiraIssueKey: string | null;
   title: string;
   kind: 'direct' | 'group' | 'work';
   defaultMemberId: string | null;
@@ -741,71 +689,8 @@ export const api = {
     return fetch(`${API_BASE}/api/team`).then(json<{ team: Team }>);
   },
 
-  listProjects(): Promise<{ projects: Project[] }> {
-    return fetch(`${API_BASE}/api/team/projects`).then(json<{ projects: Project[] }>);
-  },
-
-  createProject(input: { name: string; description?: string }): Promise<{ project: Project }> {
-    return fetch(`${API_BASE}/api/team/projects`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(input),
-    }).then(json<{ project: Project }>);
-  },
-
-  listWorkItems(filter?: { projectId?: string; status?: string }): Promise<{ workItems: WorkItem[] }> {
-    const params = new URLSearchParams();
-    if (filter?.projectId) params.set('projectId', filter.projectId);
-    if (filter?.status) params.set('status', filter.status);
-    const suffix = params.toString() ? `?${params.toString()}` : '';
-    return fetch(`${API_BASE}/api/team/work-items${suffix}`).then(json<{ workItems: WorkItem[] }>);
-  },
-
-  createWorkItem(input: { title: string; description?: string; projectId?: string | null }): Promise<{ workItem: WorkItem }> {
-    return fetch(`${API_BASE}/api/team/work-items`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(input),
-    }).then(json<{ workItem: WorkItem }>);
-  },
-
-  updateWorkItem(id: string, input: { title?: string; description?: string; status?: WorkItemStatus }): Promise<{ workItem: WorkItem }> {
-    return fetch(`${API_BASE}/api/team/work-items/${encodeURIComponent(id)}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(input),
-    }).then(json<{ workItem: WorkItem }>);
-  },
-
-  assignWorkItem(id: string, assignee: { kind: 'human' | 'agent'; principalId: string } | null): Promise<{ workItem: WorkItem }> {
-    return fetch(`${API_BASE}/api/team/work-items/${encodeURIComponent(id)}/assign`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(assignee ?? {}),
-    }).then(json<{ workItem: WorkItem }>);
-  },
-
-  claimWorkItem(id: string): Promise<{ workItem: WorkItem }> {
-    return fetch(`${API_BASE}/api/team/work-items/${encodeURIComponent(id)}/claim`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}),
-    }).then(json<{ workItem: WorkItem }>);
-  },
-
-  releaseWorkItem(id: string): Promise<{ workItem: WorkItem }> {
-    return fetch(`${API_BASE}/api/team/work-items/${encodeURIComponent(id)}/release`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}),
-    }).then(json<{ workItem: WorkItem }>);
-  },
-
-  /** Activity History：审计流水，时间正序。 */
-  listWorkItemEvents(id: string, limit = 100): Promise<{ events: WorkItemEvent[] }> {
-    return fetch(
-      `${API_BASE}/api/team/work-items/${encodeURIComponent(id)}/events?limit=${limit}`,
-    ).then(json<{ events: WorkItemEvent[] }>);
+  listCurrentActivity(): Promise<{ activity: CurrentActivity[] }> {
+    return fetch(`${API_BASE}/api/team/activity`).then(json<{ activity: CurrentActivity[] }>);
   },
 
   listPresence(): Promise<{ presence: TeamPresence[] }> {

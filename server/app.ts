@@ -15,6 +15,8 @@ import { LocalFilesystemKnowledgeProvider } from './capabilities/providers/files
 import { CoreTeamToolProvider } from './capabilities/providers/core-tools.js';
 import { KnowledgeToolProvider } from './capabilities/providers/knowledge-tools.js';
 import { HostCodingToolProvider } from './capabilities/providers/host-tools.js';
+import { JiraToolProvider } from './capabilities/providers/jira-tools.js';
+import { JiraClient } from './jira/client.js';
 import { DefaultToolPolicy } from './tool-policy.js';
 import { DenyHighRiskPolicyService } from './policy.js';
 import { TeamStructureService } from './team-structure-service.js';
@@ -80,13 +82,25 @@ registry.registerToolProvider(
     delegateMember: (input) => teamService.delegateMember(input),
     rememberMember: (input) => teamService.rememberMember(input),
     messageMember: (input) => teamService.messageMember(input),
-    listWorkItems: (input) => teamService.listWorkItemsForAgent(input),
-    claimWorkItem: (input) => teamService.claimWorkItemForAgent(input),
-    updateWorkItem: (input) => teamService.updateWorkItemForAgent(input),
   }),
 );
 registry.registerToolProvider(new KnowledgeToolProvider());
 registry.registerToolProvider(new HostCodingToolProvider());
+
+// Jira 连接三项齐了才注册：Agent 的能力清单里不该出现「调了必失败」的工单工具。
+const jiraConfigured =
+  config.jira.baseUrl && config.jira.email && config.jira.apiToken;
+if (jiraConfigured) {
+  registry.registerToolProvider(
+    new JiraToolProvider(
+      new JiraClient({
+        baseUrl: config.jira.baseUrl,
+        email: config.jira.email,
+        apiToken: config.jira.apiToken,
+      }),
+    ),
+  );
+}
 
 const capabilityResolver = new CapabilityResolver(registry);
 
@@ -104,6 +118,8 @@ teamService = new TeamService(
   capabilityService,
   capabilityResolver,
   structureService,
+  // Member Activity：业务工作在 Jira，本地广播「谁在跑哪张工单的这一轮」。
+  (teamId, type, payload) => teamEvents.append(teamId, type, payload),
 );
 
 schedulerService = new SchedulerService(structureService, () => teamService);

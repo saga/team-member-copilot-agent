@@ -1,11 +1,11 @@
-import { useEffect, useState } from 'react';
-import { Alert, Button, Card, Checkbox, Input, Select, Space } from 'antd';
-import { api, type Member, type Project } from '../../lib/api';
+import { useState } from 'react';
+import { Alert, Button, Card, Checkbox, Input, Space } from 'antd';
+import type { Member } from '../../lib/api';
 
 interface GroupCreatorProps {
   /** 可选的候选成员（已归档的不出现在这里）。 */
   members: Member[];
-  onCreate: (input: { title: string; memberIds: string[]; projectId?: string | null }) => Promise<void>;
+  onCreate: (input: { title: string; memberIds: string[] }) => Promise<void>;
   onCancel: () => void;
 }
 
@@ -22,17 +22,8 @@ interface GroupCreatorProps {
 export function GroupCreator({ members, onCreate, onCancel }: GroupCreatorProps) {
   const [title, setTitle] = useState('');
   const [selected, setSelected] = useState<string[]>([]);
-  const [projects, setProjects] = useState<Project[]>([]);
-  const [projectId, setProjectId] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    api
-      .listProjects()
-      .then((result) => setProjects(result.projects.filter((p) => p.status === 'active')))
-      .catch(() => {});
-  }, []);
 
   const canCreate = title.trim().length > 0 && selected.length >= 2 && !busy;
 
@@ -41,7 +32,7 @@ export function GroupCreator({ members, onCreate, onCancel }: GroupCreatorProps)
     setBusy(true);
     setError(null);
     try {
-      await onCreate({ title: title.trim(), memberIds: selected, projectId: projectId || null });
+      await onCreate({ title: title.trim(), memberIds: selected });
     } catch (e) {
       // 失败时保持面板打开：调用方（TeamChat）成功后会自己把它收起来
       setError(e instanceof Error ? e.message : String(e));
@@ -54,14 +45,6 @@ export function GroupCreator({ members, onCreate, onCancel }: GroupCreatorProps)
     <Card size="small" title="New Team" style={{ marginTop: 8 }}>
       <Space direction="vertical" style={{ width: '100%' }}>
         <Input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Investment Review" autoFocus />
-        <Select
-          value={projectId}
-          onChange={setProjectId}
-          placeholder="Project (optional)"
-          allowClear
-          style={{ width: '100%' }}
-          options={[{ value: '', label: 'No project' }, ...projects.map((p) => ({ value: p.id, label: p.name }))]}
-        />
         <Checkbox.Group
           value={selected}
           onChange={(values) => setSelected(values as string[])}

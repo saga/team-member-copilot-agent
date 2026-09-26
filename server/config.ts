@@ -121,4 +121,14 @@ export const config = {
   localActorId: env('LOCAL_ACTOR_ID', 'local-user'),
   /** Scheduler tick 间隔（毫秒）。只做 once + interval，不做 Calendar/RRULE。 */
   schedulerIntervalMs: intEnv('SCHEDULER_INTERVAL_MS', 2000),
+  /**
+   * Jira 连接（Cloud：站点 URL + 邮箱 + API token，Basic auth）。
+   * 三项齐了才算配置；没配置就不注册 Jira 工具 —— Agent 的能力清单里
+   * 不该出现「调了必失败」的工单工具。
+   */
+  jira: {
+    baseUrl: env('JIRA_BASE_URL', ''),
+    email: env('JIRA_EMAIL', ''),
+    apiToken: env('JIRA_API_TOKEN', ''),
+  },
 };

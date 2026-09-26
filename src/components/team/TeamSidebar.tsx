@@ -2,7 +2,7 @@ import { Collapse } from 'antd';
 import type { Conversation, Member } from '../../lib/api';
 import { ConversationList } from './ConversationList';
 import { MemberList } from './MemberList';
-import { ProjectSection, WorkSection } from './TeamSections';
+import { CurrentWorkSection } from './TeamSections';
 import { ScheduleSection } from './ScheduleSection';
 
 interface TeamSidebarProps {
@@ -66,14 +66,9 @@ export function TeamSidebar(props: TeamSidebarProps) {
           ),
         },
         {
-          key: 'projects',
-          label: 'Projects',
-          children: <ProjectSection />,
-        },
-        {
-          key: 'work',
-          label: 'Work',
-          children: <WorkSection members={members} />,
+          key: 'current-work',
+          label: 'Current Work',
+          children: <CurrentWorkSection />,
         },
         {
           key: 'schedules',

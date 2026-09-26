@@ -11,7 +11,7 @@ import { ConversationMemberService } from './conversation-member-service.js';
 import { GroupDispatcher, type DispatchPlan, type WakePlan } from './group-dispatcher.js';
 import { MemberTurnScheduler } from './member-turn-scheduler.js';
 import { NO_REPLY_SENTINEL, parseMemberTurnOutcome } from './member-decision.js';
-import { badRequest, conflict, forbidden, notFound } from './http-error.js';
+import { badRequest, conflict, notFound } from './http-error.js';
 import { MemberConversationService, isMemberDm, type MemberDirectMessage } from './member-conversation-service.js';
 import {
   MemberService,
@@ -43,10 +43,9 @@ import type {
   MemberRuntime,
   PendingWake,
   StoredConversationEvent,
-  TeamRole,
+  TeamChangeSink,
   TurnMode,
   WakeReason,
-  WorkItemStatus,
 } from './domain.js';
 
 /**
@@ -72,7 +71,7 @@ import type {
 interface ConversationRow {
   id: string;
   team_id: string;
-  project_id: string | null;
+  jira_issue_key: string | null;
   title: string;
   kind: 'direct' | 'group' | 'work';
   default_member_id: string | null;
@@ -101,7 +100,7 @@ interface ExecutionRow {
   id: string;
   conversation_id: string;
   member_id: string;
-  work_item_id: string | null;
+  jira_issue_key: string | null;
   runtime_id: string | null;
   parent_execution_id: string | null;
   delegation_path: string;
@@ -168,7 +167,8 @@ export interface CreateConversationInput {
   kind?: 'direct' | 'group' | 'work';
   memberIds: string[];
   defaultMemberId?: string;
-  projectId?: string | null;
+  /** 围绕哪张 Jira 工单。工单本体在 Jira，这里只存引用。 */
+  jiraIssueKey?: string | null;
 }
 
 /**
@@ -327,6 +327,8 @@ export class TeamService {
      */
     private readonly capabilityResolver: CapabilityResolver,
     private readonly structure?: TeamStructureService,
+    /** Member Activity 的 Team 级广播口。结构服务不认识 execution，所以在这里发。 */
+    private readonly onTeamActivity?: TeamChangeSink,
   ) {
     this.contextAssembler = new ContextAssembler(db);
     this.states = new ConversationMemberService(db, (conversationId, change) => {
@@ -493,7 +495,7 @@ export class TeamService {
     // Team 归属：单 Team 部署取默认 Team；成员不在 Team 里则自动补 membership
     // （provisioning/旧库路径），已在但 inactive 的仍拒绝。
     let teamId = '';
-    let projectId: string | null = input.projectId?.trim() || null;
+    const jiraIssueKey = input.jiraIssueKey?.trim() || null;
     try {
       const team = this.defaultTeam();
       teamId = team.id;
@@ -504,11 +506,6 @@ export class TeamService {
           this.structure?.ensureAgentMembership(teamId, memberId);
           this.structure?.requireActiveMembership(teamId, 'agent', memberId);
         }
-      }
-      if (projectId && this.structure) {
-        const project = this.structure.getProject(projectId);
-        if (project.teamId !== teamId) throw badRequest('Project 不属于这个 Team');
-        if (project.status !== 'active') throw badRequest('已归档的 Project 不能建 Conversation');
       }
     } catch (error) {
       // structure 未装配时退回无 Team 校验（旧测试路径）；有 structure 则错误向上传。
@@ -526,7 +523,7 @@ export class TeamService {
         INSERT INTO conversation (
           id,
           team_id,
-          project_id,
+          jira_issue_key,
           title,
           kind,
           default_member_id,
@@ -539,7 +536,7 @@ export class TeamService {
         VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
         `,
       )
-      .run(id, teamId, projectId, title, kind, defaultMemberId, config.localUserId, createdAt, createdAt);
+      .run(id, teamId, jiraIssueKey, title, kind, defaultMemberId, config.localUserId, createdAt, createdAt);
 
     const insertMember = this.db.prepare(
       `
@@ -963,7 +960,7 @@ export class TeamService {
       id: randomUUID(),
       conversationId: conversation.id,
       memberId: member.id,
-      workItemId: null,
+      jiraIssueKey: conversation.jiraIssueKey,
       runtimeId: null,
       parentExecutionId: null,
       delegationPath: [member.id],
@@ -1186,8 +1183,8 @@ export class TeamService {
       id: randomUUID(),
       conversationId: conversation.id,
       memberId: targetMember.id,
-      // delegation 带上父的 workItem：同一项业务工作的审计链不断。
-      workItemId: parent.workItemId,
+      // delegation 继承父的 Jira 工单：同一项业务工作的审计链不断。
+      jiraIssueKey: parent.jiraIssueKey,
       runtimeId: null,
       parentExecutionId: parent.id,
       delegationPath: [...parent.delegationPath, targetMember.id],
@@ -1291,99 +1288,6 @@ export class TeamService {
 
   rememberMember(input: { memberId: string; content: string }): Promise<string> {
     return Promise.resolve(this.members.appendMemory(input.memberId, input.content));
-  }
-
-  /**
-   * Agent 工作工具的服务端实现。授权由服务端判断，不信 LLM 参数：
-   * claim/update 的 claimer 检查在 TeamStructureService 里，list 默认只给
-   * 本 Team 的未完成项。
-   */
-  async listWorkItemsForAgent(input: {
-    memberId: string;
-    scope?: 'mine' | 'available' | 'all';
-    projectId?: string;
-    status?: string;
-  }): Promise<string> {
-    if (!this.structure) throw notFound('Team 尚未初始化');
-    const team = this.defaultTeam();
-    const scope = input.scope ?? 'available';
-    const all = this.structure.listWorkItems(team.id, {
-      ...(input.projectId ? { projectId: input.projectId } : {}),
-      ...(input.status ? { status: input.status as WorkItemStatus } : {}),
-    });
-    const open = all.filter((w) => w.status !== 'done' && w.status !== 'cancelled');
-    let items = open;
-    if (scope === 'mine') {
-      items = open.filter((w) => w.assigneeId === input.memberId || w.claimedByMemberId === input.memberId);
-    } else if (scope === 'available') {
-      items = open.filter((w) => !w.claimedByMemberId && w.status !== 'blocked');
-    }
-    return JSON.stringify({
-      source: 'work',
-      items: items.slice(0, 20).map((w) => ({
-        id: w.id,
-        title: w.title,
-        status: w.status,
-        projectId: w.projectId,
-        assigneeId: w.assigneeId,
-        claimedBy: w.claimedByMemberId,
-        version: w.version,
-      })),
-    });
-  }
-
-  async claimWorkItemForAgent(input: {
-    memberId: string;
-    executionId: string;
-    workItemId: string;
-  }): Promise<string> {
-    if (!this.structure) throw notFound('Team 尚未初始化');
-    const execution = this.getExecution(input.executionId);
-    if (execution.memberId !== input.memberId) {
-      throw forbidden('execution 不属于当前 Member');
-    }
-    if (!['queued', 'running'].includes(execution.status)) {
-      throw conflict(`execution 当前状态不能 claim：${execution.status}`);
-    }
-    // claimWorkItem 内会校验 execution 归属/状态并回写 execution.work_item_id。
-    const item = this.structure.claimWorkItem(input.workItemId, {
-      memberId: input.memberId,
-      executionId: input.executionId,
-    });
-    this.assertWorkItemExecutionLink(this.getExecution(input.executionId), item.id);
-    return JSON.stringify({
-      workItemId: item.id,
-      status: item.status,
-      version: item.version,
-      claimedExecutionId: item.claimedExecutionId,
-    });
-  }
-
-  async updateWorkItemForAgent(input: {
-    memberId: string;
-    workItemId: string;
-    status?: string;
-    title?: string;
-    description?: string;
-  }): Promise<string> {
-    if (!this.structure) throw notFound('Team 尚未初始化');
-    const team = this.defaultTeam();
-    let teamRole: TeamRole | undefined;
-    try {
-      teamRole = this.structure.getMembership(team.id, 'agent', input.memberId).role;
-    } catch {
-      teamRole = undefined;
-    }
-    const item = this.structure.updateWorkItem(
-      input.workItemId,
-      {
-        ...(input.status ? { status: input.status as WorkItemStatus } : {}),
-        ...(input.title ? { title: input.title } : {}),
-        ...(input.description ? { description: input.description } : {}),
-      },
-      { kind: 'agent', principalId: input.memberId, teamRole },
-    );
-    return JSON.stringify({ workItemId: item.id, status: item.status, version: item.version });
   }
 
   /**
@@ -1545,7 +1449,7 @@ export class TeamService {
       id: randomUUID(),
       conversationId: original.conversationId,
       memberId: original.memberId,
-      workItemId: original.workItemId,
+      jiraIssueKey: original.jiraIssueKey,
       runtimeId: null,
       parentExecutionId: original.parentExecutionId,
       delegationPath: [...original.delegationPath],
@@ -1657,8 +1561,6 @@ export class TeamService {
     conversationId: string;
     memberId: string;
     prompt: string;
-    workItemId?: string | null;
-    projectId?: string | null;
   }): Promise<string> {
     const conversation = this.getConversation(input.conversationId);
     if (conversation.kind !== 'work') throw badRequest('Schedule 只能绑定 work conversation');
@@ -1677,7 +1579,7 @@ export class TeamService {
       id: randomUUID(),
       conversationId: conversation.id,
       memberId: member.id,
-      workItemId: input.workItemId ?? null,
+      jiraIssueKey: conversation.jiraIssueKey,
       runtimeId: null,
       parentExecutionId: null,
       delegationPath: [member.id],
@@ -1801,16 +1703,6 @@ export class TeamService {
           `UPDATE scheduled_wake_run SET status = 'failed', error = ?, ended_at = ? WHERE id = ? AND status IN ('queued', 'running')`,
         )
         .run(execution.error ?? execution.status, now(), run.id);
-    }
-  }
-
-  /**
-   * WorkItem 与 Execution 双向绑定的内部校验：两者不能漂移成两个独立事实源。
-   * interactive 允许 null；member_delegate 继承父；member_work 由 scheduler/claim 指定。
-   */
-  private assertWorkItemExecutionLink(execution: ExecutionRecord, workItemId: string): void {
-    if (execution.workItemId !== workItemId) {
-      throw conflict(`Execution ${execution.id} 没有绑定 WorkItem ${workItemId}`);
     }
   }
 
@@ -2015,7 +1907,7 @@ export class TeamService {
       triggerMessageSequence: input.triggerMessageSequence,
       wakeReason: input.wakeReason,
       currentPrompt: input.prompt,
-      work: this.workContextFor(input.execution.workItemId),
+      work: this.workContextFor(input.execution.jiraIssueKey),
     });
 
     // 被取消时把已产出的半截内容留在 execution.response 里，便于 UI 展示与排查。
@@ -2174,32 +2066,12 @@ export class TeamService {
     }
   }
 
-  /** 最小工作上下文：execution 有 workItemId 时才查，不全量塞 Project。 */
-  private workContextFor(
-    workItemId: string | null,
-  ): { projectName: string | null; title: string; status: string; assignee: string | null } | null {
-    if (!workItemId) return null;
-    try {
-      const row = this.db
-        .prepare(
-          `SELECT w.title, w.status, w.assignee_id, p.name AS project_name
-           FROM work_item w LEFT JOIN project p ON p.id = w.project_id WHERE w.id = ?`,
-        )
-        .get(workItemId) as unknown as
-        | { title: string; status: string; assignee_id: string | null; project_name: string | null }
-        | undefined;
-      if (!row) return null;
-      let assignee: string | null = null;
-      if (row.assignee_id) {
-        const member = this.db.prepare(`SELECT name FROM member WHERE id = ?`).get(row.assignee_id) as unknown as
-          | { name: string }
-          | undefined;
-        assignee = member?.name ?? row.assignee_id;
-      }
-      return { projectName: row.project_name, title: row.title, status: row.status, assignee };
-    } catch {
-      return null;
-    }
+  /**
+   * 最小工作上下文：本地只有工单引用（key），标题/状态/负责人是 Jira 的数据，
+   * 不复制。Agent 需要细节时用 jira_get_issue 自己查。
+   */
+  private workContextFor(jiraIssueKey: string | null): { issueKey: string } | null {
+    return jiraIssueKey ? { issueKey: jiraIssueKey } : null;
   }
 
   /**
@@ -2736,7 +2608,7 @@ export class TeamService {
     return {
       id: row.id,
       teamId: row.team_id,
-      projectId: row.project_id,
+      jiraIssueKey: row.jira_issue_key,
       title: row.title,
       kind: row.kind,
       defaultMemberId: row.default_member_id,
@@ -2770,7 +2642,7 @@ export class TeamService {
           id,
           conversation_id,
           member_id,
-          work_item_id,
+          jira_issue_key,
           runtime_id,
           parent_execution_id,
           delegation_path,
@@ -2796,7 +2668,7 @@ export class TeamService {
         execution.id,
         execution.conversationId,
         execution.memberId,
-        execution.workItemId,
+        execution.jiraIssueKey,
         execution.runtimeId,
         execution.parentExecutionId,
         JSON.stringify(execution.delegationPath),
@@ -2881,19 +2753,25 @@ export class TeamService {
         patch.endedAt !== undefined ? patch.endedAt : current.endedAt,
         id,
       );
-
-    // Claim 生命周期与 Execution 终态统一收口：cancelled / interrupted 意味着
-    // 这一轮执行已不再拥有业务执行权，它 claim 的 WorkItem 自动释放（retry 后
-    // 由新一轮 Execution 重新 claim）。failed 保留 claim；completed 也不动 ——
-    // 完成一轮执行不等于业务工作结束。见 TeamStructureService.releaseClaimForExecution。
-    const status = patch.status !== undefined ? patch.status : current.status;
-    if (status === 'cancelled' || status === 'interrupted') {
-      this.structure?.releaseClaimForExecution(id);
-    }
   }
 
   private emitExecution(execution: ExecutionRecord): void {
     this.emit(execution.conversationId, { type: 'execution.updated', data: execution });
+    // Team 级 activity 广播：业务工作在 Jira，本地只广播「谁在跑哪张工单的这一轮」。
+    // 与 conversation 事件同一触发点，订阅方不需要同时挂两种 SSE 才能拼出 Current Work。
+    if (!this.onTeamActivity) return;
+    const row = this.db
+      .prepare(`SELECT team_id FROM conversation WHERE id = ?`)
+      .get(execution.conversationId) as unknown as { team_id: string } | undefined;
+    if (!row) return;
+    this.onTeamActivity(row.team_id, 'member.activity.changed', {
+      executionId: execution.id,
+      conversationId: execution.conversationId,
+      memberId: execution.memberId,
+      jiraIssueKey: execution.jiraIssueKey,
+      kind: execution.kind,
+      status: execution.status,
+    });
   }
 
   private updateRuntime(
@@ -3145,7 +3023,7 @@ function mapExecution(row: ExecutionRow): ExecutionRecord {
     id: row.id,
     conversationId: row.conversation_id,
     memberId: row.member_id,
-    workItemId: row.work_item_id,
+    jiraIssueKey: row.jira_issue_key,
     runtimeId: row.runtime_id,
     parentExecutionId: row.parent_execution_id,
     delegationPath: JSON.parse(row.delegation_path) as string[],

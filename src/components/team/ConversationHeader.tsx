@@ -1,9 +1,8 @@
-import { useEffect, useState } from 'react';
+import { } from 'react';
 import { Avatar, Badge, Button, Select, Space, Tag, Tooltip, Typography } from 'antd';
 import type { Conversation, ConversationMemberState, Member } from '../../lib/api';
 import { GroupMemberManager } from './GroupMemberManager';
 import { EVERYONE, EVERYONE_LABEL, isMemberDm, type MemberStatusLookup } from './constants';
-import { api } from '../../lib/api';
 
 const { Title, Text } = Typography;
 
@@ -46,20 +45,6 @@ export function ConversationHeader({
 }: ConversationHeaderProps) {
   const isGroup = conversation.kind === 'group';
   const isDm = isMemberDm(conversation);
-  const [projectName, setProjectName] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (!conversation.projectId) {
-      setProjectName(null);
-      return;
-    }
-    api
-      .listProjects()
-      .then((result) => {
-        setProjectName(result.projects.find((p) => p.id === conversation.projectId)?.name ?? null);
-      })
-      .catch(() => {});
-  }, [conversation.projectId]);
 
   return (
     <>
@@ -71,7 +56,7 @@ export function ConversationHeader({
           <Tag color={conversation.kind === 'group' ? 'blue' : conversation.kind === 'work' ? 'gold' : 'default'}>
             {conversation.kind}
           </Tag>
-          {projectName && <Tag color="cyan">Project: {projectName}</Tag>}
+          {conversation.jiraIssueKey && <Tag color="cyan">Jira: {conversation.jiraIssueKey}</Tag>}
         </Space>
 
         <div style={{ marginTop: 8, display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>

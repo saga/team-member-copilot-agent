@@ -75,9 +75,6 @@ export function createCapabilityStack(
       delegateMember: (input) => resolveTeam().delegateMember(input),
       rememberMember: (input) => resolveTeam().rememberMember(input),
       messageMember: (input) => resolveTeam().messageMember(input),
-      listWorkItems: (input) => resolveTeam().listWorkItemsForAgent(input),
-      claimWorkItem: (input) => resolveTeam().claimWorkItemForAgent(input),
-      updateWorkItem: (input) => resolveTeam().updateWorkItemForAgent(input),
     }),
   );
   registry.registerToolProvider(new KnowledgeToolProvider());
