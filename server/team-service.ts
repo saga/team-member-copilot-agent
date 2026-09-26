@@ -1698,7 +1698,10 @@ export class TeamService {
 
     this.transaction(() => {
       this.insertExecution(execution);
-      this.db
+      // 绑定必须是原子的且必须成功：changes ≠ 1 说明这个 run 已经绑了别的
+      // execution（或状态已变）。放过它会造出一个孤儿 execution —— 建了、
+      // 却没有任何 run 记得它，恢复逻辑永远不会重派它。
+      const result = this.db
         .prepare(
           `
           UPDATE scheduled_wake_run
@@ -1711,12 +1714,17 @@ export class TeamService {
           `,
         )
         .run(execution.id, input.scheduleRunId);
+      if (Number(result.changes) !== 1) {
+        throw conflict('ScheduledWakeRun 已绑定其他 Execution 或状态已改变');
+      }
     });
 
     this.emitExecution(execution);
 
-    void this.runScheduledExecution(execution.id);
-
+    // 刻意**不**在这里启动 execution：调用方（scheduler tick / recovery）要先
+    // 把 run 标成 running、把 schedule 推进到下一次，然后再启动。如果在这里
+    // 就跑，一轮极快的 execution 会在 tick 返回前完成并把 run 收口，随后
+    // tick 的 updateScheduleRun('running') 又把终态顶回 running。
     return execution.id;
   }
 
@@ -1726,9 +1734,9 @@ export class TeamService {
       throw badRequest(`不是 scheduled execution：${executionId}`);
     }
     if (execution.status !== 'queued') return;
-    const conversation = this.getConversation(execution.conversationId);
-    const member = this.requireActiveMember(conversation, execution.memberId);
     try {
+      const conversation = this.getConversation(execution.conversationId);
+      const member = this.requireActiveMember(conversation, execution.memberId);
       await this.executeMemberTurn({
         conversation,
         member,
@@ -1740,6 +1748,16 @@ export class TeamService {
       });
     } catch (error) {
       // executeMemberTurn 已经收口 execution 状态，这里不再重写终态，避免二次终态。
+      // 开跑前的校验失败（房间没了 / Member 归档）会让 execution 停在 queued，
+      // 恢复逻辑每个 tick 都会重派这条注定失败的执行 —— 把它标成 interrupted 断掉重试。
+      const current = this.findExecution(executionId);
+      if (current && current.status === 'queued') {
+        this.updateExecution(executionId, {
+          status: 'interrupted',
+          error: error instanceof Error ? error.message : String(error),
+          endedAt: now(),
+        });
+      }
       // eslint-disable-next-line no-console
       console.error(
         `[team] scheduled execution ${executionId} failed:`,
@@ -2862,6 +2880,15 @@ export class TeamService {
         patch.endedAt !== undefined ? patch.endedAt : current.endedAt,
         id,
       );
+
+    // Claim 生命周期与 Execution 终态统一收口：cancelled / interrupted 意味着
+    // 这一轮执行已不再拥有业务执行权，它 claim 的 WorkItem 自动释放（retry 后
+    // 由新一轮 Execution 重新 claim）。failed 保留 claim；completed 也不动 ——
+    // 完成一轮执行不等于业务工作结束。见 TeamStructureService.releaseClaimForExecution。
+    const status = patch.status !== undefined ? patch.status : current.status;
+    if (status === 'cancelled' || status === 'interrupted') {
+      this.structure?.releaseClaimForExecution(id);
+    }
   }
 
   private emitExecution(execution: ExecutionRecord): void {

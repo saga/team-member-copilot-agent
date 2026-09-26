@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { config } from './config.js';
+import { runInTransaction } from './db-tx.js';
 import { now } from './db.js';
 import { badRequest, conflict, forbidden, notFound } from './http-error.js';
 import type {
@@ -29,6 +30,14 @@ import type {
  */
 export class TeamStructureService {
   constructor(private readonly db: DatabaseSync) {}
+
+  /**
+   * 把跨表写入收成一个原子块。嵌套安全：深度由 db-tx 统一追踪，
+   * COMMIT 只由最外层负责，onCommit hook 在 COMMIT 之后才执行。
+   */
+  private transaction<T>(fn: () => T, onCommit?: () => void): T {
+    return runInTransaction(this.db, fn, onCommit);
+  }
 
   // ------------------------------------------------------------------ Team
 
@@ -305,28 +314,37 @@ export class TeamStructureService {
       }
     }
     const title = patch.title?.trim() || current.title;
-    this.db
-      .prepare(`UPDATE work_item SET title = ?, description = ?, status = ?, version = version + 1, updated_at = ? WHERE id = ?`)
-      .run(
-        title.slice(0, 300),
-        (patch.description ?? current.description).slice(0, 8000),
-        patch.status ?? current.status,
-        now(),
-        id,
-      );
-    // done/cancelled 后 claim 自动清空：业务结束，锁不应继续占着。
-    if (patch.status === 'done' || patch.status === 'cancelled') {
+    this.transaction(() => {
       this.db
-        .prepare(`UPDATE work_item SET claimed_by_member_id = NULL, claimed_execution_id = NULL, claimed_at = NULL WHERE id = ?`)
-        .run(id);
-    }
+        .prepare(`UPDATE work_item SET title = ?, description = ?, status = ?, version = version + 1, updated_at = ? WHERE id = ?`)
+        .run(
+          title.slice(0, 300),
+          (patch.description ?? current.description).slice(0, 8000),
+          patch.status ?? current.status,
+          now(),
+          id,
+        );
+      // done/cancelled 后 claim 自动清空：业务结束，锁不应继续占着。
+      // 必须和状态变更同事务：中间崩进程会留下「已结束却仍被 claim」的行。
+      if (patch.status === 'done' || patch.status === 'cancelled') {
+        this.db
+          .prepare(`UPDATE work_item SET claimed_by_member_id = NULL, claimed_execution_id = NULL, claimed_at = NULL WHERE id = ?`)
+          .run(id);
+      }
+    });
     return this.getWorkItem(id);
   }
 
   assignWorkItem(
     id: string,
     assignee: { kind: TeamParticipantKind; principalId: string } | null,
+    actor: PrincipalRef & { teamRole?: TeamRole },
   ): WorkItem {
+    // Assignment 是协调动作：Human = Coordinator，Agent = Worker。
+    // Agent 想接活走 claim（Execution → Claim），不能把工作指给别人。
+    if (actor.kind === 'agent') {
+      throw forbidden('Agent 不能 assign WorkItem；接活请使用 claim');
+    }
     const current = this.getWorkItem(id);
     if (current.status === 'done' || current.status === 'cancelled') {
       throw conflict(`WorkItem 已经结束：${current.status}`);
@@ -404,32 +422,77 @@ export class TeamStructureService {
     }
 
     const expectedVersion = input.expectedVersion ?? current.version;
-    const timestamp = now();
-    const result = this.db
-      .prepare(
-        `UPDATE work_item
-         SET claimed_by_member_id = ?,
-             claimed_at = ?,
-             claimed_execution_id = ?,
-             version = version + 1,
-             status = 'in_progress',
-             updated_at = ?
-         WHERE id = ?
-           AND version = ?
-           AND claimed_by_member_id IS NULL
-           AND status IN ('todo', 'in_progress')`,
-      )
-      .run(input.memberId, timestamp, input.executionId ?? null, timestamp, id, expectedVersion);
-    if (Number(result.changes) !== 1) {
-      throw conflict('Claim 失败：已被抢先、状态不允许或版本过期');
-    }
-    // 双向绑定：execution.work_item_id 与 work_item.claimed_execution_id 保持一致。
-    if (input.executionId) {
-      this.db
-        .prepare(`UPDATE execution SET work_item_id = ? WHERE id = ? AND work_item_id IS NULL`)
-        .run(id, input.executionId);
-    }
-    return this.getWorkItem(id);
+    // claim 是跨表写入（work_item + execution.work_item_id），必须同事务：
+    // 中间崩进程会留下「WorkItem 已被 claim、execution 却不知道自己在干哪项工作」的断链。
+    return this.transaction(() => {
+      const timestamp = now();
+
+      if (current.claimedByMemberId) {
+        // 已被 claim。语义是「谁负责」+「这一轮谁在驱动」，所以同一 Member
+        // 换一轮 Execution 允许重绑（retry：Execution 1 failed → Execution 2 接着驱动），
+        // 其他 Member 则一律 409 —— 那是抢别人的活。
+        if (current.claimedByMemberId !== input.memberId) {
+          throw conflict('WorkItem 已被其他 Member claim');
+        }
+        const previousExecutionId = current.claimedExecutionId;
+        const previous = previousExecutionId
+          ? (this.db.prepare(`SELECT status FROM execution WHERE id = ?`).get(previousExecutionId) as unknown as
+              | { status: ExecutionStatus }
+              | undefined)
+          : undefined;
+        // 旧轮已到任意终态（completed / failed / cancelled / interrupted）才允许重绑：
+        // 多轮工作（completed）与 retry（failed）都要把锁交给新的一轮。
+        const previousEnded =
+          !previousExecutionId ||
+          (previous !== undefined &&
+            ['completed', 'failed', 'cancelled', 'interrupted'].includes(previous.status));
+        if (!previousEnded) {
+          throw conflict('WorkItem 已被当前 Member 一条未结束的 Execution claim');
+        }
+        const rebind = this.db
+          .prepare(
+            `UPDATE work_item
+             SET claimed_execution_id = ?,
+                 claimed_at = ?,
+                 version = version + 1,
+                 updated_at = ?
+             WHERE id = ?
+               AND claimed_by_member_id = ?
+               AND version = ?`,
+          )
+          .run(input.executionId ?? null, timestamp, timestamp, id, input.memberId, expectedVersion);
+        if (Number(rebind.changes) !== 1) {
+          throw conflict('Claim 重绑失败：状态已变化，请重新读取后重试');
+        }
+      } else {
+        const result = this.db
+          .prepare(
+            `UPDATE work_item
+             SET claimed_by_member_id = ?,
+                 claimed_at = ?,
+                 claimed_execution_id = ?,
+                 version = version + 1,
+                 status = 'in_progress',
+                 updated_at = ?
+             WHERE id = ?
+               AND version = ?
+               AND claimed_by_member_id IS NULL
+               AND status IN ('todo', 'in_progress')`,
+          )
+          .run(input.memberId, timestamp, input.executionId ?? null, timestamp, id, expectedVersion);
+        if (Number(result.changes) !== 1) {
+          throw conflict('Claim 失败：已被抢先、状态不允许或版本过期');
+        }
+      }
+
+      // 双向绑定：execution.work_item_id 与 work_item.claimed_execution_id 保持一致。
+      if (input.executionId) {
+        this.db
+          .prepare(`UPDATE execution SET work_item_id = ? WHERE id = ? AND work_item_id IS NULL`)
+          .run(id, input.executionId);
+      }
+      return this.getWorkItem(id);
+    });
   }
 
   releaseWorkItem(id: string, actor: PrincipalRef & { teamRole?: TeamRole }): WorkItem {
@@ -447,6 +510,32 @@ export class TeamStructureService {
       )
       .run(now(), id);
     return this.getWorkItem(id);
+  }
+
+  /**
+   * Execution 收口为 cancelled / interrupted 时释放它 claim 的 WorkItem。
+   *
+   * 这两种终态意味着这一轮执行已不再拥有业务执行权，锁继续占着只会挡住 retry。
+   * failed 保留 claim（retry 由同一 Member 继续）；completed 也不自动释放 ——
+   * 完成一轮执行不等于业务工作结束（WorkItem ≠ Execution）。
+   *
+   * 守卫是 `claimed_execution_id = ?`：它只清「这一轮亲手 claim 的」记录，
+   * 不碰 Member 重新 claim 到别的 Execution 上的新锁。没有匹配行时是 no-op，
+   * 重复调用安全。
+   */
+  releaseClaimForExecution(executionId: string): void {
+    this.db
+      .prepare(
+        `UPDATE work_item
+         SET claimed_by_member_id = NULL,
+             claimed_execution_id = NULL,
+             claimed_at = NULL,
+             version = version + 1,
+             updated_at = ?
+         WHERE claimed_execution_id = ?
+           AND claimed_by_member_id IS NOT NULL`,
+      )
+      .run(now(), executionId);
   }
 
   // --------------------------------------------------------------- Presence
@@ -531,10 +620,9 @@ export class TeamStructureService {
     createdBy: string,
   ): ScheduledWake {
     this.getTeam(teamId);
-    const member = this.db.prepare(`SELECT id FROM member WHERE id = ?`).get(input.memberId) as unknown as
-      | { id: string }
-      | undefined;
-    if (!member) throw notFound(`Member 不存在：${input.memberId}`);
+    // 被调度的必须是 active 的 Team 成员：归档 / 停用的 Agent 不能等到
+    // scheduler 真运行时才失败 —— 那时错误藏在一个没人盯的 run 记录里。
+    this.requireActiveMembership(teamId, 'agent', input.memberId);
     const conversation = this.db
       .prepare(`SELECT id, kind, team_id FROM conversation WHERE id = ?`)
       .get(input.conversationId) as unknown as { id: string; kind: string; team_id: string } | undefined;
@@ -560,6 +648,15 @@ export class TeamStructureService {
     if (input.type === 'interval' && (!input.intervalSeconds || input.intervalSeconds <= 0)) {
       throw badRequest('interval 类型必须给正整数 intervalSeconds');
     }
+    // runAt 在创建时就验证：非法时间会变成一条永远跑不到的 schedule（once），
+    // 只有用户在列表里看到 next_run_at 是空/乱码时才发现。
+    const runAtMs = Date.parse(input.runAt);
+    if (!Number.isFinite(runAtMs)) {
+      throw badRequest('runAt 必须是有效时间');
+    }
+    if (runAtMs <= Date.now()) {
+      throw badRequest('runAt 必须是未来时间');
+    }
     const projectId = input.projectId?.trim() || null;
     if (projectId) {
       const project = this.getProject(projectId);
@@ -572,8 +669,11 @@ export class TeamStructureService {
       if (work.status === 'done' || work.status === 'cancelled') {
         throw badRequest('已结束的 WorkItem 不能建立自动任务');
       }
-      if (projectId && work.projectId && work.projectId !== projectId) {
-        throw badRequest('Schedule 的 projectId 与 WorkItem 的 projectId 不一致');
+      // Schedule 明确属于某个 Project 时，绑定的 WorkItem 必须同属那个 Project。
+      // WorkItem 没有 projectId（游离任务）也不行：自动任务产出的工作落在哪个
+      // Project 必须无歧义，不能靠「WorkItem 恰好没填」混进另一个 Project。
+      if (projectId && work.projectId !== projectId) {
+        throw badRequest('Schedule 的 projectId 必须与 WorkItem 的 projectId 一致');
       }
     }
     const id = randomUUID();
@@ -681,18 +781,25 @@ export class TeamStructureService {
     const current = this.getScheduleRun(id);
     const status = patch.status ?? current.status;
     const timestamp = now();
+    // 时间戳跟语义走，不是「status ≠ queued 就写」：running 第一次进入才写
+    // started_at（completed/failed 收口不该顶掉它），completed/failed 才写
+    // ended_at（回到 queued/running 不该清掉结束时间）。用一个旧值回填的
+    // COALESCE 写法做不到这两件事。
     this.db
       .prepare(
         `UPDATE scheduled_wake_run SET status = ?, execution_id = ?, error = ?,
-          started_at = COALESCE(started_at, ?), ended_at = ?
+          started_at = CASE WHEN ? = 'running' AND started_at IS NULL THEN ? ELSE started_at END,
+          ended_at = CASE WHEN ? IN ('completed', 'failed') THEN ? ELSE ended_at END
          WHERE id = ?`,
       )
       .run(
         status,
         patch.executionId !== undefined ? patch.executionId : current.executionId,
         patch.error !== undefined ? patch.error : current.error,
-        status === 'queued' ? null : timestamp,
-        status === 'queued' || status === 'running' ? null : timestamp,
+        status,
+        timestamp,
+        status,
+        timestamp,
         id,
       );
     return this.getScheduleRun(id);

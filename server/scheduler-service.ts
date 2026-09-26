@@ -65,9 +65,25 @@ export class SchedulerService {
             workItemId: schedule.workItemId,
             projectId: schedule.projectId,
           });
+          // 顺序固定：run 标 running、schedule 推进到下一次，**之后**才启动
+          // execution。反过来（enqueue 内部就启动）会让一轮极快的 execution 在
+          // tick 返回前完成并收口 run，随后这里的 'running' 又把终态顶回去 ——
+          // 留下「Execution completed / run running」这种 durable scheduler
+          // 最不该出现的状态。
           this.structure.updateScheduleRun(run.id, { status: 'running', executionId });
           this.structure.markFired(schedule, scheduledFor);
           fired += 1;
+          void this.team()
+            .runScheduledExecution(executionId)
+            .catch((error: unknown) => {
+              // runScheduledExecution 自己会收口 run（settleScheduleRun），
+              // 这里只是别让拒绝变成 unhandled rejection。
+              // eslint-disable-next-line no-console
+              console.error(
+                `[scheduler] scheduled execution ${executionId} failed:`,
+                error instanceof Error ? error.message : error,
+              );
+            });
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           this.structure.updateScheduleRun(run.id, { status: 'failed', error: message });
@@ -121,6 +137,9 @@ export class SchedulerService {
         // running / waiting_for_member：引擎侧由 RecoveryService 收口，这里不动。
         continue;
       }
+      // 无 executionId：重建 execution。enqueue 现在只建不跑，所以这里要像
+      // tick 一样先标 running 再启动 —— 两边共用同一份顺序，恢复出来才不会
+      // 与正常路径行为不同。
       void this.team()
         .enqueueScheduledWork({
           scheduleRunId: run.id,
@@ -129,6 +148,10 @@ export class SchedulerService {
           prompt: schedule.prompt,
           workItemId: schedule.workItemId,
           projectId: schedule.projectId,
+        })
+        .then((executionId) => {
+          this.structure.updateScheduleRun(run.id, { status: 'running', executionId });
+          return this.team().runScheduledExecution(executionId);
         })
         .catch((error: unknown) => {
           this.structure.updateScheduleRun(run.id, {

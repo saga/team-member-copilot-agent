@@ -10,7 +10,6 @@ import {
   resolveActor,
 } from '../middleware/teamScope.js';
 import type { TeamParticipantKind, TeamRole } from '../domain.js';
-import { config } from '../config.js';
 
 /**
  * Team 领域路由：Team / Membership / Project / WorkItem / Presence / Schedule。
@@ -130,7 +129,8 @@ export function teamRouter(structure: TeamStructureService) {
       return;
     }
     try {
-      res.status(201).json({ project: structure.createProject(currentTeamId(), parsed.data, config.localActorId) });
+      const actor = resolveActor(req);
+      res.status(201).json({ project: structure.createProject(currentTeamId(), parsed.data, actor.principalId) });
     } catch (error) {
       sendError(res, error);
     }
@@ -212,11 +212,17 @@ export function teamRouter(structure: TeamStructureService) {
       return;
     }
     try {
+      // Assignment 是协调动作，必须知道是谁在协调：actor 进授权判断，
+      // 也进 Activity History（audit 不能只有「被指派了」，没有「谁指派的」）。
+      const actor = resolveActor(req);
+      const teamRole = actorTeamRole(structure, actor);
       const assignee =
         parsed.data.kind && parsed.data.principalId
           ? { kind: parsed.data.kind, principalId: parsed.data.principalId }
           : null;
-      res.json({ workItem: structure.assignWorkItem((req.params.id as string), assignee) });
+      res.json({
+        workItem: structure.assignWorkItem((req.params.id as string), assignee, { ...actor, teamRole }),
+      });
     } catch (error) {
       sendError(res, error);
     }
@@ -311,7 +317,11 @@ export function teamRouter(structure: TeamStructureService) {
       return;
     }
     try {
-      res.status(201).json({ schedule: structure.createSchedule(currentTeamId(), parsed.data, config.localActorId) });
+      // created_by 记真实调用方，不再写死 local actor。当前部署都是人类 Admin
+      // 操作，所以不需要把 created_by 拆成 kind/id；接认证后 resolveActor
+      // 换实现即可，这里不动。
+      const actor = resolveActor(req);
+      res.status(201).json({ schedule: structure.createSchedule(currentTeamId(), parsed.data, actor.principalId) });
     } catch (error) {
       sendError(res, error);
     }

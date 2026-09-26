@@ -46,6 +46,29 @@ function makeAgent(name: string) {
   return member;
 }
 
+/** 测试里的默认人类协调者（与 makeAgent 的 agent 身份相对）。 */
+const HUMAN = { kind: 'human' as const, principalId: 'local-user' };
+
+/**
+ * 建一条「已到期」的 schedule。
+ *
+ * createSchedule 要求 runAt 在未来（创建时就拦非法输入），调度类用例要模拟
+ * 「过去建的、现在到期了」，用 SQL 回拨 run_at / next_run_at —— 这正是
+ * 重启恢复会看到的数据形态。
+ */
+function createScheduleDue(
+  input: Omit<Parameters<typeof structure.createSchedule>[1], 'runAt'>,
+  dueAt: string = new Date(Date.now() - 1000).toISOString(),
+): ReturnType<typeof structure.createSchedule> {
+  const schedule = structure.createSchedule(
+    team.id,
+    { ...input, runAt: new Date(Date.now() + 3600_000).toISOString() },
+    'local-user',
+  );
+  db.prepare(`UPDATE scheduled_wake SET run_at = ?, next_run_at = ? WHERE id = ?`).run(dueAt, dueAt, schedule.id);
+  return structure.getSchedule(schedule.id);
+}
+
 describe('Team / Membership', () => {
   it('默认 Team 唯一，human owner 存在，agent 自动可补', () => {
     const again = structure.ensureDefaultTeam('test');
@@ -95,17 +118,17 @@ describe('WorkItem：Assignment 与 Claim 分开', () => {
     const item = structure.createWorkItem(team.id, { title: 'Review proposal' }, 'local-user');
     assert.equal(item.status, 'todo');
 
-    const assigned = structure.assignWorkItem(item.id, { kind: 'agent', principalId: agent.id });
+    const assigned = structure.assignWorkItem(item.id, { kind: 'agent', principalId: agent.id }, HUMAN);
     assert.equal(assigned.assigneeId, agent.id);
 
     const claimed = structure.claimWorkItem(item.id, { memberId: agent.id });
     assert.equal(claimed.status, 'in_progress');
     assert.equal(claimed.claimedByMemberId, agent.id);
 
-    assert.throws(() => structure.assignWorkItem(item.id, null), /release/);
+    assert.throws(() => structure.assignWorkItem(item.id, null, HUMAN), /release/);
     const released = structure.releaseWorkItem(item.id, { kind: 'agent', principalId: agent.id });
     assert.equal(released.claimedByMemberId, null);
-    structure.assignWorkItem(item.id, null);
+    structure.assignWorkItem(item.id, null, HUMAN);
   });
 
   it('未指定 assignee 时任何 active agent 可 claim；指定后只有它能 claim', () => {
@@ -115,7 +138,7 @@ describe('WorkItem：Assignment 与 Claim 分开', () => {
     assert.equal(structure.claimWorkItem(open.id, { memberId: b.id }).claimedByMemberId, b.id);
 
     const assigned = structure.createWorkItem(team.id, { title: 'Assigned task' }, 'u');
-    structure.assignWorkItem(assigned.id, { kind: 'agent', principalId: a.id });
+    structure.assignWorkItem(assigned.id, { kind: 'agent', principalId: a.id }, HUMAN);
     assert.throws(() => structure.claimWorkItem(assigned.id, { memberId: b.id }), /指派/);
     structure.claimWorkItem(assigned.id, { memberId: a.id });
   });
@@ -127,10 +150,10 @@ describe('WorkItem：Assignment 与 Claim 分开', () => {
     const version = item.version;
     structure.claimWorkItem(item.id, { memberId: a.id, expectedVersion: version });
     // 旧版本号：version 守卫就能拦。
-    assert.throws(() => structure.claimWorkItem(item.id, { memberId: b.id, expectedVersion: version }), /抢先|版本|失败/);
+    assert.throws(() => structure.claimWorkItem(item.id, { memberId: b.id, expectedVersion: version }), /抢先|版本|失败|其他 Member/);
     // 当前版本号：只剩 claimed_by IS NULL 这道闸 —— 拿掉它 B 就能抢走 A 的 claim。
     const current = structure.getWorkItem(item.id).version;
-    assert.throws(() => structure.claimWorkItem(item.id, { memberId: b.id, expectedVersion: current }), /抢先|版本|失败/);
+    assert.throws(() => structure.claimWorkItem(item.id, { memberId: b.id, expectedVersion: current }), /抢先|版本|失败|其他 Member/);
   });
 
   it('done 必须 claimer 或 admin；done 后 claim 自动清空', () => {
@@ -165,7 +188,7 @@ describe('WorkItem：Assignment 与 Claim 分开', () => {
     const room = stack.team.createConversation({ kind: 'direct', memberIds: [agent.id] });
     muteAllMembers(stack.team, room.id);
     const item = structure.createWorkItem(team.id, { title: 'Linked work' }, 'u');
-    structure.assignWorkItem(item.id, { kind: 'agent', principalId: agent.id });
+    structure.assignWorkItem(item.id, { kind: 'agent', principalId: agent.id }, HUMAN);
     structure.claimWorkItem(item.id, { memberId: agent.id });
 
     const sent = await stack.team.sendMessage({ conversationId: room.id, content: 'hi' });
@@ -211,11 +234,7 @@ describe('Scheduler', () => {
     const scheduler = new SchedulerService(structure, () => stack.team);
 
     const past = new Date(Date.now() - 1000).toISOString();
-    const once = structure.createSchedule(
-      team.id,
-      { memberId: agent.id, conversationId: room.id, prompt: 'check once', type: 'once', runAt: past },
-      'local-user',
-    );
+    const once = createScheduleDue({ memberId: agent.id, conversationId: room.id, prompt: 'check once', type: 'once' });
     assert.equal(await scheduler.tick(), 1);
     assert.equal(structure.getSchedule(once.id).status, 'completed');
     assert.equal(await scheduler.tick(), 0);
@@ -225,10 +244,9 @@ describe('Scheduler', () => {
 
     // interval：离线 8 小时只执行一次，next 跳到未来。
     const old = new Date(Date.now() - 8 * 3600_000).toISOString();
-    const interval = structure.createSchedule(
-      team.id,
-      { memberId: agent.id, conversationId: room.id, prompt: 'hourly', type: 'interval', runAt: old, intervalSeconds: 3600 },
-      'local-user',
+    const interval = createScheduleDue(
+      { memberId: agent.id, conversationId: room.id, prompt: 'hourly', type: 'interval', intervalSeconds: 3600 },
+      old,
     );
     assert.equal(await scheduler.tick(), 1);
     const after = structure.getSchedule(interval.id);
@@ -237,10 +255,8 @@ describe('Scheduler', () => {
 
     // paused 成员不执行。
     structure.setAvailability(team.id, 'agent', agent.id, 'paused');
-    const pausedSchedule = structure.createSchedule(
-      team.id,
-      { memberId: agent.id, conversationId: room.id, prompt: 'paused task', type: 'once', runAt: new Date(Date.now() - 1000).toISOString() },
-      'local-user',
+    const pausedSchedule = createScheduleDue(
+      { memberId: agent.id, conversationId: room.id, prompt: 'paused task', type: 'once' },
     );
     assert.equal(await scheduler.tick(), 0);
     assert.equal(structure.getSchedule(pausedSchedule.id).status, 'active');
@@ -255,7 +271,7 @@ describe('Scheduler', () => {
     const room = stack.team.createConversation({ kind: 'work', memberIds: [agent.id] });
     const schedule = structure.createSchedule(
       team.id,
-      { memberId: agent.id, conversationId: room.id, prompt: 'scheduled check', type: 'once', runAt: new Date(Date.now() - 1000).toISOString() },
+      { memberId: agent.id, conversationId: room.id, prompt: 'scheduled check', type: 'once', runAt: new Date(Date.now() + 60_000).toISOString() },
       'local-user',
     );
     const run = structure.insertScheduleRun(schedule.id, schedule.nextRunAt);
@@ -285,7 +301,7 @@ describe('Scheduler', () => {
     const PROMPT = '严格按 schedule 的 prompt 执行';
     const schedule = structure.createSchedule(
       team.id,
-      { memberId: agent.id, conversationId: room.id, prompt: PROMPT, type: 'once', runAt: new Date(Date.now() - 1000).toISOString() },
+      { memberId: agent.id, conversationId: room.id, prompt: PROMPT, type: 'once', runAt: new Date(Date.now() + 60_000).toISOString() },
       'local-user',
     );
     const run = structure.insertScheduleRun(schedule.id, schedule.nextRunAt);
@@ -306,7 +322,8 @@ describe('Scheduler', () => {
     assert.equal(rows[0].id, executionId);
     assert.equal(rows[0].prompt, PROMPT);
     assert.equal(rows[0].trigger_message_sequence, null);
-    await waitFor(() => stub.turns.some((turn) => turn.executionId === executionId), 'turn 开始');
+    // enqueue 只建不跑：启动由 runScheduledExecution 负责（tick / recovery 共用）。
+    await stack.team.runScheduledExecution(executionId);
     // stub 收到的是渲染后的 prompt：schedule prompt 必须是「当前消息」本身，
     // 聊天消息只能作为共享上下文出现 —— 而不是被当成最近一条消息重放。
     const rendered = stub.turnFor(executionId).prompt;
@@ -324,17 +341,16 @@ describe('Scheduler', () => {
     const agent = stack.team.createMember({ name: 'SchedArchived', role: 'E' });
     const room = stack.team.createConversation({ kind: 'work', memberIds: [agent.id] });
     const scheduler = new SchedulerService(structure, () => stack.team);
-    stack.team.updateMember(agent.id, { status: 'archived' });
 
     // dueSchedules 是全 Team 的：先把前面用例留下的到期 schedule 清掉，
     // 这条断言才只针对本用例的目标。
     await scheduler.tick();
 
-    const schedule = structure.createSchedule(
-      team.id,
-      { memberId: agent.id, conversationId: room.id, prompt: 'never runs', type: 'once', runAt: new Date(Date.now() - 1000).toISOString() },
-      'local-user',
+    // 创建时成员还 active（创建即校验），随后归档 —— 模拟「建了之后人才走」。
+    const schedule = createScheduleDue(
+      { memberId: agent.id, conversationId: room.id, prompt: 'never runs', type: 'once' },
     );
+    stack.team.updateMember(agent.id, { status: 'archived' });
     assert.equal(await scheduler.tick(), 0);
     const run = db
       .prepare(`SELECT status, error FROM scheduled_wake_run WHERE schedule_id = ?`)
@@ -348,6 +364,102 @@ describe('Scheduler', () => {
     void stub;
   });
 
+  it('enqueueScheduledWork 只创建并绑定 execution，不启动；重复绑定同一 run 409', async () => {
+    const { StubCopilot } = await import('./support.js');
+    const stub = new StubCopilot();
+    const stack = createTestStack(db, memberService, stub.asCopilot);
+    const agent = stack.team.createMember({ name: 'EnqueueOnly', role: 'E' });
+    const room = stack.team.createConversation({ kind: 'work', memberIds: [agent.id] });
+    const schedule = structure.createSchedule(
+      team.id,
+      { memberId: agent.id, conversationId: room.id, prompt: 'not started', type: 'once', runAt: new Date(Date.now() + 60_000).toISOString() },
+      'local-user',
+    );
+    const run = structure.insertScheduleRun(schedule.id, schedule.nextRunAt);
+
+    const executionId = await stack.team.enqueueScheduledWork({
+      scheduleRunId: run.id,
+      conversationId: room.id,
+      memberId: agent.id,
+      prompt: 'not started',
+    });
+    // 启动权在调用方（tick / recovery）：enqueue 自己启动会在极快完成的场景下
+    // 与 tick 的 updateScheduleRun('running') 形成竞态。
+    assert.equal(stack.team.getExecution(executionId).status, 'queued');
+    assert.equal(stub.turns.length, 0, 'enqueue 不触发 turn');
+
+    // run 已绑定：第二次 enqueue 撞 changes=0 → 409，而不是留下孤儿 execution。
+    await assert.rejects(
+      () =>
+        stack.team.enqueueScheduledWork({
+          scheduleRunId: run.id,
+          conversationId: room.id,
+          memberId: agent.id,
+          prompt: 'again',
+        }),
+      /绑定|改变/,
+    );
+  });
+
+  it('tick 返回时 run 已 running、schedule 已推进，之后 execution 完成并把 run 收口', async () => {
+    const { StubCopilot } = await import('./support.js');
+    const stub = new StubCopilot();
+    const stack = createTestStack(db, memberService, stub.asCopilot);
+    const agent = stack.team.createMember({ name: 'TickOrder', role: 'E' });
+    const room = stack.team.createConversation({ kind: 'work', memberIds: [agent.id] });
+    const scheduler = new SchedulerService(structure, () => stack.team);
+    const schedule = createScheduleDue({ memberId: agent.id, conversationId: room.id, prompt: 'ordered', type: 'once' });
+
+    assert.equal(await scheduler.tick(), 1);
+    const run = db
+      .prepare(`SELECT id, status, execution_id FROM scheduled_wake_run WHERE schedule_id = ?`)
+      .get(schedule.id) as unknown as { id: string; status: string; execution_id: string | null };
+    // tick 返回的那一刻 run 必须是 running：如果它已经是 completed，说明
+    // execution 在 run 标 running 之前就跑完并收口了 —— 那正是被删掉的
+    // 「enqueue 内部启动」写法会触发的竞态。
+    assert.equal(run.status, 'running');
+    assert.equal(structure.getSchedule(schedule.id).status, 'completed', 'schedule 已推进到终态');
+
+    await waitFor(() => stack.team.getExecution(run.execution_id as string).status === 'completed', 'execution 完成');
+    await waitFor(() => structure.getScheduleRun(run.id).status === 'completed', 'run 被 settleScheduleRun 收口');
+  });
+
+  it('run 时间戳跟语义走：running 写 started_at，终态写 ended_at，终态不顶掉 started_at', async () => {
+    const { StubCopilot } = await import('./support.js');
+    const stack = createTestStack(db, memberService, new StubCopilot().asCopilot);
+    const agent = stack.team.createMember({ name: 'RunTs', role: 'E' });
+    const room = stack.team.createConversation({ kind: 'work', memberIds: [agent.id] });
+    const schedule = structure.createSchedule(
+      team.id,
+      { memberId: agent.id, conversationId: room.id, prompt: 'ts', type: 'once', runAt: new Date(Date.now() + 60_000).toISOString() },
+      'local-user',
+    );
+    const run = structure.insertScheduleRun(schedule.id, schedule.nextRunAt);
+    assert.equal(run.startedAt, null);
+    assert.equal(run.endedAt, null);
+
+    const running = structure.updateScheduleRun(run.id, { status: 'running' });
+    assert.ok(running.startedAt, '进入 running 才写 started_at');
+    assert.equal(running.endedAt, null);
+
+    const completed = structure.updateScheduleRun(run.id, { status: 'completed' });
+    assert.equal(completed.startedAt, running.startedAt, '终态不顶掉 started_at');
+    assert.ok(completed.endedAt, '终态写 ended_at');
+
+    // 直接从 queued 判 failed（enqueue 失败路径）：started_at 必须保持空。
+    const failedRun = structure.insertScheduleRun(
+      structure.createSchedule(
+        team.id,
+        { memberId: agent.id, conversationId: room.id, prompt: 'ts2', type: 'once', runAt: new Date(Date.now() + 120_000).toISOString() },
+        'local-user',
+      ).id,
+      new Date(Date.now() + 120_000).toISOString(),
+    );
+    const failed = structure.updateScheduleRun(failedRun.id, { status: 'failed', error: 'no target' });
+    assert.equal(failed.startedAt, null, '从未 running 过就没有 started_at');
+    assert.ok(failed.endedAt);
+  });
+
   it('恢复：无 executionId 的 run 重建 execution；遗留 running 的 run 按 execution 终态收口', async () => {
     const { StubCopilot } = await import('./support.js');
     const stub = new StubCopilot();
@@ -358,21 +470,23 @@ describe('Scheduler', () => {
 
     // A) run 建了、execution 还没建（崩溃点）→ 恢复必须重建并跑完。
     const runA = structure.insertScheduleRun(
-      structure.createSchedule(team.id, { memberId: agent.id, conversationId: room.id, prompt: 'recover-a', type: 'once', runAt: new Date(Date.now() - 1000).toISOString() }, 'local-user').id,
+      createScheduleDue({ memberId: agent.id, conversationId: room.id, prompt: 'recover-a', type: 'once' }).id,
       new Date(Date.now() - 1000).toISOString(),
     );
 
     // C) execution 已完成但 run 停在 running（老代码的遗留形态）→ 收口成 completed。
-    const scheduleC = structure.createSchedule(team.id, { memberId: agent.id, conversationId: room.id, prompt: 'recover-c', type: 'once', runAt: new Date(Date.now() - 2000).toISOString() }, 'local-user');
+    const scheduleC = createScheduleDue({ memberId: agent.id, conversationId: room.id, prompt: 'recover-c', type: 'once' }, new Date(Date.now() - 2000).toISOString());
     const runC = structure.insertScheduleRun(scheduleC.id, scheduleC.nextRunAt);
     const execC = await stack.team.enqueueScheduledWork({ scheduleRunId: runC.id, conversationId: room.id, memberId: agent.id, prompt: 'recover-c' });
+    await stack.team.runScheduledExecution(execC);
     await waitFor(() => stack.team.getExecution(execC).status === 'completed', 'execC 完成');
     structure.updateScheduleRun(runC.id, { status: 'running' });
 
     // D) execution failed → run 收口成 failed 且带走原因。
-    const scheduleD = structure.createSchedule(team.id, { memberId: agent.id, conversationId: room.id, prompt: 'recover-d', type: 'once', runAt: new Date(Date.now() - 3000).toISOString() }, 'local-user');
+    const scheduleD = createScheduleDue({ memberId: agent.id, conversationId: room.id, prompt: 'recover-d', type: 'once' }, new Date(Date.now() - 3000).toISOString());
     const runD = structure.insertScheduleRun(scheduleD.id, scheduleD.nextRunAt);
     const execD = await stack.team.enqueueScheduledWork({ scheduleRunId: runD.id, conversationId: room.id, memberId: agent.id, prompt: 'recover-d' });
+    await stack.team.runScheduledExecution(execD);
     await waitFor(() => stack.team.getExecution(execD).status === 'completed', 'execD 完成');
     db.prepare(`UPDATE execution SET status = 'failed', error = 'boom' WHERE id = ?`).run(execD);
     structure.updateScheduleRun(runD.id, { status: 'running' });
@@ -402,7 +516,7 @@ describe('Schedule 约束', () => {
       () =>
         structure.createSchedule(
           team.id,
-          { memberId: outsider.id, conversationId: room.id, prompt: 'x', type: 'once', runAt: new Date().toISOString() },
+          { memberId: outsider.id, conversationId: room.id, prompt: 'x', type: 'once', runAt: new Date(Date.now() + 60_000).toISOString() },
           'local-user',
         ),
       /必须属于/,
@@ -421,16 +535,53 @@ describe('Schedule 约束', () => {
     structure.updateWorkItem(done.id, { status: 'done' }, { kind: 'human', principalId: 'local-user', teamRole: 'owner' });
     assert.throws(
       () =>
-        structure.createSchedule(team.id, { memberId: agent.id, conversationId: room.id, workItemId: done.id, prompt: 'x', type: 'once', runAt: new Date().toISOString() }, 'local-user'),
+        structure.createSchedule(team.id, { memberId: agent.id, conversationId: room.id, workItemId: done.id, prompt: 'x', type: 'once', runAt: new Date(Date.now() + 60_000).toISOString() }, 'local-user'),
       /已结束/,
     );
 
     const mismatch = structure.createWorkItem(team.id, { title: 'Mismatch', projectId: projectA.id }, 'local-user');
     assert.throws(
       () =>
-        structure.createSchedule(team.id, { memberId: agent.id, conversationId: room.id, workItemId: mismatch.id, projectId: projectB.id, prompt: 'x', type: 'once', runAt: new Date().toISOString() }, 'local-user'),
-      /不一致/,
+        structure.createSchedule(team.id, { memberId: agent.id, conversationId: room.id, workItemId: mismatch.id, projectId: projectB.id, prompt: 'x', type: 'once', runAt: new Date(Date.now() + 60_000).toISOString() }, 'local-user'),
+      /一致/,
     );
+
+    // Schedule 明确属于某 Project 时，游离（无 project）的 WorkItem 也不接受：
+    // 产出落在哪个 Project 必须无歧义。
+    const floating = structure.createWorkItem(team.id, { title: 'Floating' }, 'local-user');
+    assert.throws(
+      () =>
+        structure.createSchedule(team.id, { memberId: agent.id, conversationId: room.id, workItemId: floating.id, projectId: projectA.id, prompt: 'x', type: 'once', runAt: new Date(Date.now() + 60_000).toISOString() }, 'local-user'),
+      /一致/,
+    );
+  });
+
+  it('schedule 创建即校验 runAt 与成员状态：不把错误留到 scheduler 运行时', async () => {
+    const { StubCopilot } = await import('./support.js');
+    const stack = createTestStack(db, memberService, new StubCopilot().asCopilot);
+    const agent = stack.team.createMember({ name: 'SchedValidate', role: 'E' });
+    const room = stack.team.createConversation({ kind: 'work', memberIds: [agent.id] });
+
+    // runAt 必须是有效时间。
+    assert.throws(
+      () =>
+        structure.createSchedule(team.id, { memberId: agent.id, conversationId: room.id, prompt: 'x', type: 'once', runAt: 'not-a-date' }, 'local-user'),
+      /有效时间/,
+    );
+    // runAt 必须在未来：过去的 once 要么永远跑不到、要么下一个 tick 立刻炸出来。
+    assert.throws(
+      () =>
+        structure.createSchedule(team.id, { memberId: agent.id, conversationId: room.id, prompt: 'x', type: 'once', runAt: new Date(Date.now() - 60_000).toISOString() }, 'local-user'),
+      /未来/,
+    );
+    // 归档的 Agent 不能被调度 —— 在创建时就拦，不等到 run 记录里才失败。
+    stack.team.updateMember(agent.id, { status: 'archived' });
+    assert.throws(
+      () =>
+        structure.createSchedule(team.id, { memberId: agent.id, conversationId: room.id, prompt: 'x', type: 'once', runAt: new Date(Date.now() + 60_000).toISOString() }, 'local-user'),
+      /归档|停用/,
+    );
+    stack.team.updateMember(agent.id, { status: 'active' });
   });
 
   it('已完成的 once schedule 不能 resume', async () => {
@@ -438,7 +589,7 @@ describe('Schedule 约束', () => {
     const stack = createTestStack(db, memberService, new StubCopilot().asCopilot);
     const agent = stack.team.createMember({ name: 'OnceResume', role: 'E' });
     const room = stack.team.createConversation({ kind: 'work', memberIds: [agent.id] });
-    const schedule = structure.createSchedule(team.id, { memberId: agent.id, conversationId: room.id, prompt: 'once', type: 'once', runAt: new Date().toISOString() }, 'local-user');
+    const schedule = structure.createSchedule(team.id, { memberId: agent.id, conversationId: room.id, prompt: 'once', type: 'once', runAt: new Date(Date.now() + 60_000).toISOString() }, 'local-user');
     structure.updateScheduleStatus(schedule.id, 'completed');
     assert.throws(() => structure.updateScheduleStatus(schedule.id, 'active'), /resume|已完成/);
   });
@@ -496,8 +647,8 @@ describe('WorkItem 权限与 execution 绑定', () => {
     const room = stack.team.createConversation({ kind: 'direct', memberIds: [agent.id] });
     const itemA = structure.createWorkItem(team.id, { title: 'A' }, 'local-user');
     const itemB = structure.createWorkItem(team.id, { title: 'B' }, 'local-user');
-    structure.assignWorkItem(itemA.id, { kind: 'agent', principalId: agent.id });
-    structure.assignWorkItem(itemB.id, { kind: 'agent', principalId: agent.id });
+    structure.assignWorkItem(itemA.id, { kind: 'agent', principalId: agent.id }, HUMAN);
+    structure.assignWorkItem(itemB.id, { kind: 'agent', principalId: agent.id }, HUMAN);
 
     let release!: () => void;
     stub.hold = new Promise<void>((resolve) => {
@@ -530,6 +681,172 @@ describe('WorkItem 权限与 execution 绑定', () => {
       release();
       stub.hold = null;
     }
+  });
+});
+
+describe('Claim 生命周期', () => {
+  it('Agent 不能 assign（Assignment 是协调动作，Agent 接活走 claim）', () => {
+    const agent = makeAgent('AssignAgent');
+    const item = structure.createWorkItem(team.id, { title: 'Coordination only' }, 'local-user');
+    assert.throws(
+      () =>
+        structure.assignWorkItem(
+          item.id,
+          { kind: 'agent', principalId: agent.id },
+          { kind: 'agent', principalId: agent.id },
+        ),
+      /Agent 不能 assign/,
+    );
+  });
+
+  it('同一 Member 旧 execution 终态后可重绑 claim；别 Member 与未结束的旧轮仍 409', async () => {
+    const { StubCopilot } = await import('./support.js');
+    const stub = new StubCopilot();
+    const stack = createTestStack(db, memberService, stub.asCopilot);
+    const agent = stack.team.createMember({ name: 'RebindAgent', role: 'E' });
+    const other = stack.team.createMember({ name: 'RebindOther', role: 'E' });
+    // 每个 execution 用独立房间：同一房间的重复唤醒会被 MemberTurnScheduler
+    // 合并，造不出「两条并行 execution」。
+    const room1 = stack.team.createConversation({ kind: 'direct', memberIds: [agent.id] });
+    const room2 = stack.team.createConversation({ kind: 'direct', memberIds: [agent.id] });
+    const room3 = stack.team.createConversation({ kind: 'direct', memberIds: [other.id] });
+    // 未指派：其他 Member 的 claim 冲突才走「已被其他 Member claim」分支。
+    const item = structure.createWorkItem(team.id, { title: 'Retry me' }, 'local-user');
+
+    let release!: () => void;
+    const holdTurn = () => {
+      stub.hold = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    };
+
+    try {
+      // 第一轮：E1 running（agent，room1），正常 claim。
+      holdTurn();
+      const sent = await stack.team.sendMessage({ conversationId: room1.id, content: '第一轮' });
+      const e1 = singleExecutionId(db, room1.id, sent.wakes);
+      await waitFor(() => stack.team.getExecution(e1).status === 'running', 'E1 running');
+      const claimed = structure.claimWorkItem(item.id, { memberId: agent.id, executionId: e1 });
+      assert.equal(claimed.claimedExecutionId, e1);
+
+      // E2 是 agent 在另一个房间的 execution（也 held 在 running）。
+      const sent2 = await stack.team.sendMessage({ conversationId: room2.id, content: '第二轮' });
+      const e2 = singleExecutionId(db, room2.id, sent2.wakes);
+      await waitFor(() => stack.team.getExecution(e2).status === 'running', 'E2 running');
+
+      // 旧 execution 还没结束：连自己也不能换绑到新的一轮。
+      assert.throws(
+        () => structure.claimWorkItem(item.id, { memberId: agent.id, executionId: e2 }),
+        /未结束/,
+      );
+      // 其他 Member 带自己的 execution 来 claim → 409。
+      const sent3 = await stack.team.sendMessage({ conversationId: room3.id, content: '别人的轮' });
+      const e3 = singleExecutionId(db, room3.id, sent3.wakes);
+      await waitFor(() => stack.team.getExecution(e3).status === 'running', 'E3 running');
+      assert.throws(
+        () => structure.claimWorkItem(item.id, { memberId: other.id, executionId: e3 }),
+        /其他 Member/,
+      );
+
+      // 全部放行 → E1 completed（终态）→ 新一轮 E4 可以重绑：
+      // claimed_execution_id 永远指向「正在驱动它的那一轮」。
+      release();
+      stub.hold = null;
+      await waitFor(() => stack.team.getExecution(e1).status === 'completed', 'E1 完成');
+
+      holdTurn();
+      const sent4 = await stack.team.sendMessage({ conversationId: room1.id, content: '第三轮' });
+      const e4 = singleExecutionId(db, room1.id, sent4.wakes);
+      await waitFor(() => stack.team.getExecution(e4).status === 'running', 'E4 running');
+      const rebound = structure.claimWorkItem(item.id, { memberId: agent.id, executionId: e4 });
+      assert.equal(rebound.claimedExecutionId, e4, 'claim 换到新一轮 execution');
+      assert.equal(rebound.claimedByMemberId, agent.id, '负责人不变');
+      assert.equal(stack.team.getExecution(e4).workItemId, item.id, '双向绑定同步');
+      release();
+      stub.hold = null;
+      await waitFor(() => stack.team.getExecution(e4).status === 'completed', 'E4 完成');
+
+      // E4 failed（retry 场景）→ E5 同样可以重绑。
+      db.prepare(`UPDATE execution SET status = 'failed', error = 'boom' WHERE id = ?`).run(e4);
+      holdTurn();
+      const sent5 = await stack.team.sendMessage({ conversationId: room1.id, content: '重试轮' });
+      const e5 = singleExecutionId(db, room1.id, sent5.wakes);
+      await waitFor(() => stack.team.getExecution(e5).status === 'running', 'E5 running');
+      const retried = structure.claimWorkItem(item.id, { memberId: agent.id, executionId: e5 });
+      assert.equal(retried.claimedExecutionId, e5, 'failed 后同 Member 重绑成功');
+    } finally {
+      stub.hold = null;
+      release();
+    }
+  });
+
+  it('execution cancelled 自动释放 claim；failed 保留给 retry', async () => {
+    const { StubCopilot } = await import('./support.js');
+    const stub = new StubCopilot();
+    const stack = createTestStack(db, memberService, stub.asCopilot);
+    const agent = stack.team.createMember({ name: 'ReleaseAgent', role: 'E' });
+    const room = stack.team.createConversation({ kind: 'direct', memberIds: [agent.id] });
+    const item = structure.createWorkItem(team.id, { title: 'Cancel releases' }, 'local-user');
+
+    const sent = await stack.team.sendMessage({
+      conversationId: room.id,
+      content: 'go',
+      targetMemberId: agent.id,
+    });
+    const e1 = singleExecutionId(db, room.id, sent.wakes);
+    await waitFor(() => stack.team.getExecution(e1).status === 'completed', 'E1 完成');
+    stub.reset();
+
+    // cancelled：把 execution 拨回 queued 模拟「排队中被取消」→
+    // cancelExecution 走落库分支，claim 必须同步释放。
+    db.prepare(`UPDATE execution SET status = 'queued' WHERE id = ?`).run(e1);
+    structure.claimWorkItem(item.id, { memberId: agent.id, executionId: e1 });
+    await stack.team.cancelExecution(e1);
+    assert.equal(stack.team.getExecution(e1).status, 'cancelled');
+    assert.equal(structure.getWorkItem(item.id).claimedByMemberId, null, '取消后锁释放');
+    assert.equal(structure.getWorkItem(item.id).claimedExecutionId, null);
+
+    // failed：锁保留 —— retry 是同一个 Member 接着干，不该被别人抢走。
+    db.prepare(`UPDATE execution SET status = 'queued' WHERE id = ?`).run(e1);
+    structure.claimWorkItem(item.id, { memberId: agent.id, executionId: e1 });
+    db.prepare(`UPDATE execution SET status = 'failed', error = 'boom' WHERE id = ?`).run(e1);
+    assert.equal(structure.getWorkItem(item.id).claimedByMemberId, agent.id, 'failed 不释放锁');
+  });
+
+  it('interrupted 自动释放 claim（恢复路径把 queued 标 interrupted 时）', async () => {
+    const { StubCopilot } = await import('./support.js');
+    const stub = new StubCopilot();
+    const stack = createTestStack(db, memberService, stub.asCopilot);
+    const agent = stack.team.createMember({ name: 'InterruptAgent', role: 'E' });
+    const room = stack.team.createConversation({ kind: 'direct', memberIds: [agent.id] });
+    const item = structure.createWorkItem(team.id, { title: 'Interrupt releases' }, 'local-user');
+
+    let release!: () => void;
+    stub.hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    try {
+      const sent = await stack.team.sendMessage({ conversationId: room.id, content: 'go' });
+      const e1 = singleExecutionId(db, room.id, sent.wakes);
+      structure.claimWorkItem(item.id, { memberId: agent.id, executionId: e1 });
+      release();
+      stub.hold = null;
+      await waitFor(() => stack.team.getExecution(e1).status === 'completed', 'E1 完成');
+
+      // 重放恢复场景：成员先归档（此时 E1 已完成，不挡归档），再把 execution
+      // 拨回 queued → resumeQueuedExecution 开跑前校验失败，标 interrupted。
+      stack.team.updateMember(agent.id, { status: 'archived' });
+      db.prepare(`UPDATE execution SET status = 'queued' WHERE id = ?`).run(e1);
+      await stack.team.resumeQueuedExecution(e1);
+      assert.equal(stack.team.getExecution(e1).status, 'interrupted');
+      assert.equal(structure.getWorkItem(item.id).claimedByMemberId, null, 'interrupted 后锁释放');
+    } finally {
+      if (stub.hold) {
+        release();
+        stub.hold = null;
+      }
+    }
+    stack.team.updateMember(agent.id, { status: 'active' });
   });
 });
 
@@ -586,7 +903,7 @@ describe('HTTP actor 边界', () => {
   it('Agent 经 /api/internal claim：无 token 401；带 token 成功并回写 execution', async () => {
     config.internalApiToken = 'internal-secret';
     const item = structure.createWorkItem(team.id, { title: 'Internal claim' }, 'local-user');
-    structure.assignWorkItem(item.id, { kind: 'agent', principalId: agent.id });
+    structure.assignWorkItem(item.id, { kind: 'agent', principalId: agent.id }, HUMAN);
 
     const noToken = await fetch(`${base}/api/internal/members/${agent.id}/work-item-claims`, {
       method: 'POST',
