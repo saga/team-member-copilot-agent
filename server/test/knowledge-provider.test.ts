@@ -130,6 +130,39 @@ describe('knowledge base 基本流', () => {
     assert.equal(personal[0].id, knowledge.findByKey('personal', `member-${member.id}`)?.id);
   });
 
+  it('binding 指向未 provision 的 team 资料源：对话不炸，空库补建且立即可写', async () => {
+    const member = makeMember('OoB', 'oob');
+    bindKnowledge(member.id, ['financial-core']);
+
+    // 模板开箱即引用 selector，资料目录可能还没有：解析必须照常工作，
+    // 而不是沿 resolver → turn 抛 404 把整个 Member 的对话废掉。
+    const sources = await knowledge.listSources(capabilityContext(member.id), binding('financial-core'));
+    assert.equal(sources.length, 1);
+    assert.equal(sources[0].scope, 'team');
+
+    const hits = await search(member.id, 'financial-core', 'anything');
+    assert.equal(hits.length, 0, '空库检索是空结果，不是错误');
+
+    // 补建的空库立刻可写：资料放进来即可检索，不需要重启或重新绑定。
+    const kb = knowledge.findByKey('team', 'financial-core');
+    assert.ok(kb, 'binding 解析时应补建 team KB 行');
+    knowledge.writeDocument({
+      knowledgeBaseId: kb.id,
+      title: 'Playbook',
+      relativePath: 'playbook.md',
+      content: 'financial core review playbook content',
+    });
+    const after = await search(member.id, 'financial-core', 'playbook');
+    assert.equal(after.length, 1);
+    assert.equal(after[0].title, 'Playbook');
+  });
+
+  it('未绑定的未知 selector 仍然 404，且不留下垃圾 KB 行', async () => {
+    const stranger = makeMember('Probe', 'probe');
+    await assert.rejects(() => search(stranger.id, 'ghost-kb', 'x'), { status: 404 });
+    assert.equal(knowledge.findByKey('team', 'ghost-kb'), null);
+  });
+
   it('重复 key 直接 400，不静默返回旧库', () => {
     knowledge.createTeamKnowledgeBase({ key: 'dup-key', name: 'first' });
     assert.throws(() => knowledge.createTeamKnowledgeBase({ key: 'dup-key', name: 'second' }), {

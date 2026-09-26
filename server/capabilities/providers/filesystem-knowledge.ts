@@ -366,12 +366,30 @@ export class LocalFilesystemKnowledgeProvider implements KnowledgeProvider {
       return kb;
     }
 
-    const kb = this.findByKey('team', selector);
-    if (!kb) {
-      throw notFound(`Knowledge source 不存在：${selector}`);
-    }
+    const kb = this.ensureBoundTeamKnowledgeBase(memberId, selector);
     this.assertMemberCanAccess(memberId, kb);
     return kb;
+  }
+
+  /**
+   * binding 指向的 team KB：不存在时补建，而不是 404。
+   *
+   * binding 先于资料存在 —— 模板开箱就引用 selector（如 financial-core），
+   * 资料目录可能还没人放。若在这里抛 404，会沿 resolver → turn 一路炸上去，
+   * 一个还没配置的资料源就废掉整个 Member 的对话；这和 personal KB 可以在
+   * 读路径上补是同一条逻辑，区别只是 team 的授权判据是 capability binding。
+   *
+   * 已存在的库走原 ACL 路径（未绑定 = 403，库的存在性本来就可见）；
+   * 只有**不存在**的库才看 binding：已授权 → 补建，未授权 → 404，
+   * 模型编造的 selector 或越权探测不会凭空留下 KB 行。
+   */
+  private ensureBoundTeamKnowledgeBase(memberId: string, selector: string): KnowledgeBase {
+    const existing = this.findByKey('team', selector);
+    if (existing) return existing;
+    if (!this.capabilities.hasKnowledgeBinding(memberId, this.id, selector)) {
+      throw notFound(`Knowledge source 不存在：${selector}`);
+    }
+    return this.createTeamKnowledgeBase({ key: selector, name: selector });
   }
 
   private assertMemberCanAccess(memberId: string, kb: KnowledgeBase): void {
