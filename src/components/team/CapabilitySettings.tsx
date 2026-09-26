@@ -539,6 +539,7 @@ export function CapabilitySettings({
   function renderScopeBody(target: Scope) {
     const catalog = catalogs[target];
     const draft = drafts[target];
+    const memberName = members.find((m) => m.id === memberId)?.name;
 
     return (
       <Space direction="vertical" style={{ width: '100%' }} size="middle">
@@ -548,22 +549,28 @@ export function CapabilitySettings({
           members.length === 0 ? (
             <Alert type="warning" showIcon message="还没有成员，先去 Team 页创建一个，再回来给他配能力。" />
           ) : (
-            <Select
-              style={{ width: '100%' }}
-              value={memberId ?? undefined}
-              placeholder="选择 Member"
-              showSearch
-              optionFilterProp="label"
-              options={members.map((member) => ({
-                value: member.id,
-                label: `${member.name} · @${member.handle} · ${member.role}`,
-              }))}
-              onChange={(next) =>
-                guardDirty(['member'], '切换 Member 后，这个 Member 上未保存的改动会丢失。', () =>
-                  setMemberId(next),
-                )
-              }
-            />
+            <div>
+              <div style={{ fontWeight: 600, marginBottom: 6 }}>选择要配置的成员</div>
+              <Select
+                style={{ width: '100%' }}
+                value={memberId ?? undefined}
+                placeholder="点这里选择成员"
+                showSearch
+                optionFilterProp="label"
+                options={members.map((member) => ({
+                  value: member.id,
+                  label: `${member.name} · @${member.handle} · ${member.role}`,
+                }))}
+                onChange={(next) =>
+                  guardDirty(['member'], '切换成员后，当前这位成员上未保存的改动会丢失。', () =>
+                    setMemberId(next),
+                  )
+                }
+              />
+              <div style={{ color: '#999', fontSize: 12, marginTop: 4 }}>
+                每位成员的额外能力各存各的，切换只换人，不影响已保存的配置。
+              </div>
+            </div>
           )
         ) : null}
 
@@ -572,7 +579,7 @@ export function CapabilitySettings({
             {renderInherited(target)}
             {target === 'member' && (
               <div>
-                <strong>Extra for this member</strong>
+                <strong>{memberName ? `${memberName} 的额外能力` : '额外能力'}</strong>
                 <div style={{ color: '#999', fontSize: 12 }}>
                   只给这位成员的额外能力。清空只是回到团队默认，不会让他什么都干不了。
                 </div>
@@ -685,7 +692,8 @@ export function CapabilitySettings({
               label: (
                 <Space size={6}>
                   <UserOutlined />
-                  This member
+                  按成员
+                  {memberId ? ` · @${members.find((m) => m.id === memberId)?.handle ?? ''}` : ''}
                   {dirty.has('member') ? <Badge status="warning" /> : null}
                 </Space>
               ),

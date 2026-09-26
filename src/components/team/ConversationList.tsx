@@ -1,4 +1,3 @@
-import { List, Tag } from 'antd';
 import type { Conversation } from '../../lib/api';
 import { isMemberDm } from './constants';
 
@@ -13,15 +12,15 @@ interface ConversationListProps {
 /**
  * 副标题。
  *
- * Member 之间的私聊和用户单聊共用 `kind = 'direct'`，只显示 kind 会让两者
- * 在列表里长得一模一样 —— 一个是「我跟 Alice 说话」，一个是「Alice 和 Bob
- * 在说话」，用户一眼要能分清。
+ * 分区头（Discussions / Work / Direct）已经说明了会话类型，行内不再重复一个
+ * 类型 Tag —— 同一个信息出现两次时，大的那个只会和标题抢视觉。唯一保留的
+ * 标记是「成员私聊」：direct 分区里既有「我跟 TA」也有「他们俩」，这个区别
+ * 分区头表达不了，而它决定用户能不能发言。
  */
-function conversationTag(conversation: Conversation) {
-  if (isMemberDm(conversation)) return <Tag color="purple">private</Tag>;
-  if (conversation.kind === 'group') return <Tag color="blue">discussion</Tag>;
-  if (conversation.kind === 'work') return <Tag color="gold">work</Tag>;
-  return <Tag>direct</Tag>;
+function rowMeta(conversation: Conversation) {
+  const names = conversation.members.map((m) => m.name).join(' · ');
+  const key = conversation.externalWorkRef?.key;
+  return key ? `${key} · ${names}` : names;
 }
 
 /**
@@ -52,30 +51,6 @@ export function ConversationList({ conversations, selectedId, onSelect, search }
     { title: 'Direct', items: visible.filter((c) => c.kind === 'direct') },
   ];
 
-  function renderRow(conversation: Conversation) {
-    return (
-      <List.Item
-        onClick={() => onSelect(conversation.id)}
-        style={{
-          cursor: 'pointer',
-          background: conversation.id === selectedId ? '#e6f4ff' : undefined,
-          borderRadius: 8,
-          padding: '8px 12px',
-        }}
-      >
-        <List.Item.Meta
-          title={conversation.title}
-          description={
-            <>
-              {conversationTag(conversation)}{' '}
-              {conversation.members.map((m) => m.name).join(' · ')}
-            </>
-          }
-        />
-      </List.Item>
-    );
-  }
-
   return (
     <div>
       {visible.length === 0 && (
@@ -86,11 +61,23 @@ export function ConversationList({ conversations, selectedId, onSelect, search }
       {groups.map(
         (group) =>
           group.items.length > 0 && (
-            <div key={group.title} style={{ marginBottom: 4 }}>
-              <div style={{ fontSize: 11, color: '#999', padding: '6px 4px 2px' }}>
-                {group.title}
-              </div>
-              <List size="small" dataSource={group.items} renderItem={renderRow} />
+            <div key={group.title} style={{ marginBottom: 8 }}>
+              <div className="conversation-group-title">{group.title}</div>
+              {group.items.map((conversation) => (
+                <div
+                  key={conversation.id}
+                  className={`conversation-item${conversation.id === selectedId ? ' selected' : ''}`}
+                  onClick={() => onSelect(conversation.id)}
+                >
+                  <div className="conversation-item-title">
+                    <span className="conversation-item-name">{conversation.title}</span>
+                    {isMemberDm(conversation) && (
+                      <span className="conversation-item-badge">成员私聊</span>
+                    )}
+                  </div>
+                  <div className="conversation-item-meta">{rowMeta(conversation)}</div>
+                </div>
+              ))}
             </div>
           ),
       )}

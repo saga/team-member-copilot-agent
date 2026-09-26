@@ -180,6 +180,70 @@ body {
   border-top: 1px solid #f0f0f0;
 }
 
+/* ── 会话列表 ──────────────────────────────────────────────────────── */
+
+/*
+ * 行内只有两级信息：标题（深色、加粗）和成员（浅灰、单行省略）。
+ * 成员名单行省略是刻意的 —— 列表是导航不是名片，三个成员的名字换行
+ * 三行会把列表变成灰字墙，全名去会话头看。
+ */
+.conversation-group-title {
+  font-size: 11px;
+  color: #999;
+  padding: 6px 10px 2px;
+}
+
+.conversation-item {
+  padding: 6px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  min-width: 0;
+}
+
+.conversation-item:hover {
+  background: #f5f5f5;
+}
+
+.conversation-item.selected {
+  background: #e6f4ff;
+}
+
+.conversation-item-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.conversation-item-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: rgba(0, 0, 0, 0.88);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 只在「成员之间的私聊」上出现：这是 Direct 分区里唯一需要额外解释的形态。 */
+.conversation-item-badge {
+  flex-shrink: 0;
+  font-size: 11px;
+  line-height: 18px;
+  padding: 0 6px;
+  border-radius: 4px;
+  color: #722ed1;
+  background: #f9f0ff;
+}
+
+.conversation-item-meta {
+  font-size: 12px;
+  color: #999;
+  margin-top: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /*
  * prefix 里的收件人 Select 和输入框文字要在同一行。
  * Sender 的 content 是 align-items: flex-end：textarea（32px）和小号

@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Button, Input, Space } from 'antd';
-import { PlusOutlined, ProjectOutlined } from '@ant-design/icons';
+import { PlusOutlined, ProjectOutlined, SearchOutlined } from '@ant-design/icons';
 import type { Conversation } from '../../lib/api';
 import { ConversationList } from '../team/ConversationList';
 
@@ -31,11 +31,13 @@ export function ConversationSidebar({
 
   return (
     <div style={{ padding: 8, display: 'flex', flexDirection: 'column', height: '100%' }}>
-      <div style={{ fontSize: 13, fontWeight: 600, padding: '4px 4px 8px' }}>Conversations</div>
-      <Input.Search
+      {/* 这一列装的全是会话，不再放「Conversations」总标题 ——
+          它和第一个分区头 Discussions 撞名，看着像上下级却说不清；分区头才承载类型信息。 */}
+      <Input
         allowClear
         size="small"
         placeholder="Search"
+        prefix={<SearchOutlined style={{ color: '#bbb' }} />}
         value={search}
         onChange={(e) => setSearch(e.target.value)}
         style={{ marginBottom: 4 }}
