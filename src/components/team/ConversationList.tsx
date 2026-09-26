@@ -12,7 +12,11 @@ interface ConversationListProps {
   showCreator: boolean;
   onToggleCreator: () => void;
   onCancelCreator: () => void;
-  onCreateGroup: (input: { title: string; memberIds: string[]; projectId?: string | null }) => Promise<void>;
+  onCreateGroup: (input: {
+    title: string;
+    memberIds: string[];
+    externalWorkRef?: { provider?: 'jira'; key: string } | null;
+  }) => Promise<void>;
 }
 
 /**

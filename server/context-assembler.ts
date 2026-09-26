@@ -84,8 +84,13 @@ export class ContextAssembler {
     wakeReason: WakeReason | null;
     /** 本次要处理的内容（direct = 用户那条消息；discussion 只是提示；delegation = 任务）。 */
     currentPrompt: string;
-    /** conversation 挂了 Jira 工单时才带的引用；工单元数据本身在 Jira。 */
-    work?: { issueKey: string } | null;
+    /**
+     * 这间房间挂了外部工作（Jira 工单）时才带的引用。
+     *
+     * 只有 provider / key / url 三样 —— 工单的标题、状态、负责人不在这里，
+     * 它们是外部系统的数据。要细节就调 jira_get_issue。
+     */
+    work?: { provider: string; key: string; url: string | null } | null;
   }): MemberContext {
     const rows = this.db
       .prepare(
@@ -147,15 +152,24 @@ export class ContextAssembler {
       turnMode: TurnMode;
       wakeReason: WakeReason | null;
       currentPrompt: string;
-      work?: { issueKey: string } | null;
+      work?: { provider: string; key: string; url: string | null } | null;
     },
   ): string {
     const sections: string[] = [];
 
-    // 最小工作上下文：只给工单引用。标题/状态/负责人是 Jira 的数据，不复制，
-    // Agent 要细节就调 jira_get_issue。
+    // 最小工作上下文：只给引用 + 深链。标题/状态/负责人是外部系统的数据，
+    // 不复制也不复述 —— Agent 要细节就调 jira_get_issue。
     if (input.work) {
-      sections.push(`Current Jira Issue: ${input.work.issueKey}`);
+      sections.push(
+        [
+          `Current work item: ${input.work.key} (${input.work.provider})`,
+          input.work.url ? `Link: ${input.work.url}` : '',
+          'Its title, status and assignee live in the external system, not here. ' +
+            'Use the jira_* tools if you need them.',
+        ]
+          .filter(Boolean)
+          .join('\n'),
+      );
     }
 
     if (input.turnMode === 'discussion') {

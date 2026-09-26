@@ -39,7 +39,8 @@ export function teamRouter(structure: TeamStructureService, teamEvents: TeamEven
   const router = Router();
 
   /**
-   * Team 级实时事件（WorkItem / Schedule / Presence / Project / Membership）。
+   * Team 级实时事件（Member Activity / Schedule / Presence / External Work /
+   * Membership）。
    *
    * 语义与 Conversation SSE 相同：事件先落 team_event 再广播，SSE 帧带
    * `id: <sequence>`，断线重连由浏览器自动带 Last-Event-ID 补发。当前部署

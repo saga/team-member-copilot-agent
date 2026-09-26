@@ -123,12 +123,21 @@ export const config = {
   schedulerIntervalMs: intEnv('SCHEDULER_INTERVAL_MS', 2000),
   /**
    * Jira 连接（Cloud：站点 URL + 邮箱 + API token，Basic auth）。
-   * 三项齐了才算配置；没配置就不注册 Jira 工具 —— Agent 的能力清单里
-   * 不该出现「调了必失败」的工单工具。
+   * 三项齐了才算配置；没配置就不注册 Jira 工具，控制面也走「无业务上下文」
+   * 路径 —— Agent 的能力清单里不该出现「调了必失败」的工单工具。
    */
   jira: {
     baseUrl: env('JIRA_BASE_URL', ''),
     email: env('JIRA_EMAIL', ''),
     apiToken: env('JIRA_API_TOKEN', ''),
+    /**
+     * Jira webhook 的共享密钥（在 Jira 的 webhook 配置里填 secret，Jira 会以
+     * `X-Jira-Webhook-Secret` 头带上）。
+     *
+     * 空 = 不做门禁（localhost 单用户原型），与 internalApiToken / adminApiToken
+     * 同一套约定。**但服务一旦不是只跑在本机就必须填**：这个端点会触发本地
+     * 广播，无门禁时任何能访问服务的人都能伪造「这条工单变了」。
+     */
+    webhookSecret: env('JIRA_WEBHOOK_SECRET', ''),
   },
 };

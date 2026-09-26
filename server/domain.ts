@@ -7,7 +7,13 @@
  *   MemberRuntime   = 某 Member 在某 Conversation 中的运行实例
  *   CopilotSession  = Runtime 的执行引擎状态（内部实现细节）
  *   Execution       = 一次实际工作
+ *
+ * 外部工作系统（Jira / …）不在这一层建模：本地没有 Project / WorkItem /
+ * JiraIssue 这些业务对象，只有 ExternalWorkRef 与 ExternalWorkSnapshot 两个
+ * **引用与取证**用的值对象（见 work-management/types.ts）。
  */
+
+import type { ExternalWorkRef, ExternalWorkSnapshot } from './work-management/types.js';
 
 export type MemberStatus = 'active' | 'archived';
 
@@ -149,6 +155,7 @@ export type TeamEventType =
   | 'member.activity.changed'
   | 'schedule.changed'
   | 'presence.changed'
+  | 'external_work.changed'
   | 'membership.changed';
 
 /**
@@ -170,8 +177,11 @@ export interface StoredTeamEvent {
 export interface Conversation {
   id: string;
   teamId: string;
-  /** 这间会话围绕哪张 Jira 工单。业务状态在 Jira，这里只是引用。 */
-  jiraIssueKey: string | null;
+  /**
+   * 这间会话围绕哪条外部工作。业务状态在 Jira，这里只是一个引用 ——
+   * 没有标题、没有状态、没有负责人。
+   */
+  externalWorkRef: ExternalWorkRef | null;
   title: string;
   kind: ConversationKind;
   defaultMemberId: string | null;
@@ -287,8 +297,19 @@ export interface ExecutionRecord {
   id: string;
   conversationId: string;
   memberId: string;
-  /** 开始时快照的 Jira 工单 key（取自 conversation），历史事实不随后续改动漂移。 */
-  jiraIssueKey: string | null;
+  /**
+   * 开始时快照的**引用**（取自 conversation），历史事实不随后续改动漂移。
+   * conversation 后来换了挂钩的工单，这条 execution 仍然知道当时在干哪条。
+   */
+  externalWorkRef: ExternalWorkRef | null;
+  /**
+   * 开跑那一刻向外部系统取证的结果。null = 没有挂业务 / 取证失败 / Provider 未配置。
+   *
+   * 取证是**尽力而为**的：外部系统抖一下不该让一整轮 Agent 工作失败。所以
+   * 「拿不到」和「没有」在这里都表现为 null —— 要区分就得看 execution.error
+   * 或日志，而不是把一次网络故障写进业务语义。
+   */
+  externalWorkSnapshot: ExternalWorkSnapshot | null;
   runtimeId: string | null;
   parentExecutionId: string | null;
   /** 从根到当前的 Member 链，用来防 A→B→C→A 和无限深链。 */
@@ -427,6 +448,14 @@ export type ConversationEventType =
    * pending / mute 这些变化都不伴随新消息。
    */
   | 'conversation_member_state.updated'
+  /**
+   * 外部工作系统（Jira）那边这条工单变了 —— webhook 推来的，不是本地产生的。
+   *
+   * 注意它**只说明「变了」，不携带变化后的值**：payload 里是引用 + 变了哪些
+   * 字段名。要值就问 Jira。这就是「最小投影」——把通知和事实分开，本地就不会
+   * 有一份会过期的工单状态。
+   */
+  | 'external_work.changed'
   | 'delegation.started'
   | 'delegation.finished';
 

@@ -3,15 +3,18 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import type { AddressInfo } from 'node:net';
+import type { Server } from 'node:http';
+import type { Request } from 'express';
+import type { TeamService } from '../team-service.js';
 
 /**
- * Team 业务模型 v1：Team / Membership / Project / WorkItem / Presence / Schedule。
+ * Team 业务模型 v1：Team / Membership / Presence / Schedule / Conversation。
  * 锁的是产品语义，不是字段数量：
- *   WorkItem ≠ Execution（completed 不自动 done）
- *   Assignment ≠ Claim（claim 原子，不先读再写）
  *   Team role ≠ Member.role
  *   Presence ≠ ConversationState（mute 不改 presence）
  *   Schedule 不补历史、不给 paused 执行
+ *   外部工作只有引用（ExternalWorkRef），没有本地工单对象
  */
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tmca-team-v1-'));
@@ -26,6 +29,13 @@ const { TeamStructureService } = await import('../team-structure-service.js');
 const { SchedulerService } = await import('../scheduler-service.js');
 const { TeamEventService } = await import('../team-event-service.js');
 const { createTestStack, muteAllMembers } = await import('./support.js');
+// config 必须在 process.env.DATA_DIR 设好之后再 import —— 静态 import 会被提升到
+// 模块体之前，那样 config.dataDir 会指向真实的 .data 而不是这个临时目录。
+const { config } = await import('../config.js');
+const { resolveActor } = await import('../middleware/teamScope.js');
+const { internalRouter } = await import('../routes/internal.js');
+const express = (await import('express')).default;
+const { once } = await import('node:events');
 
 after(() => {
   db.close();
@@ -528,21 +538,112 @@ describe('Team SSE', () => {
 
 });
 
-describe('Jira 引用：本地只有 key，业务事实在 Jira', () => {
-  it('conversation 的 jiraIssueKey 往返；不传为 null', async () => {
+// ------------------------------------------------------ Actor 身份边界
+
+describe('Actor 身份：只能由 internal 路由注入，不能靠请求头冒充', () => {
+  const originalToken = config.internalApiToken;
+
+  after(() => {
+    config.internalApiToken = originalToken;
+  });
+
+  it('X-Agent-Id 头不会让普通请求变成 Agent（头是调用方完全可控的）', () => {
+    // 这条断言守的是一个具体的洞：一旦 resolveActor 改信请求头，任何能访问
+    // 服务的人都能以任意 Member 的身份说话、claim、发消息 —— 而请求日志上
+    // 看不出任何异常。
+    const forged = { headers: { 'x-agent-id': 'm-forged' }, query: {} } as unknown as Request;
+    assert.deepEqual(
+      resolveActor(forged),
+      { kind: 'human', principalId: config.localActorId },
+      '请求头不能成为身份来源',
+    );
+  });
+
+  it('只有 /api/internal/members/:id 注入 agent 身份，普通 /api 路径没有注入点', async () => {
+    config.internalApiToken = '';
+    const fakeTeam = {
+      sendDirectMessage: async () => ({
+        conversation: { id: 'c1' },
+        peer: { id: 'm2' },
+        wakes: [],
+      }),
+    } as unknown as TeamService;
+
+    const app = express();
+    app.use(express.json());
+    app.use('/api/internal', internalRouter(fakeTeam));
+    // 探针挂在 internalRouter 之后：身份注入发生在 internalRouter 自己的
+    // `router.use('/members/:id')` 上，所以探针必须挂在同一棵 app 上、排在它后面
+    // 才看得到注入结果。
+    app.use('/api/internal', (req, res) => {
+      res.json({ actor: resolveActor(req) });
+    });
+    // 普通 /api 路径的探针 —— 这里没有任何东西注入身份。
+    app.use('/api', (req, res) => {
+      res.json({ actor: resolveActor(req) });
+    });
+
+    const server: Server = app.listen(0);
+    await once(server, 'listening');
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      const inside = await fetch(`${base}/api/internal/members/m-agent/__probe`);
+      assert.deepEqual(
+        await inside.json(),
+        { actor: { kind: 'agent', principalId: 'm-agent' } },
+        'internal 路径上 :id 就是「我代表谁」',
+      );
+
+      const outside = await fetch(`${base}/api/somewhere`, {
+        headers: { 'X-Agent-Id': 'm-agent' },
+      });
+      assert.deepEqual(
+        await outside.json(),
+        { actor: { kind: 'human', principalId: config.localActorId } },
+        '同样的头在普通路径上必须毫无效果',
+      );
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+});
+
+describe('外部工作：本地只有引用，业务事实在 Jira', () => {
+  it('conversation 的 externalWorkRef 往返；不传为 null', async () => {
     const { StubCopilot } = await import('./support.js');
     const stack = createTestStack(db, memberService, new StubCopilot().asCopilot);
     const someone = stack.team.createMember({ name: 'JiraHolder', role: 'E' });
     const other = stack.team.createMember({ name: 'JiraSecond', role: 'E' });
 
-    const conv = stack.team.createConversation({ kind: 'work', title: 'Policy Service', jiraIssueKey: ' ABC-123 ', memberIds: [someone.id] });
-    assert.equal(stack.team.getConversation(conv.id).jiraIssueKey, 'ABC-123', '前后空格要去掉');
+    const conv = stack.team.createConversation({
+      kind: 'work',
+      title: 'Policy Service',
+      externalWorkRef: { provider: 'jira', key: ' ABC-123 ' },
+      memberIds: [someone.id],
+    });
+    const ref = stack.team.getConversation(conv.id).externalWorkRef;
+    assert.equal(ref?.key, 'ABC-123', '前后空格要去掉');
+    assert.equal(ref?.provider, 'jira');
+    assert.equal(ref?.externalId, 'ABC-123', '没给不可变 id 时先用 key 占位');
 
     const plain = stack.team.createConversation({ kind: 'group', memberIds: [someone.id, other.id] });
-    assert.equal(stack.team.getConversation(plain.id).jiraIssueKey, null);
+    assert.equal(stack.team.getConversation(plain.id).externalWorkRef, null);
   });
 
-  it('execution 开始时快照 jiraIssueKey，delegation 继承', async () => {
+  it('空 key 的引用被当成「没有引用」，不会造出一条指向空工单的记录', async () => {
+    const { StubCopilot } = await import('./support.js');
+    const stack = createTestStack(db, memberService, new StubCopilot().asCopilot);
+    const someone = stack.team.createMember({ name: 'JiraBlank', role: 'E' });
+
+    const conv = stack.team.createConversation({
+      kind: 'work',
+      externalWorkRef: { provider: 'jira', key: '   ' },
+      memberIds: [someone.id],
+    });
+    assert.equal(stack.team.getConversation(conv.id).externalWorkRef, null);
+  });
+
+  it('execution 开始时快照 externalWorkRef，delegation 继承引用但不继承快照', async () => {
     const { StubCopilot, singleExecutionId } = await import('./support.js');
     const stub = new StubCopilot();
     const stack = createTestStack(db, memberService, stub.asCopilot);
@@ -550,16 +651,16 @@ describe('Jira 引用：本地只有 key，业务事实在 Jira', () => {
     const room = stack.team.createConversation({
       kind: 'work',
       title: 'ABC-128',
-      jiraIssueKey: 'ABC-128',
+      externalWorkRef: { provider: 'jira', key: 'ABC-128' },
       memberIds: [agent.id],
     });
 
     const sent = await stack.team.sendMessage({ conversationId: room.id, content: 'start work' });
-    assert.equal(
-      stack.team.getExecution(singleExecutionId(db, room.id, sent.wakes)).jiraIssueKey,
-      'ABC-128',
-      '快照取自 conversation',
-    );
+    const execution = stack.team.getExecution(singleExecutionId(db, room.id, sent.wakes));
+    assert.equal(execution.externalWorkRef?.key, 'ABC-128', '引用快照取自 conversation');
+    // 没配 Jira 连接（测试环境）时没有 Provider，取证拿不到东西 —— 必须是 null
+    // 而不是抛错：外部系统不可用不该让一整轮 Agent 工作失败。
+    assert.equal(execution.externalWorkSnapshot, null, '没有 Provider 时安静地没有快照');
   });
 
   it('Current Activity：跑着的是 active，跑完就消失', async () => {
@@ -570,7 +671,7 @@ describe('Jira 引用：本地只有 key，业务事实在 Jira', () => {
     const room = stack.team.createConversation({
       kind: 'work',
       title: 'ABC-130',
-      jiraIssueKey: 'ABC-130',
+      externalWorkRef: { provider: 'jira', key: 'ABC-130' },
       memberIds: [agent.id],
     });
     let release!: () => void;
@@ -582,8 +683,10 @@ describe('Jira 引用：本地只有 key，业务事实在 Jira', () => {
     const executionId = singleExecutionId(db, room.id, sent.wakes);
     await waitFor(() => stack.team.getExecution(executionId).status === 'running', 'execution 进入 running');
     assert.ok(
-      structure.listCurrentActivity(team.id).some((a) => a.executionId === executionId && a.jiraIssueKey === 'ABC-130'),
-      '运行中的 execution 必须出现在 Current Activity',
+      structure
+        .listCurrentActivity(team.id)
+        .some((a) => a.executionId === executionId && a.externalWorkRef?.key === 'ABC-130'),
+      '运行中的 execution 必须出现在 Current Activity，并带上外部工作引用',
     );
 
     release();
@@ -592,6 +695,70 @@ describe('Jira 引用：本地只有 key，业务事实在 Jira', () => {
       const rows = structure.listCurrentActivity(team.id);
       return !rows.some((a) => a.executionId === executionId);
     }, 'execution 完成后从 Current Activity 消失');
+  });
+
+  it('webhook 最小投影：只发「变了哪些字段」，不落工单内容', async () => {
+    const { StubCopilot } = await import('./support.js');
+    const stack = createTestStack(db, memberService, new StubCopilot().asCopilot);
+    const agent = stack.team.createMember({ name: 'WebhookProbe', role: 'E' });
+    const room = stack.team.createConversation({
+      kind: 'work',
+      title: 'ABC-500',
+      externalWorkRef: { provider: 'jira', key: 'ABC-500' },
+      memberIds: [agent.id],
+    });
+
+    const events: Array<{ type: string; data: unknown }> = [];
+    const unsubscribe = stack.team.replayAndSubscribe(room.id, 0, (event) => {
+      events.push({ type: event.type, data: event.data });
+    });
+
+    const result = stack.team.applyExternalWorkChange({
+      provider: 'jira',
+      key: 'ABC-500',
+      externalId: '100500',
+      changedFields: ['status'],
+    });
+    unsubscribe();
+    assert.deepEqual(result.conversations, [room.id], '按 key 命中挂在这条工单上的房间');
+
+    const change = events.find((e) => e.type === 'external_work.changed');
+    assert.ok(change, '必须发出一条 external_work.changed 事件');
+    const payload = change.data as { ref: { key: string }; changedFields: string[] };
+    assert.equal(payload.ref.key, 'ABC-500');
+    assert.deepEqual(payload.changedFields, ['status']);
+    // 这是最关键的一条：payload 里**不能**有工单内容。
+    // 一旦有，本地就有了第二份会过期的工单状态。
+    assert.deepEqual(
+      Object.keys(payload).sort(),
+      ['changedFields', 'receivedAt', 'ref'],
+      'payload 只说明「变了什么字段」，不携带变化后的值',
+    );
+  });
+
+  it('webhook 按不可变 id 也能命中：工单改名后房间记的还是老 key', async () => {
+    const { StubCopilot } = await import('./support.js');
+    const stack = createTestStack(db, memberService, new StubCopilot().asCopilot);
+    const agent = stack.team.createMember({ name: 'RenameProbe', role: 'E' });
+    const room = stack.team.createConversation({
+      kind: 'work',
+      title: 'old key',
+      externalWorkRef: { provider: 'jira', key: 'OLD-1', externalId: '100900' },
+      memberIds: [agent.id],
+    });
+
+    // 项目改名：Jira 侧 key 变成 NEW-1，但 issue id 不变。
+    const result = stack.team.applyExternalWorkChange({
+      provider: 'jira',
+      key: 'NEW-1',
+      externalId: '100900',
+      changedFields: ['summary'],
+    });
+    assert.deepEqual(
+      result.conversations,
+      [room.id],
+      '只按 key 匹配会漏掉这个房间 —— 必须同时按不可变 id 匹配',
+    );
   });
 });
 

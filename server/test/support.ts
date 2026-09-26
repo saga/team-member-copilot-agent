@@ -16,6 +16,7 @@ import { HostCodingToolProvider } from '../capabilities/providers/host-tools.js'
 import type { MemberService } from '../member-service.js';
 import { NO_REPLY_SENTINEL } from '../member-decision.js';
 import { TeamStructureService } from '../team-structure-service.js';
+import type { WorkManagementRegistry } from '../work-management/types.js';
 
 /**
  * 测试用的能力装配。
@@ -87,11 +88,26 @@ export function createTestStack(
   db: DatabaseSync,
   members: MemberService,
   copilot: CopilotService,
+  /**
+   * 外部工作系统适配层。默认不传 —— 绝大多数用例跑的是「这套部署没接外部
+   * 工作系统」的路径，那本身就是要保证的默认行为（引用退化成只有 key，
+   * 取证安静地拿不到东西，而不是抛错）。
+   */
+  workManagement?: WorkManagementRegistry,
 ): TestStack {
   let team!: TeamService;
   const stack = createCapabilityStack(db, members, () => team);
   const structure = new TeamStructureService(db);
-  team = new TeamService(db, members, copilot, stack.capabilities, stack.resolver, structure);
+  team = new TeamService(
+    db,
+    members,
+    copilot,
+    stack.capabilities,
+    stack.resolver,
+    structure,
+    undefined,
+    workManagement,
+  );
   return { ...stack, team, structure };
 }
 

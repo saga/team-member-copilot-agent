@@ -57,10 +57,10 @@ Member 的 binding 一行都不用改。**CopilotService 不认识任何具体 P
 | **Conversation** | 聊天/协作空间。`direct`（一个 Member）/ `group`（多个 Member）/ `work`（独立工作会话）。 |
 | **MemberRuntime** | 某 Member 在某 Conversation 中的运行实例。一个 runtime 拥有一个稳定的 Copilot Session 和一个独立 workspace。 |
 | **CopilotSession** | Runtime 的执行引擎状态。**内部实现细节，不是业务对象。** |
-| **Execution** | Agent 实际跑了一轮。记录 `parent_execution_id` / `delegation_path` / `jira_issue_key`（开始时从 conversation 快照），构成完整审计链。状态：`queued` / `running` / `waiting_for_member` / `completed` / `failed` / `cancelled` / `interrupted`。 |
+| **Execution** | Agent 实际跑了一轮。记录 `parent_execution_id` / `delegation_path` / `external_work_ref`（开始时从 conversation 快照）/ `external_work_snapshot`（开始时向外部系统取证），构成完整审计链。状态：`queued` / `running` / `waiting_for_member` / `completed` / `failed` / `cancelled` / `interrupted`。 |
 | **Team** | 顶层协作边界（单 Team 部署，`team_id` 为以后多 Team 留结构）。 |
 | **TeamMembership** | 谁属于 Team：`human`（`principalId=user id`，单机为 `LOCAL_ACTOR_ID`）/ `agent`（`principalId=member.id`），`role=owner/admin/member`。`Member.role` 是职业角色，两者绝不合并。 |
-| **Jira（外部事实源）** | 业务工作（工单、状态、负责人、工作流）以 Jira 为准，本地不复制。`Conversation` 挂 `jiraIssueKey`（nullable），`Current Work` = active execution → Jira key 的引用；Agent 通过 `atlassian.jira-tools` 读写工单。 |
+| **Jira（外部事实源）** | 业务工作（工单、状态、负责人、工作流）以 Jira 为准，**本地不复制**。本地只有两个值对象：`ExternalWorkRef`（provider/externalId/key/url，挂在 Conversation 与 Execution 上）和 `ExternalWorkSnapshot`（execution 开始时向 Jira 取证的最小字段）。没有 Project / WorkItem / JiraIssue 这些本地业务对象。`Current Work` = active execution → 外部引用。Agent 通过 `atlassian.jira-tools` 读写工单；控制面（取证、webhook 定位房间）走 `WorkManagementProvider` 直连，**不经过 LLM**。 |
 | **Presence** | Team 层可接工作状态：落库只有 `available/away/paused`，`busy/offline` 由 active execution / lastSeen 计算。`paused` 只拦自动唤醒，不拦 @ 点名。 |
 | **ScheduledWake** | `once` / `interval` 定时唤醒，必须绑定 `work` conversation，且被调度的 Member 必须在该 conversation 里；`UNIQUE(schedule_id, scheduled_for)` 幂等，周期不补历史。执行链固定为 `ScheduledWake → ScheduledWakeRun → Execution → executeMemberTurn`，**不经过 MemberTurnScheduler**（聊天 wake 与 schedule wake 不是同一种 wake，不能 coalesce）；run 的终态随 execution 收口（completed/failed），不停在 running 上没有下文。 |
 
@@ -618,7 +618,7 @@ npm run dev            # 同时启动 client(:5173) + server(:3001)
 | GET · PATCH | `/api/team/presence` | Presence 列表（须 Team 成员）/ 改 availability（本人改本人，Admin 改别人） |
 | GET · POST | `/api/team/schedules` | Schedule 列表 / 新建（owner/admin，只能绑 work 房间） |
 | PATCH · POST | `/api/team/schedules/:id` | 改状态 / pause/resume/cancel（owner/admin） |
-| POST | `/api/conversations` | 创建 Direct / Group / Work（可选 `jiraIssueKey`，业务状态在 Jira） |
+| POST | `/api/conversations` | 创建 Direct / Group / Work（可选 `externalWorkRef: { provider?, key, externalId? }`，业务状态在 Jira） |
 | GET | `/api/conversations/:id` | 单个 Conversation |
 | GET | `/api/conversations/:id/messages?limit=` | 最近 N 条消息（按 `messageSequence` 正序） |
 | POST | `/api/conversations/:id/messages` | 发送消息 → `202 { message, wakes, unresolvedMentions, deduplicated }`。可选 `clientRequestId`（幂等键）、`replyToMessageId`（必须属于本房间） |
@@ -639,6 +639,8 @@ npm run dev            # 同时启动 client(:5173) + server(:3001)
 | GET | `/api/executions/:id` | 单条 execution |
 | POST | `/api/executions/:id/retry` | `202 { executionId, execution }` —— 新建一条并指回原记录 |
 | POST | `/api/executions/:id/cancel` | 等引擎真的停下来才返回最终状态 |
+| GET | `/api/work-management/providers` | 已接入的外部工作系统（`{ providers: ['jira'] }`）—— 前端据此决定要不要显示工单字段 |
+| POST | `/api/work-management/jira/webhook` | Jira webhook → **最小投影**：按 key / 不可变 id 找到挂着这条工单的房间，发一条 `external_work.changed`（只说「变了哪些字段」）。不写工单内容、不轮询。见下 |
 
 ### API 边界：谁在调用
 
@@ -975,7 +977,8 @@ scripts/
 | `MAX_CONTEXT_MESSAGES` | `100` | 注入 prompt 的 shared message 条数上限（从最新往前取，至少 1 条） |
 | `MAX_CONTEXT_CHARS` | `60000` | 注入 prompt 的字符数上限（含每条 32 字符的固定开销），与条数上限同时生效 |
 | `HOST_CODING_TOOLS` | `false` | 是否允许 `bash` / `edit` / `grep` / `web_fetch`。**不随能力绑定打开** |
-| `JIRA_BASE_URL` / `JIRA_EMAIL` / `JIRA_API_TOKEN` | 空 | Jira Cloud 连接。三项齐了才注册 `atlassian.jira-tools`（jira_search / jira_get_issue / jira_add_comment / jira_transition_issue）；不配置则本地只有 Jira 引用、没有工单工具 |
+| `JIRA_BASE_URL` / `JIRA_EMAIL` / `JIRA_API_TOKEN` | 空 | Jira Cloud 连接。三项齐了才注册 `atlassian.jira-tools`（jira_search / jira_get_issue / jira_add_comment / jira_transition_issue）并让控制面能取证；不配置则本地只有引用、没有工单工具，execution 也不会有 `external_work_snapshot` |
+| `JIRA_WEBHOOK_SECRET` | 空 | Jira webhook 的共享密钥（`X-Jira-Webhook-Secret` 头）。空 = 端点无门禁（仅限本机单用户） |
 | `INTERNAL_API_TOKEN` | 空 | Internal API 门禁；空 = 不校验（仅限本机单用户） |
 | `ADMIN_API_TOKEN` | 空 | Admin 写入（capabilities / knowledge 管理 / skills 安装 / 建 Member / 归档）门禁；空 = 不校验（仅限本机单用户）。Team owner/admin 与 token 任一通过 |
 | `TEAM_NAME` | `AI Team` | 默认 Team 名，启动 ensure，不提供新建入口 |

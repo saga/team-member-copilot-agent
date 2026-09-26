@@ -26,6 +26,16 @@ import type { CapabilityResolver } from './capabilities/resolver.js';
 import type { CapabilityService } from './capabilities/service.js';
 import type { TeamStructureService } from './team-structure-service.js';
 import type { ResolvedKnowledgeBinding, RuntimeCapabilities } from './capabilities/types.js';
+import {
+  normalizeExternalWorkRef,
+  parseExternalWorkRef,
+  parseExternalWorkSnapshot,
+  serializeExternalWorkRef,
+  serializeExternalWorkSnapshot,
+  WorkManagementRegistry,
+  type ExternalWorkRef,
+  type ExternalWorkSnapshot,
+} from './work-management/types.js';
 import type {
   Conversation,
   ConversationEvent,
@@ -71,7 +81,7 @@ import type {
 interface ConversationRow {
   id: string;
   team_id: string;
-  jira_issue_key: string | null;
+  external_work_ref: string | null;
   title: string;
   kind: 'direct' | 'group' | 'work';
   default_member_id: string | null;
@@ -100,7 +110,8 @@ interface ExecutionRow {
   id: string;
   conversation_id: string;
   member_id: string;
-  jira_issue_key: string | null;
+  external_work_ref: string | null;
+  external_work_snapshot: string | null;
   runtime_id: string | null;
   parent_execution_id: string | null;
   delegation_path: string;
@@ -167,8 +178,14 @@ export interface CreateConversationInput {
   kind?: 'direct' | 'group' | 'work';
   memberIds: string[];
   defaultMemberId?: string;
-  /** 围绕哪张 Jira 工单。工单本体在 Jira，这里只存引用。 */
-  jiraIssueKey?: string | null;
+  /**
+   * 这间会话围绕哪条外部工作（Jira 工单）。
+   *
+   * 只收引用，不收工单内容 —— 传标题/状态进来会被静默丢掉，因为本地没有
+   * 存它们的地方。存在性也不在这里校验：那是网络调用，Jira 抖一下就不让人
+   * 开会话是错的。真正的校验与取证发生在 execution 开始时（控制面，不经 LLM）。
+   */
+  externalWorkRef?: { provider?: string | null; key: string; externalId?: string | null } | null;
 }
 
 /**
@@ -329,6 +346,14 @@ export class TeamService {
     private readonly structure?: TeamStructureService,
     /** Member Activity 的 Team 级广播口。结构服务不认识 execution，所以在这里发。 */
     private readonly onTeamActivity?: TeamChangeSink,
+    /**
+     * 外部工作系统适配层。
+     *
+     * 未配置（没有 Jira 连接）时整个模块缺席 —— 此时控制面走「无业务上下文」
+     * 路径：不取证、不校验存在性，也不假装有。它**不是**可选的功能开关，
+     * 而是「这套部署接没接外部工作系统」的事实。
+     */
+    private readonly workManagement?: WorkManagementRegistry,
   ) {
     this.contextAssembler = new ContextAssembler(db);
     this.states = new ConversationMemberService(db, (conversationId, change) => {
@@ -495,7 +520,7 @@ export class TeamService {
     // Team 归属：单 Team 部署取默认 Team；成员不在 Team 里则自动补 membership
     // （provisioning/旧库路径），已在但 inactive 的仍拒绝。
     let teamId = '';
-    const jiraIssueKey = input.jiraIssueKey?.trim() || null;
+    const externalWorkRef = this.resolveExternalWorkRef(input.externalWorkRef);
     try {
       const team = this.defaultTeam();
       teamId = team.id;
@@ -523,7 +548,7 @@ export class TeamService {
         INSERT INTO conversation (
           id,
           team_id,
-          jira_issue_key,
+          external_work_ref,
           title,
           kind,
           default_member_id,
@@ -536,7 +561,17 @@ export class TeamService {
         VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
         `,
       )
-      .run(id, teamId, jiraIssueKey, title, kind, defaultMemberId, config.localUserId, createdAt, createdAt);
+      .run(
+        id,
+        teamId,
+        serializeExternalWorkRef(externalWorkRef),
+        title,
+        kind,
+        defaultMemberId,
+        config.localUserId,
+        createdAt,
+        createdAt,
+      );
 
     const insertMember = this.db.prepare(
       `
@@ -929,6 +964,81 @@ export class TeamService {
     return this.states.list(conversationId);
   }
 
+  // ------------------------------------------------- 外部工作变更（最小投影）
+
+  /**
+   * 外部工作系统的变更通知 → **最小投影**。
+   *
+   * 它不写任何工单内容，只做两件事：
+   *
+   *   1. 找出本地哪些房间挂在这条引用上（key 或不可变 id 命中）
+   *   2. 给每个房间发一条 durable 事件：「这条外部工作变了，变的是哪些字段」
+   *
+   * ── 为什么 payload 里没有新值 ──────────────────────────────────────
+   *
+   * 通知和事实必须分开。payload 里放 status 的新值，本地就有了第二份状态，
+   * 而它只在 webhook 到达时才更新 —— 一次丢包、一次顺序颠倒、一次重放，
+   * 它就永久偏离 Jira。表现是「本地显示 Done，Jira 里其实是 In Review」，
+   * 这种 bug 最难查，因为两边看起来都对。
+   *
+   * 所以这里只说「变了什么字段」，UI 收到后自己去 Jira 读那一份真相。
+   *
+   * ── 为什么不做全量轮询 ──────────────────────────────────────────────
+   *
+   * 轮询整个 Jira 是拿「我们关心的很少」去换「每次都全量拉」，成本随租户
+   * 规模线性增长而收益恒定。webhook 只推我们挂着的那些引用，正好是反过来的。
+   */
+  applyExternalWorkChange(input: {
+    provider: string;
+    key: string;
+    externalId?: string | null;
+    changedFields: string[];
+  }): { conversations: string[] } {
+    const normalized = normalizeExternalWorkRef(input);
+    if (!normalized) return { conversations: [] };
+
+    // key 会随项目改名而变，不可变 id 不会。两个都试：改名之后 webhook 里带的是
+    // 新 key，而本地房间记的是老 key，只按 key 匹配会静默漏掉这批房间。
+    const rows = this.db
+      .prepare(
+        `
+        SELECT id, team_id
+        FROM conversation
+        WHERE json_extract(external_work_ref, '$.key') = ?
+           OR (
+             ? IS NOT NULL
+             AND json_extract(external_work_ref, '$.externalId') = ?
+           )
+        `,
+      )
+      .all(normalized.key, normalized.externalId, normalized.externalId) as unknown as Array<{
+      id: string;
+      team_id: string;
+    }>;
+
+    if (rows.length === 0) return { conversations: [] };
+
+    const payload = {
+      ref: this.resolveExternalWorkRef(normalized),
+      changedFields: input.changedFields,
+      receivedAt: now(),
+    };
+
+    // 先落库再广播（this.emit 内部就是这条纪律），断线重连能补发 ——
+    // 否则一次页面刷新就会永久错过「工单状态变了」这个通知。
+    for (const row of rows) {
+      this.emit(row.id, { type: 'external_work.changed', data: payload });
+    }
+
+    if (this.onTeamActivity) {
+      for (const teamId of new Set(rows.map((row) => row.team_id))) {
+        this.onTeamActivity(teamId, 'external_work.changed', payload);
+      }
+    }
+
+    return { conversations: rows.map((row) => row.id) };
+  }
+
   /** 静音 / 解除静音。静音的 Member 不会被 dispatcher 唤醒（@ 也唤不醒）。 */
   setMemberMuted(conversationId: string, memberId: string, muted: boolean): ConversationMemberState {
     const conversation = this.getConversation(conversationId);
@@ -960,7 +1070,8 @@ export class TeamService {
       id: randomUUID(),
       conversationId: conversation.id,
       memberId: member.id,
-      jiraIssueKey: conversation.jiraIssueKey,
+      externalWorkRef: conversation.externalWorkRef,
+      externalWorkSnapshot: null,
       runtimeId: null,
       parentExecutionId: null,
       delegationPath: [member.id],
@@ -1183,8 +1294,10 @@ export class TeamService {
       id: randomUUID(),
       conversationId: conversation.id,
       memberId: targetMember.id,
-      // delegation 继承父的 Jira 工单：同一项业务工作的审计链不断。
-      jiraIssueKey: parent.jiraIssueKey,
+      // delegation 继承父的外部工作引用：同一项业务工作的审计链不断。
+      // 快照**不继承** —— 它是「这一轮开跑时取证的结果」，子轮次会自己取证一次。
+      externalWorkRef: parent.externalWorkRef,
+      externalWorkSnapshot: null,
       runtimeId: null,
       parentExecutionId: parent.id,
       delegationPath: [...parent.delegationPath, targetMember.id],
@@ -1449,7 +1562,8 @@ export class TeamService {
       id: randomUUID(),
       conversationId: original.conversationId,
       memberId: original.memberId,
-      jiraIssueKey: original.jiraIssueKey,
+      externalWorkRef: original.externalWorkRef,
+      externalWorkSnapshot: null,
       runtimeId: null,
       parentExecutionId: original.parentExecutionId,
       delegationPath: [...original.delegationPath],
@@ -1579,7 +1693,8 @@ export class TeamService {
       id: randomUUID(),
       conversationId: conversation.id,
       memberId: member.id,
-      jiraIssueKey: conversation.jiraIssueKey,
+      externalWorkRef: conversation.externalWorkRef,
+      externalWorkSnapshot: null,
       runtimeId: null,
       parentExecutionId: null,
       delegationPath: [member.id],
@@ -1897,6 +2012,15 @@ export class TeamService {
       throw new ExecutionCancelledError();
     }
 
+    // 控制面取证：向外部系统确认「这条引用现在是什么」，记在 execution 上。
+    //
+    // 走 Provider 直连，**不经过 LLM** —— 取证必须确定、可复现，不能取决于
+    // 模型愿不愿意调工具。失败不阻断这一轮（见 captureWorkSnapshot）。
+    const workSnapshot = await this.captureWorkSnapshot(input.execution.externalWorkRef);
+    if (workSnapshot) {
+      this.updateExecution(executionId, { externalWorkSnapshot: workSnapshot });
+    }
+
     // 只注入「自该 runtime 上次成功 turn 以来新增的 shared messages」。
     // Copilot session 自己已经记着这个 Member 的历史，整段重放会重复。
     const context = this.contextAssembler.assemble({
@@ -1907,7 +2031,9 @@ export class TeamService {
       triggerMessageSequence: input.triggerMessageSequence,
       wakeReason: input.wakeReason,
       currentPrompt: input.prompt,
-      work: this.workContextFor(input.execution.jiraIssueKey),
+      // 优先用取证返回的规范引用：工单被改过 key 时，告诉 Agent 的是**现在**的
+      // key，而不是建会话那天记下的那个。
+      work: this.workContextFor(workSnapshot?.ref ?? input.execution.externalWorkRef),
     });
 
     // 被取消时把已产出的半截内容留在 execution.response 里，便于 UI 展示与排查。
@@ -2067,11 +2193,82 @@ export class TeamService {
   }
 
   /**
-   * 最小工作上下文：本地只有工单引用（key），标题/状态/负责人是 Jira 的数据，
-   * 不复制。Agent 需要细节时用 jira_get_issue 自己查。
+   * 最小工作上下文：本地只有引用（provider + key + 深链）。
+   *
+   * 标题/状态/负责人是外部系统的数据，不复制 —— 需要细节时 Agent 自己调
+   * jira_get_issue。给 url 是为了让 Agent（和读日志的人）能直接跳到工单，
+   * 这不是业务事实，只是一个地址。
    */
-  private workContextFor(jiraIssueKey: string | null): { issueKey: string } | null {
-    return jiraIssueKey ? { issueKey: jiraIssueKey } : null;
+  private workContextFor(
+    ref: ExternalWorkRef | null,
+  ): { provider: string; key: string; url: string | null } | null {
+    return ref ? { provider: ref.provider, key: ref.key, url: ref.url } : null;
+  }
+
+  /**
+   * 把调用方给的引用规范成完整的 ExternalWorkRef。
+   *
+   * 有 Provider 时由它补 url、规范 externalId —— 只有它知道站点地址和自己的
+   * id 规则。没有 Provider 时退化成一个只有 provider/key 的引用，**不抛错**：
+   * 「接了 Jira 但没配连接」和「压根没接 Jira」不该产生两种数据形状，否则
+   * 一个配置疏漏会表现成「引用丢失」。
+   */
+  private resolveExternalWorkRef(
+    input: { provider?: string | null; key: string; externalId?: string | null } | null | undefined,
+  ): ExternalWorkRef | null {
+    const normalized = normalizeExternalWorkRef(input);
+    if (!normalized) return null;
+    if (this.workManagement?.has(normalized.provider)) {
+      return this.workManagement
+        .byId(normalized.provider)
+        .ref({ key: normalized.key, externalId: normalized.externalId });
+    }
+    return {
+      provider: normalized.provider,
+      externalId: normalized.externalId ?? normalized.key,
+      key: normalized.key,
+      url: null,
+    };
+  }
+
+  /**
+   * 开跑时向外部系统取证：这条引用现在是什么。
+   *
+   * ── 为什么是「尽力而为」而不是「失败就废掉这一轮」 ──────────────────
+   *
+   * 取证失败的原因里，只有极少数（工单被删）意味着这一轮不该跑；绝大多数是
+   * 网络抖动、token 过期、Jira 发版。为后者把一整轮 Agent 工作判死，是把
+   * 外部系统的可用性变成自己平台的可用性。
+   *
+   * 所以这里只做两件事：成功就记下当时的样子；失败就返回 null 并留一行日志。
+   * 「拿不到」和「没有」在数据上都是 null —— 要区分看日志，不要把它编码进
+   * 业务语义里（那会让「网络抖了一下」变成一条永久的历史记录）。
+   *
+   * 也刻意**不校验「这条引用还必须存在」**：引用存在性不是跑一轮的前提，
+   * 它是这一轮要做的事之一（工单没了，Agent 该告诉人，而不是静默不跑）。
+   */
+  private async captureWorkSnapshot(
+    ref: ExternalWorkRef | null,
+  ): Promise<ExternalWorkSnapshot | null> {
+    if (!ref || !this.workManagement?.has(ref.provider)) return null;
+    try {
+      const summary = await this.workManagement.for(ref).get(ref);
+      return {
+        ref: summary.ref,
+        title: summary.title,
+        status: summary.status,
+        assignee: summary.assignee,
+        capturedAt: now(),
+      };
+    } catch (error) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[team] 外部工作取证失败 ${ref.provider}:${ref.key} —— ` +
+          `这一轮照跑，只是没有业务上下文快照：`,
+        error instanceof Error ? error.message : error,
+      );
+      return null;
+    }
   }
 
   /**
@@ -2608,7 +2805,7 @@ export class TeamService {
     return {
       id: row.id,
       teamId: row.team_id,
-      jiraIssueKey: row.jira_issue_key,
+      externalWorkRef: parseExternalWorkRef(row.external_work_ref),
       title: row.title,
       kind: row.kind,
       defaultMemberId: row.default_member_id,
@@ -2642,7 +2839,8 @@ export class TeamService {
           id,
           conversation_id,
           member_id,
-          jira_issue_key,
+          external_work_ref,
+          external_work_snapshot,
           runtime_id,
           parent_execution_id,
           delegation_path,
@@ -2661,14 +2859,15 @@ export class TeamService {
           ended_at,
           created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `,
       )
       .run(
         execution.id,
         execution.conversationId,
         execution.memberId,
-        execution.jiraIssueKey,
+        serializeExternalWorkRef(execution.externalWorkRef),
+        serializeExternalWorkSnapshot(execution.externalWorkSnapshot),
         execution.runtimeId,
         execution.parentExecutionId,
         JSON.stringify(execution.delegationPath),
@@ -2711,6 +2910,7 @@ export class TeamService {
       waitingForRuntimeId: string | null;
       decision: ExecutionDecision | null;
       configSnapshot: ExecutionConfigSnapshot | null;
+      externalWorkSnapshot: ExternalWorkSnapshot | null;
       startedAt: string | null;
       endedAt: string | null;
     }>,
@@ -2728,6 +2928,7 @@ export class TeamService {
           waiting_for_runtime_id = ?,
           decision = ?,
           config_snapshot = ?,
+          external_work_snapshot = ?,
           started_at = ?,
           ended_at = ?
         WHERE id = ?
@@ -2749,6 +2950,11 @@ export class TeamService {
           : current.configSnapshot
             ? JSON.stringify(current.configSnapshot)
             : null,
+        // 取证是一次性的：写了就不再被覆盖（patch 显式传 null 才能清掉）。
+        // 没有这条纪律的话，一轮 turn 里任何一次 updateExecution 都可能把它抹掉。
+        patch.externalWorkSnapshot !== undefined
+          ? serializeExternalWorkSnapshot(patch.externalWorkSnapshot)
+          : serializeExternalWorkSnapshot(current.externalWorkSnapshot),
         patch.startedAt !== undefined ? patch.startedAt : current.startedAt,
         patch.endedAt !== undefined ? patch.endedAt : current.endedAt,
         id,
@@ -2768,7 +2974,7 @@ export class TeamService {
       executionId: execution.id,
       conversationId: execution.conversationId,
       memberId: execution.memberId,
-      jiraIssueKey: execution.jiraIssueKey,
+      externalWorkRef: execution.externalWorkRef,
       kind: execution.kind,
       status: execution.status,
     });
@@ -3023,7 +3229,8 @@ function mapExecution(row: ExecutionRow): ExecutionRecord {
     id: row.id,
     conversationId: row.conversation_id,
     memberId: row.member_id,
-    jiraIssueKey: row.jira_issue_key,
+    externalWorkRef: parseExternalWorkRef(row.external_work_ref),
+    externalWorkSnapshot: parseExternalWorkSnapshot(row.external_work_snapshot),
     runtimeId: row.runtime_id,
     parentExecutionId: row.parent_execution_id,
     delegationPath: JSON.parse(row.delegation_path) as string[],

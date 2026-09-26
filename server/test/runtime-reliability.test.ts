@@ -301,7 +301,7 @@ describe('schema 就位（PRAGMA user_version）', () => {
           conversation: [
             'id',
             'team_id',
-            'jira_issue_key',
+            'external_work_ref',
             'title',
             'kind',
             'default_member_id',
@@ -360,7 +360,8 @@ describe('schema 就位（PRAGMA user_version）', () => {
             'id',
             'conversation_id',
             'member_id',
-            'jira_issue_key',
+            'external_work_ref',
+            'external_work_snapshot',
             'runtime_id',
             'parent_execution_id',
             'delegation_path',
@@ -419,10 +420,11 @@ describe('schema 就位（PRAGMA user_version）', () => {
       ).map((row) => row.name);
       assert.deepEqual(indexes, [
         'idx_conversation_event_replay',
+        'idx_conversation_external_work_key',
         'idx_conversation_member_state_wake',
         'idx_conversation_team',
         'idx_execution_conversation_created',
-        'idx_execution_jira_issue',
+        'idx_execution_external_work_key',
         'idx_execution_parent',
         'idx_execution_status',
         'idx_knowledge_document_kb',

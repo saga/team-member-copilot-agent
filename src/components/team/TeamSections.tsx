@@ -41,7 +41,9 @@ export function CurrentWorkSection() {
             <List.Item>
               <div style={{ minWidth: 0, flex: 1 }}>
                 <div style={{ fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {item.jiraIssueKey ? <Tag color="blue">{item.jiraIssueKey}</Tag> : null}
+                  {item.externalWorkRef ? (
+                    <Tag color="blue">{item.externalWorkRef.key}</Tag>
+                  ) : null}
                   <span>{item.memberName}</span>
                 </div>
                 <div style={{ fontSize: 12, color: 'var(--ant-color-text-tertiary, #999)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>

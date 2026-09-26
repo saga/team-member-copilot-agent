@@ -17,6 +17,8 @@ import { KnowledgeToolProvider } from './capabilities/providers/knowledge-tools.
 import { HostCodingToolProvider } from './capabilities/providers/host-tools.js';
 import { JiraToolProvider } from './capabilities/providers/jira-tools.js';
 import { JiraClient } from './jira/client.js';
+import { JiraProvider } from './work-management/jira-provider.js';
+import { WorkManagementRegistry } from './work-management/types.js';
 import { DefaultToolPolicy } from './tool-policy.js';
 import { DenyHighRiskPolicyService } from './policy.js';
 import { TeamStructureService } from './team-structure-service.js';
@@ -30,6 +32,7 @@ import { internalRouter } from './routes/internal.js';
 import { conversationsRouter } from './routes/conversations.js';
 import { executionsRouter } from './routes/executions.js';
 import { teamRouter } from './routes/team.js';
+import { workManagementRouter, describeWebhookBoundary } from './routes/work-management.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { initTeamScope } from './middleware/teamScope.js';
 
@@ -87,19 +90,29 @@ registry.registerToolProvider(
 registry.registerToolProvider(new KnowledgeToolProvider());
 registry.registerToolProvider(new HostCodingToolProvider());
 
-// Jira 连接三项齐了才注册：Agent 的能力清单里不该出现「调了必失败」的工单工具。
-const jiraConfigured =
-  config.jira.baseUrl && config.jira.email && config.jira.apiToken;
+// 外部工作系统适配层。Jira 连接三项齐了才注册 —— 没有连接就没有 Provider，
+// 控制面因此走「无业务上下文」路径（不取证、不校验），而不是拿着一个调不通的
+// 客户端去假装有业务上下文。
+//
+// 注意装配顺序：同一个 Provider 实例**同时**给两处用 ——
+//   - 工具层（Agent 自己决定要不要评论/流转）
+//   - 控制面（TeamService 在 execution 开始时取证、webhook 定位房间）
+// 一个实现、两种调用方。控制面的动作永远不经过 LLM，但它们和 Agent 用的是
+// 同一份业务语义，这是刻意的：否则「Agent 看到的工单」和「平台看到的工单」
+// 会漂移成两套。
+const workManagement = new WorkManagementRegistry();
+const jiraConfigured = config.jira.baseUrl && config.jira.email && config.jira.apiToken;
 if (jiraConfigured) {
-  registry.registerToolProvider(
-    new JiraToolProvider(
-      new JiraClient({
-        baseUrl: config.jira.baseUrl,
-        email: config.jira.email,
-        apiToken: config.jira.apiToken,
-      }),
-    ),
+  const jiraProvider = new JiraProvider(
+    new JiraClient({
+      baseUrl: config.jira.baseUrl,
+      email: config.jira.email,
+      apiToken: config.jira.apiToken,
+    }),
+    config.jira.baseUrl,
   );
+  workManagement.register(jiraProvider);
+  registry.registerToolProvider(new JiraToolProvider(jiraProvider));
 }
 
 const capabilityResolver = new CapabilityResolver(registry);
@@ -120,6 +133,7 @@ teamService = new TeamService(
   structureService,
   // Member Activity：业务工作在 Jira，本地广播「谁在跑哪张工单的这一轮」。
   (teamId, type, payload) => teamEvents.append(teamId, type, payload),
+  workManagement,
 );
 
 schedulerService = new SchedulerService(structureService, () => teamService);
@@ -142,6 +156,7 @@ app.use('/api/members', membersRouter(teamService));
 app.use('/api/capabilities', capabilitiesRouter(teamService, registry));
 app.use('/api/knowledge', knowledgeRouter(localKnowledgeProvider));
 app.use('/api/team', teamRouter(structureService, teamEvents));
+app.use('/api/work-management', workManagementRouter(teamService, workManagement));
 app.use('/api/conversations', conversationsRouter(teamService));
 app.use('/api/executions', executionsRouter(teamService));
 // 以某个 Member 的身份说话 —— 独立的命名空间 + token 门禁，见 middleware/apiScope.ts
@@ -179,6 +194,8 @@ export {
   structureService,
   schedulerService,
   teamEvents,
+  workManagement,
+  describeWebhookBoundary,
 };
 
 export { initTeamScope };

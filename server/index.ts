@@ -11,6 +11,8 @@ import {
   teamService,
   structureService,
   schedulerService,
+  workManagement,
+  describeWebhookBoundary,
   initTeamScope,
 } from './app.js';
 import { config } from './config.js';
@@ -144,6 +146,14 @@ async function bootstrap(): Promise<void> {
     // 边界只在日志里说出来才存在：没配 token 时得让人知道这个服务只该待在本机。
     // eslint-disable-next-line no-console
     console.log(`[server] ${describeApiBoundary()}`);
+    // 外部工作系统的接入状态也要说出来：没接 Provider 时「工单引用」会静默
+    // 退化成「只有 key 的引用」，而这件事从数据上看不出来。
+    // eslint-disable-next-line no-console
+    console.log(
+      `[server] work management: ${workManagement.size ? 'jira' : '未配置（无外部工作上下文）'}`,
+    );
+    // eslint-disable-next-line no-console
+    console.log(`[server] ${describeWebhookBoundary()}`);
     if (config.warmup) {
       void copilotService.warmup().then((result) => {
         if (result.ok) {

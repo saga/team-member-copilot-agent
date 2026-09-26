@@ -15,6 +15,7 @@ import type {
   TeamPresence,
   TeamRole,
 } from './domain.js';
+import { parseExternalWorkRef, type ExternalWorkRef } from './work-management/types.js';
 
 /**
  * Team 业务对象：Team / Membership / Presence / Schedule。
@@ -243,9 +244,11 @@ export class TeamStructureService {
   }
 
   /**
-   * Member 正在干什么 = active execution；挂了 Jira 工单的带上引用。
+   * Member 正在干什么 = active execution；挂了外部工作的带上引用。
    * 没有独立的 activity 表：execution 本身就是「此刻在跑什么」的记录，
    * 再建一张就是在第二个地方记同一件事。
+   *
+   * 返回的是**引用**而不是工单内容：要看标题/状态，拿 ref 去问 Jira。
    */
   listCurrentActivity(
     teamId: string,
@@ -255,7 +258,7 @@ export class TeamStructureService {
     conversationTitle: string;
     memberId: string;
     memberName: string;
-    jiraIssueKey: string | null;
+    externalWorkRef: ExternalWorkRef | null;
     kind: string;
     status: string;
     startedAt: string | null;
@@ -264,7 +267,7 @@ export class TeamStructureService {
     const rows = this.db
       .prepare(
         `
-        SELECT e.id AS execution_id, e.conversation_id, e.member_id, e.jira_issue_key,
+        SELECT e.id AS execution_id, e.conversation_id, e.member_id, e.external_work_ref,
                e.kind, e.status, e.started_at,
                c.title AS conversation_title, m.name AS member_name
         FROM execution e
@@ -279,7 +282,7 @@ export class TeamStructureService {
         execution_id: string;
         conversation_id: string;
         member_id: string;
-        jira_issue_key: string | null;
+        external_work_ref: string | null;
         kind: string;
         status: string;
         started_at: string | null;
@@ -292,7 +295,7 @@ export class TeamStructureService {
       conversationTitle: row.conversation_title,
       memberId: row.member_id,
       memberName: row.member_name,
-      jiraIssueKey: row.jira_issue_key,
+      externalWorkRef: parseExternalWorkRef(row.external_work_ref),
       kind: row.kind,
       status: row.status,
       startedAt: row.started_at,

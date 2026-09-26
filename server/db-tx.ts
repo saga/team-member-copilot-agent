@@ -4,7 +4,8 @@ import type { DatabaseSync } from 'node:sqlite';
  * 跨 service 的共享事务深度追踪。
  *
  * 为什么不用各 service 自己的 boolean 标志：一次业务动作经常横跨两个 service
- * （例如 claim 要同时写 work_item、execution 和事件表），如果两个 service 各自
+ * （例如「一条消息唤醒多个 Member」要同时写 conversation_message、
+ * conversation_member_state 和事件表），如果两个 service 各自
  * `BEGIN`，嵌套调用就会撞上 SQLite 的「cannot start a transaction within a
  * transaction」。深度追踪让嵌套调用变成普通函数调用，COMMIT 只由最外层负责。
  *

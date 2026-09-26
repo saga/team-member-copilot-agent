@@ -75,8 +75,15 @@ export class CapabilityResolver {
     };
 
     const tools: RuntimeTool[] = [];
+    // RuntimeTool 上只有 providerId，没有 Provider 的 version —— 而 manifest 要
+    // 回答「这一轮跑的是哪一版实现」，所以边解析边把版本记下来。
+    //
+    // 三层都要有：只记 skill 的版本，会让「换掉 tool provider 的实现（声明不变）」
+    // 在审计链上完全看不出来 —— 而那恰恰是「同一份 prompt 两次行为不同」的常见成因。
+    const toolProviderVersions = new Map<string, string>();
     for (const binding of capabilities.tools) {
       const provider = this.registry.toolProvider(binding.providerId);
+      toolProviderVersions.set(provider.id, provider.version);
       tools.push(...(await provider.resolve(toolContext, binding)));
     }
 
@@ -88,7 +95,13 @@ export class CapabilityResolver {
       knowledge,
       tools: dedupedTools,
       toolIndex: new Map(dedupedTools.map((tool) => [tool.name, tool])),
-      manifestHash: manifestHashOf(capabilities, dedupedSkills, knowledge, dedupedTools),
+      manifestHash: manifestHashOf(
+        capabilities,
+        dedupedSkills,
+        knowledge,
+        dedupedTools,
+        toolProviderVersions,
+      ),
     };
   }
 }
@@ -146,6 +159,7 @@ function manifestHashOf(
   skills: ResolvedSkill[],
   knowledge: ResolvedKnowledgeBinding[],
   tools: RuntimeTool[],
+  toolProviderVersions: Map<string, string>,
 ): string {
   const payload = {
     bindings: {
@@ -177,6 +191,9 @@ function manifestHashOf(
       .sort(byKey((tool) => `${tool.providerId}\u0000${tool.name}`))
       .map((tool) => ({
         providerId: tool.providerId,
+        // 与 skills / knowledge 同一纪律：Provider 的实现版本必须进 manifest，
+        // 否则「换了实现、声明没变」这一轮和上一轮在审计上无法区分。
+        providerVersion: toolProviderVersions.get(tool.providerId) ?? '',
         implementation: tool.implementation,
         name: tool.name,
         kind: tool.kind,

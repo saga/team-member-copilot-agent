@@ -56,7 +56,9 @@ export function ConversationHeader({
           <Tag color={conversation.kind === 'group' ? 'blue' : conversation.kind === 'work' ? 'gold' : 'default'}>
             {conversation.kind}
           </Tag>
-          {conversation.jiraIssueKey && <Tag color="cyan">Jira: {conversation.jiraIssueKey}</Tag>}
+          {conversation.externalWorkRef && (
+            <Tag color="cyan">Jira: {conversation.externalWorkRef.key}</Tag>
+          )}
         </Space>
 
         <div style={{ marginTop: 8, display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>

@@ -83,13 +83,27 @@ export interface TeamMembership {
   updatedAt: string;
 }
 
+/**
+ * 对一条外部工作（Jira 工单）的引用。**只有引用，没有工单内容** ——
+ * 标题/状态/负责人在 Jira，本地不复制。
+ */
+export interface ExternalWorkRef {
+  provider: 'jira';
+  /** Provider 侧的不可变 id（Jira：issue id）。 */
+  externalId: string;
+  /** 人读的 key（Jira：ABC-123）。会随项目改名而变。 */
+  key: string;
+  /** 深链。null = 还没问过 Provider。 */
+  url: string | null;
+}
+
 export interface CurrentActivity {
   executionId: string;
   conversationId: string;
   conversationTitle: string;
   memberId: string;
   memberName: string;
-  jiraIssueKey: string | null;
+  externalWorkRef: ExternalWorkRef | null;
   kind: string;
   status: string;
   startedAt: string | null;
@@ -108,6 +122,7 @@ export type TeamEventType =
   | 'member.activity.changed'
   | 'schedule.changed'
   | 'presence.changed'
+  | 'external_work.changed'
   | 'membership.changed';
 
 /**
@@ -128,8 +143,6 @@ export interface ScheduledWake {
   teamId: string;
   memberId: string;
   conversationId: string;
-  projectId: string | null;
-  workItemId: string | null;
   prompt: string;
   type: 'once' | 'interval';
   runAt: string;
@@ -146,8 +159,8 @@ export interface ScheduledWake {
 export interface Conversation {
   id: string;
   teamId: string;
-  /** 这间会话围绕哪张 Jira 工单。业务状态在 Jira，这里只是引用。 */
-  jiraIssueKey: string | null;
+  /** 这间会话围绕哪条外部工作（Jira 工单）。业务状态在 Jira，这里只是引用。 */
+  externalWorkRef: ExternalWorkRef | null;
   title: string;
   kind: 'direct' | 'group' | 'work';
   defaultMemberId: string | null;
@@ -226,7 +239,16 @@ export interface ExecutionRecord {
   id: string;
   conversationId: string;
   memberId: string;
-  workItemId: string | null;
+  /** 开始时快照的引用（取自 conversation），历史事实不随后续改动漂移。 */
+  externalWorkRef: ExternalWorkRef | null;
+  /** 开跑那一刻向 Jira 取证的结果。null = 没挂业务 / 取证失败 / 未配置。 */
+  externalWorkSnapshot: {
+    ref: ExternalWorkRef;
+    title: string;
+    status: string | null;
+    assignee: string | null;
+    capturedAt: string;
+  } | null;
   runtimeId: string | null;
   parentExecutionId: string | null;
   delegationPath: string[];
@@ -564,7 +586,8 @@ export const api = {
     kind?: 'direct' | 'group' | 'work';
     memberIds: string[];
     defaultMemberId?: string;
-    projectId?: string | null;
+    /** 围绕哪条外部工作。只传引用，工单内容在 Jira。 */
+    externalWorkRef?: { provider?: 'jira'; key: string; externalId?: string | null } | null;
   }): Promise<{ conversation: Conversation }> {
     return fetch(`${API_BASE}/api/conversations`, {
       method: 'POST',
@@ -712,8 +735,6 @@ export const api = {
   createSchedule(input: {
     memberId: string;
     conversationId: string;
-    projectId?: string | null;
-    workItemId?: string | null;
     prompt: string;
     type: 'once' | 'interval';
     runAt: string;
@@ -747,8 +768,8 @@ export const api = {
   },
 
   /**
-   * Team 级 SSE：work_item / schedule / presence / project / membership 的变更。
-   * 机制与 conversations.eventsUrl 相同（Last-Event-ID 补发）。
+   * Team 级 SSE：member.activity / schedule / presence / external_work /
+   * membership 的变更。机制与 conversations.eventsUrl 相同（Last-Event-ID 补发）。
    */
   teamEventsUrl(since?: number): string {
     const base = `${API_BASE}/api/team/events`;

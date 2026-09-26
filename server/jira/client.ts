@@ -3,6 +3,10 @@
  *
  * 这里只做「HTTP + 认证 + 错误翻译」，不做任何业务建模：不缓存工单状态、
  * 不映射本地对象 —— 业务事实在 Jira，本地复制一份就开始腐烂。
+ *
+ * 它是 **传输层**，不是业务层。上层 WorkManagementProvider 把「读一条、搜一批、
+ * 评论、流转、改负责人」翻译成这里的调用；换成 MCP 传输时，换的是这一层，
+ * 业务契约（WorkManagementProvider）不动。
  */
 
 export interface JiraConfig {
@@ -73,6 +77,20 @@ export class JiraClient {
   listTransitions(key: string): Promise<{ transitions: Array<{ id: string; name: string; to: { name: string } }> }> {
     return this.request(`/issue/${encodeURIComponent(key)}/transitions`);
   }
+
+  /**
+   * 改负责人。`null` = 取消指派。
+   *
+   * 参数是 **accountId**（Jira Cloud 的稳定用户标识），不是显示名也不是邮箱 ——
+   * 显示名会重名，邮箱会变。谁来把「张三」解析成 accountId 是上层的事：
+   * 解析错了是给人改错了负责人，不是一个可以靠默认值糊过去的参数。
+   */
+  assign(key: string, accountId: string | null): Promise<void> {
+    return this.request(`/issue/${encodeURIComponent(key)}/assignee`, {
+      method: 'PUT',
+      body: { accountId },
+    });
+  }
 }
 
 export interface JiraSearchResult {
@@ -80,6 +98,11 @@ export interface JiraSearchResult {
 }
 
 export interface JiraIssue {
+  /**
+   * 服务端生成的**不可变** id。key 会随项目改名而变（ABC-1 → XYZ-1），
+   * 它不会 —— 这就是 ExternalWorkRef 里 externalId 的来源。
+   */
+  id: string;
   key: string;
   fields: {
     summary: string;

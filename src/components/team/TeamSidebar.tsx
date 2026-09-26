@@ -22,7 +22,11 @@ interface TeamSidebarProps {
   showGroupCreator: boolean;
   onToggleGroupCreator: () => void;
   onCancelGroupCreator: () => void;
-  onCreateGroup: (input: { title: string; memberIds: string[]; projectId?: string | null }) => Promise<void>;
+  onCreateGroup: (input: {
+    title: string;
+    memberIds: string[];
+    externalWorkRef?: { provider?: 'jira'; key: string } | null;
+  }) => Promise<void>;
 }
 
 /** 左栏：Members / Projects / Work / Schedules / Conversations 五个分区。只负责排布与转发。 */

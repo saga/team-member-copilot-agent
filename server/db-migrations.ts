@@ -20,7 +20,7 @@ import type { DatabaseSync } from 'node:sqlite';
  *
  * 程序不认识任何别的编号 —— 没有升级代码，认出来也无从下手。
  */
-export const SCHEMA_VERSION = 12;
+export const SCHEMA_VERSION = 13;
 
 /**
  * 当前 schema 的完整定义，按最终形状写。
@@ -250,9 +250,12 @@ CREATE INDEX idx_scheduled_wake_run_execution
 CREATE TABLE conversation (
   id TEXT PRIMARY KEY,
   team_id TEXT NOT NULL,
-  -- 业务工作以 Jira 为唯一事实源；这里只存「这间会话围绕哪张工单」的引用。
-  -- NULL = 不挂钩业务的普通会话。工单的标题/状态/负责人不落本地，查 Jira。
-  jira_issue_key TEXT,
+  -- 这间会话围绕哪条外部工作（JSON ExternalWorkRef：provider/externalId/key/url）。
+  -- NULL = 不挂钩业务的普通会话。
+  --
+  -- 只存**引用**，不存工单内容：没有 title / status / assignee。业务事实在
+  -- Jira，本地复制一份就开始腐烂 —— 而且腐烂得很安静，副本和真话长得一样。
+  external_work_ref TEXT,
   title TEXT NOT NULL,
   kind TEXT NOT NULL
     CHECK (kind IN ('direct', 'group', 'work')),
@@ -274,6 +277,14 @@ CREATE TABLE conversation (
 
 CREATE INDEX idx_conversation_team
   ON conversation(team_id, updated_at);
+
+-- 按外部工作的 key 反查「哪些房间围绕它」。webhook 进来时靠它定位受影响
+-- 的房间，而不是把整个 Jira 拉一遍。
+--
+-- 表达式索引而不是再存一列 key：一列 key 就是同一个事实的第二个存放点，
+-- 它和 external_work_ref 里的 key 迟早会不一致（改名、迁移、手改数据）。
+CREATE INDEX idx_conversation_external_work_key
+  ON conversation(json_extract(external_work_ref, '$.key'));
 
 CREATE TABLE conversation_member (
   conversation_id TEXT NOT NULL,
@@ -401,9 +412,18 @@ CREATE TABLE execution (
   id TEXT PRIMARY KEY,
   conversation_id TEXT NOT NULL,
   member_id TEXT NOT NULL,
-  -- 开始时快照的 Jira 工单 key（取自 conversation）。execution 是历史事实：
-  -- conversation 的 Jira context 后来被改了，这条记录仍然知道当时在干哪张工单。
-  jira_issue_key TEXT,
+  -- 开始时快照的**引用**（取自 conversation）。execution 是历史事实：
+  -- conversation 后来换了挂钩的工单，这条记录仍然知道当时在干哪条。
+  external_work_ref TEXT,
+  -- 开始时向外部系统取证的结果（JSON ExternalWorkSnapshot：ref/title/status/
+  -- assignee/capturedAt）。
+  --
+  -- 和 config_snapshot 同一个思路：输入会变，而 execution 是「当时真的这样跑过
+  -- 一轮」的记录。没有它，事后看两条 execution 只能看到行为不同，看不到
+  -- 当时的业务上下文不同。
+  --
+  -- **它不是缓存**：没有任何读路径拿它当业务事实用。要看现在的状态，问 Jira。
+  external_work_snapshot TEXT,
   runtime_id TEXT,
   parent_execution_id TEXT,
   delegation_path TEXT NOT NULL DEFAULT '[]',
@@ -465,8 +485,8 @@ CREATE INDEX idx_execution_parent
 CREATE INDEX idx_execution_status
   ON execution(status);
 
-CREATE INDEX idx_execution_jira_issue
-  ON execution(jira_issue_key);
+CREATE INDEX idx_execution_external_work_key
+  ON execution(json_extract(external_work_ref, '$.key'));
 
 -- ─────────────────────────────────────────────── Knowledge Base ───────────
 --

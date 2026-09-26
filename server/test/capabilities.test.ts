@@ -321,6 +321,25 @@ describe('manifest：描述能力组成，不描述是谁', () => {
     }
   });
 
+  it('Provider 实现版本变化 → 哈希变（同一份 prompt 也可能跑在另一版实现上）', async () => {
+    // 9 月 25 日和 9 月 30 日可以是同一份 system prompt、同一份记忆，但一次用
+    // 本地 KB、一次用企业搜索 —— 那是两种不同的能力实现。只记 Provider ID
+    // 会让这两轮看起来完全一样，而它们的输入根本不同。
+    const base = await manifestHash(manifestCapabilities());
+
+    for (const bumped of [
+      manifestRegistry({ skills: [skillProvider('stub.skills', '2', [artifact('stub.skills', 'arch')])] }),
+      manifestRegistry({
+        knowledge: [
+          knowledgeProvider('stub.knowledge', '2', [{ id: 'kb-1', name: 'Alpha', scope: 'team' }]),
+        ],
+      }),
+      manifestRegistry({ tools: [toolProvider('stub.tools', '2', [builtinTool('stub.tools', 'lookup')])] }),
+    ]) {
+      assert.notEqual(await manifestHash(manifestCapabilities(), bumped), base);
+    }
+  });
+
   it('Skill 名冲突直接抛，不静默去重', async () => {
     const registry = registryOf({
       skills: [

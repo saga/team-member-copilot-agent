@@ -7,7 +7,8 @@ import type { StoredTeamEvent, TeamEventType } from './domain.js';
 export type { StoredTeamEvent, TeamEventType };
 
 /**
- * Team 级实时事件：WorkItem / Schedule / Presence / Project / Membership。
+ * Team 级实时事件：Member Activity / Schedule / Presence / External Work /
+ * Membership。
  *
  * 和 Conversation SSE 是两套边界、共用同一套纪律：
  *
@@ -18,9 +19,10 @@ export type { StoredTeamEvent, TeamEventType };
  * 分配，UNIQUE(team_id, sequence) 是 replay 不丢不重的锚点），COMMIT 之后才
  * broadcast —— 一旦回滚，前端已经看到的状态就是 DB 从没承认过的。
  *
- * 注意分工：这里是**通知层**。WorkItem 的审计真相在 work_item_event（列式、
- * 可查询）；team_event 的 payload 是「什么变了」，消费方据此决定刷哪块 UI，
- * 不承担审计职责。
+ * 注意分工：这里是**通知层**，不是审计层。team_event 的 payload 是「什么变了」，
+ * 消费方据此决定刷哪块 UI。审计真相在 execution / conversation_event：
+ * 尤其是外部工作（Jira 工单），本地**不存**它的状态，payload 里也不放它的值 ——
+ * 要事实就去问 Jira。
  */
 
 /** 回放分页大小。 */

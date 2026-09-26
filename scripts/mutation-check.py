@@ -145,28 +145,6 @@ MUTATIONS = [
         ],
     },
     {
-        "name": "claim 去掉 claimed_by IS NULL（双抢都成功）",
-        "test": "server/test/team-v1.test.ts",
-        "steps": [
-            (
-                "server/team-structure-service.ts",
-                "           AND claimed_by_member_id IS NULL\n",
-                "",
-            )
-        ],
-    },
-    {
-        "name": "done/cancelled 不验 claimer（路过也能结单）",
-        "test": "server/test/team-v1.test.ts",
-        "steps": [
-            (
-                "server/team-structure-service.ts",
-                "      if (\n        ['in_progress', 'blocked', 'done', 'cancelled'].includes(patch.status) &&\n        !isAdmin &&\n        !isAgentClaimer\n      ) {\n        throw forbidden('只有当前 claimer 或 Team admin/owner 可以改变工作状态');\n      }",
-                "",
-            )
-        ],
-    },
-    {
         "name": "删掉 schedule 幂等 UNIQUE（同一时间点执行两遍）",
         "test": "server/test/team-v1.test.ts",
         "steps": [
@@ -207,55 +185,6 @@ MUTATIONS = [
                 "server/scheduler-service.ts",
                 "        if (execution.status === 'completed') {\n          this.structure.updateScheduleRun(run.id, { status: 'completed' });\n          continue;\n        }",
                 "        if (execution.status === 'completed') {\n          continue;\n        }",
-            )
-        ],
-    },
-    {
-        "name": "claim 不回写 execution.work_item_id（双向绑定断一面）",
-        "test": "server/test/team-v1.test.ts",
-        "steps": [
-            (
-                "server/team-structure-service.ts",
-                "    if (input.executionId) {\n      this.db\n        .prepare(`UPDATE execution SET work_item_id = ? WHERE id = ? AND work_item_id IS NULL`)\n        .run(id, input.executionId);\n    }",
-                "",
-            )
-        ],
-    },
-    {
-        "name": "claim 不校验 execution 归属（两层检查一起拆）",
-        "test": "server/test/team-v1.test.ts",
-        "steps": [
-            (
-                "server/team-service.ts",
-                "    if (execution.memberId !== input.memberId) {\n      throw forbidden('execution 不属于当前 Member');\n    }",
-                "",
-            ),
-            (
-                "server/team-structure-service.ts",
-                "      if (execution.member_id !== input.memberId) {\n        throw forbidden('Execution 不属于当前 Member');\n      }",
-                "",
-            ),
-        ],
-    },
-    {
-        "name": "一条 execution 可以绑第二个 WorkItem",
-        "test": "server/test/team-v1.test.ts",
-        "steps": [
-            (
-                "server/team-structure-service.ts",
-                "      if (execution.work_item_id && execution.work_item_id !== id) {\n        throw conflict('Execution 已绑定另一个 WorkItem');\n      }",
-                "",
-            )
-        ],
-    },
-    {
-        "name": "release 不验 claimer/admin（谁都能释放别人的 claim）",
-        "test": "server/test/team-v1.test.ts",
-        "steps": [
-            (
-                "server/team-structure-service.ts",
-                "    if (!isClaimer && !isAdmin) {\n      throw forbidden('只有 claimer 或 Team admin/owner 能 release WorkItem');\n    }",
-                "",
             )
         ],
     },
@@ -344,6 +273,50 @@ MUTATIONS = [
                 "server/routes/internal.ts",
                 "  router.use('/members/:id', (req, _res, next) => {\n    (req as { agentMemberId?: string }).agentMemberId = req.params.id as string;\n    next();\n  });",
                 "",
+            )
+        ],
+    },
+    {
+        "name": "空 key 也造出一条引用（指向一张不存在的工单）",
+        "test": "server/test/work-management.test.ts",
+        "steps": [
+            (
+                "server/work-management/types.ts",
+                "  const key = input.key?.trim();\n  if (!key) return null;\n",
+                "  const key = input.key?.trim() ?? '';\n",
+            )
+        ],
+    },
+    {
+        "name": "get() 不把引用规范成不可变 id（永远停在会变的 key 上）",
+        "test": "server/test/work-management.test.ts",
+        "steps": [
+            (
+                "server/work-management/jira-provider.ts",
+                "        externalId: issue.id || issue.key,",
+                "        externalId: issue.key,",
+            )
+        ],
+    },
+    {
+        "name": "execution 收口时抹掉取证快照（历史只剩空壳）",
+        "test": "server/test/work-management.test.ts",
+        "steps": [
+            (
+                "server/team-service.ts",
+                "        patch.externalWorkSnapshot !== undefined\n          ? serializeExternalWorkSnapshot(patch.externalWorkSnapshot)\n          : serializeExternalWorkSnapshot(current.externalWorkSnapshot),",
+                "        serializeExternalWorkSnapshot(patch.externalWorkSnapshot ?? null),",
+            )
+        ],
+    },
+    {
+        "name": "webhook 只按 key 匹配（工单改名后漏掉房间）",
+        "test": "server/test/team-v1.test.ts",
+        "steps": [
+            (
+                "server/team-service.ts",
+                "           OR (\n             ? IS NOT NULL\n",
+                "           OR (\n             0\n",
             )
         ],
     },
