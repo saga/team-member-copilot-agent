@@ -219,6 +219,44 @@ export class StubCopilot {
    * 落在「已经跑完」之后，走的是另一条路径。
    */
   hold: Promise<void> | null = null;
+  /**
+   * 只按住这些 Member 的 turn；`null` = 按住全部。
+   *
+   * 「等这一批跑完再判断房间是不是沉默了」这条守卫只在**有人已收口、有人还在跑**
+   * 的形状下才可观测。全局 `hold` 表达不了它 —— 那会把所有人都按住，
+   * 于是谁都不收口，被考的那条分支根本走不到。
+   */
+  holdMemberIds: Set<string> | null = null;
+  /**
+   * 逐字符把回复喂给 `onDelta`，模拟真实引擎的流式输出。
+   *
+   * 必须显式打开：哨兵过滤（NoReplyStreamGate）只在流式路径上有意义 ——
+   * 整段一次性到达时它只是原样转发一次。不开这个开关，那条接线就完全没被
+   * 跑到：过滤器单测全绿，而集成路径可以是断的。
+   */
+  streamDeltas = false;
+  /**
+   * 这些 Member 一律返回 `<NO_REPLY>`，其他 Member 按 `mode` 走。
+   *
+   * 用来构造「房间里只有某一个人会说话」—— 兜底（escalation）这类行为必须
+   * 在「其他人都沉默」的前提下才谈得上，而 `mode` 是全局开关，表达不了
+   * 「A 说话、B 和 C 沉默」。
+   */
+  readonly skipMemberIds = new Set<string>();
+  /**
+   * 只在这些 wake_reason 上开口，其余一律沉默。
+   *
+   * 兜底用例需要表达「**同一个人**：第一轮沉默、被兜底时回答」。按 member
+   * 或按全局开关都说不清这件事 —— 只有按**唤醒原因**才说得清。
+   *
+   * 需要 `wakeReasonOf` 配合（StubCopilot 不持有 db）。
+   */
+  speakOnlyOnReasons: Set<string> | null = null;
+  /**
+   * 查一条 execution 的 wake_reason。由用例注入 —— 让 stub 自己拿着 db
+   * 会把「假引擎」和「数据库」耦在一起，而它本来只该模拟引擎。
+   */
+  wakeReasonOf: ((executionId: string) => string | null) | null = null;
 
   async runMemberTurn(input: RunMemberTurnInput): Promise<string> {
     this.turns.push({
@@ -227,14 +265,32 @@ export class StubCopilot {
       systemPrompt: input.systemPrompt,
       prompt: input.prompt,
     });
-    if (this.hold) await this.hold;
-    return this.mode === 'skip' ? NO_REPLY_SENTINEL : `reply from ${input.member.name}`;
+    if (this.hold && (!this.holdMemberIds || this.holdMemberIds.has(input.member.id))) {
+      await this.hold;
+    }
+
+    const reason = this.wakeReasonOf?.(input.executionId) ?? null;
+    const skip =
+      this.mode === 'skip' ||
+      this.skipMemberIds.has(input.member.id) ||
+      (this.speakOnlyOnReasons !== null && !this.speakOnlyOnReasons.has(reason ?? ''));
+
+    const reply = skip ? NO_REPLY_SENTINEL : `reply from ${input.member.name}`;
+    if (this.streamDeltas) {
+      for (const char of reply) input.onDelta?.(char);
+    }
+    return reply;
   }
 
   reset(): void {
     this.turns.length = 0;
     this.mode = 'reply';
     this.hold = null;
+    this.holdMemberIds = null;
+    this.streamDeltas = false;
+    this.skipMemberIds.clear();
+    this.speakOnlyOnReasons = null;
+    // wakeReasonOf 是用例在 before() 里接上的接线，reset 不动它
   }
 
   turnFor(executionId: string): StubTurn {

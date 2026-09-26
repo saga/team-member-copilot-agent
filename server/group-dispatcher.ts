@@ -13,17 +13,27 @@ import type { ConversationMemberService } from './conversation-member-service.js
  *   direct / work   → 房间里的那一个 Member（显式 targetMemberId 优先）
  *   group + @mention → 被 @ 到的 active 成员
  *   group + 无 mention
- *     用户发的     → 所有 active 且未静音的成员（open discussion）
- *     Member 发的  → 同上，但受 groupAutoWakeRounds 限制（follow_up）
+ *     用户发的     → 一名「应答者」（reason=direct，必须回答）+ 其余成员
+ *                    （reason=open_discussion，可补可沉默）
+ *     Member 发的  → 全体 active 且未静音的成员（follow_up），受
+ *                    groupAutoWakeRounds 限制
  *
- * 三条边界值得单独说：
+ * 还有一条不走「新消息」的规则，见 planEscalation()：
+ *
+ *   整个房间都没回应 → 房间负责人（escalation，必须回答）
+ *
+ * 五条边界值得单独说：
  *
  * 1. **作者不会被自己的消息唤醒。** 否则 Member 一发言就把自己再唤醒一次。
- * 2. **member 消息的自动唤醒有上限。** A 发言 → 唤醒 B → B 发言 → 唤醒 A → …
+ * 2. **用户消息必须有人负责回答。** 见下面 pickPrimaryResponder 的长注释 ——
+ *    这是「三个 Agent 各说一遍」和「三个 Agent 都不说」之间的那根线。
+ * 3. **member 消息的自动唤醒有上限。** A 发言 → 唤醒 B → B 发言 → 唤醒 A → …
  *    是个没有天然终点的循环，会一直烧 token。用户消息重置计数；连续 N 条
  *    member 消息之后，只有 @mention 还能唤醒别人（mention 永远有效）。
- * 3. **@ 了但没匹配到人时，不广播。** 用户明确想找某个人，把消息广播给全员
+ * 4. **@ 了但没匹配到人时，不广播。** 用户明确想找某个人，把消息广播给全员
  *    是更糟的误解。这里返回 unresolvedMentions，由 API 如实告诉调用方。
+ * 5. **负责人只在「全员沉默」时兜底，不参与日常排序。** 让负责人回答每一条
+ *    消息，等于把房间变回「一个 Agent 加几个装饰」—— 那正是这套东西要避免的。
  */
 export class GroupDispatcher {
   constructor(
@@ -91,7 +101,7 @@ export class GroupDispatcher {
       return { wakes: [], unresolvedMentions: [] };
     }
 
-    const wakes: WakePlan[] = active
+    const candidates = active
       .filter((member) => member.id !== input.authorMemberId)
       .filter((member) => !this.states.get(conversation.id, member.id).muted)
       // 已经读过这条消息的成员不需要再被唤醒（coalescing 的最后一道闸）。
@@ -99,14 +109,102 @@ export class GroupDispatcher {
         (member) =>
           this.states.get(conversation.id, member.id).lastSeenMessageSequence <
           message.messageSequence,
-      )
-      .map((member) => ({
-        memberId: member.id,
-        reason,
-        triggerSequence: message.messageSequence,
-      }));
+      );
+
+    // 用户对房间说话时，指定唯一一名应答者。
+    const primary =
+      message.senderType === 'user' ? this.pickPrimaryResponder(conversation, candidates) : null;
+
+    const wakes: WakePlan[] = candidates.map((member) => ({
+      memberId: member.id,
+      reason: member.id === primary ? 'direct' : reason,
+      triggerSequence: message.messageSequence,
+    }));
 
     return { wakes, unresolvedMentions: [] };
+  }
+
+  /**
+   * 用户对房间说话（没有 @ 任何人）时，指定**唯一一名**必须回答的成员。
+   *
+   * ── 为什么必须有这么一个人 ──────────────────────────────────────────
+   *
+   * 没有它的时候，一条 `我希望做架构设计review，应该做什么` 会广播给全体，
+   * 每个人都被告知「没有新东西就说 <NO_REPLY>」。结果是三个 Member 各自
+   * 判断「别人会说 / 我说的别人也会说」，**全体沉默** —— 用户对着房间提问，
+   * 房间一个字都没回。这是典型的责任扩散（bystander effect），不是模型
+   * 偷懒：每一个成员单独看都做了合理判断。
+   *
+   * 所以「允许沉默」这条规则只能用于**顺带被唤醒**的场景（member 之间的
+   * follow_up）。用户直接问房间时，房间欠一个回答，而欠条必须落在具体
+   * 某个人头上才成立。
+   *
+   * ── 为什么是「最久没发言的那个」 ────────────────────────────────────
+   *
+   * 判据必须确定性、可复现、不需要新状态。用 `last_replied_message_sequence`
+   * 排序刚好三条都满足：它是已有的房间状态，重启后依然正确，而且天然轮流 ——
+   * 不会变成「永远同一个人回答，另外两个永远沉默」。
+   *
+   * 刻意**不**按 role 关键词去猜「谁最懂这个问题」：那是概率性路由，猜错的
+   * 代价是派给了错的人，而且出错时没有任何东西可以解释。要精确点名就用
+   * @handle —— 那是用户的显式意图，不是平台的猜测。
+   */
+  private pickPrimaryResponder(conversation: Conversation, candidates: Member[]): string | null {
+    if (candidates.length === 0) return null;
+
+    const ranked = [...candidates].sort((a, b) => {
+      const left = this.states.get(conversation.id, a.id).lastRepliedMessageSequence;
+      const right = this.states.get(conversation.id, b.id).lastRepliedMessageSequence;
+      if (left !== right) return left - right;
+      // 平手（新房间全员都是 0）时按 id 定序：同一份数据必须得到同一个结果，
+      // 否则「谁回答」会取决于数组顺序这种没人看得见的东西。
+      return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+    });
+
+    return ranked[0].id;
+  }
+
+  /**
+   * 用户对着房间说话、而**整个房间都没回应**时，把这一轮交给负责人兜底。
+   *
+   * ── 它是第二道保险，不是第一道 ──────────────────────────────────────
+   *
+   * 第一道是 pickPrimaryResponder：平台指定一名应答者，并在指令里明确告诉它
+   * 「必须回答」。但**指令是可以被无视的** —— 模型有自己的判断。用户截图里
+   * 那六条 completed / decision=skip 的 execution 就是这么来的：机制全对，
+   * 每个 Member 都选了沉默。
+   *
+   * 所以还需要一道不依赖模型配合的兜底：既然整个房间都没接话，那就由负责人
+   * 来接。对应职场里「问了一圈没人应，负责人总得说话」。
+   *
+   * ── 为什么不是「负责人回答每一条」 ───────────────────────────────────
+   *
+   * 那会把房间变回「一个 Agent 加几个装饰」：负责人永远在说话，其他人永远
+   * 沉默 —— 和「永远同一个人回答」是同一个问题。负责人只在全员沉默时出现。
+   *
+   * 返回 null 表示「这个房间没有能兜底的人」：没设负责人、负责人已归档、
+   * 负责人被静音。三种都**不抛错** —— 没有负责人只是没有兜底，不是配置错误，
+   * 而且静音是用户的显式意图，不该被兜底机制绕过去。
+   *
+   * 注意这里只做**花名册**判断（谁是负责人、它现在能不能接活）。「这一批
+   * 是不是已经跑完了」「有没有人已经说过话」是执行历史，属于 TeamService。
+   */
+  planEscalation(input: { conversation: Conversation; triggerSequence: number }): WakePlan | null {
+    const { conversation } = input;
+    if (conversation.kind !== 'group') return null;
+
+    const leadId = this.states.lead(conversation.id);
+    if (!leadId) return null;
+
+    const lead = conversation.members.find((member) => member.id === leadId);
+    if (!lead || lead.status !== 'active') return null;
+    if (this.states.get(conversation.id, leadId).muted) return null;
+
+    return {
+      memberId: leadId,
+      reason: 'escalation',
+      triggerSequence: input.triggerSequence,
+    };
   }
 
   /**

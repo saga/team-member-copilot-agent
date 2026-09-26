@@ -1,6 +1,6 @@
 /**
  * 真实装配的 smoke test：拉起 dist-server 本体（不是测试里自建的 express），
- * 验证 schema v13 能建出来、新路由挂上了、webhook 在未配 Jira 时也安全。
+ * 验证 schema 能建出来、新路由挂上了、webhook 在未配 Jira 时也安全。
  *
  * 必须 spawn + fetch + kill 在同一个脚本里：后台进程在工具调用返回后会被回收。
  */
@@ -8,6 +8,12 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+
+// 版本号从编译产物读，**不要**在这里写常量：schema 每次改都会动它，
+// 而写死的那个数字不会有任何东西提醒你同步 —— 它只会让这个 smoke test 悄悄失效。
+const { SCHEMA_VERSION } = await import(
+  new URL('../dist-server/db-migrations.js', import.meta.url).href
+);
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tmca-smoke-'));
 const port = 3987;
@@ -65,7 +71,7 @@ try {
   await waitForBoot();
   console.log('服务已启动\n');
 
-  check('启动日志显示 schema v13', logs.includes('schema v13'), logs.split('\n')[1] ?? '');
+  check('启动日志显示 schema 版本', logs.includes(`schema v${SCHEMA_VERSION}`), logs.split('\n')[1] ?? '');
   check(
     '启动日志说明外部工作系统未配置',
     logs.includes('work management: 未配置'),
@@ -129,9 +135,9 @@ try {
   check('execution 有 external_work_snapshot', executionCols.includes('external_work_snapshot'));
   check('execution 不再有 jira_issue_key', !executionCols.includes('jira_issue_key'));
   check(
-    'schema 登记为 13',
+    `schema 登记为 ${SCHEMA_VERSION}`,
     new DatabaseSync(path.join(dataDir, 'team-member.db')).prepare('PRAGMA user_version').get()
-      .user_version === 13,
+      .user_version === SCHEMA_VERSION,
   );
 } catch (error) {
   failures.push(`异常：${error instanceof Error ? error.message : error}`);

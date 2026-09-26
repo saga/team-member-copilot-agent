@@ -55,6 +55,7 @@ Member 的 binding 一行都不用改。**CopilotService 不认识任何具体 P
 | **Member** | 业务上的长期 AI 同事。持久身份 + role + style + system prompt + model + 能力组成 + long-term memory。跨 conversation 稳定。 |
 | **Capability** | Member 引用哪些 Skill / Knowledge / Tool Provider（`member_capability_binding`）。它是「能用什么」的唯一答案。 |
 | **Conversation** | 聊天/协作空间。`direct`（一个 Member）/ `group`（多个 Member）/ `work`（独立工作会话）。 |
+| **RoomLead** | 某 Member 在**某个 group 房间**里的负责人（`conversation_member_state.is_lead`）。**房间维度**：同一个人可以在 A 房间是负责人、在 B 房间只是普通成员。一个房间至多一个（偏索引强制），且不参与日常轮转 —— 只在「用户对着房间说话、而全体沉默」时兜底回答。 |
 | **MemberRuntime** | 某 Member 在某 Conversation 中的运行实例。一个 runtime 拥有一个稳定的 Copilot Session 和一个独立 workspace。 |
 | **CopilotSession** | Runtime 的执行引擎状态。**内部实现细节，不是业务对象。** |
 | **Execution** | Agent 实际跑了一轮。记录 `parent_execution_id` / `delegation_path` / `external_work_ref`（开始时从 conversation 快照）/ `external_work_snapshot`（开始时向外部系统取证），构成完整审计链。状态：`queued` / `running` / `waiting_for_member` / `completed` / `failed` / `cancelled` / `interrupted`。 |
@@ -315,7 +316,7 @@ scheduler 的入队单位**就是**落库的重放单位：
 interface PendingWake {
   conversationId: string;
   memberId: string;
-  reason: WakeReason;      // direct | mention | open_discussion | follow_up
+  reason: WakeReason;      // escalation | mention | direct | open_discussion | follow_up
   triggerSequence: number; // 是哪条消息唤起的
 }
 ```
@@ -336,6 +337,39 @@ interface PendingWake {
   以来的全部消息。
 - **区分「跑失败了」与「连跑都没跑起来」。** 后者要清掉 durable 标记，否则每次重启
   都会重派一条注定失败的唤醒。scheduler 通过 `run(wake, markStarted)` 回调拿到这个区分。
+
+**用户对着房间说话时，房间欠一个回答。** 「允许沉默」只能给**顺带被唤醒**的人：全体都
+被允许沉默时，每个人单独看都做了合理判断（「别人会说」），合起来是房间一个字都不回。
+真实发生过 —— 用户提问，三条 execution 全部 `completed / decision = skip`、没有一条报错。
+
+所以 reason 分档，**指令也跟着分档**，两件事缺一不可：
+
+```
+escalation        整个房间都没接话 → 负责人兜底（最强）
+mention           用户 @ 了它
+direct            平台指定它当这一轮的应答者（最久没发言的优先，平手按 id 定序）
+open_discussion   顺带被唤醒，可以沉默
+follow_up         同上
+```
+
+只改路由是无效的：reason 标成 `direct`、指令里却仍写着「没东西可补就 `<NO_REPLY>`」，
+模型会挑更省力的那个。三处细节：
+
+- **兜底是第二层，因为指令可以被无视。** `maybeEscalateSilentRoom()` 在**每条** skip
+  收口之后检查这一批是不是全体沉默。必须在这条 execution 收口**之后**（收口之前它自己
+  还算 active，「跑完了没有」永远是否），也必须在**每条** skip 之后（只有最后收口的那条
+  能通过「全部收口」这一关，所以不会重复派发）。
+- **合并时兜底必须赢**：`escalation(4) > mention(3) > direct(2) > follow_up(1) >
+  open_discussion(0)`。负责人可能同时握有一条更弱的待跑唤醒，一旦兜底输给它，负责人拿到的
+  就是「你是这一轮的应答者」—— 那段话里没有「房间里没人接话」，它会**再判断一次**。
+- **负责人是房间维度的角色**（`conversation_member_state.is_lead`），一个房间至多一个，
+  由偏索引 `WHERE is_lead = 1` 强制（不是靠代码记得先清后设）。它**不参与日常轮转** ——
+  只在全员沉默时出场，否则房间就退回「一个 Agent 加几个装饰」。
+
+`<NO_REPLY>` 是控制信号，不是内容，**绝不能到达客户端**。流式路径上由 `NoReplyStreamGate`
+扣住前缀与哨兵一致的部分，一旦分叉就原样放行（正常回复零额外延迟）；收尾时
+`flush(decision)` **必须**带上判定结果 —— skip 时被扣住的那条尾巴就是哨兵本身，放出去
+正是要修的现象（先出现再消失，看起来像 UI 故障）。
 
 归档 / 移出 Member 前有三道闸门（未结束的 execution、`pending_wake`/`wake_status`、
 scheduler 内存队列），任一条命中就 `409 Conflict` —— 不做「边跑边踢」。移出时
@@ -419,7 +453,7 @@ KB、一次用企业搜索 —— 那是两种不同的能力实现，而快照�
 ### 10. 状态变化也是事件
 
 `conversation_member_state` 的每一次变化（读游标推进、`wakeStatus`、`pendingWake`、
-静音、被移出）都落 `conversation_event` 再广播：
+静音、负责人变更、被移出）都落 `conversation_event` 再广播：
 
 ```
 { type: 'conversation_member_state.updated', data: { memberId, state: ConversationMemberState | null } }
@@ -427,6 +461,9 @@ KB、一次用企业搜索 —— 那是两种不同的能力实现，而快照�
 
 否则前端只能靠「消息数变了」猜要不要刷新 —— 而 NO_REPLY、queued、mute 这三种
 状态变化**都不伴随新消息**，猜不出来。
+
+换负责人要发**两行**事件：新上任的，以及被顶掉的那个。只发前者会让旧负责人在 UI 上
+一直挂着「Lead」徽章 —— 客户端是按 `memberId` 整体替换状态的，没人通知它就没人改。
 
 三处形状上的选择：
 
@@ -589,7 +626,7 @@ npm run dev            # 同时启动 client(:5173) + server(:3001)
 首次启动的日志里会有一行 provisioning：
 
 ```
-[server] 新建数据库 schema v9
+[server] 新建数据库 schema v14
 [server] knowledge sync: team+3 personal+0 indexed=3
 [server] member provisioning: created=3 (financial-services.solution-architect, ...) skipped=0
 ```
@@ -626,8 +663,8 @@ npm run dev            # 同时启动 client(:5173) + server(:3001)
 | DELETE | `/api/conversations/:id/members/:memberId` | 移出 Member（仅 `group`） |
 | GET | `/api/conversations/:id/events?since=` | 会话级 SSE（支持 `Last-Event-ID` 回放） |
 | GET | `/api/conversations/:id/executions?limit=` | 该会话的 execution，按 `createdAt` 正序（默认 200，夹在 1..1000） |
-| GET | `/api/conversations/:id/state` | 房间里每个 Member 的读游标 / 唤醒状态 / 静音 |
-| PATCH | `/api/conversations/:id/members/:memberId/state` | 静音 / 取消静音 |
+| GET | `/api/conversations/:id/state` | 房间里每个 Member 的读游标 / 唤醒状态 / 静音 / 是否负责人 |
+| PATCH | `/api/conversations/:id/members/:memberId/state` | `{ muted?, isLead? }` —— 至少给一个字段（都不给 `400`）。设 `isLead: true` 会同时顶掉旧的负责人，返回的是被改的那个 Member 的状态 |
 | GET | `/api/members/:id/direct-messages` | 该 Member 参与的全部私聊（只读） |
 | GET | `/api/members/:id/memory` · `PUT` | 该 Member 的长期记忆 → `{ content, version }`；`PUT` 可带 `expectedVersion`，不匹配 `409` |
 | GET | `/api/members/:id/skills` · `POST` · `DELETE` | 该 Member 的 skill（zip 上传 / 卸载）—— 「磁盘上装了什么」，不是「启用了哪个能力来源」 |
@@ -951,7 +988,9 @@ server/                       # Express + Copilot SDK 后端
     member-skills.test.ts          # skill 安装 / 卸载 / zip 校验
     runtime-reliability.test.ts    # schema 形状 / 序号 / 增量上下文 / durable event / 恢复 / 死锁
     runtime-correctness.test.ts    # resume 分类 / 超时 abort / 工具授权接线 / cancel 状态机 / retry
-    team-chat.test.ts              # 产品行为：direct / group / @mention / NO_REPLY / persona 与 memory 隔离
+    team-chat.test.ts              # 产品行为：direct / group / @mention / NO_REPLY / 应答者与负责人兜底 / 唤醒原因读回 / persona 与 memory 隔离
+    member-decision.test.ts        # 哨兵判定（normalize 容忍度）与流式过滤：两个模块对「什么算 <NO_REPLY>」不能有分歧
+    conversations-api.test.ts      # 真实 HTTP：externalWorkRef 过边界 / 负责人 set-swap-clear / state patch 字段校验 / SSE 字节流上没有哨兵
     data-integrity.test.ts         # replyTo 校验 / 消息幂等 / 记忆乐观并发 / 上下文上限 / 配置快照 / state 事件 / mention 精确匹配
     member-template-seeder.test.ts # provisioning 幂等 / 不覆盖已改 Member / 归档不复活 / 穿越与重复 key / 能力绑定
     knowledge-provider.test.ts     # 检索范围限定在授权的 KB / personal 隔离 / 路径与 FTS 注入 / 索引幂等 / 磁盘同步

@@ -306,13 +306,47 @@ function selectWindow(
  *
  * 关键是把 skip 明确成**合法结果**，否则模型会为了「有问必答」而重复别人
  * 已经说过的话 —— 三个 Member 各说一遍同样的结论，是 group chat 最典型的失败形态。
+ *
+ * 但「允许沉默」只能给**顺带被唤醒**的人。用户对着房间说话时，房间里必须有
+ * 一个人是欠着回答的，否则每个成员都合理地认为「别人会说」，全体沉默 ——
+ * 用户提问、房间一个字都不回。所以四种 reason 分四档：
+ *
+ *   escalation  整个房间都没接话 → 负责人兜底（最强）
+ *   mention     用户 @ 了它 —— 指名道姓
+ *   direct      平台指定它当这一轮的应答者（GroupDispatcher.pickPrimaryResponder）
+ *   open_discussion / follow_up  顺带被唤醒，可以沉默
+ *
+ * mention 和 direct 都必须回答，但**说辞必须分开**：告诉一个没被点名的人
+ * 「用户点名了你」，模型可能会先去纠正这个并不存在的前提，而不是回答问题。
+ * 它被指定为应答者是平台的决定，那就如实说 —— 理由本身是充分的。
+ *
+ * escalation 也单独一档，而且必须说清楚「房间里没人说话」：那是这一档独有的
+ * 信息，也是它和 direct 唯一的区别。不说的话，模型会以为这只是一次普通的
+ * 「轮到你」，然后**再判断一次**「也许别人会说」—— 兜底就白兜了。
  */
 function discussionInstruction(reason: WakeReason | null): string {
-  const mustReply = reason === 'direct' || reason === 'mention';
-
-  if (mustReply) {
+  if (reason === 'escalation') {
     return [
-      'You were explicitly addressed, so you must respond.',
+      "The rest of this room stayed silent on the user's message.",
+      'As the lead of this room, answering it is your responsibility.',
+      'Do not stay silent, and do not wait for anyone else —',
+      'reply with your message directly. Keep it short.',
+    ].join('\n');
+  }
+
+  if (reason === 'mention') {
+    return [
+      'You were addressed by name, so you must respond.',
+      'Do not restate what other participants already said — add what only you can add.',
+      'Reply with your message directly. Keep it short.',
+    ].join('\n');
+  }
+
+  // 注意：这条只出现在 group 房间（1:1 房间走 turnMode=direct，不到这里）。
+  if (reason === 'direct') {
+    return [
+      'You are the participant this room expects to answer this message.',
+      'You must respond — staying silent is not an option for you here.',
       'Do not restate what other participants already said — add what only you can add.',
       'Reply with your message directly. Keep it short.',
     ].join('\n');

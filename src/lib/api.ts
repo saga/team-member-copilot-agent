@@ -323,6 +323,13 @@ export interface ConversationMemberState {
   pendingWakeTriggerSequence: number | null;
   pendingWakeReason: WakeReason | null;
   muted: boolean;
+  /**
+   * 房间负责人（lead / key contact）。
+   *
+   * 平时不参与排序 —— 日常仍然是轮流应答。只在「用户对着房间说话、而整个
+   * 房间都没接话」时兜底回答。一个房间至多一个。
+   */
+  isLead: boolean;
   updatedAt: string;
 }
 
@@ -525,11 +532,16 @@ export const api = {
     ).then(json<{ states: ConversationMemberState[] }>);
   },
 
-  /** 静音后 dispatcher 不会唤醒它 —— @ 也唤不醒。 */
-  setMemberMuted(
+  /**
+   * 改 Member 在房间里的状态：静音 / 负责人。
+   *
+   * 两个字段都可选，但至少要有一个 —— 空 patch 服务端会回 400，而不是
+   * 静默地什么都不改却回 200。
+   */
+  setMemberState(
     conversationId: string,
     memberId: string,
-    muted: boolean,
+    patch: { muted?: boolean; isLead?: boolean },
   ): Promise<{ state: ConversationMemberState }> {
     return fetch(
       `${API_BASE}/api/conversations/${encodeURIComponent(
@@ -538,9 +550,31 @@ export const api = {
       {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ muted }),
+        body: JSON.stringify(patch),
       },
     ).then(json<{ state: ConversationMemberState }>);
+  },
+
+  /** 静音后 dispatcher 不会唤醒它 —— @ 也唤不醒。 */
+  setMemberMuted(
+    conversationId: string,
+    memberId: string,
+    muted: boolean,
+  ): Promise<{ state: ConversationMemberState }> {
+    return api.setMemberState(conversationId, memberId, { muted });
+  },
+
+  /**
+   * 指定 / 撤销房间负责人。
+   *
+   * 一个房间至多一个：指定新的会自动顶掉旧的（服务端保证）。
+   */
+  setMemberLead(
+    conversationId: string,
+    memberId: string,
+    isLead: boolean,
+  ): Promise<{ state: ConversationMemberState }> {
+    return api.setMemberState(conversationId, memberId, { isLead });
   },
 
   /**

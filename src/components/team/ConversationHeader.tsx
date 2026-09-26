@@ -45,6 +45,12 @@ export function ConversationHeader({
 }: ConversationHeaderProps) {
   const isGroup = conversation.kind === 'group';
   const isDm = isMemberDm(conversation);
+  /**
+   * 房间负责人。展示在标题行，因为它的作用**不是**「谁先回答」——
+   * 日常仍然是轮流应答，它只在全员沉默时兜底。不解释的话，用户会以为
+   * 设了负责人就等于把房间变成单人聊天。
+   */
+  const leadMember = conversation.members.find((member) => states[member.id]?.isLead);
 
   return (
     <>
@@ -59,6 +65,11 @@ export function ConversationHeader({
           {conversation.externalWorkRef && (
             <Tag color="cyan">Jira: {conversation.externalWorkRef.key}</Tag>
           )}
+          {leadMember && (
+            <Tooltip title="日常仍然是轮流应答；只有当用户对房间说话、而整个房间都没接话时，由它兜底回答">
+              <Tag color="gold">Lead: {leadMember.name}</Tag>
+            </Tooltip>
+          )}
         </Space>
 
         <div style={{ marginTop: 8, display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
@@ -66,11 +77,14 @@ export function ConversationHeader({
             {conversation.members.map((member) => {
               const status = memberStatus(member.id);
               const dot = status.className === 'working' ? 'processing' : status.className === 'muted' ? 'default' : 'success';
+              const lead = states[member.id]?.isLead ? ' · 负责人' : '';
               return (
-                <Tooltip key={member.id} title={`${member.name} · ${status.label}（点击静音切换）`}>
+                <Tooltip key={member.id} title={`${member.name} · ${status.label}${lead}（点击静音切换）`}>
                   <span onClick={isGroup ? () => onToggleMute(member.id) : undefined} style={{ cursor: isGroup ? 'pointer' : 'default' }}>
                     <Badge dot status={dot as 'processing' | 'default' | 'success'}>
-                      <Avatar>{member.name.slice(0, 1).toUpperCase()}</Avatar>
+                      <Avatar style={states[member.id]?.isLead ? { boxShadow: '0 0 0 2px #d4a017' } : undefined}>
+                        {member.name.slice(0, 1).toUpperCase()}
+                      </Avatar>
                     </Badge>
                   </span>
                 </Tooltip>

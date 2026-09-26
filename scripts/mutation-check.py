@@ -2,6 +2,11 @@
 
 每个变异只改一处，跑一个定向测试文件，断言它失败，然后按内存里的原文还原
 （不走 git —— 这些文件里可能有尚未提交的改动）。
+
+**超时算「捕获」**：有些变异会把系统推进死循环（例如拿掉「已经有人回答过就不再兜底」
+这一关，兜底会自我循环），测试不会红，而是一直跑下去。挂死也是一种失败 ——
+而且是比断言失败更严重的失败，所以这里给它一个上限，超时即判定断言有区分度。
+顺带这也是还原逻辑的保护：没有超时的话，杀掉脚本会留下一个被改过的源文件。
 """
 
 import subprocess
@@ -10,15 +15,23 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
+# 单个测试文件的上限。正常一次 1~3 秒，给足余量；超过就是挂住了。
+TEST_TIMEOUT_SECONDS = 60
+
 
 def run_test(rel_path: str) -> bool:
-    """跑一个测试文件，返回它是否通过。"""
-    result = subprocess.run(
-        ["node", "--import", "tsx", "--test", rel_path],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-    )
+    """跑一个测试文件，返回它是否通过。超时视为不通过（= 变异被捕获）。"""
+    try:
+        result = subprocess.run(
+            ["node", "--import", "tsx", "--test", rel_path],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=TEST_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"      （测试超过 {TEST_TIMEOUT_SECONDS}s 未结束 —— 变异把系统推成了死循环）")
+        return False
     return "# fail 0" in result.stdout and result.returncode == 0
 
 
@@ -317,6 +330,180 @@ MUTATIONS = [
                 "server/team-service.ts",
                 "           OR (\n             ? IS NOT NULL\n",
                 "           OR (\n             0\n",
+            )
+        ],
+    },
+    {
+        "name": "用户消息不指定应答者（回到全员可沉默 → 责任扩散）",
+        "test": "server/test/team-chat.test.ts",
+        "steps": [
+            (
+                "server/group-dispatcher.ts",
+                "      message.senderType === 'user' ? this.pickPrimaryResponder(conversation, candidates) : null;",
+                "      null;",
+            )
+        ],
+    },
+    {
+        "name": "应答者拿到的是「可以沉默」的指令（出口没关）",
+        "test": "server/test/team-chat.test.ts",
+        "steps": [
+            ("server/context-assembler.ts", "  if (reason === 'direct') {", "  if (reason === null) {")
+        ],
+    },
+    {
+        "name": "应答者平手时不定序（谁回答取决于数组顺序）",
+        "test": "server/test/team-chat.test.ts",
+        "steps": [
+            (
+                "server/group-dispatcher.ts",
+                "      return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;",
+                "      return 0;",
+            )
+        ],
+    },
+    {
+        "name": "应答者排序方向反了（永远同一个人回答）",
+        "test": "server/test/team-chat.test.ts",
+        "steps": [
+            (
+                "server/group-dispatcher.ts",
+                "      if (left !== right) return left - right;",
+                "      if (left !== right) return right - left;",
+            )
+        ],
+    },
+    # ── 负责人兜底：房间全体沉默时，由负责人回答 ────────────────────────────
+    {
+        "name": "兜底被降级成普通讨论（负责人拿到「你可以沉默」）",
+        "test": "server/test/team-chat.test.ts",
+        "steps": [
+            ("server/group-dispatcher.ts", "      reason: 'escalation',", "      reason: 'open_discussion',")
+        ],
+    },
+    {
+        "name": "兜底根本不派（房间沉默下去没人管）",
+        "test": "server/test/team-chat.test.ts",
+        "steps": [
+            (
+                "server/team-service.ts",
+                "          this.maybeEscalateSilentRoom(input.conversation, input.triggerMessageSequence);",
+                "          void input.triggerMessageSequence;",
+            )
+        ],
+    },
+    {
+        "name": "有人已经回答过还兜底（负责人抢答）",
+        "test": "server/test/team-chat.test.ts",
+        "steps": [("server/team-service.ts", "    if ((counts.replies ?? 0) > 0) return;\n", "")],
+    },
+    {
+        "name": "不等这一批跑完就兜底（一次沉默兜多次）",
+        "test": "server/test/team-chat.test.ts",
+        "steps": [("server/team-service.ts", "    if ((counts.active ?? 0) > 0) return;\n", "")],
+    },
+    {
+        "name": "被静音的负责人照样被兜底唤醒（绕过用户的显式意图）",
+        "test": "server/test/team-chat.test.ts",
+        "steps": [
+            (
+                "server/group-dispatcher.ts",
+                "    if (this.states.get(conversation.id, leadId).muted) return null;\n",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "Member 之间的沉默也当成房间失职（兜底被滥用）",
+        "test": "server/test/team-chat.test.ts",
+        "steps": [
+            (
+                "server/team-service.ts",
+                "    if (!trigger || trigger.senderType !== 'user') return;",
+                "    if (!trigger) return;",
+            )
+        ],
+    },
+    {
+        "name": "兜底合并时输给更弱的唤醒（「房间已沉默」这条信息丢掉）",
+        "test": "server/test/team-chat.test.ts",
+        "steps": [("server/member-turn-scheduler.ts", "  escalation: 4,", "  escalation: 1,")],
+    },
+    {
+        "name": "兜底指令退化成 direct 的说辞（负责人会再判断一次）",
+        "test": "server/test/team-chat.test.ts",
+        "steps": [
+            ("server/context-assembler.ts", "  if (reason === 'escalation') {", "  if (reason === 'never-match') {")
+        ],
+    },
+    # ── 唤醒原因的持久化读回 ──────────────────────────────────────────────
+    {
+        "name": "escalation 没进读回白名单（崩溃恢复时被降级成 open_discussion）",
+        "test": "server/test/team-chat.test.ts",
+        "steps": [
+            (
+                "server/conversation-member-service.ts",
+                "  escalation: true,\n  mention: true,",
+                "  mention: true,",
+            )
+        ],
+    },
+    # ── 一个房间至多一个负责人 ────────────────────────────────────────────
+    {
+        "name": "换负责人时不撤销旧的（两个负责人，谁兜底不确定）",
+        "test": "server/test/team-chat.test.ts",
+        "steps": [
+            (
+                "server/conversation-member-service.ts",
+                "          is_lead = CASE WHEN member_id = ? THEN ? ELSE 0 END,",
+                "          is_lead = CASE WHEN member_id = ? THEN ? ELSE is_lead END,",
+            )
+        ],
+    },
+    {
+        "name": "读负责人时不筛 is_lead（兜底落到随便一个成员头上）",
+        "test": "server/test/team-chat.test.ts",
+        "steps": [
+            (
+                "server/conversation-member-service.ts",
+                "          AND is_lead = 1\n        LIMIT 1",
+                "        LIMIT 1",
+            )
+        ],
+    },
+    # ── 哨兵不能泄漏到客户端 ──────────────────────────────────────────────
+    {
+        "name": "流式路径不过滤哨兵（用户会先看到 <NO_REPLY> 再看着它消失）",
+        "test": "server/test/team-chat.test.ts",
+        "steps": [
+            ("server/team-service.ts", "          const visible = streamGate.push(delta);", "          const visible = delta;")
+        ],
+    },
+    {
+        "name": "收尾时不看判定结果（skip 的尾巴 = 哨兵本身，直接放出去）",
+        "test": "server/test/team-chat.test.ts",
+        "steps": [
+            (
+                "server/team-service.ts",
+                "      const tail = streamGate.flush(outcome.decision);",
+                "      const tail = streamGate.flush('reply');",
+            )
+        ],
+    },
+    {
+        # 同一条变异，但钉在**客户端真正看到的字节流**上。
+        #
+        # 这一条单独存在是因为 SSE 断言有个非常容易踩的空绿：`message.delta` 是
+        # 逐字符的，每个字符各占一帧，所以 `<NO_REPLY>` 在原始 body 里从来不会连续
+        # 出现 —— 直接对 body 做字符串匹配**永远**为 false，包括哨兵真的漏出去时。
+        # 必须解析帧、把 delta 拼起来再断言。这条变异保证那个解析真的做了。
+        "name": "SSE 把 delta 原样转发（客户端会看到哨兵长出来再消失）",
+        "test": "server/test/conversations-api.test.ts",
+        "steps": [
+            (
+                "server/team-service.ts",
+                "          const visible = streamGate.push(delta);",
+                "          const visible = delta;",
             )
         ],
     },

@@ -129,7 +129,17 @@ describe('Scheduler', () => {
     const scheduler = new SchedulerService(structure, () => stack.team);
 
     const past = new Date(Date.now() - 1000).toISOString();
-    const once = createScheduleDue({ memberId: agent.id, conversationId: room.id, prompt: 'check once', type: 'once' });
+    // dueAt 必须**复用** past，不能让 createScheduleDue 自己再读一次时钟。
+    //
+    // 下面那条断言依赖 UNIQUE(schedule_id, scheduled_for) 精确撞上 tick 建的那条 run。
+    // 两次独立的 `Date.now() - 1000` 只有在**同一个毫秒**里求值才相等（ISO 串带毫秒），
+    // 而全量跑时两次调用之间夹着有负载的调度，跨毫秒边界是常事 —— 于是 scheduled_for
+    // 差 1ms，insert 成功，assert.throws 报 "Missing expected exception"。
+    // 全量跑时约 1/4 的轮次会红，单跑几乎不复现（没负载，两次调用贴在一起）。
+    const once = createScheduleDue(
+      { memberId: agent.id, conversationId: room.id, prompt: 'check once', type: 'once' },
+      past,
+    );
     assert.equal(await scheduler.tick(), 1);
     assert.equal(structure.getSchedule(once.id).status, 'completed');
     assert.equal(await scheduler.tick(), 0);

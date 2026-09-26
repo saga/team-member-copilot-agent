@@ -20,7 +20,7 @@ import type { DatabaseSync } from 'node:sqlite';
  *
  * 程序不认识任何别的编号 —— 没有升级代码，认出来也无从下手。
  */
-export const SCHEMA_VERSION = 13;
+export const SCHEMA_VERSION = 14;
 
 /**
  * 当前 schema 的完整定义，按最终形状写。
@@ -320,6 +320,13 @@ CREATE TABLE conversation_member_state (
   -- 重建表，而取值集合在 TypeScript 侧已经是封闭联合，写入口只有 scheduler 一处。
   pending_wake_reason TEXT,
   muted INTEGER NOT NULL DEFAULT 0,
+  -- 房间负责人（lead / key contact）。整个房间都沉默时由它兜底回答。
+  --
+  -- 「至多一个」不是靠 CHECK 保证的（SQLite 加 CHECK 只能重建表，而且
+  -- 「同房间只有一行 is_lead=1」这种跨行约束本来就不该用列级 CHECK 表达），
+  -- 而是靠 ConversationMemberService.setLead 在同一个事务里先清后设。
+  -- 写入入口只有那一个，所以这个不变量有唯一的守门人。
+  is_lead INTEGER NOT NULL DEFAULT 0,
   updated_at TEXT NOT NULL,
   PRIMARY KEY (conversation_id, member_id),
   FOREIGN KEY (conversation_id)
@@ -332,6 +339,16 @@ CREATE TABLE conversation_member_state (
 
 CREATE INDEX idx_conversation_member_state_wake
   ON conversation_member_state(conversation_id, wake_status);
+
+-- 「一个房间至多一个负责人」是**数据库不变量**，不是代码约定。
+--
+-- 偏索引（partial index）只索引 is_lead = 1 的行，所以同一 conversation_id
+-- 出现第二行 is_lead=1 会直接 UNIQUE 冲突。这比「记得在事务里先清后设」可靠：
+-- 后者漏掉一次就是一个房间两个负责人，而且没有任何东西会报错 —— 表现只是
+-- 「沉默时有时是 A 兜底、有时是 B」，几乎不可能查。
+CREATE UNIQUE INDEX idx_conversation_member_state_lead
+  ON conversation_member_state(conversation_id)
+  WHERE is_lead = 1;
 
 CREATE TABLE conversation_message (
   id TEXT PRIMARY KEY,

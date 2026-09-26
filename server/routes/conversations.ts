@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import type { TeamService } from '../team-service.js';
-import type { StoredConversationEvent } from '../domain.js';
+import type { ConversationMemberState, StoredConversationEvent } from '../domain.js';
 import { sendError } from '../middleware/errorHandler.js';
 
 const createConversationSchema = z.object({
@@ -9,7 +9,32 @@ const createConversationSchema = z.object({
   kind: z.enum(['direct', 'group', 'work']).optional(),
   memberIds: z.array(z.string().min(1)).min(1).max(20),
   defaultMemberId: z.string().optional(),
-  jiraIssueKey: z.string().trim().max(60).nullable().optional(),
+  /**
+   * 这间会话围绕哪条外部工作。
+   *
+   * 只收引用 —— 工单内容在 Jira，本地没有存它的地方。zod 会把没声明的键
+   * 静默剥掉，所以这里必须显式声明：漏一个字段的表现是「调用方传了、服务端
+   * 当没看见」，而它不会报任何错（真实发生过：重构掉 jiraIssueKey 之后，
+   * 前端改传 externalWorkRef，这个 schema 没跟着改，引用被丢在边界上）。
+   */
+  externalWorkRef: z
+    .object({
+      /**
+       * provider 在这里枚举，而不是交给 registry 校验：schema 是**输入形状**
+       * 的权威，registry 是**能力**的权威。放行一个未知 provider 会让
+       * normalizeExternalWorkRef 抛普通 Error，最后表现成 500 —— 一个客户端
+       * 输入错误不该是 500。代价是新增外部系统要同时改这里和 registry。
+       */
+      provider: z.literal('jira').optional(),
+      /**
+       * 允许空串：`normalizeExternalWorkRef` 把空 key 当成「没有引用」而不是
+       * 错误（调用方清空输入框时不该炸）。语义判断留在 service，schema 只管形状。
+       */
+      key: z.string().trim().max(60),
+      externalId: z.string().trim().max(120).nullable().optional(),
+    })
+    .nullable()
+    .optional(),
 });
 
 const sendMessageSchema = z.object({
@@ -30,9 +55,20 @@ const addMemberSchema = z.object({
   memberId: z.string().min(1),
 });
 
-const setMemberStateSchema = z.object({
-  muted: z.boolean(),
-});
+/**
+ * 改 Member 在房间里的状态。
+ *
+ * 两个字段都可选，但**至少要有一个**：空 body 什么都不改却回 200，是最难查的
+ * 一类「接口没问题但没生效」。
+ */
+const setMemberStateSchema = z
+  .object({
+    muted: z.boolean().optional(),
+    isLead: z.boolean().optional(),
+  })
+  .refine((value) => value.muted !== undefined || value.isLead !== undefined, {
+    message: '至少要提供 muted 或 isLead 之一',
+  });
 
 export function conversationsRouter(team: TeamService) {
   const router = Router();
@@ -139,21 +175,33 @@ export function conversationsRouter(team: TeamService) {
   });
 
   /**
-   * 改某个 Member 在房间里的状态。当前只有 `muted` 一个可变字段。
+   * 改某个 Member 在房间里的状态：`muted`（静音）与 `isLead`（房间负责人）。
    *
    * 静音的语义是「dispatcher 不唤醒它」——@ 也唤不醒。成员仍然看得见历史，
    * 只是不再被拉进讨论。
+   *
+   * 负责人的语义是「用户对着房间说话、而整个房间都没接话时，由它兜底回答」。
+   * 它不参与日常排序 —— 让她回答每一条，房间就变回「一个 Agent 加几个装饰」。
+   * 一个房间至多一个负责人，由 DB 上的偏索引强制（换人会自动顶掉旧的）。
    */
   router.patch('/:id/members/:memberId/state', (req, res) => {
     const parsed = setMemberStateSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
-      res.status(400).json({ error: 'muted 必须是 boolean' });
+      res.status(400).json({ error: parsed.error.issues.map((i) => i.message).join('; ') });
       return;
     }
     try {
-      res.json({
-        state: team.setMemberMuted(req.params.id, req.params.memberId, parsed.data.muted),
-      });
+      const { muted, isLead } = parsed.data;
+      // 两个 setter 各自返回**改完之后**的完整状态，所以最后一个的结果就是
+      // 响应该给的那份 —— 不需要再查一次全房间的状态。
+      let state: ConversationMemberState | undefined;
+      if (muted !== undefined) {
+        state = team.setMemberMuted(req.params.id, req.params.memberId, muted);
+      }
+      if (isLead !== undefined) {
+        state = team.setMemberLead(req.params.id, req.params.memberId, isLead);
+      }
+      res.json({ state });
     } catch (error) {
       sendError(res, error);
     }

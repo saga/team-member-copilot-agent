@@ -322,6 +322,7 @@ describe('schema 就位（PRAGMA user_version）', () => {
             'pending_wake_trigger_sequence',
             'pending_wake_reason',
             'muted',
+            'is_lead',
             'updated_at',
           ],
           conversation_message: [
@@ -421,6 +422,7 @@ describe('schema 就位（PRAGMA user_version）', () => {
       assert.deepEqual(indexes, [
         'idx_conversation_event_replay',
         'idx_conversation_external_work_key',
+        'idx_conversation_member_state_lead',
         'idx_conversation_member_state_wake',
         'idx_conversation_team',
         'idx_execution_conversation_created',

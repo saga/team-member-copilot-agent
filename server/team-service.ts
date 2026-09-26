@@ -10,7 +10,7 @@ import { ContextAssembler } from './context-assembler.js';
 import { ConversationMemberService } from './conversation-member-service.js';
 import { GroupDispatcher, type DispatchPlan, type WakePlan } from './group-dispatcher.js';
 import { MemberTurnScheduler } from './member-turn-scheduler.js';
-import { NO_REPLY_SENTINEL, parseMemberTurnOutcome } from './member-decision.js';
+import { NoReplyStreamGate, NO_REPLY_SENTINEL, parseMemberTurnOutcome } from './member-decision.js';
 import { badRequest, conflict, notFound } from './http-error.js';
 import { MemberConversationService, isMemberDm, type MemberDirectMessage } from './member-conversation-service.js';
 import {
@@ -1049,6 +1049,28 @@ export class TeamService {
   }
 
   /**
+   * 指定 / 撤销房间负责人（lead / key contact）。
+   *
+   * 负责人是**房间维度**的角色：同一个 Member 可以是安全评审室的负责人、
+   * 同时在架构室里只是普通成员。一个房间至多一个 —— 这条不变量由
+   * `conversation_member_state` 上的偏索引强制，不是靠这里记得先清后设。
+   *
+   * 它平时不影响任何排序（日常仍然是轮流应答），只在「用户对着房间说话、
+   * 而整个房间都没回应」时兜底。见 maybeEscalateSilentRoom。
+   */
+  setMemberLead(
+    conversationId: string,
+    memberId: string,
+    isLead: boolean,
+  ): ConversationMemberState {
+    const conversation = this.getConversation(conversationId);
+    this.requireConversationMember(conversation, memberId);
+    this.states.ensure(conversationId, memberId);
+    this.states.setLead(conversationId, memberId, isLead);
+    return this.states.get(conversationId, memberId);
+  }
+
+  /**
    * 真正跑一次唤醒。
    *
    * execution 在这里创建（而不是在 sendMessage 里）：scheduler 已经保证了
@@ -1614,6 +1636,10 @@ export class TeamService {
    *
    * retry 和重启恢复都不该「猜」一个 turnMode：delegation 与房间讨论的
    * prompt 差别很大，猜错会让恢复出来的一轮行为莫名其妙。
+   *
+   * 判据是**房间种类**，不是唤醒原因 —— group 房间一律 discussion 模式
+   * （房间活动以 transcript 给出），「必须回答」这条差异由
+   * ContextAssembler.discussionInstruction 按 reason 表达。
    */
   private turnModeFor(conversation: Conversation, execution: ExecutionRecord): TurnMode {
     if (execution.kind === 'member_delegate') return 'delegation';
@@ -2041,6 +2067,10 @@ export class TeamService {
     let streamed = '';
     let partial: string | null = null;
 
+    // 哨兵过滤器：`<NO_REPLY>` 是控制信号，不是内容，一个字符都不该转发出去。
+    // 否则用户会看着它长出来，再在收口时整条消失 —— 看起来像 UI 故障。
+    const streamGate = new NoReplyStreamGate();
+
     try {
       // 能力解析必须在拼 system prompt 之前：prompt 里的资料源清单就是解析结果
       // （Provider 说这个 Member 能看哪些源），两者共用一次解析，模型被明确告知
@@ -2065,13 +2095,15 @@ export class TeamService {
         conversationId: input.conversation.id,
         capabilities: runtimeCapabilities,
         onDelta: (delta) => {
-          streamed += delta;
+          const visible = streamGate.push(delta);
+          if (!visible) return;
+          streamed += visible;
           this.emit(input.conversation.id, {
             type: 'message.delta',
             data: {
               executionId,
               memberId: input.member.id,
-              delta,
+              delta: visible,
             },
           });
         },
@@ -2085,6 +2117,18 @@ export class TeamService {
       }
 
       const outcome = parseMemberTurnOutcome(result);
+
+      // 把过滤器扣住的尾巴放出来。必须带上判定结果：skip 时那条尾巴**就是**
+      // 哨兵本身，放出去正是要修的现象。也要赶在 message.created 之前 ——
+      // 那条事件会清掉流式占位，之后再补一个 delta 会留下一个没人收的占位。
+      const tail = streamGate.flush(outcome.decision);
+      if (tail) {
+        streamed += tail;
+        this.emit(input.conversation.id, {
+          type: 'message.delta',
+          data: { executionId, memberId: input.member.id, delta: tail },
+        });
+      }
 
       // checkpoint 只在成功后才推进；失败时保持不变，下一轮重新注入，
       // 宁可重复也不要丢上下文。
@@ -2112,6 +2156,17 @@ export class TeamService {
           endedAt: now(),
         });
         this.emitExecution(this.getExecution(executionId));
+
+        // 第二道保险：这一条 skip 之后，房间是不是**全体沉默**了。
+        //
+        // 必须在这一条 execution 收口**之后**判断：收口之前它自己还是 active，
+        // 「这一批跑完了没有」永远是否，兜底就永远不会触发。也必须在**每条**
+        // skip 之后都判断 —— 只有最后收口的那条会通过「全部收口」这一关，
+        // 前面几条会被拦掉，所以不会重复派发。
+        if (input.triggerMessageSequence !== null) {
+          this.maybeEscalateSilentRoom(input.conversation, input.triggerMessageSequence);
+        }
+
         // 没有新消息 → 不需要再派发唤醒，循环自然终止
         return '';
       }
@@ -2181,6 +2236,89 @@ export class TeamService {
 
       throw error;
     }
+  }
+
+  /**
+   * 第二道保险：用户对着房间说话、而**整个房间都没接话**时，把这一轮交给负责人。
+   *
+   * ── 为什么需要第二道 ────────────────────────────────────────────────
+   *
+   * 第一道（GroupDispatcher.pickPrimaryResponder）是**一条指令**：平台指定
+   * 一名应答者并明确告诉它「必须回答」。指令是可以被无视的 —— 模型有自己的
+   * 判断。真实发生过的样子是六条 execution 全部 completed / decision=skip：
+   * 机制全对，每个人都选了沉默。
+   *
+   * 所以还需要一道**不依赖模型配合**的兜底：既然整个房间都没接话，那就由
+   * 负责人来接。对应职场里「问了一圈没人应，负责人总得说话」。
+   *
+   * ── 触发条件（全部满足才兜底） ──────────────────────────────────────
+   *
+   *   1. 触发消息是**用户**发的 —— Member 之间的 follow_up 沉默不算房间失职
+   *   2. 这一批 execution 已**全部收口**（还有在跑的就不急，它可能正要回答）
+   *   3. 这一批里**没有任何一条** decision=reply（有人说了话就不必兜底）
+   *   4. 这条触发消息**还没兜过底** —— 一次静默只兜一次，否则兜底失败会自我循环
+   *   5. 负责人存在、在房间里、active、未被静音（静音是显式意图，不绕过）
+   *
+   * ── 刻意**不**加的一条：负责人已经当过应答者就不再问 ─────────────────
+   *
+   * 加过，又删了。它看起来合理（「同一件事不做两遍」），但它会在一个真实且
+   * 常见的场景里让房间继续沉默：负责人恰好被 pickPrimaryResponder 选中，
+   * 拿着「你必须回答」的指令选择了沉默，其他人也沉默 —— 房间一个字都没回。
+   * 这正是要修的现象，而这条「优化」恰好把它放行。
+   *
+   * 而且再问一次并不真的是同一件事：兜底的指令带着一条别的分支没有的信息
+   * （「房间里没人接话」）。同一个 Member 收到不同的输入，本来就可能有不同的
+   * 判断。代价有上界（条件 4 保证一次静默只兜一次），而房间保持沉默的代价
+   * 没有上界 —— 用户看着一个死房间。
+   *
+   * ── 只在 skip 之后调用，不在 failed / cancelled 之后 ─────────────────
+   *
+   *   failed    是引擎故障，用户已经看到错误提示。再叠一次兜底会让一次故障
+   *             表现成两条错误，而且大概率同样失败。
+   *   cancelled 是用户自己叫停的，此时替他再派一轮是违背他的意图。
+   *
+   * 「大家都不发言」这句话的精确含义就是「所有人都主动选择了沉默」。
+   */
+  private maybeEscalateSilentRoom(conversation: Conversation, triggerSequence: number): void {
+    if (conversation.kind !== 'group') return;
+
+    const counts = this.db
+      .prepare(
+        `
+        SELECT
+          SUM(CASE WHEN status IN ('queued', 'running', 'waiting_for_member')
+                   THEN 1 ELSE 0 END) AS active,
+          SUM(CASE WHEN decision = 'reply' THEN 1 ELSE 0 END) AS replies,
+          SUM(CASE WHEN wake_reason = 'escalation' THEN 1 ELSE 0 END) AS escalations
+        FROM execution
+        WHERE conversation_id = ?
+          AND trigger_message_sequence = ?
+        `,
+      )
+      .get(conversation.id, triggerSequence) as unknown as {
+      active: number | null;
+      replies: number | null;
+      escalations: number | null;
+    };
+
+    if ((counts.active ?? 0) > 0) return;
+    if ((counts.replies ?? 0) > 0) return;
+    if ((counts.escalations ?? 0) > 0) return;
+
+    const trigger = this.findMessageBySequence(conversation.id, triggerSequence);
+    if (!trigger || trigger.senderType !== 'user') return;
+
+    // 花名册判断（谁是负责人、它现在能不能接活）交给 dispatcher；
+    // 「这一批跑完没有、有没有人说过话」是执行历史，留在这一层。
+    const plan = this.dispatcher.planEscalation({ conversation, triggerSequence });
+    if (!plan) return;
+
+    this.scheduler.enqueue({
+      conversationId: conversation.id,
+      memberId: plan.memberId,
+      reason: plan.reason,
+      triggerSequence,
+    });
   }
 
   private touchAgentPresence(memberId: string): void {
@@ -2443,8 +2581,10 @@ export class TeamService {
       'How this room works:',
       'You are one participant among several, not the assistant of the whole room.',
       'Mention another Member with @handle when you want a specific person to respond.',
-      'In a group room you may be woken without being addressed; if you have nothing',
-      `useful and non-duplicative to add, reply with exactly ${NO_REPLY_SENTINEL} instead of a message.`,
+      'In a group room you may be woken without being addressed. When you ARE addressed',
+      '(by @handle, or as the Member picked to answer the room), you must reply.',
+      'Only when you were merely copied in and have nothing useful and non-duplicative',
+      `to add, reply with exactly ${NO_REPLY_SENTINEL} instead of a message.`,
       '',
       'Delegation:',
       'Use ask_member when another Member is better suited to a specific subtask.',

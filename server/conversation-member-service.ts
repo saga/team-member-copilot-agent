@@ -18,6 +18,7 @@ interface StateRow {
   pending_wake_trigger_sequence: number | null;
   pending_wake_reason: string | null;
   muted: number;
+  is_lead: number;
   updated_at: string;
 }
 
@@ -299,6 +300,61 @@ export class ConversationMemberService {
     this.emitState(conversationId, memberId);
   }
 
+  /**
+   * 指定 / 撤销房间负责人。
+   *
+   * ── 为什么是一条 CASE UPDATE，而不是「先清后设」两条 ────────────────
+   *
+   * 一条语句就同时表达了「指定这个」和「其余全部让位」，中间不存在
+   * 「一个房间零个负责人」或「两个负责人」的瞬间 —— 后者会被偏索引
+   * （idx_conversation_member_state_lead）直接拒掉，前者虽然合法但会让
+   * 兜底静默失效。少一个中间态，就少一次「进程恰好死在两条语句之间」。
+   *
+   * 代价是这条语句会碰到房间里所有行。房间只有几十个成员，一次 UPDATE
+   * 比一次事务便宜得多。
+   *
+   * 通知要发**两行**：新上任的，以及被顶掉的那个 —— 只通知前者会让旧负责人
+   * 在 UI 上一直挂着「Lead」徽章。
+   */
+  setLead(conversationId: string, memberId: string, isLead: boolean): void {
+    const previous = this.lead(conversationId);
+
+    this.db
+      .prepare(
+        `
+        UPDATE conversation_member_state
+        SET
+          is_lead = CASE WHEN member_id = ? THEN ? ELSE 0 END,
+          updated_at = ?
+        WHERE conversation_id = ?
+        `,
+      )
+      .run(memberId, isLead ? 1 : 0, now(), conversationId);
+
+    const affected = new Set<string>();
+    if (previous) affected.add(previous);
+    if (isLead) affected.add(memberId);
+    else if (previous === memberId) affected.add(memberId);
+    for (const id of affected) this.emitState(conversationId, id);
+  }
+
+  /** 房间的负责人。没有就返回 null —— 没设负责人是合法状态，不是错误。 */
+  lead(conversationId: string): string | null {
+    const row = this.db
+      .prepare(
+        `
+        SELECT member_id
+        FROM conversation_member_state
+        WHERE conversation_id = ?
+          AND is_lead = 1
+        LIMIT 1
+        `,
+      )
+      .get(conversationId) as unknown as { member_id: string } | undefined;
+
+    return row?.member_id ?? null;
+  }
+
   /** 成员被移出 conversation（或成员归档）时清理。 */
   remove(conversationId: string, memberId: string): void {
     this.db
@@ -354,6 +410,11 @@ export class ConversationMemberService {
    * triggerSequence = 0 + open_discussion：宁可重放成一次允许沉默的唤醒，
    * 也不要把一条 unknown 的原因当成 mention 逼出一条消息。调用方看到
    * triggerSequence = 0 会用房间当前水位兜底。
+   *
+   * 注意「退回」只针对**认不出来**的值。已知的值必须原样重放，尤其是
+   * escalation —— 它一旦在这里被降级成 open_discussion，负责人在重启后拿到的
+   * 就是「你可以沉默」，兜底会在最需要它的时刻静默失效。判据统一在
+   * asWakeReason，不要在调用处另写一套。
    */
   findLostWakes(): PendingWake[] {
     const rows = this.db
@@ -406,17 +467,38 @@ export class ConversationMemberService {
 }
 
 /**
+ * 所有合法的「非 schedule」唤醒原因，列成 Record 而不是一串字符串比较。
+ *
+ * 用 Record 是为了让**编译器**帮忙：给 WakeReason 加一个新原因时，这里少写一行
+ * 就编译不过。这不是洁癖 —— 这里原本是 `value === 'direct' || ...` 的写法，加
+ * 'escalation' 时漏改了，于是**最强**的唤醒原因读回来被降级成**最弱**的
+ * open_discussion：RecoveryService 重放一条 durable 的兜底唤醒时，负责人拿到的是
+ * 「你可以沉默」，兜底在重启之后静默失效 —— 而那正是它最该起作用的时候。
+ * 字符串比较不会报错，Record 会。
+ */
+const KNOWN_WAKE_REASONS: Record<Exclude<WakeReason, 'schedule'>, true> = {
+  escalation: true,
+  mention: true,
+  direct: true,
+  follow_up: true,
+  open_discussion: true,
+};
+
+/**
  * 把落库的 reason 收窄回联合类型。
  *
  * 数据库里是自由 TEXT（加 CHECK 只能重建表，而这张表被 conversation / member
  * 两张表引用），取值由 domain.ts 的封闭联合守住，写入口只有 scheduler 一处，
- * 所以读回来必须过这一层：认不出来的一律按最宽松的 open_discussion 处理。
- * RecoveryService 也用它，两处读同一列不能有两套判据。
+ * 所以读回来必须过这一层。RecoveryService 也用它，两处读同一列不能有两套判据。
  */
 export function asWakeReason(value: string | null): Exclude<WakeReason, 'schedule'> {
-  return value === 'direct' || value === 'mention' || value === 'follow_up'
-    ? value
-    : 'open_discussion';
+  // hasOwnProperty 而不是 `in`：`'toString' in obj` 会穿过原型链为真。
+  if (value !== null && Object.prototype.hasOwnProperty.call(KNOWN_WAKE_REASONS, value)) {
+    return value as Exclude<WakeReason, 'schedule'>;
+  }
+  // 认不出来的一律按**最宽松**的处理：宁可让一个成员可以沉默，也不要让一个
+  // 乱码值变成「必须回答」。
+  return 'open_discussion';
 }
 
 function mapState(row: StateRow): ConversationMemberState {
@@ -430,6 +512,7 @@ function mapState(row: StateRow): ConversationMemberState {
     pendingWakeTriggerSequence: row.pending_wake_trigger_sequence,
     pendingWakeReason: row.pending_wake_reason ? asWakeReason(row.pending_wake_reason) : null,
     muted: row.muted === 1,
+    isLead: row.is_lead === 1,
     updatedAt: row.updated_at,
   };
 }
