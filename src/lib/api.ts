@@ -380,13 +380,6 @@ export interface ConversationMemberState {
   pendingWakeTriggerSequence: number | null;
   pendingWakeReason: WakeReason | null;
   muted: boolean;
-  /**
-   * 房间负责人（lead / key contact）。
-   *
-   * 平时不参与排序 —— 日常仍然是轮流应答。只在「用户对着房间说话、而整个
-   * 房间都没接话」时兜底回答。一个房间至多一个。
-   */
-  isLead: boolean;
   updatedAt: string;
 }
 
@@ -579,6 +572,52 @@ export const api = {
     }).then(json<MemberMemory>);
   },
 
+  /**
+   * 这个 Member 在某一个 Team 的上下文全文。teamId 省略 = 当前默认 Team。
+   *
+   * 与全局记忆同一套语义（全文 + sha256 版本 + 409），只是落盘位置不同：
+   * `.data/members/<id>/teams/<teamId>/MEMORY.md`。
+   */
+  getMemberTeamContext(memberId: string, teamId?: string): Promise<MemberMemory> {
+    const query = teamId ? `?teamId=${encodeURIComponent(teamId)}` : '';
+    return fetch(
+      `${API_BASE}/api/members/${encodeURIComponent(memberId)}/team-context${query}`,
+    ).then(json<MemberMemory>);
+  },
+
+  replaceMemberTeamContext(
+    memberId: string,
+    content: string,
+    expectedVersion?: string,
+    teamId?: string,
+  ): Promise<MemberMemory> {
+    return fetch(`${API_BASE}/api/members/${encodeURIComponent(memberId)}/team-context`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(
+        expectedVersion || teamId
+          ? { content, ...(expectedVersion ? { expectedVersion } : {}), ...(teamId ? { teamId } : {}) }
+          : { content },
+      ),
+    }).then(json<MemberMemory>);
+  },
+
+  /**
+   * Member 视角的历史：参与过的 conversation（按最后活动倒序）与所属 Team。
+   * Member Profile 的 Recent activity 只读这两条，不建新表。
+   */
+  listMemberConversations(memberId: string): Promise<{ conversations: Conversation[] }> {
+    return fetch(
+      `${API_BASE}/api/members/${encodeURIComponent(memberId)}/conversations`,
+    ).then(json<{ conversations: Conversation[] }>);
+  },
+
+  listMemberTeams(memberId: string): Promise<{ teams: Team[] }> {
+    return fetch(`${API_BASE}/api/members/${encodeURIComponent(memberId)}/teams`).then(
+      json<{ teams: Team[] }>,
+    );
+  },
+
   listScopedSkills(scope: SkillScope, memberId?: string): Promise<{ skills: MemberSkill[] }> {
     return fetch(`${API_BASE}${scopedSkillPath(scope, memberId)}`).then(
       json<{ skills: MemberSkill[] }>,
@@ -627,15 +666,12 @@ export const api = {
   },
 
   /**
-   * 改 Member 在房间里的状态：静音 / 负责人。
-   *
-   * 两个字段都可选，但至少要有一个 —— 空 patch 服务端会回 400，而不是
-   * 静默地什么都不改却回 200。
+   * 改 Member 在房间里的静音状态。静音后 dispatcher 不会唤醒它 —— @ 也唤不醒。
    */
   setMemberState(
     conversationId: string,
     memberId: string,
-    patch: { muted?: boolean; isLead?: boolean },
+    patch: { muted: boolean },
   ): Promise<{ state: ConversationMemberState }> {
     return fetch(
       `${API_BASE}/api/conversations/${encodeURIComponent(
@@ -656,19 +692,6 @@ export const api = {
     muted: boolean,
   ): Promise<{ state: ConversationMemberState }> {
     return api.setMemberState(conversationId, memberId, { muted });
-  },
-
-  /**
-   * 指定 / 撤销房间负责人。
-   *
-   * 一个房间至多一个：指定新的会自动顶掉旧的（服务端保证）。
-   */
-  setMemberLead(
-    conversationId: string,
-    memberId: string,
-    isLead: boolean,
-  ): Promise<{ state: ConversationMemberState }> {
-    return api.setMemberState(conversationId, memberId, { isLead });
   },
 
   /**

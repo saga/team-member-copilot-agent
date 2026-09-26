@@ -20,7 +20,10 @@ import {
 } from './team/ConversationMessages';
 import { MessageComposer } from './team/MessageComposer';
 import { MemberProfile } from './team/MemberProfile';
-import { TeamSidebar } from './team/TeamSidebar';
+import { TeamManagement } from './team/TeamManagement';
+import { CapabilitySettings } from './team/CapabilitySettings';
+import { ConversationSidebar } from './chat/ConversationSidebar';
+import { WorkspaceNav, type WorkspaceView } from './workspace/WorkspaceNav';
 import type { WorkDraft } from './team/WorkCreator';
 import { ResizableSider } from './ResizableSider';
 import { EVERYONE, type MemberStatus, type MemberStatusLookup } from './team/constants';
@@ -91,7 +94,13 @@ function mergeMessages(
 }
 
 /**
- * Team UI 的容器：只持有「当前会话 / 当前成员 / 实时状态」，其余交给 team/* 子组件。
+ * Team UI 的容器：只持有「当前视图 / 会话 / 成员 / 实时状态」，排布交给各面。
+ *
+ * 三个面各管一层，互不掺和：
+ *
+ *   chat     —— 日常对话（第二列只有会话）
+ *   team     —— 成员 / Current Work / Schedules
+ *   settings —— Capabilities（Admin 面，不在聊天顶栏）
  *
  * 三条数据通道必须分清，混起来就会出现难查的不一致：
  *
@@ -100,6 +109,16 @@ function mergeMessages(
  *   conversation_member_state —— 每个成员在房间里的读游标 / 唤醒状态 / 静音
  */
 export function TeamChat() {
+  /** 当前在哪个面：工作面 / 管理面 / 设置面。 */
+  const [view, setView] = useState<WorkspaceView>('chat');
+  /**
+   * 从 Member 行点进 Settings 时的落点（哪一层、哪个人）。
+   * CapabilitySettings 只在挂载时读一次，切人时用 key 换 key 强制重挂。
+   */
+  const [capabilityTarget, setCapabilityTarget] = useState<{
+    scope: 'global' | 'team' | 'member';
+    memberId: string | null;
+  } | null>(null);
   const [members, setMembers] = useState<Member[]>([]);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [conversationId, setConversationId] = useState<string | null>(null);
@@ -199,7 +218,7 @@ export function TeamChat() {
    * 成员在房间里的状态，用来渲染 ●idle / ●working / 🔇muted。
    *
    * muted 以服务端为准（它是 dispatcher 的真实输入）；wakeStatus 覆盖「有唤醒
-   * 在排队 / 在跑」；两者都没有但有活跃 execution 时兜底成 working，免得调度器
+   * 在排队 / 在跑」；两者都没有但有活跃 execution 时显示成 working，免得调度器
    * 状态和 UI 出现一瞬不一致。
    */
   const memberStatus: MemberStatusLookup = (memberId) => {
@@ -470,8 +489,25 @@ export function TeamChat() {
     );
   }
 
-  async function toggleMuted(memberId: string): Promise<void> {
-    if (!conversationId) return;
+  /**
+   * 从 Member 行进 Settings：落在「这个人」的增量能力上。
+   * Settings 是 Admin 面，入口在管理面和小菜单，不在聊天顶栏。
+   */
+  function manageMemberCapabilities(member: Member) {
+    setCapabilityTarget({ scope: 'member', memberId: member.id });
+    setView('settings');
+  }
+
+  async function archiveMember(member: Member): Promise<void> {
+    try {
+      const result = await api.updateMember(member.id, { status: 'archived' });
+      applyMemberSaved(result.member);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function toggleMuted(memberId: string): Promise<void> {    if (!conversationId) return;
     const muted = !conversationStates[memberId]?.muted;
     try {
       const result = await api.setMemberMuted(conversationId, memberId, muted);
@@ -506,6 +542,7 @@ export function TeamChat() {
     );
     if (existing) {
       openConversation(existing.id);
+      setView('chat');
       return;
     }
 
@@ -519,6 +556,7 @@ export function TeamChat() {
       ...current.filter((item) => item.id !== result.conversation.id),
     ]);
     openConversation(result.conversation.id);
+    setView('chat');
   }
 
   /**
@@ -656,40 +694,76 @@ export function TeamChat() {
   }
 
   return (
-    <Layout style={{ height: '100%' }}>
-      <ResizableSider>
-        <TeamSidebar
-          members={members}
-          conversations={conversations}
-          selectedConversationId={conversationId}
-          onSelectConversation={openConversation}
-          showNewMember={showNewMember}
-          onToggleNewMember={() =>
-            setCreator((current) => (current === 'member' ? null : 'member'))
-          }
-          onCreateMember={createMember}
-          onCancelNewMember={() => setCreator(null)}
-          onChatMember={(member) => void createDirect(member)}
-          onEditMember={(member) => setEditingMemberId(member.id)}
-          showGroupCreator={showGroupCreator}
-          onToggleGroupCreator={() => setCreator('group')}
-          onCancelGroupCreator={() => setCreator(null)}
-          onCreateGroup={createGroup}
-          showWorkCreator={showWorkCreator}
-          onToggleWorkCreator={() => setCreator('work')}
-          onCancelWorkCreator={() => setCreator(null)}
-          onCreateWork={createWork}
-        />
-      </ResizableSider>
+    <Layout style={{ height: '100%', flexDirection: 'row' }}>
+      <WorkspaceNav view={view} onChange={setView} />
 
-      <Layout>
-        {!selectedConversation && (
+      {view === 'chat' && (
+        <ResizableSider>
+          <ConversationSidebar
+            members={members}
+            conversations={conversations}
+            selectedConversationId={conversationId}
+            onSelectConversation={openConversation}
+            showGroupCreator={showGroupCreator}
+            onToggleGroupCreator={() => setCreator('group')}
+            onCancelGroupCreator={() => setCreator(null)}
+            onCreateGroup={createGroup}
+            showWorkCreator={showWorkCreator}
+            onToggleWorkCreator={() => setCreator('work')}
+            onCancelWorkCreator={() => setCreator(null)}
+            onCreateWork={createWork}
+          />
+        </ResizableSider>
+      )}
+
+      <Layout style={{ minWidth: 0 }}>
+        {error && (
+          <Alert
+            type="error"
+            showIcon
+            closable
+            onClose={() => setError(null)}
+            message={error}
+            style={{ margin: '8px 18px 0' }}
+          />
+        )}
+
+        {view === 'team' && (
+          <TeamManagement
+            members={members}
+            conversations={conversations}
+            showNewMember={showNewMember}
+            onToggleNewMember={() =>
+              setCreator((current) => (current === 'member' ? null : 'member'))
+            }
+            onCreateMember={createMember}
+            onCancelNewMember={() => setCreator(null)}
+            onChatMember={(member) => void createDirect(member)}
+            onViewMember={(member) => setEditingMemberId(member.id)}
+            onManageMemberCapabilities={manageMemberCapabilities}
+            onArchiveMember={(member) => void archiveMember(member)}
+          />
+        )}
+
+        {view === 'settings' && (
+          <div style={{ padding: '12px 18px', overflowY: 'auto', height: '100%' }}>
+            <CapabilitySettings
+              key={`${capabilityTarget?.scope ?? 'global'}:${capabilityTarget?.memberId ?? ''}`}
+              inline
+              initialScope={capabilityTarget?.scope ?? 'global'}
+              initialMemberId={capabilityTarget?.memberId ?? null}
+              onClose={() => setView('chat')}
+            />
+          </div>
+        )}
+
+        {view === 'chat' && !selectedConversation && (
           <Content style={{ display: 'grid', placeItems: 'center', color: '#999' }}>
             <Empty description="先选择一个 Team Member" />
           </Content>
         )}
 
-        {selectedConversation && (
+        {view === 'chat' && selectedConversation && (
           <Content style={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>
             <ConversationHeader
               conversation={selectedConversation}
@@ -738,17 +812,6 @@ export function TeamChat() {
                 closable
                 onClose={() => setNotice(null)}
                 message={notice}
-                style={{ margin: '0 18px' }}
-              />
-            )}
-
-            {error && (
-              <Alert
-                type="error"
-                showIcon
-                closable
-                onClose={() => setError(null)}
-                message={error}
                 style={{ margin: '0 18px' }}
               />
             )}

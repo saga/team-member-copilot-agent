@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import type { TeamService } from '../team-service.js';
-import type { ConversationMemberState, StoredConversationEvent } from '../domain.js';
+import type { StoredConversationEvent } from '../domain.js';
 import { sendError } from '../middleware/errorHandler.js';
 
 const createConversationSchema = z.object({
@@ -56,19 +56,14 @@ const addMemberSchema = z.object({
 });
 
 /**
- * 改 Member 在房间里的状态。
+ * 改 Member 在房间里的静音状态。
  *
- * 两个字段都可选，但**至少要有一个**：空 body 什么都不改却回 200，是最难查的
+ * body 必须是 `{ muted: boolean }`：空 body 什么都不改却回 200，是最难查的
  * 一类「接口没问题但没生效」。
  */
-const setMemberStateSchema = z
-  .object({
-    muted: z.boolean().optional(),
-    isLead: z.boolean().optional(),
-  })
-  .refine((value) => value.muted !== undefined || value.isLead !== undefined, {
-    message: '至少要提供 muted 或 isLead 之一',
-  });
+const setMemberStateSchema = z.object({
+  muted: z.boolean(),
+});
 
 export function conversationsRouter(team: TeamService) {
   const router = Router();
@@ -175,14 +170,10 @@ export function conversationsRouter(team: TeamService) {
   });
 
   /**
-   * 改某个 Member 在房间里的状态：`muted`（静音）与 `isLead`（房间负责人）。
+   * 改某个 Member 在房间里的静音状态。
    *
    * 静音的语义是「dispatcher 不唤醒它」——@ 也唤不醒。成员仍然看得见历史，
    * 只是不再被拉进讨论。
-   *
-   * 负责人的语义是「用户对着房间说话、而整个房间都没接话时，由它兜底回答」。
-   * 它不参与日常排序 —— 让她回答每一条，房间就变回「一个 Agent 加几个装饰」。
-   * 一个房间至多一个负责人，由 DB 上的偏索引强制（换人会自动顶掉旧的）。
    */
   router.patch('/:id/members/:memberId/state', (req, res) => {
     const parsed = setMemberStateSchema.safeParse(req.body ?? {});
@@ -191,16 +182,7 @@ export function conversationsRouter(team: TeamService) {
       return;
     }
     try {
-      const { muted, isLead } = parsed.data;
-      // 两个 setter 各自返回**改完之后**的完整状态，所以最后一个的结果就是
-      // 响应该给的那份 —— 不需要再查一次全房间的状态。
-      let state: ConversationMemberState | undefined;
-      if (muted !== undefined) {
-        state = team.setMemberMuted(req.params.id, req.params.memberId, muted);
-      }
-      if (isLead !== undefined) {
-        state = team.setMemberLead(req.params.id, req.params.memberId, isLead);
-      }
+      const state = team.setMemberMuted(req.params.id, req.params.memberId, parsed.data.muted);
       res.json({ state });
     } catch (error) {
       sendError(res, error);

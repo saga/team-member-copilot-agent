@@ -265,26 +265,19 @@ export type TurnMode = 'direct' | 'discussion' | 'delegation';
  *   mention         消息里 @ 了它
  *   open_discussion 用户没 @ 任何人，让房间里的成员自行判断要不要发言
  *   follow_up       另一个 Member 发言后，没被 @ 的成员被顺带唤醒（受 autoWakeRounds 限制）
- *   escalation      用户对着房间说话，但**整个房间都没回应** —— 平台把这一轮
- *                   交给房间的负责人（lead）兜底
  *   schedule        定时唤醒
- *
- * direct / mention / escalation 必须回答；open_discussion / follow_up 允许 <NO_REPLY>。
- *
- * `direct` 之所以也覆盖「平台指定的应答者」：用户对着房间提问时，房间欠一个
- * 回答，而这条欠条必须落在具体某个人头上 —— 否则三个 Member 会各自认为
- * 「别人会说」，全体沉默。见 GroupDispatcher.pickPrimaryResponder。
- *
- * `escalation` 是**第二道**保险：第一道（direct）是一条指令，指令是可以被
- * 无视的。整个房间都沉默时，这一轮改由负责人回答 —— 对应职场里「没人接话，
- * 那就负责人来接」。它只可能发生一次（见 TeamService.maybeEscalateSilentRoom）。
- */
+  *
+  * direct / mention 必须回答；open_discussion / follow_up 允许 <NO_REPLY>。
+  *
+  * `direct` 之所以也覆盖「平台指定的应答者」：用户对着房间提问时，房间欠一个
+  * 回答，而这条欠条必须落在具体某个人头上 —— 否则三个 Member 会各自认为
+  * 「别人会说」，全体沉默。见 GroupDispatcher.pickPrimaryResponder。
+  */
 export type WakeReason =
   | 'direct'
   | 'mention'
   | 'open_discussion'
   | 'follow_up'
-  | 'escalation'
   | 'schedule';
 
 /**
@@ -429,17 +422,6 @@ export interface ConversationMemberState {
   pendingWakeReason: WakeReason | null;
   /** 静音：dispatcher 不会唤醒它（@ 也唤不醒）。 */
   muted: boolean;
-  /**
-   * 房间负责人（lead / key contact）。
-   *
-   * 它**不是**「谁先回答」的排序依据 —— 日常仍然是轮流应答。它只在一种情况下
-   * 生效：用户对着房间说话、而整个房间都没人回应时，由它兜底回答。
-   *
-   * 放在这里（而不是 Member 上）是因为「负责人」是**房间维度**的角色：同一个
-   * Member 可以是安全评审室的负责人、同时在架构室里只是普通成员。一个房间
-   * 至多一个负责人，由 `ConversationMemberService.setLead` 在事务里保证。
-   */
-  isLead: boolean;
   updatedAt: string;
 }
 

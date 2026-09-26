@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
-import { Avatar, Badge, Button, Tag, Typography } from 'antd';
-import { MessageOutlined, SettingOutlined, UserAddOutlined } from '@ant-design/icons';
+import { Avatar, Badge, Button, Dropdown, Modal, Tag, Typography } from 'antd';
+import { EllipsisOutlined, MessageOutlined, UserAddOutlined } from '@ant-design/icons';
 import { api, type Member, type TeamPresence } from '../../lib/api';
 import { NewMemberForm } from './NewMemberForm';
 
@@ -11,7 +11,9 @@ interface MemberListProps {
   onCreateMember: (input: { name: string; role: string }) => Promise<void>;
   onCancelNewMember: () => void;
   onChat: (member: Member) => void;
-  onEdit: (member: Member) => void;
+  onViewProfile: (member: Member) => void;
+  onManageCapabilities: (member: Member) => void;
+  onArchive: (member: Member) => void;
 }
 
 const AVAILABILITY_DOT: Record<string, 'success' | 'warning' | 'default' | 'error'> = {
@@ -23,13 +25,11 @@ const AVAILABILITY_DOT: Record<string, 'success' | 'warning' | 'default' | 'erro
 };
 
 /**
- * 侧栏的 Team Members。
+ * Team 管理面的 Members 页。
  *
- * 每一行是两个独立动作：
- *   Chat —— 打开/复用这个 Member 的 1:1 房间
- *   Edit —— 打开档案页（人格 / 记忆 / skill）
- *
- * 合成一个 handler 会把「改一下它的 system prompt」变成「顺手开了个新会话」。
+ * 每一行只有一个主动作 —— Open chat（使用这个 Member）。
+ * 管理类动作（看档案、配能力、归档）收进 `...` 菜单：使用与管理是两个层次，
+ * 并排成 Chat / Edit 会让人以为是两个平行产品。
  *
  * 布局不用 antd List：它的 actions 与 Meta 在窄侧栏里互相挤压，
  * 长名字/长 role 会被折成一行一个词。这里用显式 flex + minWidth:0 + ellipsis，
@@ -42,7 +42,9 @@ export function MemberList({
   onCreateMember,
   onCancelNewMember,
   onChat,
-  onEdit,
+  onViewProfile,
+  onManageCapabilities,
+  onArchive,
 }: MemberListProps) {
   // Team presence：只读显示，不替换房间内的 working/muted。
   const [presence, setPresence] = useState<Record<string, TeamPresence>>({});
@@ -116,23 +118,41 @@ export function MemberList({
                   @{member.handle} · {member.role}
                 </Typography.Text>
 
-                <div style={{ marginTop: 2 }}>
+                <div style={{ marginTop: 2, display: 'flex', gap: 4 }}>
                   <Button
                     type="link"
                     size="small"
                     icon={<MessageOutlined />}
                     onClick={() => onChat(member)}
                   >
-                    Chat
+                    Open chat
                   </Button>
-                  <Button
-                    type="link"
-                    size="small"
-                    icon={<SettingOutlined />}
-                    onClick={() => onEdit(member)}
+                  <Dropdown
+                    menu={{
+                      items: [
+                        { key: 'profile', label: 'View profile' },
+                        { key: 'capabilities', label: 'Manage capabilities' },
+                        { key: 'archive', label: 'Archive', danger: true },
+                      ],
+                      onClick: ({ key }) => {
+                        if (key === 'profile') onViewProfile(member);
+                        else if (key === 'capabilities') onManageCapabilities(member);
+                        else if (key === 'archive') {
+                          Modal.confirm({
+                            title: `归档 ${member.name}？`,
+                            content:
+                              '归档后它不再接活，但保留在历史会话里。需要时可以恢复。',
+                            okText: 'Archive',
+                            okButtonProps: { danger: true },
+                            cancelText: 'Cancel',
+                            onOk: () => onArchive(member),
+                          });
+                        }
+                      },
+                    }}
                   >
-                    Edit
-                  </Button>
+                    <Button type="link" size="small" icon={<EllipsisOutlined />} aria-label="更多操作" />
+                  </Dropdown>
                 </div>
               </div>
             </div>

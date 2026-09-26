@@ -65,7 +65,7 @@ const { team } = createTestStack(db, memberService, stub.asCopilot);
 /**
  * 假引擎需要知道「这一轮是被什么原因唤醒的」。
  *
- * 兜底用例靠它区分「第一轮选择沉默」和「被兜底时开口」—— 真实引擎是从
+ * 按原因开口的用例靠它区分「第几轮开口」—— 真实引擎是从
  * prompt 里的措辞读到这件事的，stub 直接查库更稳：断言不该绑在指令文案上，
  * 否则改一次措辞就会让一批用例变红，而它们本来想守的不是文案。
  */
@@ -450,366 +450,21 @@ describe('应答者：用户对着房间说话时，房间欠一个回答', () =
   });
 });
 
-describe('负责人兜底：整个房间都不接话时，由负责人回答', () => {
-  interface EscalationRow {
-    id: string;
-    member_id: string;
-    status: string;
-    decision: string | null;
-    trigger_message_sequence: number | null;
-  }
-
-  function escalationExecutions(conversationId: string): EscalationRow[] {
-    return db
-      .prepare(
-        `
-        SELECT id, member_id, status, decision, trigger_message_sequence
-        FROM execution
-        WHERE conversation_id = ? AND wake_reason = 'escalation'
-        ORDER BY rowid
-        `,
-      )
-      .all(conversationId) as unknown as EscalationRow[];
-  }
-
-  /** 兜底是在最后一条 skip 收口时**同步**派出去的，这里等它落库。 */
-  async function waitForEscalation(conversationId: string, expected = 1): Promise<void> {
-    for (let attempt = 0; attempt < 600; attempt += 1) {
-      if (escalationExecutions(conversationId).length >= expected) return;
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    assert.fail(
-      `没有出现兜底 execution（期望 ${expected} 条，实际 ${escalationExecutions(conversationId).length} 条）`,
-    );
-  }
-
-  function makeRoom(title: string): string {
-    return team.createConversation({
-      kind: 'group',
-      title,
-      memberIds: [alice.id, bob.id, iris.id],
-    }).id;
-  }
-
-  /** 这个房间里已经收口成 skip 的 execution 有几条。 */
-  function settledSkips(conversationId: string): number {
-    const row = db
-      .prepare(
-        `
-        SELECT COUNT(*) AS n
-        FROM execution
-        WHERE conversation_id = ?
-          AND status = 'completed'
-          AND decision = 'skip'
-        `,
-      )
-      .get(conversationId) as unknown as { n: number };
-    return row.n;
-  }
-
-  async function waitForSettledSkips(conversationId: string, expected: number): Promise<void> {
-    for (let attempt = 0; attempt < 600; attempt += 1) {
-      if (settledSkips(conversationId) >= expected) return;
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    assert.fail(`只等到 ${settledSkips(conversationId)} 条收口的 skip（期望 ${expected} 条）`);
-  }
-
+describe('唤醒合并：更明确的理由赢', () => {
   /**
-   * 「等这一批跑完」这条守卫只在**有人已收口、有人还在跑**的形状下才可观测。
+   * 这条用例守的是**合并优先级**，而不是「唤醒有没有派出去」。
    *
-   * 少了它，兜底会在**第一个** skip 收口时就派出去 —— 那时还有人在想，而那个人
-   * 的回答可能马上就到。后果不是「多跑一轮」，是负责人与还没跑完的成员**同时**回答，
-   * 房间轮流应答的规则被绕过。
+   * 一条更明确的唤醒可能和一条更弱的唤醒撞在同一个 (房间, 成员) 上：
+   * 这个人此刻正忙，它被 `direct` 顺手指定过、还没轮到跑；这时一条 @ 到了。
+   * 如果合并时 mention 输给 `direct`，那次点名就被悄悄降级成「顺带看看」。
    *
-   * 光靠「一次沉默只兜一次」的计数断言抓不到它：`escalations > 0` 那道守卫会把
-   * 后续的重复派发都拦掉，计数看起来仍然是对的（变异验证发现这条断言没有区分度）。
-   * 必须真的制造出「半批已收口」的中间态。
+   * 这里直接构造 scheduler，而不是走 sendMessage：要考的是合并规则本身，
+   * 通过消息驱动只能间接凑出这个竞态，而且结果会依赖 turn 的交替顺序。
    */
-  it('这一批还没跑完时不兜底（否则负责人会在别人还在想的时候抢答）', async () => {
-    const roomId = makeRoom('Still Running Room');
-    team.setMemberLead(roomId, alice.id, true);
-
-    // alice / iris 一律沉默，bob 是唯一会说话的人 —— 但把他按住，模拟「他还在想」
-    stub.skipMemberIds.add(alice.id);
-    stub.skipMemberIds.add(iris.id);
-
-    let release!: () => void;
-    stub.hold = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    stub.holdMemberIds = new Set([bob.id]);
-
-    try {
-      await team.sendMessage({ conversationId: roomId, content: '这个方案该怎么推进' });
-
-      // 两条 skip 已收口，bob 还挂在 running 上 —— 房间**还不能**算沉默
-      await waitForSettledSkips(roomId, 2);
-      assert.deepEqual(
-        escalationExecutions(roomId),
-        [],
-        '还有人在跑就不能认定房间沉默 —— 那个人的回答可能马上就到',
-      );
-    } finally {
-      release();
-      stub.hold = null;
-      stub.holdMemberIds = null;
-    }
-
-    await waitForConversationIdle(roomId);
-    assert.deepEqual(
-      escalationExecutions(roomId),
-      [],
-      'bob 最后回答了，本来就不该有兜底',
-    );
-  });
-
-  it('全员沉默 → 负责人兜底回答，且只兜一次', async () => {
-    const roomId = makeRoom('Escalation Room');
-    team.setMemberLead(roomId, alice.id, true);
-
-    // 只有「被兜底」这一种唤醒才开口：前一轮的 direct / open_discussion 全部沉默。
-    // 这正是用户截图里发生的事 —— 三个 Member 各自判断「别人会说」。
-    stub.speakOnlyOnReasons = new Set(['escalation']);
-
-    await team.sendMessage({ conversationId: roomId, content: '这个方案该怎么推进' });
-    await waitForEscalation(roomId);
-    await waitForConversationIdle(roomId);
-
-    const escalations = escalationExecutions(roomId);
-    assert.equal(escalations.length, 1, '一次静默只兜一次底 —— 否则兜底失败会自我循环');
-    assert.equal(escalations[0].member_id, alice.id, '兜底必须落在负责人头上');
-    assert.equal(escalations[0].status, 'completed');
-    assert.equal(escalations[0].decision, 'reply', '负责人这次真的开口了');
-    assert.equal(escalations[0].trigger_message_sequence, 1, '兜底对着的是用户那条消息');
-
-    // 房间里恰好一条 Member 消息，而且是负责人的
-    const memberMessages = team
-      .listMessages(roomId)
-      .filter((message) => message.senderType === 'member');
-    assert.equal(memberMessages.length, 1);
-    assert.equal(memberMessages[0].senderId, alice.id);
-  });
-
-  /**
-   * 这条用例守的是**兜底指令本身**，而不只是「兜底有没有被派出去」。
-   *
-   * 派发正确但指令写错，兜底是白兜的：负责人拿到一段和 `direct` 一模一样的
-   * 说辞（「你是这个房间期待的回答者」），它会**再判断一次**「也许别人会说」——
-   * 而它手上并没有「别人都沉默过」这条信息，于是又一次合理地选择沉默。
-   *
-   * 所以这一段里必须出现**别的档位没有**的那个事实：房间里没人接话。
-   */
-  it('兜底指令必须说清「房间里没人说话」—— 否则负责人会再判断一次', async () => {
-    const roomId = makeRoom('Escalation Wording Room');
-    team.setMemberLead(roomId, alice.id, true);
-    stub.speakOnlyOnReasons = new Set(['escalation']);
-
-    await team.sendMessage({ conversationId: roomId, content: '这个方案该怎么推进' });
-    await waitForEscalation(roomId);
-    await waitForConversationIdle(roomId);
-
-    const escalation = escalationExecutions(roomId)[0];
-    const prompt = stub.turnFor(escalation.id).prompt;
-
-    // 兜底档独有的信息：整个房间都沉默过。这是它和 direct 唯一的区别。
-    assert.match(prompt, /stayed silent/i, '必须告诉负责人：房间里没人接话');
-    assert.match(prompt, /lead/i, '必须点明它是负责人 —— 这是它欠回答的理由');
-
-    // 与 direct 的分野：不能复用 direct 的说辞，否则负责人会以为自己只是
-    // 「这一轮的应答者」，重新判断一次「也许别人会说」。
-    assert.doesNotMatch(
-      prompt,
-      /expects to answer this message/,
-      '兜底不能退化成 direct 的说辞，否则「房间已沉默」这条信息就丢了',
-    );
-
-    // 出口同样必须是关的。
-    assert.doesNotMatch(
-      prompt,
-      new RegExp(NO_REPLY_SENTINEL.replace(/[<>]/g, '\\$&')),
-      '兜底的人不该拿到 <NO_REPLY> 这个出口',
-    );
-  });
-
-  it('有人接话时不兜底（负责人不需要出场）', async () => {
-    const roomId = makeRoom('Answered Room');
-    team.setMemberLead(roomId, alice.id, true);
-
-    // 被指定为应答者的那个人会开口，顺带被唤醒的沉默。
-    stub.speakOnlyOnReasons = new Set(['direct']);
-
-    await team.sendMessage({ conversationId: roomId, content: '这个方案该怎么推进' });
-    await waitForConversationIdle(roomId);
-
-    assert.deepEqual(escalationExecutions(roomId), [], '已经有人回答了，不该再叫负责人');
-  });
-
-  it('负责人本人就是应答者、也选择了沉默时，仍然兜底（房间不能就这么沉默下去）', async () => {
-    const roomId = makeRoom('Asked Lead Room');
-    team.setMemberLead(roomId, alice.id, true);
-    stub.mode = 'skip';
-
-    // 这条用例守的是一个**被删掉的「优化」**：早先的版本规定「负责人已经被
-    // 明确问过就不再兜底」，理由是「同一件事不做两遍」。但它会在一个真实且
-    // 常见的场景里让房间继续沉默 —— 负责人恰好被选为应答者、拿着「你必须
-    // 回答」的指令选择了沉默，于是没人兜底。
-    //
-    // 再问一次并不是同一件事：兜底的指令带着一条别的分支没有的信息
-    // （「房间里没人接话」）。房间保持沉默的代价没有上界，多跑一轮有。
-    await team.sendMessage({ conversationId: roomId, content: '@alice 这个方案该怎么推进' });
-    await waitForEscalation(roomId);
-    await waitForConversationIdle(roomId);
-
-    const escalations = escalationExecutions(roomId);
-    assert.equal(escalations.length, 1, '一次静默只兜一次');
-    assert.equal(escalations[0].member_id, alice.id);
-
-    // 前置条件：她确实先被 @ 到过（否则这条用例守的是别的东西）
-    const asked = db
-      .prepare(
-        `
-        SELECT wake_reason FROM execution
-        WHERE conversation_id = ? AND member_id = ?
-        `,
-      )
-      .all(roomId, alice.id) as unknown as Array<{ wake_reason: string }>;
-    assert.ok(
-      asked.some((row) => row.wake_reason === 'mention'),
-      `前置条件：她应该先被 @ 到过一次，实际 ${JSON.stringify(asked)}`,
-    );
-  });
-
-  it('负责人自己也沉默时不会无限兜底（第二次不再派）', async () => {
-    const roomId = makeRoom('Silent Lead Room');
-    team.setMemberLead(roomId, alice.id, true);
-    stub.mode = 'skip';
-
-    await team.sendMessage({ conversationId: roomId, content: '这个方案该怎么推进' });
-    await waitForEscalation(roomId);
-    await waitForConversationIdle(roomId);
-
-    // 兜底本身也可能被无视 —— 那时房间确实没人回答，但**不能**再兜一次：
-    // 同一个问题、同一份上下文，再问一次不会得到不同结果，只会烧 token。
-    const escalations = escalationExecutions(roomId);
-    assert.equal(escalations.length, 1, '兜底必须是一次性的');
-    assert.equal(escalations[0].decision, 'skip');
-  });
-
-  it('member 之间的 follow_up 沉默不算房间失职（不兜底）', async () => {
-    const roomId = makeRoom('Member Silence Room');
-    team.setMemberLead(roomId, alice.id, true);
-    // Alice 是唯一会说话的人：她先回答用户，然后对别人的话一律沉默。
-    stub.speakOnlyOnReasons = new Set(['direct']);
-
-    await team.sendMessage({ conversationId: roomId, content: '这个方案该怎么推进' });
-    await waitForConversationIdle(roomId);
-
-    // 用户的提问已经有人回答 → 没有兜底。她后续的沉默属于讨论，不是失职。
-    assert.deepEqual(escalationExecutions(roomId), []);
-  });
-
-  it('负责人不参与日常排序：他只在全员沉默时出场，不是默认发言人', async () => {
-    const group = team.createConversation({
-      kind: 'group',
-      title: 'Lead Is Not The Default',
-      memberIds: [alice.id, bob.id, iris.id],
-    });
-    team.setMemberLead(group.id, alice.id, true);
-
-    // 先静音全体把消息落库（不在这一刻派发），再解除静音手动算一次 plan。
-    muteAllMembers(team, group.id);
-    const sent = await team.sendMessage({ conversationId: group.id, content: '这个方案该怎么推进' });
-    assert.deepEqual(sent.wakes, []);
-    for (const member of [alice, bob, iris]) {
-      team.setMemberMuted(group.id, member.id, false);
-    }
-
-    // 让 Alice（负责人）成为**最近刚发过言**的那个。如果负责人参与排序，
-    // 她会被选成应答者；如果她只是兜底，就轮不到她。
-    const states = new ConversationMemberService(db);
-    states.markReplied(group.id, alice.id, sent.message.messageSequence + 5);
-
-    const dispatcher = new GroupDispatcher(db, states, 2);
-    const plan = dispatcher.plan({
-      conversation: team.getConversation(group.id),
-      message: sent.message,
-    });
-
-    const responder = plan.wakes.find((wake) => wake.reason === 'direct');
-    assert.ok(responder, '日常仍然要有一名应答者');
-    assert.notEqual(
-      responder.memberId,
-      alice.id,
-      '负责人不该抢日常应答 —— 让她回答每一条，房间就变回「一个 Agent 加几个装饰」',
-    );
-    assert.equal(
-      plan.wakes.some((wake) => wake.reason === 'escalation'),
-      false,
-      '兜底不是「新消息到达」时的唤醒理由，它由房间沉默触发',
-    );
-  });
-
-  it('planEscalation：只在 group 房间、且有能接活的负责人时才返回计划', () => {
-    const dispatcher = new GroupDispatcher(db, new ConversationMemberService(db), 2);
-
-    const directRoom = team.createConversation({ kind: 'direct', memberIds: [alice.id] });
-    assert.equal(
-      dispatcher.planEscalation({
-        conversation: team.getConversation(directRoom.id),
-        triggerSequence: 1,
-      }),
-      null,
-      '1:1 房间没有「房间沉默」这回事',
-    );
-
-    const group = team.createConversation({
-      kind: 'group',
-      title: 'Escalation Edges',
-      memberIds: [alice.id, bob.id],
-    });
-    assert.equal(
-      dispatcher.planEscalation({
-        conversation: team.getConversation(group.id),
-        triggerSequence: 1,
-      }),
-      null,
-      '没设负责人时没有兜底人 —— 这是合法状态，不是配置错误',
-    );
-
-    team.setMemberLead(group.id, bob.id, true);
-    const plan = dispatcher.planEscalation({
-      conversation: team.getConversation(group.id),
-      triggerSequence: 7,
-    });
-    assert.deepEqual({ ...plan }, { memberId: bob.id, reason: 'escalation', triggerSequence: 7 });
-
-    team.setMemberMuted(group.id, bob.id, true);
-    assert.equal(
-      dispatcher.planEscalation({
-        conversation: team.getConversation(group.id),
-        triggerSequence: 7,
-      }),
-      null,
-      '被静音的负责人不兜底 —— 静音是用户的显式意图',
-    );
-  });
-
-  /**
-   * 这条用例守的是**合并优先级**，而不是「兜底有没有派出去」。
-   *
-   * 兜底的唤醒可能和一条更弱的唤醒撞在同一个 (房间, 成员) 上：负责人此刻正忙，
-   * 它作为普通成员被 `direct` 顺手指定过、还没轮到跑；这时房间全体沉默，兜底到了。
-   * 如果合并时兜底输给 `direct`，负责人拿到的是「你是这一轮的应答者」—— 那段话里
-   * 没有「房间里没人接话」，于是它会**再判断一次**「也许别人会说」，兜底就白兜了。
-   *
-   * 这里直接构造 scheduler，而不是走 sendMessage：要考的是合并规则本身，通过消息
-   * 驱动只能间接凑出这个竞态，而且结果会依赖 turn 的交替顺序。
-   */
-  it('兜底与更弱的唤醒相撞时兜底必须赢（否则「房间已沉默」这条信息会丢）', () => {
+  it('mention 与更弱的唤醒相撞时 mention 必须赢（否则点名会被降级成顺带看看）', () => {
     const room = team.createConversation({
       kind: 'group',
-      title: 'Escalation Priority',
+      title: 'Mention Priority',
       memberIds: [alice.id, bob.id],
     });
 
@@ -842,7 +497,7 @@ describe('负责人兜底：整个房间都不接话时，由负责人回答', (
     scheduler.enqueue({
       conversationId: room.id,
       memberId: alice.id,
-      reason: 'escalation',
+      reason: 'mention',
       triggerSequence: 5,
     });
 
@@ -850,41 +505,13 @@ describe('负责人兜底：整个房间都不接话时，由负责人回答', (
     assert.equal(pending.pendingWake, true);
     assert.equal(
       pending.pendingWakeReason,
-      'escalation',
-      '兜底必须压过 direct —— 反过来负责人就看不到「房间里没人接话」',
+      'mention',
+      '点名必须压过 direct —— 反过来那次 @ 就被吞掉了',
     );
     assert.equal(
       pending.pendingWakeTriggerSequence,
       5,
       'reason 与 trigger 必须来自同一条消息，不能拼出一个不存在的事件',
-    );
-  });
-
-  it('一个房间至多一个负责人（换人会顶掉旧的）', () => {
-    const room = team.createConversation({
-      kind: 'group',
-      title: 'Lead Swap',
-      memberIds: [alice.id, bob.id],
-    });
-
-    team.setMemberLead(room.id, alice.id, true);
-    assert.deepEqual(
-      team.listConversationState(room.id).filter((state) => state.isLead).map((s) => s.memberId),
-      [alice.id],
-    );
-
-    team.setMemberLead(room.id, bob.id, true);
-    assert.deepEqual(
-      team.listConversationState(room.id).filter((state) => state.isLead).map((s) => s.memberId),
-      [bob.id],
-      '换负责人必须顶掉旧的，不能出现两个 —— 否则「谁兜底」会变得不确定',
-    );
-
-    team.setMemberLead(room.id, bob.id, false);
-    assert.deepEqual(
-      team.listConversationState(room.id).filter((state) => state.isLead),
-      [],
-      '撤销负责人是合法状态',
     );
   });
 });
@@ -897,19 +524,18 @@ describe('唤醒原因：落库之后必须原样读回来', () => {
    * 凭空逼出一条消息）—— 这一半是对的。但**已知**的值必须原样还原，因为
    * `asWakeReason` 是 scheduler 写入、RecoveryService 与 mapState 读回的唯一判据。
    *
-   * 真实踩过的坑：这里原本是一串 `value === 'direct' || ...`，加 'escalation' 时
-   * 漏改了。字符串比较不会报错，于是**最强**的唤醒原因被静默降级成**最弱**的 ——
-   * 崩溃恢复重放一条 durable 的兜底唤醒时，负责人拿到「你可以沉默」，兜底在最
-   * 需要它的时刻失效，而且没有任何报错。所以这张表必须逐项钉死。
+   * 真实踩过的坑：这里原本是一串 `value === 'direct' || ...` 的字符串比较，
+   * 加新原因时漏改，**最强**的唤醒原因被静默降级成**最弱**的，而且没有任何
+   * 报错。所以这张表必须逐项钉死 —— 现在它是一张 Record，少写一行编译不过。
    */
-  it('五个已知原因逐一还原，认不出来的退回最宽松的一档', () => {
-    const known = ['escalation', 'mention', 'direct', 'follow_up', 'open_discussion'] as const;
+  it('四个已知原因逐一还原，认不出来的退回最宽松的一档', () => {
+    const known = ['mention', 'direct', 'follow_up', 'open_discussion'] as const;
     for (const reason of known) {
       assert.equal(asWakeReason(reason), reason, `${reason} 必须原样还原`);
     }
 
     // 乱码 / NULL / 未来版本写进来的值 / 大小写变体：一律退回最宽松的一档
-    for (const junk of [null, '', 'schedule', 'ESCALATION', 'nonsense']) {
+    for (const junk of [null, '', 'schedule', 'ESCALATION', 'escalation', 'nonsense']) {
       assert.equal(
         asWakeReason(junk),
         'open_discussion',
@@ -918,21 +544,21 @@ describe('唤醒原因：落库之后必须原样读回来', () => {
     }
   });
 
-  it('崩溃恢复：排到一半的兜底唤醒重放时仍然是兜底，不能降级成普通讨论', () => {
+  it('崩溃恢复：排到一半的点名唤醒重放时仍然是点名，不能降级成普通讨论', () => {
     const room = team.createConversation({
       kind: 'group',
-      title: 'Lost Escalation',
+      title: 'Lost Mention',
       memberIds: [alice.id, bob.id],
     });
     const states = new ConversationMemberService(db);
 
-    // 兜底唤醒已经入队（durable 落库），但引擎还没跑起来 —— 进程就是在这个
+    // 点名唤醒已经入队（durable 落库），但引擎还没跑起来 —— 进程就是在这个
     // 窗口里挂掉的。run 永不返回，把这一行留在 queued 上，正是崩溃现场的形状。
     const scheduler = new MemberTurnScheduler(states, () => new Promise<void>(() => {}), () => {});
     scheduler.enqueue({
       conversationId: room.id,
       memberId: alice.id,
-      reason: 'escalation',
+      reason: 'mention',
       triggerSequence: 3,
     });
 
@@ -940,8 +566,8 @@ describe('唤醒原因：落库之后必须原样读回来', () => {
     assert.equal(lost.length, 1, 'queued 的唤醒应该被恢复出来');
     assert.equal(
       lost[0].reason,
-      'escalation',
-      '降级成 open_discussion 的话，负责人重启后拿到的是「你可以沉默」—— 兜底白设',
+      'mention',
+      '降级成 open_discussion 的话，一次明确的点名重启后就变成「顺带看看」',
     );
     assert.equal(lost[0].triggerSequence, 3);
     assert.equal(lost[0].memberId, alice.id);
@@ -1182,4 +808,40 @@ describe('Member 之间是隔离的', () => {
     assert.doesNotMatch(bobPrompt, new RegExp(ALICE_PROMPT));
   });
 
+  it('Team 上下文只注入当前 Team 的那一份，不泄漏其他 Team 的', async () => {
+    const teamId = team.getConversation(roomId).teamId;
+    team.replaceMemberTeamContext(
+      alice.id,
+      '# Team Context\n\n这个 Team 的 review 输出要求先给 P0/P1 风险。',
+      teamId,
+    );
+    // 另一个 Team 的上下文：同一个 Member，但这一轮不该看到。
+    // 直接走 MemberService 落文件 —— TeamService 层会校验 Team 存在，
+    // 而单 Team 部署下本来就建不出第二个 Team。
+    memberService.replaceTeamMemory(
+      alice.id,
+      'other-team-id',
+      '# Team Context\n\n某客户的尚未公开项目代号是 Bluebird。',
+    );
+
+    const prompt = await runInRoom(alice);
+    assert.match(prompt, /P0\/P1/, '当前 Team 的上下文必须进 prompt');
+    assert.doesNotMatch(prompt, /Bluebird/, '其他 Team 的上下文进了 prompt 就是泄漏');
+  });
+
+  it('全局记忆与 Team 上下文分段注入，各归各的段', async () => {
+    const teamId = team.getConversation(roomId).teamId;
+    team.replaceMemberMemory(bob.id, '# Long-term Memory\n\n习惯把事实和推论分开写。');
+    team.replaceMemberTeamContext(
+      bob.id,
+      '# Team Context\n\n本 Team 的 review 输出要求先给 P0/P1 风险。',
+      teamId,
+    );
+
+    const prompt = await runInRoom(bob);
+    assert.match(prompt, /stable habits/, '全局记忆段必须标出它是跨 Team 的');
+    assert.match(prompt, /习惯把事实和推论分开写/);
+    assert.match(prompt, /this Team only/, 'Team 上下文段必须标出它不出这个 Team');
+    assert.match(prompt, /P0\/P1/);
+  });
 });

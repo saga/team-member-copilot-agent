@@ -148,6 +148,71 @@ export function membersRouter(team: TeamService) {
     }
   });
 
+  /**
+   * 这个 Member 在某一个 Team 的上下文（全文，不是给 prompt 用的截断版）。
+   *
+   * `teamId` 走 query，省略 = 当前默认 Team：单 Team 部署下调用方不需要知道
+   * Team 的存在。多 Team 后按显式 teamId 读写 —— 未来形如
+   * `/api/teams/:teamId/members/:memberId/context` 的嵌套路由出现时，
+   * 这个 query 参数直接变成路径参数，不留两套。
+   */
+  router.get('/:id/team-context', (req, res) => {
+    try {
+      const teamId = typeof req.query.teamId === 'string' ? req.query.teamId : undefined;
+      res.json(team.getMemberTeamContext(req.params.id, teamId));
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  router.put('/:id/team-context', (req, res) => {
+    if (!canAdmin(req)) {
+      res.status(403).json({ error: '需要 Team owner/admin（或有效的 ADMIN_API_TOKEN）' });
+      return;
+    }
+    const parsed = memorySchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: 'content 必须是 string（expectedVersion 可选）' });
+      return;
+    }
+    try {
+      const body = req.body as { teamId?: unknown };
+      const teamId = typeof body.teamId === 'string' ? body.teamId : undefined;
+      res.json(
+        team.replaceMemberTeamContext(
+          req.params.id,
+          parsed.data.content,
+          teamId,
+          parsed.data.expectedVersion,
+        ),
+      );
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  /**
+   * Member 视角的历史：参与过的 conversation（按最后活动倒序）与所属 Team。
+   *
+   * 不建新表 —— 前者是 conversation_member 的 join，后者是 team_membership 的
+   * join。Member Profile 的 Recent activity 只读这两条。
+   */
+  router.get('/:id/conversations', (req, res) => {
+    try {
+      res.json({ conversations: team.listMemberConversations(req.params.id) });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  router.get('/:id/teams', (req, res) => {
+    try {
+      res.json({ teams: team.listMemberTeams(req.params.id) });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
   // ------------------------------------------------- Member ↔ Member 私聊
 
   /**

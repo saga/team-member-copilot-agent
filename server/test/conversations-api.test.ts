@@ -129,33 +129,19 @@ describe('POST /conversations：externalWorkRef 必须穿过边界', () => {
   });
 });
 
-describe('PATCH /members/:memberId/state：muted 与 isLead', () => {
-  it('指定负责人回 200，并且换人会顶掉旧的（一个房间至多一个）', async () => {
-    const conversationId = await makeGroup('Lead Api Room');
-
-    const first = await patchState(conversationId, alice.id, { isLead: true });
-    assert.equal(first.status, 200);
-    const firstBody = (await first.json()) as { state: { isLead: boolean; memberId: string } };
-    assert.equal(firstBody.state.isLead, true);
-    assert.equal(firstBody.state.memberId, alice.id);
-
-    const second = await patchState(conversationId, bob.id, { isLead: true });
-    assert.equal(second.status, 200);
-    assert.equal(((await second.json()) as { state: { isLead: boolean } }).state.isLead, true);
+describe('PATCH /members/:memberId/state：muted', () => {
+  it('静音 / 解除静音回 200，状态落库', async () => {
+    const conversationId = await makeGroup('Mute Api Room');
+    const muted = await patchState(conversationId, alice.id, { muted: true });
+    assert.equal(muted.status, 200);
+    assert.equal(((await muted.json()) as { state: { muted: boolean } }).state.muted, true);
 
     const states = stack.team.listConversationState(conversationId);
-    assert.deepEqual(
-      states.filter((state) => state.isLead).map((state) => state.memberId),
-      [bob.id],
-      '换负责人必须顶掉旧的 —— 出现两个的话「谁兜底」就不确定了',
-    );
+    assert.equal(states.find((state) => state.memberId === alice.id)?.muted, true);
 
-    const cleared = await patchState(conversationId, bob.id, { isLead: false });
-    assert.equal(cleared.status, 200);
-    assert.equal(
-      stack.team.listConversationState(conversationId).some((state) => state.isLead),
-      false,
-    );
+    const unmuted = await patchState(conversationId, alice.id, { muted: false });
+    assert.equal(unmuted.status, 200);
+    assert.equal(((await unmuted.json()) as { state: { muted: boolean } }).state.muted, false);
   });
 
   it('空 patch 回 400，而不是「什么都不改但回 200」', async () => {
@@ -165,26 +151,10 @@ describe('PATCH /members/:memberId/state：muted 与 isLead', () => {
     assert.equal(response.status, 400);
   });
 
-  it('muted 仍然走同一条路径（回归）', async () => {
-    const conversationId = await makeGroup('Mute Api Room');
-    const response = await patchState(conversationId, alice.id, { muted: true });
-    assert.equal(response.status, 200);
-    assert.equal(((await response.json()) as { state: { muted: boolean } }).state.muted, true);
-  });
-
-  it('两个字段可以一次改完，回的是改完之后的状态', async () => {
-    const conversationId = await makeGroup('Both Fields Room');
-    const response = await patchState(conversationId, alice.id, { muted: true, isLead: true });
-    assert.equal(response.status, 200);
-    const body = (await response.json()) as { state: { muted: boolean; isLead: boolean } };
-    assert.equal(body.state.muted, true);
-    assert.equal(body.state.isLead, true, '后一个 setter 的结果必须包含前一个的改动');
-  });
-
   it('不属于这个房间的成员回 400', async () => {
     const conversationId = await makeGroup('Stranger Room');
     const stranger = stack.team.createMember({ name: 'Stranger', role: 'X' });
-    const response = await patchState(conversationId, stranger.id, { isLead: true });
+    const response = await patchState(conversationId, stranger.id, { muted: true });
     assert.equal(response.status, 400);
   });
 });

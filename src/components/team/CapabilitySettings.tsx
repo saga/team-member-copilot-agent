@@ -55,6 +55,14 @@ const LAYER_ORDER: Scope[] = ['global', 'team', 'member'];
 
 interface CapabilitySettingsProps {
   onClose: () => void;
+  /**
+   * 内嵌进 Settings 页面时为 true：不套 Modal，保存栏放顶部，
+   * 也没有「关闭」这个动作（切 Rail 就是离开）。
+   */
+  inline?: boolean;
+  /** 从 Member 行的 `... → Manage capabilities` 进来时，直接落在那个人身上。 */
+  initialScope?: Scope;
+  initialMemberId?: string | null;
 }
 
 /** 服务端目录 → 本地草稿：勾选态即 enabled。 */
@@ -73,10 +81,15 @@ function draftFromCatalog(catalog: ScopeCatalog): Draft {
  * 才看得见。页签里只出现 Skill / Knowledge / Action 的名字与开关，
  * providerId / selector 只存在后端。
  */
-export function CapabilitySettings({ onClose }: CapabilitySettingsProps) {
+export function CapabilitySettings({
+  onClose,
+  inline = false,
+  initialScope = 'global',
+  initialMemberId = null,
+}: CapabilitySettingsProps) {
   const [members, setMembers] = useState<Member[]>([]);
-  const [scope, setScope] = useState<Scope>('global');
-  const [memberId, setMemberId] = useState<string | null>(null);
+  const [scope, setScope] = useState<Scope>(initialScope);
+  const [memberId, setMemberId] = useState<string | null>(initialMemberId);
 
   const [catalogs, setCatalogs] = useState<Record<Scope, ScopeCatalog | null>>({
     global: null,
@@ -134,8 +147,13 @@ export function CapabilitySettings({ onClose }: CapabilitySettingsProps) {
         const memberResult = await api.listMembers();
         if (cancelled) return;
         setMembers(memberResult.members);
-        const first = memberResult.members[0]?.id ?? null;
-        setMemberId(first);
+        // 从 Member 行点进来时留在那个人身上，否则落在第一个 Member 上。
+        if (initialMemberId) {
+          setMemberId(initialMemberId);
+        } else {
+          const first = memberResult.members[0]?.id ?? null;
+          setMemberId(first);
+        }
         await Promise.all([
           (async () => {
             const result = await api.getCapabilityCatalog('global');
@@ -160,6 +178,8 @@ export function CapabilitySettings({ onClose }: CapabilitySettingsProps) {
     return () => {
       cancelled = true;
     };
+    // initialMemberId 只是首次落点：之后换人走 memberId state，不重跑装配。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // 换人 / 首次拿到 Member：member 层草稿换成这个人的服务端状态。
@@ -496,9 +516,9 @@ export function CapabilitySettings({ onClose }: CapabilitySettingsProps) {
     return (
       <Space direction="vertical" style={{ width: '100%' }} size="small">
         <div>
-          <strong>Inherited from company & team</strong>
+          <strong>Included by default</strong>
           <div style={{ color: '#999', fontSize: 12 }}>
-            这些能力自动拥有，在上面两层里改，不在这里改。
+            这个 Member 自动拥有的部分，在 Company / Team 两层里改，不在这里改。
           </div>
         </div>
         <div>
@@ -551,6 +571,14 @@ export function CapabilitySettings({ onClose }: CapabilitySettingsProps) {
         {target === 'member' && !memberId ? null : (
           <>
             {renderInherited(target)}
+            {target === 'member' && (
+              <div>
+                <strong>Extra for this member</strong>
+                <div style={{ color: '#999', fontSize: 12 }}>
+                  只属于这个人的增量。清空 = 退回团队基线，不是变成什么都不会的人。
+                </div>
+              </div>
+            )}
             <Collapse
               defaultActiveKey={['skills', 'knowledge', 'actions']}
               items={[
@@ -593,6 +621,111 @@ export function CapabilitySettings({ onClose }: CapabilitySettingsProps) {
     );
   }
 
+  function renderSettingsActions() {
+    return (
+      <Space>
+        <Button
+          icon={<ReloadOutlined />}
+          disabled={busy}
+          onClick={() => guardDirty([...LAYER_ORDER], '重新加载后未保存的改动会丢失。', () => void reload())}
+        >
+          Reload
+        </Button>
+        {!inline && (
+          <Button onClick={() => guardDirty([...LAYER_ORDER], '关闭后未保存的改动会丢失。', onClose)}>
+            Cancel
+          </Button>
+        )}
+        <Button
+          type="primary"
+          icon={<SaveOutlined />}
+          loading={busy}
+          disabled={dirty.size === 0}
+          onClick={() => void saveAll()}
+        >
+          {dirty.size > 1 ? `Save ${dirty.size} layers` : 'Save'}
+        </Button>
+      </Space>
+    );
+  }
+
+  function renderBody() {
+    if (loading) return <Spin tip="Loading capabilities…" />;
+    return (
+      <Space direction="vertical" style={{ width: '100%' }} size="middle">
+        {error ? <Alert type="error" showIcon closable message={error} onClose={() => setError(null)} /> : null}
+
+        <Tabs
+          activeKey={scope}
+          onChange={(key) => setScope(key as Scope)}
+          items={[
+            {
+              key: 'global',
+              label: (
+                <Space size={6}>
+                  <GlobalOutlined />
+                  Company defaults
+                  {dirty.has('global') ? <Badge status="warning" /> : null}
+                </Space>
+              ),
+              children: <div className="capability-pane">{renderScopeBody('global')}</div>,
+            },
+            {
+              key: 'team',
+              label: (
+                <Space size={6}>
+                  <TeamOutlined />
+                  Team defaults
+                  {dirty.has('team') ? <Badge status="warning" /> : null}
+                </Space>
+              ),
+              children: <div className="capability-pane">{renderScopeBody('team')}</div>,
+            },
+            {
+              key: 'member',
+              label: (
+                <Space size={6}>
+                  <UserOutlined />
+                  This member
+                  {dirty.has('member') ? <Badge status="warning" /> : null}
+                </Space>
+              ),
+              children: <div className="capability-pane">{renderScopeBody('member')}</div>,
+            },
+          ]}
+        />
+      </Space>
+    );
+  }
+
+  if (inline) {
+    return (
+      <>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+          <h2 style={{ margin: 0, fontSize: 16 }}>Capabilities</h2>
+          {renderSettingsActions()}
+        </div>
+        {renderBody()}
+
+        <Modal
+          open={pendingAction !== null}
+          title="有未保存的改动"
+          okText="放弃改动"
+          okButtonProps={{ danger: true }}
+          cancelText="继续编辑"
+          onOk={() => {
+            const action = pendingAction;
+            setPendingAction(null);
+            action?.run();
+          }}
+          onCancel={() => setPendingAction(null)}
+        >
+          {pendingAction?.message}
+        </Modal>
+      </>
+    );
+  }
+
   return (
     <>
       <Modal
@@ -600,80 +733,12 @@ export function CapabilitySettings({ onClose }: CapabilitySettingsProps) {
         onCancel={() =>
           guardDirty([...LAYER_ORDER], '关闭后未保存的改动会丢失。', onClose)
         }
-        footer={
-          <Space>
-            <Button
-              icon={<ReloadOutlined />}
-              disabled={busy}
-              onClick={() => guardDirty([...LAYER_ORDER], '重新加载后未保存的改动会丢失。', () => void reload())}
-            >
-              Reload
-            </Button>
-            <Button onClick={() => guardDirty([...LAYER_ORDER], '关闭后未保存的改动会丢失。', onClose)}>
-              Cancel
-            </Button>
-            <Button
-              type="primary"
-              icon={<SaveOutlined />}
-              loading={busy}
-              disabled={dirty.size === 0}
-              onClick={() => void saveAll()}
-            >
-              {dirty.size > 1 ? `Save ${dirty.size} layers` : 'Save'}
-            </Button>
-          </Space>
-        }
+        footer={renderSettingsActions()}
         width={880}
         styles={{ body: { paddingTop: 8 } }}
         title={<Space><span>Capabilities</span></Space>}
       >
-        {loading ? (
-          <Spin tip="Loading capabilities…" />
-        ) : (
-          <Space direction="vertical" style={{ width: '100%' }} size="middle">
-            {error ? <Alert type="error" showIcon closable message={error} onClose={() => setError(null)} /> : null}
-
-            <Tabs
-              activeKey={scope}
-              onChange={(key) => setScope(key as Scope)}
-              items={[
-                {
-                  key: 'global',
-                  label: (
-                    <Space size={6}>
-                      <GlobalOutlined />
-                      Company defaults
-                      {dirty.has('global') ? <Badge status="warning" /> : null}
-                    </Space>
-                  ),
-                  children: <div className="capability-pane">{renderScopeBody('global')}</div>,
-                },
-                {
-                  key: 'team',
-                  label: (
-                    <Space size={6}>
-                      <TeamOutlined />
-                      Team defaults
-                      {dirty.has('team') ? <Badge status="warning" /> : null}
-                    </Space>
-                  ),
-                  children: <div className="capability-pane">{renderScopeBody('team')}</div>,
-                },
-                {
-                  key: 'member',
-                  label: (
-                    <Space size={6}>
-                      <UserOutlined />
-                      This member
-                      {dirty.has('member') ? <Badge status="warning" /> : null}
-                    </Space>
-                  ),
-                  children: <div className="capability-pane">{renderScopeBody('member')}</div>,
-                },
-              ]}
-            />
-          </Space>
-        )}
+        {renderBody()}
       </Modal>
 
       <Modal

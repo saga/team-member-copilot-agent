@@ -142,15 +142,8 @@ function keyOf(conversationId: string, memberId: string): string {
  *
  * 合并时保留更具体的那一个：被 @ 到比「顺带唤醒」更值得回答，
  * 反过来降级会让一次明确的点名被吞掉。
- *
- * escalation 排在最前：它代表「整个房间都没接话」，是所有唤醒理由里最不该
- * 被别的理由顶掉的一个。负责人身上**确实可能同时**挂着一条更弱的唤醒
- * （比如它作为普通成员被 open_discussion 顺带唤醒，还没轮到跑），
- * 这时合并结果必须是兜底 —— 否则「房间没人接话」这件事会被悄悄降级成
- * 「顺带看看」，负责人就不知道该由自己收尾了。
  */
 const REASON_PRIORITY: Record<Exclude<WakeReason, 'schedule'>, number> = {
-  escalation: 4,
   mention: 3,
   direct: 2,
   follow_up: 1,

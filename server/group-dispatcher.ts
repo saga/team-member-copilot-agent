@@ -18,11 +18,7 @@ import type { ConversationMemberService } from './conversation-member-service.js
  *     Member 发的  → 全体 active 且未静音的成员（follow_up），受
  *                    groupAutoWakeRounds 限制
  *
- * 还有一条不走「新消息」的规则，见 planEscalation()：
- *
- *   整个房间都没回应 → 房间负责人（escalation，必须回答）
- *
- * 五条边界值得单独说：
+ * 四条边界值得单独说：
  *
  * 1. **作者不会被自己的消息唤醒。** 否则 Member 一发言就把自己再唤醒一次。
  * 2. **用户消息必须有人负责回答。** 见下面 pickPrimaryResponder 的长注释 ——
@@ -32,8 +28,6 @@ import type { ConversationMemberService } from './conversation-member-service.js
  *    member 消息之后，只有 @mention 还能唤醒别人（mention 永远有效）。
  * 4. **@ 了但没匹配到人时，不广播。** 用户明确想找某个人，把消息广播给全员
  *    是更糟的误解。这里返回 unresolvedMentions，由 API 如实告诉调用方。
- * 5. **负责人只在「全员沉默」时兜底，不参与日常排序。** 让负责人回答每一条
- *    消息，等于把房间变回「一个 Agent 加几个装饰」—— 那正是这套东西要避免的。
  */
 export class GroupDispatcher {
   constructor(
@@ -162,49 +156,6 @@ export class GroupDispatcher {
     });
 
     return ranked[0].id;
-  }
-
-  /**
-   * 用户对着房间说话、而**整个房间都没回应**时，把这一轮交给负责人兜底。
-   *
-   * ── 它是第二道保险，不是第一道 ──────────────────────────────────────
-   *
-   * 第一道是 pickPrimaryResponder：平台指定一名应答者，并在指令里明确告诉它
-   * 「必须回答」。但**指令是可以被无视的** —— 模型有自己的判断。用户截图里
-   * 那六条 completed / decision=skip 的 execution 就是这么来的：机制全对，
-   * 每个 Member 都选了沉默。
-   *
-   * 所以还需要一道不依赖模型配合的兜底：既然整个房间都没接话，那就由负责人
-   * 来接。对应职场里「问了一圈没人应，负责人总得说话」。
-   *
-   * ── 为什么不是「负责人回答每一条」 ───────────────────────────────────
-   *
-   * 那会把房间变回「一个 Agent 加几个装饰」：负责人永远在说话，其他人永远
-   * 沉默 —— 和「永远同一个人回答」是同一个问题。负责人只在全员沉默时出现。
-   *
-   * 返回 null 表示「这个房间没有能兜底的人」：没设负责人、负责人已归档、
-   * 负责人被静音。三种都**不抛错** —— 没有负责人只是没有兜底，不是配置错误，
-   * 而且静音是用户的显式意图，不该被兜底机制绕过去。
-   *
-   * 注意这里只做**花名册**判断（谁是负责人、它现在能不能接活）。「这一批
-   * 是不是已经跑完了」「有没有人已经说过话」是执行历史，属于 TeamService。
-   */
-  planEscalation(input: { conversation: Conversation; triggerSequence: number }): WakePlan | null {
-    const { conversation } = input;
-    if (conversation.kind !== 'group') return null;
-
-    const leadId = this.states.lead(conversation.id);
-    if (!leadId) return null;
-
-    const lead = conversation.members.find((member) => member.id === leadId);
-    if (!lead || lead.status !== 'active') return null;
-    if (this.states.get(conversation.id, leadId).muted) return null;
-
-    return {
-      memberId: leadId,
-      reason: 'escalation',
-      triggerSequence: input.triggerSequence,
-    };
   }
 
   /**

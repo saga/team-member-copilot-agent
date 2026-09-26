@@ -960,4 +960,35 @@ describe('TeamService 的能力读写入口', () => {
       before.capabilityManifestHash,
     );
   });
+
+  it('remember_member 工具：不传 scope 默认写 Team 上下文，不进全局记忆', async () => {
+    const member = stack.team.createMember({ name: 'ScopedMemory', role: 'T' });
+    const provider = stack.registry.toolProvider('team.core-tools');
+    const context = {
+      ...toolContext(member.id, 'remember_member'),
+      memberCapabilities: { skills: [], knowledge: [], tools: [] },
+      knowledge: [],
+    };
+    const tools = await provider.resolve(context, { providerId: 'team.core-tools' });
+    const remember = tools.find((tool) => tool.name === 'remember_member');
+    assert.ok(remember?.execute, 'core-tools 必须解析出 remember_member');
+
+    await remember.execute(context, { content: '这个 Team 的站会是每天早上十点。' });
+
+    assert.match(
+      memberService.readTeamMemory(member.id, defaultTeam.id),
+      /早上十点/,
+      '默认 scope 必须落到 Team 上下文',
+    );
+    assert.ok(
+      !memberService.readMemory(member.id).includes('早上十点'),
+      'Team 上下文不能漏进全局记忆',
+    );
+
+    await remember.execute(context, {
+      content: '习惯把事实和推论分开写。',
+      scope: 'global',
+    });
+    assert.match(memberService.readMemory(member.id), /事实和推论/);
+  });
 });

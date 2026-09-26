@@ -76,10 +76,9 @@ Provider ID 是稳定契约，实现可以替换：把 `local.filesystem-knowled
 
 | 概念 | 含义 |
 |------|------|
-| **Member** | 业务上的长期 AI 同事。持久身份 + role + style + system prompt + model + 能力组成 + long-term memory。跨 conversation 稳定。 |
+| **Member** | 业务上的长期 AI 同事。持久身份 + role + style + system prompt + model + 能力组成 + 全局长期记忆 + Team 上下文。身份跨 Team 稳定（同一个人），记忆按 Team 隔离。 |
 | **Capability** | 三层能力引用：`global` / `team` / `member`，存在同一张 `capability_binding` 表里（`scope_type` + `scope_id`）。**`effective = global + team + member` 才是「能用什么」的唯一答案**，任何单层都不是。 |
 | **Conversation** | 聊天/协作空间。`direct`（一个 Member）/ `group`（多个 Member）/ `work`（独立工作会话）。 |
-| **RoomLead** | 某 Member 在**某个 group 房间**里的负责人（`conversation_member_state.is_lead`）。**房间维度**：同一个人可以在 A 房间是负责人、在 B 房间只是普通成员。一个房间至多一个（偏索引强制），且不参与日常轮转 —— 只在「用户对着房间说话、而全体沉默」时兜底回答。 |
 | **MemberRuntime** | 某 Member 在某 Conversation 中的运行实例。一个 runtime 拥有一个稳定的 Copilot Session 和一个独立 workspace。 |
 | **CopilotSession** | Runtime 的执行引擎状态。**内部实现细节，不是业务对象。** |
 | **Execution** | Agent 实际跑了一轮。记录 `parent_execution_id` / `delegation_path` / `external_work_ref`（开始时从 conversation 快照）/ `external_work_snapshot`（开始时向外部系统取证），构成完整审计链。状态：`queued` / `running` / `waiting_for_member` / `completed` / `failed` / `cancelled` / `interrupted`。 |
@@ -167,7 +166,7 @@ Member       = 应用层业务身份（跨 Conversation 稳定）
 - skills（`skillDirectories` = 各 Skill Provider 解析出来的目录）
 - Member 身份（`systemMessage` append）
 - delegation（`ask_member`）
-- memory（`.data/members/<member-id>/memory/MEMORY.md`）
+- memory（全局 `.data/members/<member-id>/memory/MEMORY.md` + Team 上下文 `.data/members/<member-id>/teams/<team-id>/MEMORY.md`，分段注入）
 
 ### 能力解析：一条单向链路
 
@@ -270,7 +269,7 @@ Provider 里声明它的 `risk` / `requiresHostAccess`，授权层不动。硬�
 | DB 说失败 / 已取消，引擎还在跑 | `resumeSession` 错误分类收窄 + 超时 `abort()` + `activeSessions` 句柄，让 cancel 能真的落地 |
 | 排队中的唤醒经不起重启 | 唤醒的**触发消息序号与原因一起落库**，恢复时原样重派，而不是拿当前水位猜一个 |
 | 网络重试会写出重复消息 | `clientRequestId` 落到唯一索引上，重试命中已有那条并回 `deduplicated: true`（序号不会被重复分配） |
-| 两个人同时改同一份记忆 | `MEMORY.md` 的 `version` = 全文 sha256，PUT 带 `expectedVersion`，不匹配 `409` 且不写盘 |
+| 两个人同时改同一份记忆 | 全局与 Team 两份 `MEMORY.md` 各自 `version` = 全文 sha256，PUT 带 `expectedVersion`，不匹配 `409` 且不写盘 |
 | 上下文无限增长会撑爆 prompt | `ContextAssembler` 按条数 + 字符数双重上限，**从最新往前取**，并在 transcript 前显式说明省略了多少条 |
 | 事后看不出「这一轮用的是哪份配置」 | `execution.config_snapshot` 存指纹（memberRevision / model / 各种 hash，含 `capabilityManifestHash`），不存全文 |
 | 状态变化没有消息可看，前端只能靠猜 | `conversation_member_state.updated` 落 `conversation_event` 再广播，前端按 `updatedAt` 合并 |
@@ -360,7 +359,7 @@ scheduler 的入队单位**就是**落库的重放单位：
 interface PendingWake {
   conversationId: string;
   memberId: string;
-  reason: WakeReason;      // escalation | mention | direct | open_discussion | follow_up
+  reason: WakeReason;      // mention | direct | open_discussion | follow_up
   triggerSequence: number; // 是哪条消息唤起的
 }
 ```
@@ -389,7 +388,6 @@ interface PendingWake {
 所以 reason 分档，**指令也跟着分档**，两件事缺一不可：
 
 ```
-escalation        整个房间都没接话 → 负责人兜底（最强）
 mention           用户 @ 了它
 direct            平台指定它当这一轮的应答者（最久没发言的优先，平手按 id 定序）
 open_discussion   顺带被唤醒，可以沉默
@@ -397,18 +395,14 @@ follow_up         同上
 ```
 
 只改路由是无效的：reason 标成 `direct`、指令里却仍写着「没东西可补就 `<NO_REPLY>`」，
-模型会挑更省力的那个。三处细节：
+模型会挑更省力的那个。两处细节：
 
-- **兜底是第二层，因为指令可以被无视。** `maybeEscalateSilentRoom()` 在**每条** skip
-  收口之后检查这一批是不是全体沉默。必须在这条 execution 收口**之后**（收口之前它自己
-  还算 active，「跑完了没有」永远是否），也必须在**每条** skip 之后（只有最后收口的那条
-  能通过「全部收口」这一关，所以不会重复派发）。
-- **合并时兜底必须赢**：`escalation(4) > mention(3) > direct(2) > follow_up(1) >
-  open_discussion(0)`。负责人可能同时握有一条更弱的待跑唤醒，一旦兜底输给它，负责人拿到的
-  就是「你是这一轮的应答者」—— 那段话里没有「房间里没人接话」，它会**再判断一次**。
-- **负责人是房间维度的角色**（`conversation_member_state.is_lead`），一个房间至多一个，
-  由偏索引 `WHERE is_lead = 1` 强制（不是靠代码记得先清后设）。它**不参与日常轮转** ——
-  只在全员沉默时出场，否则房间就退回「一个 Agent 加几个装饰」。
+- **用户消息必须有人负责回答。** `pickPrimaryResponder()` 按「最久没发言」指定唯一
+  一名应答者并明确告诉它「必须回答」—— 否则三个 Member 各自认为「别人会说」，
+  全体沉默，而每个成员单独看都做了合理判断。
+- **合并时更明确的理由必须赢**：`mention(3) > direct(2) > follow_up(1) >
+  open_discussion(0)`。一次 @ 和一条顺带唤醒撞在同一个人身上时，点名输了就
+  被悄悄降级成「顺带看看」。
 
 `<NO_REPLY>` 是控制信号，不是内容，**绝不能到达客户端**。流式路径上由 `NoReplyStreamGate`
 扣住前缀与哨兵一致的部分，一旦分叉就原样放行（正常回复零额外延迟）；收尾时
@@ -447,9 +441,21 @@ sendMessage({ content, clientRequestId })
 `replyToMessageId` 同理不能只信请求体：引用的消息不存在 → `400`，属于另一个房间 → `400`。
 不校验的话，前端拿到的一个过期 id 会把它变成一个跨房间的信息泄露口。
 
-### 8. 两份记忆与乐观并发
+### 8. 两层记忆与乐观并发
 
-`members/<id>/memory/MEMORY.md` 有两个写者：用户在 UI 里改、Agent 调 `remember_member`。
+同一个 Member 在不同 Team 里是同一个人，但知道的东西必须隔离：
+
+```
+.data/members/<id>/
+├── memory/MEMORY.md            # 全局记忆：跨 Team 稳定的习惯，只放长期事实
+└── teams/<team-id>/MEMORY.md   # Team 上下文：这个 Team 的工作方式 / 成员关系 / 项目事实
+```
+
+`remember_member({ content, scope })` 默认写 Team 上下文（`scope = "team"`）；
+只有明确跨 Team 稳定的工作习惯才用 `scope = "global"`。两段在 prompt 里分段
+注入（`Long-term memory` / `Team context`），切换 Team 后另一份不会被读到。
+
+两份文件各有两个写者：用户在 UI 里改、Agent 调 `remember_member`。
 后写的直接覆盖先写的，会安静地丢掉一段记忆。
 
 ```ts
@@ -485,7 +491,7 @@ ExecutionConfigSnapshot {
 KB、一次用企业搜索 —— 那是两种不同的能力实现，而快照必须能区分它们。
 
 只存指纹不存全文：全文能从 member 行 + 磁盘重算，存两份必然有一份过期。
-`memoryHash` 是**整份记忆文件**的指纹，不是「注入了 tail 16000 字符」的指纹 ——
+`memoryHash` 是**两份记忆文件合起来**的指纹，不是「注入了 tail 16000 字符」的指纹 ——
 它回答的是「当时是哪一份记忆」，不是「当时塞进去了哪些字节」。
 
 写在 `runTurn()` 里，因为 `systemPromptHash` 依赖「当时真的拼出来的那段 prompt」。
@@ -497,7 +503,7 @@ KB、一次用企业搜索 —— 那是两种不同的能力实现，而快照�
 ### 10. 状态变化也是事件
 
 `conversation_member_state` 的每一次变化（读游标推进、`wakeStatus`、`pendingWake`、
-静音、负责人变更、被移出）都落 `conversation_event` 再广播：
+静音、被移出）都落 `conversation_event` 再广播：
 
 ```
 { type: 'conversation_member_state.updated', data: { memberId, state: ConversationMemberState | null } }
@@ -505,9 +511,6 @@ KB、一次用企业搜索 —— 那是两种不同的能力实现，而快照�
 
 否则前端只能靠「消息数变了」猜要不要刷新 —— 而 NO_REPLY、queued、mute 这三种
 状态变化**都不伴随新消息**，猜不出来。
-
-换负责人要发**两行**事件：新上任的，以及被顶掉的那个。只发前者会让旧负责人在 UI 上
-一直挂着「Lead」徽章 —— 客户端是按 `memberId` 整体替换状态的，没人通知它就没人改。
 
 三处形状上的选择：
 
@@ -728,10 +731,13 @@ npm run dev            # 同时启动 client(:5173) + server(:3001)
 | DELETE | `/api/conversations/:id/members/:memberId` | 移出 Member（仅 `group`） |
 | GET | `/api/conversations/:id/events?since=` | 会话级 SSE（支持 `Last-Event-ID` 回放） |
 | GET | `/api/conversations/:id/executions?limit=` | 该会话的 execution，按 `createdAt` 正序（默认 200，夹在 1..1000） |
-| GET | `/api/conversations/:id/state` | 房间里每个 Member 的读游标 / 唤醒状态 / 静音 / 是否负责人 |
-| PATCH | `/api/conversations/:id/members/:memberId/state` | `{ muted?, isLead? }` —— 至少给一个字段（都不给 `400`）。设 `isLead: true` 会同时顶掉旧的负责人，返回的是被改的那个 Member 的状态 |
+| GET | `/api/conversations/:id/state` | 房间里每个 Member 的读游标 / 唤醒状态 / 静音 |
+| PATCH | `/api/conversations/:id/members/:memberId/state` | `{ muted: boolean }` —— 静音后 dispatcher 不再唤醒它（@ 也唤不醒） |
 | GET | `/api/members/:id/direct-messages` | 该 Member 参与的全部私聊（只读） |
-| GET | `/api/members/:id/memory` · `PUT` | 该 Member 的长期记忆 → `{ content, version }`；`PUT` 可带 `expectedVersion`，不匹配 `409` |
+| GET | `/api/members/:id/conversations` | 该 Member 参与过的 conversation（按最后活动倒序，Member Profile 的 Recent activity 只读它） |
+| GET | `/api/members/:id/teams` | 该 Member 所属的 Team |
+| GET | `/api/members/:id/memory` · `PUT` | 该 Member 的全局长期记忆 → `{ content, version }`；`PUT` 可带 `expectedVersion`，不匹配 `409` |
+| GET | `/api/members/:id/team-context` · `PUT` | 该 Member 在某一个 Team 的上下文（`?teamId=` 省略 = 默认 Team；`PUT` 可带 `teamId` + `expectedVersion`） |
 | GET · POST · DELETE | `/api/capabilities/skills/global[/:name]` | global skill 文件（zip 上传 / 卸载）。**owner/admin** |
 | GET · POST · DELETE | `/api/capabilities/skills/team[/:name]` | team skill 文件。**owner/admin** |
 | GET · POST · DELETE | `/api/capabilities/skills/members/:memberId[/:name]` | member skill 文件。**owner/admin** |
@@ -925,7 +931,8 @@ Group Chat：
 ├── members/
 │   └── <member-id>/
 │       ├── SOUL.md                    # role / description / style / system prompt
-│       ├── memory/MEMORY.md           # 长期记忆（remember_member 写入）
+│       ├── memory/MEMORY.md           # 全局记忆（remember_member scope=global 写入）
+│       ├── teams/<team-id>/MEMORY.md  # Team 上下文（remember_member 默认写入）
 │       ├── skills/                    # member.filesystem-skills 的根目录
 │       └── knowledge/                 # 该 Member 的 personal KB（$personal）
 ├── team/
@@ -995,27 +1002,32 @@ config/
     financial-security-reviewer/
 
 src/                          # Vite + React + Ant Design 前端
-  App.tsx                     # ConfigProvider + Layout（Header 上有 Capabilities 入口）
+  App.tsx                     # ConfigProvider + Layout（Header 只剩标题 + 健康状态）
   index.css                   # 布局级覆盖（含可拖拽左栏、配置窗口页签滚动）
   components/
     HealthBadge.tsx           # antd Badge（success/warning/error）
     ResizableSider.tsx        # 可拖拽调宽度的左栏（Pointer Events，宽度落 localStorage）
-    TeamChat.tsx              # 编排：conversation / SSE / 状态合并（Layout Content + Alert/Tag）
-    team/                     # TeamChat 的拆分：list / messages / composer / 各编辑面板
-      TeamSidebar.tsx         # Collapse 四分区：Members/Current Work/Schedules/Conversations
-      CapabilitySettings.tsx  # 能力配置**窗口**：Modal + 三页签（Company defaults / Team defaults / This member），Skill / Knowledge / Action 的名字与开关
+    TeamChat.tsx              # 组合根：视图切换（chat / team / settings）+ conversation / SSE / 状态合并
+    workspace/
+      WorkspaceNav.tsx        # 窄导航 Rail：Chat / Team / Settings
+    chat/
+      ConversationSidebar.tsx # 聊天工作面第二列：Search + 会话分组 + New Team / New Work
+    team/                     # 各面共用的业务组件
+      TeamManagement.tsx      # Team 管理面：Members / Current Work / Automation 三页签
+      CapabilitySettings.tsx  # 能力配置：Modal（旧入口）与 Settings 页内嵌两种形态；三页签（Company defaults / Team defaults / This member），Skill / Knowledge / Action 的名字与开关
       ScopedSkillLibrary.tsx  # skill 文件库（global / team / member 共用同一个组件；能力窗口里上传即启用）
       TeamSections.tsx        # CurrentWorkSection（active execution → Jira key）
-      ConversationList.tsx    # antd List（Tag 区分 private/group/work/direct）+ New Team / New Work 入口
+      ConversationList.tsx    # 会话分组列表（Team discussions / Work / Direct + Search 过滤）+ New Team / New Work 入口
       WorkCreator.tsx         # 新建 Work：title + Member + Jira key + 第一条指令（建完可直接开跑）
       GroupCreator.tsx        # 新建 Team（≥2 个成员；Work 是 1 个成员，所以是另一个入口）
       ConversationMessages.tsx  # @ant-design/x Bubble.List + Timeline（delegation）
       MessageComposer.tsx     # @ant-design/x Sender
-      ConversationHeader.tsx  # Avatar.Group + Tag + Select
-      GroupMemberManager.tsx  # antd Table（有未完成工作时禁止 Remove）
-      MemberEditor.tsx        # antd Form + Popconfirm Archive（能力已移到 Capabilities 窗口）
-      MemberMemory.tsx        # 乐观并发（409 → Save anyway）
-      MemberProfile.tsx       # antd Modal + Tabs
+      ConversationHeader.tsx  # 会话标题 + 成员状态 + 收件人选择（管理按钮不在这里）
+      GroupMemberManager.tsx  # antd Table：加人 / 移人 / 静音（有未完成工作时禁止 Remove）
+      MemberEditor.tsx        # antd Form + Popconfirm Archive（能力已移到 Capabilities）
+      MemberMemory.tsx        # 记忆编辑器（global / team 复用同一套全文 + 版本 + 409）
+      MemberActivity.tsx      # Member 视角的动态（参与过的 conversation / 所属 Team）
+      MemberProfile.tsx       # antd Drawer + Tabs（Profile / Memory / Team Context / Skills）+ Recent activity
       ...
   lib/api.ts                  # 后端 API 客户端（含 SSE 解析）
 
@@ -1029,7 +1041,8 @@ server/                       # Express + Copilot SDK 后端
   tool-policy.ts              # 工具授权：只看 RuntimeTool 声明的 risk / requiresHostAccess
   context-assembler.ts        # 增量上下文（message_sequence checkpoint）
   recovery-service.ts         # 启动恢复（保守策略，不自动重跑 running）
-  member-service.ts           # 长期 Member 身份 + member home + seedKey
+  member-service.ts           # 长期 Member 身份 + member home + seedKey（文件读写在 member-memory.ts）
+  member-memory.ts            # 全局记忆 + Team 上下文的文件层（全文 + 版本 + 原子写 + 409）
   member-template-seeder.ts   # Member 层模板 provisioning（不含任何业务内容，也不认识任何后端）
   skill-service.ts            # skill 内容投放的唯一入口（三个 scope + zip 安全闸）
   capabilities/               # 能力层：三层 binding → RuntimeCapabilities
@@ -1075,9 +1088,9 @@ server/                       # Express + Copilot SDK 后端
     member-skills.test.ts          # 三个 scope 的 skill 安装 / 卸载 / zip 安全闸（穿越、symlink、体积、同名覆盖）
     runtime-reliability.test.ts    # schema 形状 / 序号 / 增量上下文 / durable event / 恢复 / 死锁
     runtime-correctness.test.ts    # resume 分类 / 超时 abort / 工具授权接线 / cancel 状态机 / retry
-    team-chat.test.ts              # 产品行为：direct / group / @mention / NO_REPLY / 应答者与负责人兜底 / 唤醒原因读回 / persona 与 memory 隔离
+    team-chat.test.ts              # 产品行为：direct / group / @mention / NO_REPLY / 应答者 / 唤醒合并与原因读回 / persona 与记忆隔离
     member-decision.test.ts        # 哨兵判定（normalize 容忍度）与流式过滤：两个模块对「什么算 <NO_REPLY>」不能有分歧
-    conversations-api.test.ts      # 真实 HTTP：externalWorkRef 过边界 / 负责人 set-swap-clear / state patch 字段校验 / SSE 字节流上没有哨兵
+    conversations-api.test.ts      # 真实 HTTP：externalWorkRef 过边界 / 静音 state patch / SSE 字节流上没有哨兵
     data-integrity.test.ts         # replyTo 校验 / 消息幂等 / 记忆乐观并发 / 上下文上限 / 配置快照 / state 事件 / mention 精确匹配
     member-template-seeder.test.ts # provisioning 幂等 / 不覆盖已改 Member / 归档不复活 / 穿越与重复 key / 能力绑定
     knowledge-provider.test.ts     # 检索范围限定在授权的 KB / personal 隔离 / 路径注入 / 索引幂等 / 磁盘同步
@@ -1145,7 +1158,7 @@ runtime 仍然是宿主机上的进程 —— 没有沙箱时 `bash` 能走到 w
 - **Execution UI**：`ExecutionStrip` / `ExecutionTree`（客户端按 `parentExecutionId` 组树）+ retry / cancel 按钮。`TeamChat.tsx` 已拆到 `src/components/team/`，但 execution 视图还没有独立组件。
 - **多副本**：`RecoveryService` 与 `cancelRequests` 目前都假设单进程。多副本前要把「谁是 owner」和取消信号都升级成 DB lease / 跨进程通道。
 - **认证**：`local-user` 是占位。接 Entra ID / AD / OIDC 时只改请求上下文，业务数据模型不动。
-- **会话记忆 vs Member 记忆**：`conversation_message` 是会话上下文，`members/<id>/memory/MEMORY.md` 是 Member 长期记忆，两者不要混。
+- **会话记忆 vs Member 记忆**：`conversation_message` 是会话上下文，全局 `members/<id>/memory/MEMORY.md` 是跨 Team 的长期记忆，`members/<id>/teams/<teamId>/MEMORY.md` 是 Team 上下文，三者不要混。
 - **Member 记忆提案**：让模型用 `propose_member_memory` 提议、由应用审核后再落盘，而不是让 `remember_member` 直接写。
 - **Restore to template**：把某个 Member 恢复成模板 baseline（含 preview diff）。provisioning 刻意不做这件事 —— 它必须是显式操作，不能是启动副作用。届时再引入 `templateRevision` / `profileRevision`。
 - 只在真正出现「谁该接这个问题」的规模后，再引入 Member Router（LLM 路由会多一层概率性决策）。

@@ -244,9 +244,8 @@ export class StubCopilot {
   /**
    * 只按住这些 Member 的 turn；`null` = 按住全部。
    *
-   * 「等这一批跑完再判断房间是不是沉默了」这条守卫只在**有人已收口、有人还在跑**
-   * 的形状下才可观测。全局 `hold` 表达不了它 —— 那会把所有人都按住，
-   * 于是谁都不收口，被考的那条分支根本走不到。
+   * 构造「有人已收口、有人还在跑」的中间态时用：全局 `hold` 表达不了它 ——
+   * 那会把所有人都按住，于是谁都不收口，被考的那条分支根本走不到。
    */
   holdMemberIds: Set<string> | null = null;
   /**
@@ -260,15 +259,13 @@ export class StubCopilot {
   /**
    * 这些 Member 一律返回 `<NO_REPLY>`，其他 Member 按 `mode` 走。
    *
-   * 用来构造「房间里只有某一个人会说话」—— 兜底（escalation）这类行为必须
-   * 在「其他人都沉默」的前提下才谈得上，而 `mode` 是全局开关，表达不了
-   * 「A 说话、B 和 C 沉默」。
+   * 用来构造「房间里只有某一个人会说话」。
    */
   readonly skipMemberIds = new Set<string>();
   /**
    * 只在这些 wake_reason 上开口，其余一律沉默。
    *
-   * 兜底用例需要表达「**同一个人**：第一轮沉默、被兜底时回答」。按 member
+   * 用来表达「**同一个人**：某种唤醒原因开口、其他原因沉默」。按 member
    * 或按全局开关都说不清这件事 —— 只有按**唤醒原因**才说得清。
    *
    * 需要 `wakeReasonOf` 配合（StubCopilot 不持有 db）。

@@ -4,6 +4,11 @@ import { api, type Member } from '../../lib/api';
 
 interface MemberMemoryProps {
   member: Member;
+  /**
+   * global = 跨 Team 稳定的长期记忆；team = 只属于当前 Team 的上下文。
+   * 同一套全文 + 版本 + 409 语义，只是读写的位置不同。
+   */
+  kind?: 'global' | 'team';
 }
 
 interface Loaded {
@@ -12,21 +17,24 @@ interface Loaded {
 }
 
 /**
- * Member 的长期记忆。
+ * Member 的记忆编辑器。
  *
- * 存的是 `.data/members/<id>/memory/MEMORY.md`，两个入口写它：
+ * global 读 `.data/members/<id>/memory/MEMORY.md`，
+ * team 读 `.data/members/<id>/teams/<teamId>/MEMORY.md`，两个入口写它：
  *
  *   remember_member  tool —— Agent 自己在干活时记下的
  *   这个页面              —— 人直接改的
  *
- * 它每轮都会被拼进 system prompt（见 buildMemberSystemPrompt 的
- * `Long-term memory:` 段），所以这里改的是**行为**，不是备注。
+ * 它们每轮都会被拼进 system prompt（见 buildMemberSystemPrompt 的
+ * `Long-term memory` / `Team context` 段），所以这里改的是**行为**，不是备注。
  *
  * 因为有两个写入方，保存必须带上「我读到的是哪一版」（`version` 是全文的
  * sha256）。不带的话，一次全文覆盖会把 Agent 在我们编辑期间写下的那句
  * 无声吃掉 —— 冲突时服务端返回 409，这里把它翻译成「重新加载」这个动作。
  */
-export function MemberMemory({ member }: MemberMemoryProps) {
+export function MemberMemory({ member, kind = 'global' }: MemberMemoryProps) {
+  const isTeam = kind === 'team';
+  const title = isTeam ? '# Team Context' : '# Long-term Memory';
   const [content, setContent] = useState('');
   const [loaded, setLoaded] = useState<Loaded>({ content: '', version: '' });
   const [loading, setLoading] = useState(true);
@@ -36,7 +44,7 @@ export function MemberMemory({ member }: MemberMemoryProps) {
   const [savedAt, setSavedAt] = useState<string | null>(null);
 
   function fetchMemory(): Promise<Loaded> {
-    return api.getMemberMemory(member.id);
+    return isTeam ? api.getMemberTeamContext(member.id) : api.getMemberMemory(member.id);
   }
 
   useEffect(() => {
@@ -63,7 +71,7 @@ export function MemberMemory({ member }: MemberMemoryProps) {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [member.id]);
+  }, [member.id, kind]);
 
   const dirty = content !== loaded.content;
 
@@ -72,9 +80,11 @@ export function MemberMemory({ member }: MemberMemoryProps) {
     setError(null);
     setConflict(false);
     try {
-      // 服务端会把标题归一化成 `# Long-term Memory`，回读落盘结果而不是
+      // 服务端会把标题归一化，回读落盘结果而不是
       // 拿本地文本当准 —— 否则下次进来就会看到两个标题。
-      const result = await api.replaceMemberMemory(member.id, content, loaded.version);
+      const result = isTeam
+        ? await api.replaceMemberTeamContext(member.id, content, loaded.version)
+        : await api.replaceMemberMemory(member.id, content, loaded.version);
       setContent(result.content);
       setLoaded(result);
       setSavedAt(new Date().toLocaleTimeString());
@@ -103,9 +113,9 @@ export function MemberMemory({ member }: MemberMemoryProps) {
   return (
     <Space direction="vertical" style={{ width: '100%' }}>
       <span style={{ color: '#666', fontSize: 13 }}>
-        这段内容每轮都会注入 {member.name} 的 system prompt。它只属于这个 Member，
-        不随 conversation 变化。Agent 干活时也会往这里写 —— 保存时会检查版本，
-        不会把它的写入覆盖掉。
+        {isTeam
+          ? `这段内容只属于当前 Team，每轮都会注入 ${member.name} 的 system prompt，换 Team 后看不到。Agent 干活时也会往这里写 —— 保存时会检查版本，不会把它的写入覆盖掉。`
+          : `这段内容跨所有 Team 稳定，每轮都会注入 ${member.name} 的 system prompt，只放长期习惯，不放某个 Team 的项目事实。Agent 干活时也会往这里写 —— 保存时会检查版本，不会把它的写入覆盖掉。`}
       </span>
 
       <Input.TextArea
@@ -114,7 +124,7 @@ export function MemberMemory({ member }: MemberMemoryProps) {
         spellCheck={false}
         rows={14}
         style={{ fontFamily: 'ui-monospace, monospace', fontSize: 13 }}
-        placeholder={'# Long-term Memory\n\n用户喜欢先看风险再看收益。'}
+        placeholder={isTeam ? `${title}\n\n这个 Team 的 review 输出要求先给 P0/P1 风险。` : `${title}\n\n用户喜欢先看风险再看收益。`}
       />
 
       {error && <Alert type="error" showIcon message={error} />}

@@ -2,9 +2,22 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
-import { config } from './config.js';
-import { hashText } from './content-hash.js';
 import { now } from './db.js';
+import {
+  appendGlobalMemory,
+  appendTeamMemory,
+  ensureMemberHome,
+  getGlobalMemory,
+  getTeamMemory,
+  memberHomeDir,
+  globalMemoryFile,
+  readGlobalMemory,
+  readTeamMemory,
+  replaceGlobalMemory,
+  replaceTeamMemory,
+  teamMemoryFile,
+  type MemoryDocument,
+} from './member-memory.js';
 import type { Member } from './domain.js';
 
 interface MemberRow {
@@ -81,19 +94,8 @@ function normalizeHandle(value: string): string {
   return normalized || `member-${randomUUID().slice(0, 8)}`;
 }
 
-/** 记忆文件的一级标题；replaceMemory 用它保证文件里只有一个标题。 */
-const MEMORY_TITLE = /^\s*#\s*Long-?term Memory\s*/i;
-
-/**
- * 长期记忆的全文 + 版本。
- *
- * `version` 是全文的 sha256，不是 schema 版本：记忆没有字段级结构，能表达
- * 「这份内容和我上次读到的是不是同一份」的最小信息就是它自己的指纹。
- */
-export interface MemberMemory {
-  content: string;
-  version: string;
-}
+/** 记忆文件的一级标题由 member-memory.ts 归一化，这里只透出它的文档形状。 */
+export interface MemberMemory extends MemoryDocument {}
 
 /**
  * 长期 Member 身份。Member 是跨 conversation 稳定的业务对象，
@@ -253,19 +255,30 @@ export class MemberService {
   }
 
   homePath(memberId: string): string {
-    return path.join(config.memberHomeRoot, memberId);
+    return memberHomeDir(memberId);
   }
 
   memoryPath(memberId: string): string {
-    return path.join(this.homePath(memberId), 'memory', 'MEMORY.md');
+    return globalMemoryFile(memberId);
   }
 
+  teamMemoryPath(memberId: string, teamId: string): string {
+    return teamMemoryFile(memberId, teamId);
+  }
+
+  /**
+   * 给 prompt 用的全局记忆尾部。Team 上下文不在这里 —— 它随 Team 变化，
+   * 由调用方按当前 conversation 的 teamId 另取并分段注入。
+   */
   readMemory(memberId: string): string {
-    this.ensureHome(memberId);
-    const file = this.memoryPath(memberId);
-    if (!fs.existsSync(file)) return '';
-    // 只回传尾部，避免长记忆把 system prompt 撑爆
-    return fs.readFileSync(file, 'utf8').slice(-16000);
+    this.get(memberId);
+    return readGlobalMemory(memberId);
+  }
+
+  /** 给 prompt 用的 Team 上下文尾部；换 Team 就换一份，不会泄漏到别的 Team。 */
+  readTeamMemory(memberId: string, teamId: string): string {
+    this.get(memberId);
+    return readTeamMemory(memberId, teamId);
   }
 
   /**
@@ -279,9 +292,7 @@ export class MemberService {
    */
   getMemory(memberId: string): MemberMemory {
     this.get(memberId);
-    this.ensureHome(memberId);
-    const content = fs.readFileSync(this.memoryPath(memberId), 'utf8');
-    return { content, version: hashText(content) };
+    return getGlobalMemory(memberId);
   }
 
   /**
@@ -299,62 +310,40 @@ export class MemberService {
    */
   replaceMemory(memberId: string, content: string, expectedVersion?: string): MemberMemory {
     this.get(memberId);
-    this.ensureHome(memberId);
-
-    const current = this.getMemory(memberId);
-    if (expectedVersion !== undefined && expectedVersion !== current.version) {
-      throw Object.assign(
-        new Error(
-          '长期记忆已被其他地方修改（可能是 Agent 在干活时记下的，或另一个页面保存过）。' +
-            '请重新加载后再保存，避免覆盖掉中间写入的内容。',
-        ),
-        { status: 409 },
-      );
-    }
-
-    const body = content.replace(MEMORY_TITLE, '').trim();
-    this.writeMemory(memberId, body ? `# Long-term Memory\n\n${body}\n` : '# Long-term Memory\n\n');
-    return this.getMemory(memberId);
+    return replaceGlobalMemory(memberId, content, expectedVersion);
   }
 
   appendMemory(memberId: string, content: string): string {
     const member = this.get(memberId);
-    this.ensureHome(member.id);
-    const line = content.trim();
-    if (!line) throw new Error('memory 内容不能为空');
-
-    // 读-改-写而不是 appendFileSync：语义上仍然是「追加」，但落盘走同一个
-    // 原子写路径，不会出现「文件被截断了一半」或者和 replaceMemory 的
-    // temp→rename 交错的中间态。
-    const current = fs.readFileSync(this.memoryPath(member.id), 'utf8');
-    this.writeMemory(member.id, `${current}\n\n## ${new Date().toISOString()}\n\n${line}\n`);
+    appendGlobalMemory(member.id, content);
     return `已保存到 ${member.name} 的长期记忆。`;
   }
 
   /**
-   * 原子写入：先写同目录的临时文件并 fsync，再 rename 覆盖目标。
+   * 只属于某一个 Team 的上下文（工作方式、成员关系、项目事实）。
    *
-   * 直接 `writeFileSync(target)` 在写到一半时崩溃（或断电）会留下一个被截断的
-   * 文件 —— 对记忆文件来说就是「这个人格的一半记忆没了」，而且没有任何备份。
-   * rename 在同一个目录内是原子的：读到的要么是旧全文，要么是新全文。
+   * 和全局记忆共用同一套文件语义（全文 + 版本 + 409），只是落盘位置不同。
+   * Team 是否存在由 TeamService 守，这里只管文件。
    */
-  private writeMemory(memberId: string, content: string): void {
-    const file = this.memoryPath(memberId);
-    const temp = `${file}.${randomUUID()}.tmp`;
+  getTeamMemory(memberId: string, teamId: string): MemberMemory {
+    this.get(memberId);
+    return getTeamMemory(memberId, teamId);
+  }
 
-    try {
-      const fd = fs.openSync(temp, 'w');
-      try {
-        fs.writeFileSync(fd, content, 'utf8');
-        fs.fsyncSync(fd);
-      } finally {
-        fs.closeSync(fd);
-      }
-      fs.renameSync(temp, file);
-    } catch (error) {
-      fs.rmSync(temp, { force: true });
-      throw error;
-    }
+  replaceTeamMemory(
+    memberId: string,
+    teamId: string,
+    content: string,
+    expectedVersion?: string,
+  ): MemberMemory {
+    this.get(memberId);
+    return replaceTeamMemory(memberId, teamId, content, expectedVersion);
+  }
+
+  appendTeamMemory(memberId: string, teamId: string, content: string): string {
+    const member = this.get(memberId);
+    appendTeamMemory(member.id, teamId, content);
+    return `已保存到 ${member.name} 在这个 Team 的上下文。`;
   }
 
   /**
@@ -370,17 +359,7 @@ export class MemberService {
   }
 
   private ensureHome(memberId: string): void {
-    const home = this.homePath(memberId);
-    fs.mkdirSync(home, { recursive: true });
-    fs.mkdirSync(path.dirname(this.memoryPath(memberId)), { recursive: true });
-    // skill 目录仍在这里兜底建：member home 的形状是 MemberService 的契约，
-    // 即使 skill 的读写已经搬去 SkillService（见 skill-service.ts）。
-    fs.mkdirSync(path.join(home, 'skills'), { recursive: true });
-
-    const memoryFile = this.memoryPath(memberId);
-    if (!fs.existsSync(memoryFile)) {
-      fs.writeFileSync(memoryFile, '# Long-term Memory\n\n', 'utf8');
-    }
+    ensureMemberHome(memberId);
   }
 
   private writeSoul(member: Member): void {

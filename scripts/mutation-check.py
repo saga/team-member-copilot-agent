@@ -4,8 +4,8 @@
 （不走 git —— 这些文件里可能有尚未提交的改动）。开跑之前先做一次基线预检：
 测试文件本身就是红的就直接停，否则「上一次被中断留下的变异」会被误读成锚点写错。
 
-**超时算「捕获」**：有些变异会把系统推进死循环（例如拿掉「已经有人回答过就不再兜底」
-这一关，兜底会自我循环），测试不会红，而是一直跑下去。挂死也是一种失败 ——
+**超时算「捕获」**：有些变异会把系统推进死循环（例如拿掉唤醒合并，
+同一条唤醒被反复重派），测试不会红，而是一直跑下去。挂死也是一种失败 ——
 而且是比断言失败更严重的失败，所以这里给它一个上限，超时即判定断言有区分度。
 顺带这也是还原逻辑的保护：没有超时的话，杀掉脚本会留下一个被改过的源文件。
 """
@@ -33,7 +33,11 @@ def run_test(rel_path: str) -> bool:
     except subprocess.TimeoutExpired:
         print(f"      （测试超过 {TEST_TIMEOUT_SECONDS}s 未结束 —— 变异把系统推成了死循环）")
         return False
-    return "# fail 0" in result.stdout and result.returncode == 0
+    # Node 24 的 test runner 输出 `ℹ fail 0`，旧版输出 `# fail 0` —— 两种都认。
+    return (
+        ("# fail 0" in result.stdout or "ℹ fail 0" in result.stdout)
+        and result.returncode == 0
+    )
 
 
 MUTATIONS = [
@@ -374,101 +378,44 @@ MUTATIONS = [
             )
         ],
     },
-    # ── 负责人兜底：房间全体沉默时，由负责人回答 ────────────────────────────
+    # ── 唤醒合并优先级：更明确的理由赢 ──────────────────────────────────
     {
-        "name": "兜底被降级成普通讨论（负责人拿到「你可以沉默」）",
+        "name": "mention 合并时输给更弱的唤醒（点名被降级成顺带看看）",
         "test": "server/test/team-chat.test.ts",
-        "steps": [
-            ("server/group-dispatcher.ts", "      reason: 'escalation',", "      reason: 'open_discussion',")
-        ],
-    },
-    {
-        "name": "兜底根本不派（房间沉默下去没人管）",
-        "test": "server/test/team-chat.test.ts",
-        "steps": [
-            (
-                "server/team-service.ts",
-                "          this.maybeEscalateSilentRoom(input.conversation, input.triggerMessageSequence);",
-                "          void input.triggerMessageSequence;",
-            )
-        ],
-    },
-    {
-        "name": "有人已经回答过还兜底（负责人抢答）",
-        "test": "server/test/team-chat.test.ts",
-        "steps": [("server/team-service.ts", "    if ((counts.replies ?? 0) > 0) return;\n", "")],
-    },
-    {
-        "name": "不等这一批跑完就兜底（一次沉默兜多次）",
-        "test": "server/test/team-chat.test.ts",
-        "steps": [("server/team-service.ts", "    if ((counts.active ?? 0) > 0) return;\n", "")],
-    },
-    {
-        "name": "被静音的负责人照样被兜底唤醒（绕过用户的显式意图）",
-        "test": "server/test/team-chat.test.ts",
-        "steps": [
-            (
-                "server/group-dispatcher.ts",
-                "    if (this.states.get(conversation.id, leadId).muted) return null;\n",
-                "",
-            )
-        ],
-    },
-    {
-        "name": "Member 之间的沉默也当成房间失职（兜底被滥用）",
-        "test": "server/test/team-chat.test.ts",
-        "steps": [
-            (
-                "server/team-service.ts",
-                "    if (!trigger || trigger.senderType !== 'user') return;",
-                "    if (!trigger) return;",
-            )
-        ],
-    },
-    {
-        "name": "兜底合并时输给更弱的唤醒（「房间已沉默」这条信息丢掉）",
-        "test": "server/test/team-chat.test.ts",
-        "steps": [("server/member-turn-scheduler.ts", "  escalation: 4,", "  escalation: 1,")],
-    },
-    {
-        "name": "兜底指令退化成 direct 的说辞（负责人会再判断一次）",
-        "test": "server/test/team-chat.test.ts",
-        "steps": [
-            ("server/context-assembler.ts", "  if (reason === 'escalation') {", "  if (reason === 'never-match') {")
-        ],
+        "steps": [("server/member-turn-scheduler.ts", "  mention: 3,", "  mention: 0,")],
     },
     # ── 唤醒原因的持久化读回 ──────────────────────────────────────────────
     {
-        "name": "escalation 没进读回白名单（崩溃恢复时被降级成 open_discussion）",
+        "name": "mention 没进读回白名单（崩溃恢复时点名被降级成顺带看看）",
         "test": "server/test/team-chat.test.ts",
         "steps": [
             (
                 "server/conversation-member-service.ts",
-                "  escalation: true,\n  mention: true,",
-                "  mention: true,",
+                "  mention: true,\n  direct: true,",
+                "  direct: true,",
             )
         ],
     },
-    # ── 一个房间至多一个负责人 ────────────────────────────────────────────
+    # ── Member 记忆隔离：Team 上下文不出 Team ─────────────────────────────
     {
-        "name": "换负责人时不撤销旧的（两个负责人，谁兜底不确定）",
-        "test": "server/test/team-chat.test.ts",
+        "name": "remember_member 默认写全局（Team 上下文漏进所有 Team）",
+        "test": "server/test/capabilities.test.ts",
         "steps": [
             (
-                "server/conversation-member-service.ts",
-                "          is_lead = CASE WHEN member_id = ? THEN ? ELSE 0 END,",
-                "          is_lead = CASE WHEN member_id = ? THEN ? ELSE is_lead END,",
+                "server/capabilities/providers/core-tools.ts",
+                "            scope: args.scope === 'global' ? 'global' : 'team',",
+                "            scope: 'global',",
             )
         ],
     },
     {
-        "name": "读负责人时不筛 is_lead（兜底落到随便一个成员头上）",
+        "name": "prompt 里不注入 Team 上下文（换 Team 也看不到）",
         "test": "server/test/team-chat.test.ts",
         "steps": [
             (
-                "server/conversation-member-service.ts",
-                "          AND is_lead = 1\n        LIMIT 1",
-                "        LIMIT 1",
+                "server/team-service.ts",
+                "    const teamMemory = this.members.readTeamMemory(member.id, conversation.teamId);",
+                "    const teamMemory = '';",
             )
         ],
     },

@@ -309,9 +309,8 @@ function selectWindow(
  *
  * 但「允许沉默」只能给**顺带被唤醒**的人。用户对着房间说话时，房间里必须有
  * 一个人是欠着回答的，否则每个成员都合理地认为「别人会说」，全体沉默 ——
- * 用户提问、房间一个字都不回。所以四种 reason 分四档：
+ * 用户提问、房间一个字都不回。所以三种 reason 分三档：
  *
- *   escalation  整个房间都没接话 → 负责人兜底（最强）
  *   mention     用户 @ 了它 —— 指名道姓
  *   direct      平台指定它当这一轮的应答者（GroupDispatcher.pickPrimaryResponder）
  *   open_discussion / follow_up  顺带被唤醒，可以沉默
@@ -319,21 +318,8 @@ function selectWindow(
  * mention 和 direct 都必须回答，但**说辞必须分开**：告诉一个没被点名的人
  * 「用户点名了你」，模型可能会先去纠正这个并不存在的前提，而不是回答问题。
  * 它被指定为应答者是平台的决定，那就如实说 —— 理由本身是充分的。
- *
- * escalation 也单独一档，而且必须说清楚「房间里没人说话」：那是这一档独有的
- * 信息，也是它和 direct 唯一的区别。不说的话，模型会以为这只是一次普通的
- * 「轮到你」，然后**再判断一次**「也许别人会说」—— 兜底就白兜了。
  */
 function discussionInstruction(reason: WakeReason | null): string {
-  if (reason === 'escalation') {
-    return [
-      "The rest of this room stayed silent on the user's message.",
-      'As the lead of this room, answering it is your responsibility.',
-      'Do not stay silent, and do not wait for anyone else —',
-      'reply with your message directly. Keep it short.',
-    ].join('\n');
-  }
-
   if (reason === 'mention') {
     return [
       'You were addressed by name, so you must respond.',

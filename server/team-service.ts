@@ -20,6 +20,7 @@ import {
   type UpdateMemberInput,
 } from './member-service.js';
 import type { CopilotService } from './copilot.js';
+import type { MemberMemoryScope } from './member-memory.js';
 import type { CapabilityResolver } from './capabilities/resolver.js';
 import type { CapabilityService } from './capabilities/service.js';
 import type { TeamStructureService } from './team-structure-service.js';
@@ -51,6 +52,7 @@ import type {
   MemberRuntime,
   PendingWake,
   StoredConversationEvent,
+  Team,
   TeamChangeSink,
   TurnMode,
   WakeReason,
@@ -169,6 +171,26 @@ interface EventRow {
   event_type: ConversationEventType;
   payload: string;
   created_at: string;
+}
+
+interface TeamRow {
+  id: string;
+  name: string;
+  description: string;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+}
+
+function mapTeamRow(row: TeamRow): Team {
+  return {
+    id: row.id,
+    name: row.name,
+    description: row.description,
+    createdBy: row.created_by,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
 }
 
 export interface CreateConversationInput {
@@ -489,6 +511,50 @@ export class TeamService {
       )
       .all() as unknown as ConversationRow[];
     return rows.map((row) => this.hydrateConversation(row));
+  }
+
+  /**
+   * Member 视角的历史：它参与过哪些 conversation，按最后活动倒序。
+   *
+   * 不建新表 —— conversation_member 本来就是 roster 事实，这只是一条 join。
+   * UI 的 Member Profile 用它渲染 Recent activity。
+   */
+  listMemberConversations(memberId: string): Conversation[] {
+    this.members.get(memberId);
+    const rows = this.db
+      .prepare(
+        `
+        SELECT c.*
+        FROM conversation c
+        JOIN conversation_member cm ON cm.conversation_id = c.id
+        WHERE cm.member_id = ?
+        ORDER BY c.updated_at DESC
+        `,
+      )
+      .all(memberId) as unknown as ConversationRow[];
+    return rows.map((row) => this.hydrateConversation(row));
+  }
+
+  /**
+   * Member 视角的 Team 列表：哪些 Team 里有它的 membership。
+   *
+   * 同样只是 join，不建新模型。单 Team 部署下永远只回一个。
+   */
+  listMemberTeams(memberId: string): Team[] {
+    this.members.get(memberId);
+    if (!this.structure) return [];
+    const rows = this.db
+      .prepare(
+        `
+        SELECT t.*
+        FROM team t
+        JOIN team_membership m ON m.team_id = t.id
+        WHERE m.kind = 'agent' AND m.principal_id = ?
+        ORDER BY t.created_at
+        `,
+      )
+      .all(memberId) as unknown as TeamRow[];
+    return rows.map(mapTeamRow);
   }
 
   getConversation(id: string): Conversation {
@@ -1075,28 +1141,6 @@ export class TeamService {
   }
 
   /**
-   * 指定 / 撤销房间负责人（lead / key contact）。
-   *
-   * 负责人是**房间维度**的角色：同一个 Member 可以是安全评审室的负责人、
-   * 同时在架构室里只是普通成员。一个房间至多一个 —— 这条不变量由
-   * `conversation_member_state` 上的偏索引强制，不是靠这里记得先清后设。
-   *
-   * 它平时不影响任何排序（日常仍然是轮流应答），只在「用户对着房间说话、
-   * 而整个房间都没回应」时兜底。见 maybeEscalateSilentRoom。
-   */
-  setMemberLead(
-    conversationId: string,
-    memberId: string,
-    isLead: boolean,
-  ): ConversationMemberState {
-    const conversation = this.getConversation(conversationId);
-    this.requireConversationMember(conversation, memberId);
-    this.states.ensure(conversationId, memberId);
-    this.states.setLead(conversationId, memberId, isLead);
-    return this.states.get(conversationId, memberId);
-  }
-
-  /**
    * 真正跑一次唤醒。
    *
    * execution 在这里创建（而不是在 sendMessage 里）：scheduler 已经保证了
@@ -1447,8 +1491,20 @@ export class TeamService {
     }
   }
 
-  rememberMember(input: { memberId: string; content: string }): Promise<string> {
-    return Promise.resolve(this.members.appendMemory(input.memberId, input.content));
+  rememberMember(input: {
+    memberId: string;
+    content: string;
+    scope?: MemberMemoryScope;
+    teamId?: string;
+  }): Promise<string> {
+    // 默认写 Team 上下文：Agent 随口说的「记住这个」几乎都是当前 Team 的事，
+    // 只有明确跨 Team 稳定的工作习惯才配进全局记忆。
+    if (input.scope === 'global') {
+      return Promise.resolve(this.members.appendMemory(input.memberId, input.content));
+    }
+    const teamId = input.teamId ?? this.defaultTeam().id;
+    if (this.structure) this.structure.getTeam(teamId);
+    return Promise.resolve(this.members.appendTeamMemory(input.memberId, teamId, input.content));
   }
 
   /**
@@ -1467,6 +1523,36 @@ export class TeamService {
 
   replaceMemberMemory(memberId: string, content: string, expectedVersion?: string): MemberMemory {
     return this.members.replaceMemory(memberId, content, expectedVersion);
+  }
+
+  /**
+   * 某 Member 在某 Team 的上下文（全文 + 版本，供 UI 编辑）。
+   *
+   * teamId 省略 = 当前默认 Team：单 Team 部署下调用方不需要知道 Team 的存在，
+   * 多 Team 后按显式 teamId 读写。Team 不存在时 404，而不是建一个空文件。
+   */
+  getMemberTeamContext(memberId: string, teamId?: string): MemberMemory {
+    return this.members.getTeamMemory(memberId, this.resolveTeamId(teamId));
+  }
+
+  replaceMemberTeamContext(
+    memberId: string,
+    content: string,
+    teamId?: string,
+    expectedVersion?: string,
+  ): MemberMemory {
+    return this.members.replaceTeamMemory(
+      memberId,
+      this.resolveTeamId(teamId),
+      content,
+      expectedVersion,
+    );
+  }
+
+  private resolveTeamId(teamId?: string): string {
+    const resolved = teamId ?? this.defaultTeam().id;
+    if (this.structure) this.structure.getTeam(resolved);
+    return resolved;
   }
 
   // ------------------------------------------------------------- Execution
@@ -2094,7 +2180,7 @@ export class TeamService {
       );
       // 快照写在这里而不是建 execution 时：system prompt 与能力组成都是到这里
       // 才定下来的，而它们的指纹就是快照的核心。
-      this.recordConfigSnapshot(executionId, input.member, systemPrompt, runtimeCapabilities.manifestHash);
+      this.recordConfigSnapshot(executionId, input.member, input.conversation.teamId, systemPrompt, runtimeCapabilities.manifestHash);
 
       const result = await this.copilot.runMemberTurn({
         runtime,
@@ -2169,16 +2255,6 @@ export class TeamService {
         });
         this.emitExecution(this.getExecution(executionId));
 
-        // 第二道保险：这一条 skip 之后，房间是不是**全体沉默**了。
-        //
-        // 必须在这一条 execution 收口**之后**判断：收口之前它自己还是 active，
-        // 「这一批跑完了没有」永远是否，兜底就永远不会触发。也必须在**每条**
-        // skip 之后都判断 —— 只有最后收口的那条会通过「全部收口」这一关，
-        // 前面几条会被拦掉，所以不会重复派发。
-        if (input.triggerMessageSequence !== null) {
-          this.maybeEscalateSilentRoom(input.conversation, input.triggerMessageSequence);
-        }
-
         // 没有新消息 → 不需要再派发唤醒，循环自然终止
         return '';
       }
@@ -2248,89 +2324,6 @@ export class TeamService {
 
       throw error;
     }
-  }
-
-  /**
-   * 第二道保险：用户对着房间说话、而**整个房间都没接话**时，把这一轮交给负责人。
-   *
-   * ── 为什么需要第二道 ────────────────────────────────────────────────
-   *
-   * 第一道（GroupDispatcher.pickPrimaryResponder）是**一条指令**：平台指定
-   * 一名应答者并明确告诉它「必须回答」。指令是可以被无视的 —— 模型有自己的
-   * 判断。真实发生过的样子是六条 execution 全部 completed / decision=skip：
-   * 机制全对，每个人都选了沉默。
-   *
-   * 所以还需要一道**不依赖模型配合**的兜底：既然整个房间都没接话，那就由
-   * 负责人来接。对应职场里「问了一圈没人应，负责人总得说话」。
-   *
-   * ── 触发条件（全部满足才兜底） ──────────────────────────────────────
-   *
-   *   1. 触发消息是**用户**发的 —— Member 之间的 follow_up 沉默不算房间失职
-   *   2. 这一批 execution 已**全部收口**（还有在跑的就不急，它可能正要回答）
-   *   3. 这一批里**没有任何一条** decision=reply（有人说了话就不必兜底）
-   *   4. 这条触发消息**还没兜过底** —— 一次静默只兜一次，否则兜底失败会自我循环
-   *   5. 负责人存在、在房间里、active、未被静音（静音是显式意图，不绕过）
-   *
-   * ── 刻意**不**加的一条：负责人已经当过应答者就不再问 ─────────────────
-   *
-   * 加过，又删了。它看起来合理（「同一件事不做两遍」），但它会在一个真实且
-   * 常见的场景里让房间继续沉默：负责人恰好被 pickPrimaryResponder 选中，
-   * 拿着「你必须回答」的指令选择了沉默，其他人也沉默 —— 房间一个字都没回。
-   * 这正是要修的现象，而这条「优化」恰好把它放行。
-   *
-   * 而且再问一次并不真的是同一件事：兜底的指令带着一条别的分支没有的信息
-   * （「房间里没人接话」）。同一个 Member 收到不同的输入，本来就可能有不同的
-   * 判断。代价有上界（条件 4 保证一次静默只兜一次），而房间保持沉默的代价
-   * 没有上界 —— 用户看着一个死房间。
-   *
-   * ── 只在 skip 之后调用，不在 failed / cancelled 之后 ─────────────────
-   *
-   *   failed    是引擎故障，用户已经看到错误提示。再叠一次兜底会让一次故障
-   *             表现成两条错误，而且大概率同样失败。
-   *   cancelled 是用户自己叫停的，此时替他再派一轮是违背他的意图。
-   *
-   * 「大家都不发言」这句话的精确含义就是「所有人都主动选择了沉默」。
-   */
-  private maybeEscalateSilentRoom(conversation: Conversation, triggerSequence: number): void {
-    if (conversation.kind !== 'group') return;
-
-    const counts = this.db
-      .prepare(
-        `
-        SELECT
-          SUM(CASE WHEN status IN ('queued', 'running', 'waiting_for_member')
-                   THEN 1 ELSE 0 END) AS active,
-          SUM(CASE WHEN decision = 'reply' THEN 1 ELSE 0 END) AS replies,
-          SUM(CASE WHEN wake_reason = 'escalation' THEN 1 ELSE 0 END) AS escalations
-        FROM execution
-        WHERE conversation_id = ?
-          AND trigger_message_sequence = ?
-        `,
-      )
-      .get(conversation.id, triggerSequence) as unknown as {
-      active: number | null;
-      replies: number | null;
-      escalations: number | null;
-    };
-
-    if ((counts.active ?? 0) > 0) return;
-    if ((counts.replies ?? 0) > 0) return;
-    if ((counts.escalations ?? 0) > 0) return;
-
-    const trigger = this.findMessageBySequence(conversation.id, triggerSequence);
-    if (!trigger || trigger.senderType !== 'user') return;
-
-    // 花名册判断（谁是负责人、它现在能不能接活）交给 dispatcher；
-    // 「这一批跑完没有、有没有人说过话」是执行历史，留在这一层。
-    const plan = this.dispatcher.planEscalation({ conversation, triggerSequence });
-    if (!plan) return;
-
-    this.scheduler.enqueue({
-      conversationId: conversation.id,
-      memberId: plan.memberId,
-      reason: plan.reason,
-      triggerSequence,
-    });
   }
 
   private touchAgentPresence(memberId: string): void {
@@ -2499,12 +2492,13 @@ export class TeamService {
    * 只存指纹不存全文：system prompt 和 memory 都能从 member 行 + 磁盘重算，
    * 存全文只会制造第二份真相源（而且它和第一份迟早会不一致）。
    *
-   * `memoryHash` 取的是**整份记忆文件**的指纹，而注入 prompt 的只是尾部
-   * 16000 字符（见 MemberService.readMemory）。两者刻意不同：快照回答的是
+   * `memoryHash` 取的是**两份记忆文件合起来**的指纹，而注入 prompt 的只是各自
+   * 的尾部 16000 字符（见 MemberService.readMemory）。两者刻意不同：快照回答的是
    * 「当时是哪一份记忆」，不是「当时塞进去了哪些字节」。
    */
   private buildConfigSnapshot(
     member: Member,
+    teamId: string,
     systemPrompt: string,
     capabilityManifestHash: string,
   ): ExecutionConfigSnapshot {
@@ -2512,7 +2506,9 @@ export class TeamService {
       memberRevision: member.updatedAt,
       model: member.model ?? config.defaultModel,
       systemPromptHash: hashText(systemPrompt),
-      memoryHash: this.members.getMemory(member.id).version,
+      memoryHash: hashText(
+        `${this.members.getMemory(member.id).content}\0${this.members.getTeamMemory(member.id, teamId).content}`,
+      ),
       capabilityManifestHash,
       hostToolsEnabled: config.allowHostCodingTools,
     };
@@ -2528,12 +2524,13 @@ export class TeamService {
   private recordConfigSnapshot(
     executionId: string,
     member: Member,
+    teamId: string,
     systemPrompt: string,
     capabilityManifestHash: string,
   ): void {
     try {
       this.updateExecution(executionId, {
-        configSnapshot: this.buildConfigSnapshot(member, systemPrompt, capabilityManifestHash),
+        configSnapshot: this.buildConfigSnapshot(member, teamId, systemPrompt, capabilityManifestHash),
       });
     } catch (error) {
       // eslint-disable-next-line no-console
@@ -2567,6 +2564,9 @@ export class TeamService {
       .join('\n');
 
     const memory = this.members.readMemory(member.id);
+    // Team 上下文随当前 conversation 的归属 Team 变化：只注入这一份，
+    // 其他 Team 的上下文不读、不拼、不泄漏。
+    const teamMemory = this.members.readTeamMemory(member.id, conversation.teamId);
 
     const describeSources = (scope: 'team' | 'personal'): string => {
       const sources = knowledge
@@ -2634,8 +2634,11 @@ export class TeamService {
       'Use search_knowledge to find material across the sources listed above;',
       'use open_knowledge_document when a snippet is not enough.',
       '',
-      'Long-term memory:',
+      'Long-term memory (stable habits, applies across all Teams):',
       memory || '(no stored memory yet)',
+      '',
+      'Team context (this Team only — never carry it into another Team):',
+      teamMemory || '(no Team context yet)',
     ]
       .filter(Boolean)
       .join('\n');
