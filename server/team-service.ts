@@ -8,7 +8,7 @@ import { runInTransaction } from './db-tx.js';
 import { now } from './db.js';
 import { ContextAssembler } from './context-assembler.js';
 import { ConversationMemberService } from './conversation-member-service.js';
-import { GroupDispatcher, type DispatchPlan, type WakePlan } from './group-dispatcher.js';
+import { GroupDispatcher, type WakePlan } from './group-dispatcher.js';
 import { MemberTurnScheduler } from './member-turn-scheduler.js';
 import { NoReplyStreamGate, NO_REPLY_SENTINEL, parseMemberTurnOutcome } from './member-decision.js';
 import { badRequest, conflict, notFound } from './http-error.js';
@@ -20,7 +20,6 @@ import {
   type UpdateMemberInput,
 } from './member-service.js';
 import type { CopilotService } from './copilot.js';
-import type { MemberMemoryScope } from './member-memory.js';
 import type { CapabilityResolver } from './capabilities/resolver.js';
 import type { CapabilityService } from './capabilities/service.js';
 import type { TeamStructureService } from './team-structure-service.js';
@@ -382,7 +381,7 @@ export class TeamService {
       // NO_REPLY / pending / mute 都不伴随新消息。
       this.emit(conversationId, { type: 'conversation_member_state.updated', data: change });
     });
-    this.dispatcher = new GroupDispatcher(db, this.states, config.groupAutoWakeRounds);
+    this.dispatcher = new GroupDispatcher(this.states);
     this.memberConversations = new MemberConversationService(db, this);
     this.scheduler = new MemberTurnScheduler(
       this.states,
@@ -1018,34 +1017,6 @@ export class TeamService {
     return { conversationId: result.conversation.id, messageId: result.message.id };
   }
 
-  /**
-   * 某个 Member 发言之后，把它这条消息再派发一次 —— 别人可能该被唤醒。
-   *
-   * 这就是 Team discussion 的闭环：
-   *
-   *   message → wake → Member 判断 → reply / skip → new message → 其它 Member wake
-   *
-   * 必须带 `authorMemberId`：否则 Member 一发言就把自己再唤醒一次。
-   */
-  private dispatchMessage(input: {
-    conversation: Conversation;
-    message: ConversationMessage;
-    authorMemberId?: string;
-  }): DispatchPlan {
-    const plan = this.dispatcher.plan(input);
-
-    for (const wake of plan.wakes) {
-      this.scheduler.enqueue({
-        conversationId: input.conversation.id,
-        memberId: wake.memberId,
-        reason: wake.reason,
-        triggerSequence: wake.triggerSequence,
-      });
-    }
-
-    return plan;
-  }
-
   // ---------------------------------------------------- Conversation state
 
   /** 房间里每个 Member 的读游标 / 唤醒状态 / 未读数。 */
@@ -1212,7 +1183,7 @@ export class TeamService {
    * 重启恢复用：重新派发一个被进程带走的唤醒。
    *
    * 触发消息与原因原样带过来 —— 它们和这次唤醒一起落库，就是为了让恢复出来的
-   * 是**同一轮**。以前这里用「房间当前最大序号 + open_discussion」猜：一次
+   * 是**同一轮**。以前这里用「房间当前最大序号 + everyone」猜：一次
    * `@bob 看下风险`（mention @17）会被重放成对着第 23 条消息的顺带唤醒。
    */
   redispatchWake(wake: PendingWake): void {
@@ -1224,10 +1195,10 @@ export class TeamService {
 
     // 触发消息必须还在。丢弃了它就不能拿当前水位糊弄过去 —— 那会换一条消息重跑。
     // 只有确实查不到（房间被手工清理过）时才退回当前水位，并把原因降成
-    // open_discussion：对着一条不是原地唤醒它的话，不该逼它必须回答。
+    // everyone：对着一条不是原地唤醒它的话，不该逼它必须回答。
     const trigger = this.findMessageBySequence(wake.conversationId, wake.triggerSequence);
     const triggerSequence = trigger ? wake.triggerSequence : this.latestMessageSequence(wake.conversationId);
-    const reason: WakeReason = trigger ? wake.reason : 'open_discussion';
+    const reason: WakeReason = trigger ? wake.reason : 'everyone';
 
     if (triggerSequence <= state.lastSeenMessageSequence) return;
 
@@ -1493,16 +1464,10 @@ export class TeamService {
 
   rememberMember(input: {
     memberId: string;
+    teamId: string;
     content: string;
-    scope?: MemberMemoryScope;
-    teamId?: string;
   }): Promise<string> {
-    // 默认写 Team 上下文：Agent 随口说的「记住这个」几乎都是当前 Team 的事，
-    // 只有明确跨 Team 稳定的工作习惯才配进全局记忆。
-    if (input.scope === 'global') {
-      return Promise.resolve(this.members.appendMemory(input.memberId, input.content));
-    }
-    const teamId = input.teamId ?? this.defaultTeam().id;
+    const teamId = input.teamId;
     if (this.structure) this.structure.getTeam(teamId);
     return Promise.resolve(this.members.appendTeamMemory(input.memberId, teamId, input.content));
   }
@@ -2285,19 +2250,6 @@ export class TeamService {
       this.emitExecution(this.getExecution(executionId));
       this.touchConversation(input.conversation.id);
       this.touchAgentPresence(input.member.id);
-
-      // Team discussion 的闭环：这条新消息可能该唤醒别人。
-      // 必须带 authorMemberId，否则这个 Member 会被自己的消息再唤醒一次。
-      //
-      // DM 房间例外：那里没有人在旁边盯着，让回复自动唤醒对方会让两个 Member
-      // 无限对谈下去。DM 的唤醒只由「显式发一条消息」触发，见 isMemberDm。
-      if (!isMemberDm(input.conversation)) {
-        this.dispatchMessage({
-          conversation: input.conversation,
-          message,
-          authorMemberId: input.member.id,
-        });
-      }
 
       return outcome.content;
     } catch (error) {

@@ -200,13 +200,13 @@ export function singleExecutionId(
 /**
  * 静音房间里全部成员。
  *
- * group 房间默认是「共享讨论」：用户消息以 open_discussion 广播给全体，
- * Member 发言后 follow_up 还会顺带唤醒别人。runtime / event / delegation
- * 这些机制类用例要的是「一次显式点名 = 一轮」，被自动唤醒的讨论搅进来只会
+ * 用户消息（无 mention）会以 everyone 广播给全体未静音成员；
+ * 机制类用例要的是确定性（一次发送 = 可数的 execution），广播进来只会
  * 让断言之间的时序变得不可预测。
  *
- * 显式 `targetMemberId` 不经过静音判断（它等价于一次 mention），
- * 所以静音之后每一轮仍然由用例自己驱动。
+ * 注意 mute 会挡掉一切唤醒，包括显式 `targetMemberId` 与 @mention。
+ * 用 targetMemberId 驱动单轮的用例不需要 mute：点名只唤醒一个人，
+ * 而 Member 的回复不会再自动唤醒别人，没有连锁可压。
  */
 export function muteAllMembers(team: TeamService, conversationId: string): void {
   for (const member of team.getConversation(conversationId).members) {

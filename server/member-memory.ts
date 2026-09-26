@@ -24,8 +24,6 @@ export interface MemoryDocument {
   version: string;
 }
 
-export type MemberMemoryScope = 'team' | 'global';
-
 const GLOBAL_TITLE = /^\s*#\s*Long-?term Memory\s*/i;
 const TEAM_TITLE = /^\s*#\s*Team Context\s*/i;
 

@@ -29,7 +29,6 @@ export interface CoreToolHost {
     memberId: string;
     teamId: string;
     content: string;
-    scope: 'team' | 'global';
   }): Promise<string>;
 
   /**
@@ -112,25 +111,22 @@ export class CoreTeamToolProvider implements ToolProvider {
         kind: 'custom',
         name: 'remember_member',
         description:
-          'Save something the Member should remember. ' +
-          'scope "team" (default) is only relevant to this Team and never leaks ' +
-          'to other Teams — use it for Team workflows, relationships and project facts. ' +
-          'scope "global" carries across all Teams — use it only for stable personal ' +
-          'work habits that hold everywhere.',
+          'Save something this Member should remember for the current Team. ' +
+          'Use this for Team workflows, relationships, project facts, and local working conventions. ' +
+          'Do not use this as a global personality or preference store.',
         risk: 'self-write',
         parameters: z.object({
-          content: z.string().min(1).max(8000).describe('The memory to persist'),
-          scope: z
-            .enum(['team', 'global'])
-            .optional()
-            .describe('Where to save it. Defaults to "team".'),
+          content: z
+            .string()
+            .min(1)
+            .max(8000)
+            .describe('Information to remember for the current Team.'),
         }),
         execute: (context, args) =>
           this.host.rememberMember({
             memberId: context.memberId,
             teamId: context.teamId,
             content: String(args.content),
-            scope: args.scope === 'global' ? 'global' : 'team',
           }),
       }
     ];

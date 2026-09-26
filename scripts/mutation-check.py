@@ -339,50 +339,38 @@ MUTATIONS = [
         ],
     },
     {
-        "name": "用户消息不指定应答者（回到全员可沉默 → 责任扩散）",
-        "test": "server/test/team-chat.test.ts",
+        "name": "Member 发言自动唤醒别人（自动接龙回来）",
+        "test": "server/test/group-dispatcher.test.ts",
         "steps": [
             (
                 "server/group-dispatcher.ts",
-                "      message.senderType === 'user' ? this.pickPrimaryResponder(conversation, candidates) : null;",
-                "      null;",
+                "    if (message.senderType === 'member') {",
+                "    if (false) {",
             )
         ],
     },
     {
-        "name": "应答者拿到的是「可以沉默」的指令（出口没关）",
+        "name": "everyone 拿不到「可以沉默」的指令（出口没关）",
         "test": "server/test/team-chat.test.ts",
         "steps": [
-            ("server/context-assembler.ts", "  if (reason === 'direct') {", "  if (reason === null) {")
+            ("server/context-assembler.ts", "  if (reason === 'everyone') {", "  if (reason === null) {")
         ],
     },
     {
-        "name": "应答者平手时不定序（谁回答取决于数组顺序）",
+        "name": "认不出的唤醒原因变成必须回答（宁可误报也不沉默）",
         "test": "server/test/team-chat.test.ts",
         "steps": [
             (
-                "server/group-dispatcher.ts",
-                "      return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;",
-                "      return 0;",
+                "server/conversation-member-service.ts",
+                "  return 'everyone';",
+                "  return 'direct';",
             )
         ],
     },
-    {
-        "name": "应答者排序方向反了（永远同一个人回答）",
-        "test": "server/test/team-chat.test.ts",
-        "steps": [
-            (
-                "server/group-dispatcher.ts",
-                "      if (left !== right) return left - right;",
-                "      if (left !== right) return right - left;",
-            )
-        ],
-    },
-    # ── 唤醒合并优先级：更明确的理由赢 ──────────────────────────────────
     {
         "name": "mention 合并时输给更弱的唤醒（点名被降级成顺带看看）",
         "test": "server/test/team-chat.test.ts",
-        "steps": [("server/member-turn-scheduler.ts", "  mention: 3,", "  mention: 0,")],
+        "steps": [("server/member-turn-scheduler.ts", "  mention: 2,", "  mention: 0,")],
     },
     # ── 唤醒原因的持久化读回 ──────────────────────────────────────────────
     {
@@ -398,13 +386,13 @@ MUTATIONS = [
     },
     # ── Member 记忆隔离：Team 上下文不出 Team ─────────────────────────────
     {
-        "name": "remember_member 默认写全局（Team 上下文漏进所有 Team）",
-        "test": "server/test/capabilities.test.ts",
+        "name": "remember_member 写全局（Team 上下文漏进所有 Team）",
+        "test": "server/test/member-memory.test.ts",
         "steps": [
             (
-                "server/capabilities/providers/core-tools.ts",
-                "            scope: args.scope === 'global' ? 'global' : 'team',",
-                "            scope: 'global',",
+                "server/team-service.ts",
+                "    return Promise.resolve(this.members.appendTeamMemory(input.memberId, teamId, input.content));",
+                "    return Promise.resolve(this.members.appendMemory(input.memberId, input.content));",
             )
         ],
     },

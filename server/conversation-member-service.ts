@@ -351,7 +351,7 @@ export class ConversationMemberService {
    * 只把状态清回 idle，交给 execution 那侧的 interrupted 处理。
    *
    * 元数据为 NULL 的行只可能来自 v3→v4 迁移的瞬间（极端罕见），这时退回
-   * triggerSequence = 0 + open_discussion：宁可重放成一次允许沉默的唤醒，
+   * triggerSequence = 0 + everyone：宁可重放成一次允许沉默的唤醒，
    * 也不要把一条 unknown 的原因当成 mention 逼出一条消息。调用方看到
    * triggerSequence = 0 会用房间当前水位兜底。
    *
@@ -417,8 +417,7 @@ export class ConversationMemberService {
 const KNOWN_WAKE_REASONS: Record<Exclude<WakeReason, 'schedule'>, true> = {
   mention: true,
   direct: true,
-  follow_up: true,
-  open_discussion: true,
+  everyone: true,
 };
 
 /**
@@ -435,7 +434,7 @@ export function asWakeReason(value: string | null): Exclude<WakeReason, 'schedul
   }
   // 认不出来的一律按**最宽松**的处理：宁可让一个成员可以沉默，也不要让一个
   // 乱码值变成「必须回答」。
-  return 'open_discussion';
+  return 'everyone';
 }
 
 function mapState(row: StateRow): ConversationMemberState {

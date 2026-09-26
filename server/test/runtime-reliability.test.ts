@@ -28,7 +28,7 @@ const { db } = await import('../db.js');
 const { MemberService } = await import('../member-service.js');
 const { RecoveryService } = await import('../recovery-service.js');
 const { ConversationMemberService } = await import('../conversation-member-service.js');
-const { singleExecutionId, muteAllMembers, createTestStack } = await import('./support.js');
+const { singleExecutionId, createTestStack } = await import('./support.js');
 const { migrate, getUserVersion, SCHEMA_VERSION } = await import(
   '../db-migrations.js'
 );
@@ -542,9 +542,8 @@ describe('ContextAssembler：增量上下文而不是整段重放', () => {
       title: 'Incremental',
       memberIds: [alice.id, bob.id],
     });
-    // 四轮都由显式 targetMemberId 驱动；自动唤醒只会在中间插进额外的 turn，
-    // 让「谁在什么时候读到了什么」没法断言。
-    muteAllMembers(team, conv.id);
+    // 四轮都由显式 targetMemberId 驱动（点名只唤醒一个人，
+    // Member 的回复也不会自动唤醒别人），「谁在什么时候读到了什么」可断言。
 
     // 1) Alice 先说话
     const first = await sendMessage({
@@ -652,7 +651,6 @@ describe('wait-for 环检测（跨 delegation 树的死锁保护）', () => {
       title: 'WaitFor',
       memberIds: [alice.id, bob.id],
     });
-    muteAllMembers(team, conv.id);
 
     const aliceRun = await sendMessage({
       conversationId: conv.id,
@@ -986,7 +984,6 @@ describe('redispatchWake：恢复出来的是同一轮', () => {
       title: 'Crash Room',
       memberIds: [alice.id, bob.id],
     });
-    muteAllMembers(team, room.id);
 
     // 只点名 Bob。Alice 从头到尾没被唤醒，读游标停在 0。
     const first = await sendMessage({

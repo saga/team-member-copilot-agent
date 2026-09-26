@@ -304,47 +304,34 @@ function selectWindow(
 /**
  * group 房间里「要不要发言」的指令。
  *
- * 关键是把 skip 明确成**合法结果**，否则模型会为了「有问必答」而重复别人
- * 已经说过的话 —— 三个 Member 各说一遍同样的结论，是 group chat 最典型的失败形态。
- *
- * 但「允许沉默」只能给**顺带被唤醒**的人。用户对着房间说话时，房间里必须有
- * 一个人是欠着回答的，否则每个成员都合理地认为「别人会说」，全体沉默 ——
- * 用户提问、房间一个字都不回。所以三种 reason 分三档：
- *
- *   mention     用户 @ 了它 —— 指名道姓
- *   direct      平台指定它当这一轮的应答者（GroupDispatcher.pickPrimaryResponder）
- *   open_discussion / follow_up  顺带被唤醒，可以沉默
- *
- * mention 和 direct 都必须回答，但**说辞必须分开**：告诉一个没被点名的人
- * 「用户点名了你」，模型可能会先去纠正这个并不存在的前提，而不是回答问题。
- * 它被指定为应答者是平台的决定，那就如实说 —— 理由本身是充分的。
+ * 三档：direct / mention 必须回答；everyone 可以 NO_REPLY。
  */
 function discussionInstruction(reason: WakeReason | null): string {
   if (reason === 'mention') {
     return [
       'You were addressed by name, so you must respond.',
-      'Do not restate what other participants already said — add what only you can add.',
-      'Reply with your message directly. Keep it short.',
+      'Do not repeat what other participants already said.',
+      'Add only information that is useful and distinct.',
+      'Reply directly and concisely.',
     ].join('\n');
   }
 
-  // 注意：这条只出现在 group 房间（1:1 房间走 turnMode=direct，不到这里）。
-  if (reason === 'direct') {
+  if (reason === 'everyone') {
     return [
-      'You are the participant this room expects to answer this message.',
-      'You must respond — staying silent is not an option for you here.',
-      'Do not restate what other participants already said — add what only you can add.',
-      'Reply with your message directly. Keep it short.',
+      'You are one of the participants included in this discussion.',
+      '',
+      'Decide whether you have something useful to contribute.',
+      `If you do not have anything useful or non-duplicative to add, reply with exactly: ${NO_REPLY_SENTINEL}`,
+      '',
+      'Do not summarize the entire discussion.',
+      'Do not agree merely for the sake of participating.',
+      'Add information, reasoning, risks, or a concrete next step only when useful.',
     ].join('\n');
   }
 
   return [
-    'Decide whether you should contribute to this room right now.',
-    '',
-    `- If you have something genuinely useful that is not already covered, reply with it directly.`,
-    `- If the room already covers your view, or you have nothing to add, reply with exactly: ${NO_REPLY_SENTINEL}`,
-    '',
-    `Do not summarize the discussion. Do not agree for the sake of it. ${NO_REPLY_SENTINEL} is a valid and expected answer.`,
+    'Reply directly to the user.',
+    'Be concise and useful.',
   ].join('\n');
 }
 

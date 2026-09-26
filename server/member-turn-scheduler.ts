@@ -144,10 +144,9 @@ function keyOf(conversationId: string, memberId: string): string {
  * 反过来降级会让一次明确的点名被吞掉。
  */
 const REASON_PRIORITY: Record<Exclude<WakeReason, 'schedule'>, number> = {
-  mention: 3,
-  direct: 2,
-  follow_up: 1,
-  open_discussion: 0,
+  mention: 2,
+  direct: 1,
+  everyone: 0,
 };
 
 /**
@@ -157,7 +156,7 @@ const REASON_PRIORITY: Record<Exclude<WakeReason, 'schedule'>, number> = {
  * 取更大的」分别计算，于是可能拼出一条并不存在的事件：
  *
  *   #10 "@bob 看一下"   → mention @10
- *   #11 "大家再看一下"   → open_discussion @11
+ *   #11 "大家再看一下"   → everyone @11
  *   合并结果           → mention @11      ← #11 并没有点名 Bob
  *
  * ContextAssembler 会照 reason 给出「你被明确点名，必须回答」，但它指的是一条

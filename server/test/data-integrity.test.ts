@@ -135,9 +135,6 @@ describe('replyToMessageId 必须指得着，而且是同一个房间里的', ()
     const room = team.createConversation({ kind: 'direct', memberIds: [alice.id] });
     const other = team.createConversation({ kind: 'direct', memberIds: [bob.id] });
 
-    await muteAllMembers(team, room.id);
-    await muteAllMembers(team, other.id);
-
     const elsewhere = await team.sendMessage({ conversationId: other.id, content: '别的房间' });
 
     await assert.rejects(
@@ -175,7 +172,6 @@ describe('POST /messages 的幂等键', () => {
   it('同一个 key 第二次到达：不落新消息、不再唤醒、把第一条原样返回', async () => {
     const alice = makeMember('Idem Alice', 'idem-alice');
     const room = team.createConversation({ kind: 'direct', memberIds: [alice.id] });
-    await muteAllMembers(team, room.id);
 
     const key = 'req-0001';
 
@@ -209,7 +205,6 @@ describe('POST /messages 的幂等键', () => {
   it('幂等命中不消费 message_sequence，也不留空号', async () => {
     const alice = makeMember('Idem2 Alice', 'idem2-alice');
     const room = team.createConversation({ kind: 'direct', memberIds: [alice.id] });
-    await muteAllMembers(team, room.id);
 
     await team.sendMessage({ conversationId: room.id, content: 'a', clientRequestId: 'k1' });
     await waitForConversationIdle(room.id);
@@ -385,7 +380,7 @@ describe('ContextAssembler 的单轮上限', () => {
         member: team.getMember(alice.id),
         turnMode: 'discussion',
         triggerMessageSequence: 2,
-        wakeReason: 'open_discussion',
+        wakeReason: 'everyone',
         currentPrompt: '',
       });
 
@@ -407,7 +402,6 @@ describe('execution 记录当时用的配置', () => {
   it('跑完一轮后有快照；改了 Member 身份之后 retry 的快照跟着变', async () => {
     const alice = makeMember('Snapshot Alice', 'snapshot-alice');
     const room = team.createConversation({ kind: 'direct', memberIds: [alice.id] });
-    await muteAllMembers(team, room.id);
 
     const sent = await team.sendMessage({ conversationId: room.id, content: '第一轮' });
     const executionId = singleExecutionId(db, room.id, sent.wakes);

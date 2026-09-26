@@ -26,7 +26,7 @@ process.env.COPILOT_WARMUP = 'false';
 const { config } = await import('../config.js');
 const { db } = await import('../db.js');
 const { MemberService } = await import('../member-service.js');
-const { singleExecutionId, muteAllMembers, createTestStack } = await import('./support.js');
+const { singleExecutionId, createTestStack } = await import('./support.js');
 
 interface RunTurnInput {
   runtime: { id: string; copilotSessionId: string; workspacePath: string };
@@ -156,9 +156,8 @@ before(() => {
     memberIds: [researcher.id, coder.id, reviewer.id, analyst.id, archivist.id],
   });
   // 这个 group 是给 delegation / 审计链用例当「同一个房间里的多个 Member」用的。
-  // 静音全体：这些用例每一轮都显式点名，不需要 open_discussion 广播把 5 个人
-  // 同时唤醒。共享讨论本身由 team-chat.test.ts 覆盖。
-  muteAllMembers(team, conversation.id);
+  // 每一轮都显式点名（targetMemberId 只唤醒一个人），Member 的回复也不会
+  // 自动唤醒别人，所以不需要静音来压制广播。共享讨论本身由 team-chat.test.ts 覆盖。
   teamConversationId = conversation.id;
 });
 
@@ -176,13 +175,14 @@ describe('Member 是跨 conversation 的长期身份', () => {
     assert.ok(fs.existsSync(path.join(home, 'skills')));
   });
 
-  it('remember_member 默认写入这个 Team 的上下文，不进全局记忆', async () => {
+  it('remember_member 只写入这个 Team 的上下文，不进全局记忆', async () => {
+    const teamId = team.getConversation(teamConversationId).teamId;
     const result = await team.rememberMember({
       memberId: researcher.id,
+      teamId,
       content: '这个 Team 的 review 输出要求先给 P0/P1 风险。',
     });
     assert.match(result, /Team/);
-    const teamId = team.getConversation(teamConversationId).teamId;
     assert.match(memberService.readTeamMemory(researcher.id, teamId), /P0\/P1/);
     assert.ok(
       !memberService.readMemory(researcher.id).includes('P0/P1'),
@@ -190,13 +190,22 @@ describe('Member 是跨 conversation 的长期身份', () => {
     );
   });
 
-  it('remember_member scope=global 才写入跨 Team 的长期记忆', async () => {
-    const result = await team.rememberMember({
+  it('remember_member 没有 global 入口：签名里只有 teamId + content', async () => {
+    const teamId = team.getConversation(teamConversationId).teamId;
+    await team.rememberMember({
       memberId: researcher.id,
+      teamId,
       content: '用户偏好先看风险再看收益。',
-      scope: 'global',
     });
-    assert.match(result, /长期记忆/);
+    assert.match(memberService.readTeamMemory(researcher.id, teamId), /先看风险再看收益/);
+    assert.ok(
+      !memberService.readMemory(researcher.id).includes('先看风险再看收益'),
+      'Agent 的写入不能漏进全局记忆',
+    );
+  });
+
+  it('人仍然可以直接改全局记忆（人工维护的长期习惯）', () => {
+    team.replaceMemberMemory(researcher.id, '# Long-term Memory\n\n用户偏好先看风险再看收益。');
     assert.match(memberService.readMemory(researcher.id), /先看风险再看收益/);
   });
 
@@ -415,7 +424,6 @@ describe('Member 生命周期边界', () => {
       kind: 'group',
       memberIds: [archivist.id, reviewer.id],
     });
-    muteAllMembers(team, group.id);
 
     await whileBusy(async () => {
       const first = await sendMessage({
@@ -450,7 +458,6 @@ describe('Member 生命周期边界', () => {
       kind: 'group',
       memberIds: [coder.id, reviewer.id, analyst.id],
     });
-    muteAllMembers(team, group.id);
 
     // 先让 analyst 在房间里跑一轮，把 runtime 用起来
     const first = await sendMessage({

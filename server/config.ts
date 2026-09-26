@@ -73,14 +73,6 @@ export const config = {
    */
   executionTimeoutMs: intEnv('EXECUTION_TIMEOUT_MS', 600_000),
   /**
-   * group 房间里「没有 @mention 的 Member 发言」最多能连着唤醒几轮。
-   *
-   * A 发言 → 唤醒 B → B 发言 → 唤醒 A → ... 是一个没有天然终点的循环。
-   * 用户消息重置这个计数；连续 N 条 member 消息之后，member 消息只靠
-   * @mention 才能唤醒别人（mention 永远有效）。见 group-dispatcher.ts。
-   */
-  groupAutoWakeRounds: intEnv('GROUP_AUTO_WAKE_ROUNDS', 2),
-  /**
    * 单轮注进入 prompt 的 shared message 条数上限。
    *
    * 没有它时会有一个很具体的事故：一个 Member 沉默很久（或被静音一段时间）

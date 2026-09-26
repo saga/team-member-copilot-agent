@@ -20,7 +20,7 @@ import type { DatabaseSync } from 'node:sqlite';
  *
  * 程序不认识任何别的编号 —— 没有升级代码，认出来也无从下手。
  */
-export const SCHEMA_VERSION = 16;
+export const SCHEMA_VERSION = 17;
 
 /**
  * 当前 schema 的完整定义，按最终形状写。
@@ -363,7 +363,7 @@ CREATE TABLE conversation_member_state (
   --
   -- 不落库的话，重启恢复只能拿「房间当前最大序号」+ 最宽松的 reason 去猜：
   -- 一次 "@bob 看下风险"（reason=mention, trigger=17）会被重放成
-  -- reason=open_discussion、trigger=23，对着完全另一条消息重新判断要不要发言。
+  -- reason=everyone、trigger=23，对着完全另一条消息重新判断要不要发言。
   pending_wake_trigger_sequence INTEGER,
   -- WakeReason 的取值由 domain.ts 定义。刻意不加 CHECK：SQLite 加 CHECK 只能
   -- 重建表，而取值集合在 TypeScript 侧已经是封闭联合，写入口只有 scheduler 一处。
@@ -500,7 +500,7 @@ CREATE TABLE execution (
   -- 这一轮最终判断了什么（发言 / 沉默）以及唤醒它的那条消息
   decision TEXT,
   trigger_message_sequence INTEGER,
-  -- 为什么唤醒这个 Member（direct / mention / open_discussion / follow_up / schedule）。
+  -- 为什么唤醒这个 Member（direct / mention / everyone / schedule）。
   -- 落库是为了重启恢复时能忠实重放同一轮，而不是猜一个。
   wake_reason TEXT,
   -- 这一轮跑的时候，这个 Member 的配置长什么样。

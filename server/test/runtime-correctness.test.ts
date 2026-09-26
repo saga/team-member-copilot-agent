@@ -29,7 +29,7 @@ const { CopilotService, isSessionNotFound, isTurnTimeout } = await import('../co
 const { DefaultToolPolicy } = await import('../tool-policy.js');
 import type { PolicyService } from '../policy.js';
 import type { MemberCapabilities } from '../domain.js';
-const { createTestStack, capabilityContext, singleExecutionId, muteAllMembers } = await import(
+const { createTestStack, capabilityContext, singleExecutionId } = await import(
   './support.js'
 );
 
@@ -698,7 +698,6 @@ describe('Execution cancel 状态机', () => {
       kind: 'group',
       memberIds: [alice.id, bob.id],
     });
-    muteAllMembers(team, conv.id);
 
     let release!: () => void;
     stub.hold = new Promise<void>((resolve) => {
@@ -788,9 +787,7 @@ describe('归档 Member 的 conversation 语义', () => {
       kind: 'group',
       memberIds: [alice.id, bob.id],
     });
-    // 这个用例只关心「bob 被点名那一轮」，把自动唤醒关掉
-    muteAllMembers(team, conv.id);
-
+    // 这个用例只关心「bob 被点名那一轮」
     const sent = await sendMessage({
       conversationId: conv.id,
       content: 'first',
@@ -844,9 +841,7 @@ describe('listExecutions', () => {
       kind: 'group',
       memberIds: [alice.id, bob.id],
     });
-    // 断言的是「恰好 2 条 execution」，所以每一轮都点名，不让讨论自己展开
-    muteAllMembers(team, conv.id);
-
+    // 断言的是「恰好 2 条 execution」，所以每一轮都点名
     const parent = await sendMessage({
       conversationId: conv.id,
       content: 'parent',

@@ -38,10 +38,9 @@ const { MemberService } = await import('../member-service.js');
 const { ConversationMemberService, asWakeReason } = await import(
   '../conversation-member-service.js'
 );
-const { GroupDispatcher } = await import('../group-dispatcher.js');
-const { MemberTurnScheduler } = await import('../member-turn-scheduler.js');
 const { NO_REPLY_SENTINEL } = await import('../member-decision.js');
-const { executionIdForWake, muteAllMembers, StubCopilot, createTestStack } = await import('./support.js');
+const { MemberTurnScheduler } = await import('../member-turn-scheduler.js');
+const { executionIdForWake, StubCopilot, createTestStack } = await import('./support.js');
 
 const ALICE_PROMPT = 'ALICE_PERSONA_SENTINEL';
 const BOB_PROMPT = 'BOB_PERSONA_SENTINEL';
@@ -102,9 +101,8 @@ async function waitForStatus(id: string, status: string): Promise<void> {
 /**
  * 等到房间里没有在跑的 execution。
  *
- * group 里的成员发言会 follow_up 唤醒别人（受 groupAutoWakeRounds 限制），
- * 断言「消息数 / execution 数」之前必须先等这串连锁反应收敛，
- * 否则读到的只是一个中间态。
+ * 用户消息以 everyone 广播时会同时起好几轮，断言「消息数 / execution 数」
+ * 之前必须先等它们收敛，否则读到的只是一个中间态。
  */
 async function waitForConversationIdle(conversationId: string): Promise<void> {
   for (let attempt = 0; attempt < 600; attempt += 1) {
@@ -152,9 +150,8 @@ before(() => {
     title: 'Shared Room',
     memberIds: [alice.id, bob.id, iris.id],
   });
-  // 静音全体：每一轮都由用例显式点名（targetMemberId 不走静音判断），
-  // 免得 open_discussion / follow_up 的连锁唤醒把「谁跑了几轮」变随机。
-  muteAllMembers(team, room.id);
+  // 不静音：每一轮都由用例显式点名（targetMemberId 只唤醒一个人），
+  // 而 Member 的回复不会自动唤醒别人，没有连锁可压。
   roomId = room.id;
 });
 
@@ -168,7 +165,7 @@ after(() => {
 });
 
 describe('Group conversation', () => {
-  it('用户无 mention 的消息：全体被唤醒，但恰好一人被指定为应答者', async () => {
+  it('用户无 mention 的消息：全体未静音成员以 everyone 被唤醒', async () => {
     const group = team.createConversation({
       kind: 'group',
       title: 'Investment Review Team',
@@ -183,17 +180,9 @@ describe('Group conversation', () => {
       [alice.id, bob.id, iris.id].sort(),
     );
 
-    // 恰好一人 reason=direct（必须回答），其余 open_discussion（可补可沉默）。
-    // 「全员可沉默」曾经让三个 Member 各自判断「别人会说」，用户提问房间无人应答。
-    const responders = first.wakes.filter((wake) => wake.reason === 'direct');
-    assert.equal(responders.length, 1, '用户对着房间说话时必须有且只有一名应答者');
-    assert.equal(
-      first.wakes.filter((wake) => wake.reason === 'open_discussion').length,
-      2,
-      '其余成员是顺带被唤醒的，允许沉默',
-    );
-
+    // 没有「应答者」：everyone 全员可以沉默，想协作走 ask_member / message_member。
     for (const wake of first.wakes) {
+      assert.equal(wake.reason, 'everyone');
       assert.equal(wake.triggerSequence, first.message.messageSequence);
     }
     await waitForConversationIdle(group.id);
@@ -205,13 +194,7 @@ describe('Group conversation', () => {
     assert.deepEqual(
       second.wakes.map((wake) => wake.memberId).sort(),
       [alice.id, bob.id].sort(),
-      'muted 的成员不该被 open discussion 唤醒',
-    );
-    // 应答者只能从「被唤醒的人」里选：静音的成员不该被指定。
-    assert.equal(
-      second.wakes.filter((wake) => wake.reason === 'direct').length,
-      1,
-      '静音的成员不能被指定为应答者',
+      'muted 的成员不该被 everyone 唤醒',
     );
     await waitForConversationIdle(group.id);
 
@@ -219,7 +202,7 @@ describe('Group conversation', () => {
     assert.equal(states.find((state) => state.memberId === iris.id)?.muted, true);
   });
 
-  it('全员静音时，用户消息不产生任何应答者（没有候选就没有 direct）', async () => {
+  it('全员静音时，用户消息不产生任何唤醒', async () => {
     const group = team.createConversation({
       kind: 'group',
       title: 'All Muted Room',
@@ -230,18 +213,18 @@ describe('Group conversation', () => {
 
     const result = await team.sendMessage({ conversationId: group.id, content: '有人吗' });
 
-    assert.deepEqual(result.wakes, [], '全员静音时没有候选，不该凭空造一个应答者');
+    assert.deepEqual(result.wakes, [], '全员静音时没有候选，不该凭空唤醒任何人');
     await waitForConversationIdle(group.id);
   });
 
-  it('Member 发言触发的 follow_up 不指定应答者（作者之外无人欠回答）', async () => {
+  it('Member 发言不自动唤醒任何人（没有自动接龙）', async () => {
     const group = team.createConversation({
       kind: 'group',
-      title: 'Follow Up Room',
+      title: 'No Chain Room',
       memberIds: [alice.id, bob.id, iris.id],
     });
 
-    // 用户点名 Alice，让 Alice 说一句；她那句话会 follow_up 唤醒另外两人。
+    // 用户点名 Alice，让 Alice 说一句；她那句话不该再唤醒另外两人。
     const trigger = await team.sendMessage({
       conversationId: group.id,
       content: '先看下风险',
@@ -251,19 +234,16 @@ describe('Group conversation', () => {
     await waitForStatus(aliceExecution, 'completed');
     await waitForConversationIdle(group.id);
 
-    // 连回触发消息的作者：**「作者不被自己的消息唤醒」是逐条消息的规则，
-    // 不是逐个人的**。Alice 会被 Bob 的下一条消息合法地唤醒 —— 她只是不能
-    // 被自己刚发的那条唤醒。所以断言必须落在 (execution, 触发消息) 这一对上。
-    const followUps = db
+    const chained = db
       .prepare(
         `
         SELECT e.member_id AS member_id, m.sender_id AS sender_id, m.sender_type AS sender_type
         FROM execution e
         JOIN conversation_message m
           ON m.conversation_id = e.conversation_id
-         AND m.message_sequence = e.trigger_message_sequence
+          AND m.message_sequence = e.trigger_message_sequence
         WHERE e.conversation_id = ?
-          AND e.wake_reason = 'follow_up'
+          AND m.sender_type = 'member'
         `,
       )
       .all(group.id) as unknown as Array<{
@@ -272,24 +252,7 @@ describe('Group conversation', () => {
       sender_type: string;
     }>;
 
-    assert.ok(followUps.length > 0, 'Alice 的发言应该 follow_up 唤醒其他成员');
-    for (const row of followUps) {
-      assert.equal(row.sender_type, 'member', 'follow_up 只由 Member 的消息触发');
-      assert.notEqual(row.member_id, row.sender_id, '没人该被自己刚发的那条消息唤醒');
-    }
-
-    // follow_up 全员可沉默 —— 应答者机制只服务于「用户对着房间说话」。
-    // member 消息不该把任何人指定成应答者，否则房间会自己给自己派活。
-    const strayDirect = db
-      .prepare(
-        `
-        SELECT COUNT(*) AS n
-        FROM execution
-        WHERE conversation_id = ? AND wake_reason = 'direct' AND member_id != ?
-        `,
-      )
-      .get(group.id, alice.id) as unknown as { n: number };
-    assert.equal(strayDirect.n, 0, 'member 消息不该把任何人指定成应答者');
+    assert.equal(chained.length, 0, 'Member 的发言不该自动唤醒其他成员');
   });
 
   it('@mention 只唤醒被点到的人，@ 到不存在的人则不广播', async () => {
@@ -318,22 +281,19 @@ describe('Group conversation', () => {
   });
 });
 
-describe('应答者：用户对着房间说话时，房间欠一个回答', () => {
+describe('everyone：用户对着房间说话时，人人都可以沉默', () => {
   /**
-   * 这个 describe 守的是一条产品承诺：**用户对房间提问，房间必须有人回答。**
+   * 这个 describe 守的是一条产品承诺：**discussion 里没有默认的接话人。**
    *
-   * 曾经的失败形态（真实发生过）：用户发「我希望做架构设计review，应该做什么」，
-   * 三个 Member 都被 open_discussion 唤醒，每个人都被允许沉默，于是三个人各自
-   * 判断「别人会说」，全体沉默 —— 六条 execution 全部 completed / decision=skip，
-   * 没有一条报错。机制完全正常，产品行为完全错误。
+   * 用户发一条无 mention 的消息，全体以 everyone 被唤醒，每个人都拿到
+   * 「没东西补就 <NO_REPLY>」的出口。房间要推进靠显式协作
+   *（@mention / ask_member / message_member），不靠平台指定应答者。
    *
    * 所以这里必须断言**两件事**，缺一不可：
-   *   1. 路由（wakes 里的 reason）—— 恰好一人是 direct
-   *   2. 指令（真正渲染给模型的那段话）—— 被指定的那个不能拿到沉默的出口
-   * 只断言 1 是不够的：reason 对了但指令里仍写着「没东西可补就 <NO_REPLY>」，
-   * 模型照样沉默。
+   *   1. 路由（wakes 里的 reason）—— 全员 everyone，没有 direct
+   *   2. 指令（真正渲染给模型的那段话）—— 每个人都看到 <NO_REPLY> 出口
    */
-  it('被指定的应答者拿到「必须回答」，其余成员拿到「可以沉默」', async () => {
+  it('everyone 唤醒的成员拿到「可以沉默」，不拿到「必须回答」', async () => {
     const group = team.createConversation({
       kind: 'group',
       title: 'Addressed Room',
@@ -346,91 +306,20 @@ describe('应答者：用户对着房间说话时，房间欠一个回答', () =
     });
     await waitForConversationIdle(group.id);
 
-    const responder = result.wakes.find((wake) => wake.reason === 'direct');
-    assert.ok(responder, '用户对着房间说话时必须有且只有一名应答者');
-    const bystanders = result.wakes.filter((wake) => wake.memberId !== responder.memberId);
-    assert.equal(bystanders.length, 2);
-
-    const responderPrompt = stub.turnFor(executionIdForWake(db, group.id, responder)).prompt;
-    assert.match(responderPrompt, /expects to answer this message/);
-    assert.match(responderPrompt, /must respond/);
-    // 关键：应答者不能同时看到「你可以沉默」这条出口，否则两个指令互相抵消，
-    // 模型会挑更省力的那个 —— 责任扩散就是这么发生的。
-    assert.doesNotMatch(
-      responderPrompt,
-      new RegExp(NO_REPLY_SENTINEL.replace(/[<>]/g, '\\$&')),
-      '应答者不该拿到 <NO_REPLY> 这个出口',
-    );
-
-    for (const wake of bystanders) {
+    assert.equal(result.wakes.length, 3);
+    for (const wake of result.wakes) {
+      assert.equal(wake.reason, 'everyone');
       const prompt = stub.turnFor(executionIdForWake(db, group.id, wake)).prompt;
       assert.match(
         prompt,
         new RegExp(NO_REPLY_SENTINEL.replace(/[<>]/g, '\\$&')),
-        '顺带被唤醒的成员必须知道沉默是合法的，否则会重复别人的话',
+        'everyone 唤醒的成员必须知道沉默是合法的，否则会重复别人的话',
       );
       assert.doesNotMatch(prompt, /expects to answer this message/);
     }
   });
 
-  it('选择规则：最久没发言的成员优先，同一份数据总是得到同一个答案', async () => {
-    const group = team.createConversation({
-      kind: 'group',
-      title: 'Rotation Room',
-      memberIds: [alice.id, bob.id, iris.id],
-    });
-
-    // 先静音全体：把消息落库但不在这一刻派发唤醒。这个用例考的是选择规则本身，
-    // 不需要真的跑 turn —— 让引擎跑起来反而会和下面的 markReplied 抢状态。
-    muteAllMembers(team, group.id);
-    const sent = await team.sendMessage({ conversationId: group.id, content: '这个方案该怎么推进' });
-    assert.deepEqual(sent.wakes, [], '静音状态下不该派发唤醒');
-
-    // 解除静音：静音只用来阻止这一刻的派发，不参与选择规则的断言
-    // （静音成员本来就会被排除在候选之外，那由上一个 describe 覆盖）。
-    for (const member of [alice, bob, iris]) {
-      team.setMemberMuted(group.id, member.id, false);
-    }
-
-    const states = new ConversationMemberService(db);
-    const dispatcher = new GroupDispatcher(db, states, 2);
-    const conversation = team.getConversation(group.id);
-
-    const primaryOf = (c = conversation): string => {
-      const plan = dispatcher.plan({ conversation: c, message: sent.message });
-      const responders = plan.wakes.filter((wake) => wake.reason === 'direct');
-      assert.equal(responders.length, 1, '用户消息必须恰好指定一名应答者');
-      return responders[0].memberId;
-    };
-
-    // 新房间全员 last_replied 都是 0 → 平手。平手必须按 id 定序，
-    // 否则「谁回答」会取决于一个没人看得见的数组顺序。
-    const first = primaryOf();
-    assert.equal(first, [alice.id, bob.id, iris.id].sort()[0], '平手时按 id 定序');
-
-    // 换一个成员数组顺序，结果必须一样。
-    assert.equal(
-      primaryOf({ ...conversation, members: [...conversation.members].reverse() }),
-      first,
-      '选择结果不能取决于成员在房间里的排列顺序',
-    );
-
-    // 应答者发言之后轮到他之外最久没发言的那个 —— 房间要轮流，不能永远同一个人。
-    states.markReplied(group.id, first, sent.message.messageSequence);
-    const second = primaryOf();
-    assert.notEqual(second, first, '刚回答过的人应该让位');
-
-    states.markReplied(group.id, second, sent.message.messageSequence + 1);
-    const third = primaryOf();
-    assert.notEqual(third, second, '连续两次都换人');
-    assert.notEqual(third, first, '第三轮轮到还没回答过的那个');
-
-    // 走完一圈回到第一个人：不是「谁先发言谁永远发言」，也不是随机。
-    states.markReplied(group.id, third, sent.message.messageSequence + 2);
-    assert.equal(primaryOf(), first, '三人各回答一次之后轮回到第一个人');
-  });
-
-  it('@mention 时不额外指定应答者：指名道姓已经是更强的指定', async () => {
+  it('@mention 时只唤醒被点到的人，不广播', async () => {
     const group = team.createConversation({
       kind: 'group',
       title: 'Mentioned Room',
@@ -481,7 +370,7 @@ describe('唤醒合并：更明确的理由赢', () => {
     scheduler.enqueue({
       conversationId: room.id,
       memberId: alice.id,
-      reason: 'open_discussion',
+      reason: 'everyone',
       triggerSequence: 1,
     });
 
@@ -520,7 +409,7 @@ describe('唤醒原因：落库之后必须原样读回来', () => {
   /**
    * 这一层守的是一条**不对称**的契约。
    *
-   * 读不出来的值退回最宽松的 open_discussion（宁可让一个成员可以沉默，也不要
+   * 读不出来的值退回最宽松的 everyone（宁可让一个成员可以沉默，也不要
    * 凭空逼出一条消息）—— 这一半是对的。但**已知**的值必须原样还原，因为
    * `asWakeReason` 是 scheduler 写入、RecoveryService 与 mapState 读回的唯一判据。
    *
@@ -528,18 +417,18 @@ describe('唤醒原因：落库之后必须原样读回来', () => {
    * 加新原因时漏改，**最强**的唤醒原因被静默降级成**最弱**的，而且没有任何
    * 报错。所以这张表必须逐项钉死 —— 现在它是一张 Record，少写一行编译不过。
    */
-  it('四个已知原因逐一还原，认不出来的退回最宽松的一档', () => {
-    const known = ['mention', 'direct', 'follow_up', 'open_discussion'] as const;
+  it('三个已知原因逐一还原，认不出来的退回最宽松的一档', () => {
+    const known = ['mention', 'direct', 'everyone'] as const;
     for (const reason of known) {
       assert.equal(asWakeReason(reason), reason, `${reason} 必须原样还原`);
     }
 
     // 乱码 / NULL / 未来版本写进来的值 / 大小写变体：一律退回最宽松的一档
-    for (const junk of [null, '', 'schedule', 'ESCALATION', 'escalation', 'nonsense']) {
+    for (const junk of [null, '', 'schedule', 'ESCALATION', 'escalation', 'follow_up', 'open_discussion', 'nonsense']) {
       assert.equal(
         asWakeReason(junk),
-        'open_discussion',
-        `${String(junk)} 应该退回 open_discussion`,
+        'everyone',
+        `${String(junk)} 应该退回 everyone`,
       );
     }
   });
@@ -567,7 +456,7 @@ describe('唤醒原因：落库之后必须原样读回来', () => {
     assert.equal(
       lost[0].reason,
       'mention',
-      '降级成 open_discussion 的话，一次明确的点名重启后就变成「顺带看看」',
+      '降级成 everyone 的话，一次明确的点名重启后就变成「顺带看看」',
     );
     assert.equal(lost[0].triggerSequence, 3);
     assert.equal(lost[0].memberId, alice.id);
@@ -704,10 +593,9 @@ describe('同一轮还在跑时到达的唤醒', () => {
     });
 
     // 静音 Bob：这个用例考的是 Alice 的 pending 合并，而 Bob 是同一房间里另一个
-    // 会自动被唤醒的 Member —— 他的回复会再反过来 follow_up 唤醒 Alice。那一轮
-    // 到底有没有发生取决于两人 turn 的交替顺序（Alice 的 checkpoint 是否已经越过
-    // Bob 那条消息），于是「Alice 恰好两条 execution」这个断言会随微任务顺序飘。
-    // 断言时序之外的东西只能靠把无关的自动唤醒关掉，而不是把断言放宽。
+    // 会被广播唤醒的 Member —— 他的 turn 会和 Alice 的抢时序（Alice 的 checkpoint
+    // 是否已经越过 Bob 那条消息），于是「Alice 恰好两条 execution」这个断言会随
+    // 微任务顺序飘。断言时序之外的东西只能靠把无关的唤醒关掉，而不是把断言放宽。
     team.setMemberMuted(group.id, bob.id, true);
 
     // 按住引擎，让 Alice 的第一轮停在 running —— 后面两条唤醒才会落进 pending
@@ -730,7 +618,7 @@ describe('同一轮还在跑时到达的唤醒', () => {
       // #2 @alice → mention。入队，等第一轮结束再跑。
       await team.sendMessage({ conversationId: group.id, content: '@alice 再看下依赖' });
 
-      // #3 无 mention 的广播 → open_discussion（更弱）。它不该把 mention 顶掉。
+      // #3 无 mention 的广播 → everyone（更弱）。它不该把 mention 顶掉。
       await team.sendMessage({ conversationId: group.id, content: '大家也一起看下' });
 
       // 关键断言：留下的是 mention 与它自己那条消息。

@@ -260,24 +260,17 @@ export type TurnMode = 'direct' | 'discussion' | 'delegation';
 /**
  * 为什么唤醒这个 Member。确定性规则产出，不经过 LLM 路由。
  *
- *   direct          1:1 房间、请求里显式指定 targetMemberId，
- *                   或**平台在 group 房间里指定的那名应答者**
- *   mention         消息里 @ 了它
- *   open_discussion 用户没 @ 任何人，让房间里的成员自行判断要不要发言
- *   follow_up       另一个 Member 发言后，没被 @ 的成员被顺带唤醒（受 autoWakeRounds 限制）
- *   schedule        定时唤醒
-  *
-  * direct / mention 必须回答；open_discussion / follow_up 允许 <NO_REPLY>。
-  *
-  * `direct` 之所以也覆盖「平台指定的应答者」：用户对着房间提问时，房间欠一个
-  * 回答，而这条欠条必须落在具体某个人头上 —— 否则三个 Member 会各自认为
-  * 「别人会说」，全体沉默。见 GroupDispatcher.pickPrimaryResponder。
-  */
+ *   direct   1:1 房间、请求里显式指定 targetMemberId
+ *   mention  消息里 @ 了它
+ *   everyone 用户对 discussion 说话、没 @ 任何人
+ *   schedule 定时唤醒
+ *
+ * direct / mention 必须回答；everyone 允许 <NO_REPLY>。
+ */
 export type WakeReason =
   | 'direct'
   | 'mention'
-  | 'open_discussion'
-  | 'follow_up'
+  | 'everyone'
   | 'schedule';
 
 /**

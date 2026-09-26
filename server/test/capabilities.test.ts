@@ -37,7 +37,7 @@ const { DefaultToolPolicy } = await import('../tool-policy.js');
 const { CapabilityResolver } = await import('../capabilities/resolver.js');
 const { CopilotCapabilityAdapter } = await import('../capabilities/copilot-adapter.js');
 const { PERSONAL_SELECTOR } = await import('../capabilities/providers/filesystem-knowledge.js');
-const { createTestStack, capabilityContext, singleExecutionId, muteAllMembers, StubCopilot } =
+const { createTestStack, capabilityContext, singleExecutionId, StubCopilot } =
   await import('./support.js');
 
 import type { MemberCapabilities } from '../domain.js';
@@ -927,7 +927,6 @@ describe('TeamService 的能力读写入口', () => {
   it('快照里的 capabilityManifestHash 就是解析出来的那一份；改能力之后跟着变', async () => {
     const member = stack.team.createMember({ name: 'Rotating', role: 'T' });
     const room = stack.team.createConversation({ kind: 'direct', memberIds: [member.id] });
-    muteAllMembers(stack.team, room.id);
 
     const first = await stack.team.sendMessage({ conversationId: room.id, content: 'one' });
     const before = await snapshotOf(singleExecutionId(db, room.id, first.wakes));
@@ -961,7 +960,7 @@ describe('TeamService 的能力读写入口', () => {
     );
   });
 
-  it('remember_member 工具：不传 scope 默认写 Team 上下文，不进全局记忆', async () => {
+  it('remember_member 工具：只写当前 Team 的上下文，写不到全局记忆', async () => {
     const member = stack.team.createMember({ name: 'ScopedMemory', role: 'T' });
     const provider = stack.registry.toolProvider('team.core-tools');
     const context = {
@@ -978,17 +977,24 @@ describe('TeamService 的能力读写入口', () => {
     assert.match(
       memberService.readTeamMemory(member.id, defaultTeam.id),
       /早上十点/,
-      '默认 scope 必须落到 Team 上下文',
+      '必须落到 Team 上下文',
     );
     assert.ok(
       !memberService.readMemory(member.id).includes('早上十点'),
       'Team 上下文不能漏进全局记忆',
     );
 
+    // 工具 schema 里没有 scope 参数：即使传了 scope 也会被 zod 剥掉，
+    // 内容照样只进 Team 上下文。Agent 没有写全局记忆的入口；
+    // 人改全局记忆走 MemberService.replaceMemory（UI 的 Memory 页）。
     await remember.execute(context, {
       content: '习惯把事实和推论分开写。',
       scope: 'global',
     });
-    assert.match(memberService.readMemory(member.id), /事实和推论/);
+    assert.match(memberService.readTeamMemory(member.id, defaultTeam.id), /事实和推论/);
+    assert.ok(
+      !memberService.readMemory(member.id).includes('事实和推论'),
+      'Agent 的写入不能漏进全局记忆',
+    );
   });
 });
