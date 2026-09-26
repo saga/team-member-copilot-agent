@@ -820,4 +820,24 @@ export const api = {
       body: JSON.stringify(input),
     }).then(json<{ schedule: ScheduledWake }>);
   },
+
+  /** 三个动作比一个通用的 PATCH status 清楚：按钮即语义。 */
+  pauseSchedule(id: string): Promise<{ schedule: ScheduledWake }> {
+    return this.scheduleAction(id, 'pause');
+  },
+
+  resumeSchedule(id: string): Promise<{ schedule: ScheduledWake }> {
+    return this.scheduleAction(id, 'resume');
+  },
+
+  cancelSchedule(id: string): Promise<{ schedule: ScheduledWake }> {
+    return this.scheduleAction(id, 'cancel');
+  },
+
+  scheduleAction(id: string, action: 'pause' | 'resume' | 'cancel'): Promise<{ schedule: ScheduledWake }> {
+    return fetch(
+      `${API_BASE}/api/team/schedules/${encodeURIComponent(id)}/${action}`,
+      { method: 'POST' },
+    ).then(json<{ schedule: ScheduledWake }>);
+  },
 };

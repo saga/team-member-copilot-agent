@@ -2,7 +2,8 @@ import { Collapse } from 'antd';
 import type { Conversation, Member } from '../../lib/api';
 import { ConversationList } from './ConversationList';
 import { MemberList } from './MemberList';
-import { ProjectSection, ScheduleSection, WorkSection } from './TeamSections';
+import { ProjectSection, WorkSection } from './TeamSections';
+import { ScheduleSection } from './ScheduleSection';
 
 interface TeamSidebarProps {
   members: Member[];
@@ -77,7 +78,7 @@ export function TeamSidebar(props: TeamSidebarProps) {
         {
           key: 'schedules',
           label: 'Schedules',
-          children: <ScheduleSection />,
+          children: <ScheduleSection members={members} conversations={conversations} />,
         },
         {
           key: 'conversations',

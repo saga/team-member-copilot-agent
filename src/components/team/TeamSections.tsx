@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Button, Card, Input, List, Space, Tag } from 'antd';
 import { PlusOutlined } from '@ant-design/icons';
-import { api, type Project, type ScheduledWake, type WorkItem } from '../../lib/api';
+import { api, type Project, type WorkItem } from '../../lib/api';
 import { WorkItemRow } from './WorkItemRow';
 
 /** Projects：只有列表 + 新建，不做完整 Project 页。 */
@@ -121,39 +121,6 @@ export function WorkSection({ members }: { members: { id: string; name: string }
           Add
         </Button>
       </Space.Compact>
-    </Card>
-  );
-}
-
-/** Schedules：只读列表，不做 Calendar 页。 */
-export function ScheduleSection() {
-  const [schedules, setSchedules] = useState<ScheduledWake[]>([]);
-
-  useEffect(() => {
-    api
-      .listSchedules()
-      .then((result) => setSchedules(result.schedules))
-      .catch(() => {});
-  }, []);
-
-  const active = schedules.filter((s) => s.status === 'active');
-  if (active.length === 0) return null;
-
-  return (
-    <Card size="small" bordered={false} title={`Schedules (${active.length})`} style={{ marginBottom: 8 }}>
-      <List
-        size="small"
-        dataSource={active.slice(0, 5)}
-        renderItem={(schedule) => (
-          <List.Item>
-            <List.Item.Meta
-              title={schedule.prompt.slice(0, 40)}
-              description={`${schedule.type} · ${schedule.nextRunAt.slice(0, 16).replace('T', ' ')}`}
-            />
-            <Tag>{schedule.type}</Tag>
-          </List.Item>
-        )}
-      />
     </Card>
   );
 }
