@@ -96,6 +96,39 @@ export interface Project {
 
 export type WorkItemStatus = 'todo' | 'in_progress' | 'blocked' | 'done' | 'cancelled';
 
+export type WorkItemEventType =
+  | 'created'
+  | 'updated'
+  | 'assigned'
+  | 'unassigned'
+  | 'claimed'
+  | 'released'
+  | 'status_changed';
+
+/**
+ * WorkItem 的一条审计记录（server/domain.ts 的镜像）。
+ * from/to 成对出现，按时间重放可以还原任意时刻的状态。
+ */
+export interface WorkItemEvent {
+  id: string;
+  teamId: string;
+  workItemId: string;
+  eventType: WorkItemEventType;
+  actorKind: 'human' | 'agent' | 'system';
+  actorId: string;
+  /** claimed 事件记录发起 claim 的那一轮 execution。 */
+  executionId: string | null;
+  fromStatus: WorkItemStatus | null;
+  toStatus: WorkItemStatus | null;
+  fromAssigneeKind: 'human' | 'agent' | null;
+  fromAssigneeId: string | null;
+  toAssigneeKind: 'human' | 'agent' | null;
+  toAssigneeId: string | null;
+  fromClaimedByMemberId: string | null;
+  toClaimedByMemberId: string | null;
+  createdAt: string;
+}
+
 export interface WorkItem {
   id: string;
   teamId: string;
@@ -746,6 +779,13 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({}),
     }).then(json<{ workItem: WorkItem }>);
+  },
+
+  /** Activity History：审计流水，时间正序。 */
+  listWorkItemEvents(id: string, limit = 100): Promise<{ events: WorkItemEvent[] }> {
+    return fetch(
+      `${API_BASE}/api/team/work-items/${encodeURIComponent(id)}/events?limit=${limit}`,
+    ).then(json<{ events: WorkItemEvent[] }>);
   },
 
   listPresence(): Promise<{ presence: TeamPresence[] }> {

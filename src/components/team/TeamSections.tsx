@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { Button, Card, Input, List, Space, Tag } from 'antd';
 import { PlusOutlined } from '@ant-design/icons';
 import { api, type Project, type ScheduledWake, type WorkItem } from '../../lib/api';
+import { WorkItemRow } from './WorkItemRow';
 
 /** Projects：只有列表 + 新建，不做完整 Project 页。 */
 export function ProjectSection({ onChanged }: { onChanged?: () => void }) {
@@ -60,7 +61,7 @@ export function ProjectSection({ onChanged }: { onChanged?: () => void }) {
   );
 }
 
-/** Work：按 status 分组的最简列表，不做拖拽 Kanban。 */
+/** Work：按 status 分组的最简列表，不做拖拽 Kanban。行的操作在 WorkItemRow。 */
 export function WorkSection({ members }: { members: { id: string; name: string }[] }) {
   const [items, setItems] = useState<WorkItem[]>([]);
   const [title, setTitle] = useState('');
@@ -70,7 +71,7 @@ export function WorkSection({ members }: { members: { id: string; name: string }
     try {
       setItems((await api.listWorkItems()).workItems);
     } catch {
-      // 同上
+      // Team 未初始化时保持空列表，不挡主界面
     }
   }
 
@@ -110,29 +111,7 @@ export function WorkSection({ members }: { members: { id: string; name: string }
             size="small"
             dataSource={group.items.slice(0, 8)}
             locale={{ emptyText: undefined }}
-            renderItem={(item) => (
-              <List.Item
-                actions={
-                  item.status !== 'done'
-                    ? [
-                        <Button
-                          key="done"
-                          type="link"
-                          size="small"
-                          onClick={() => void api.updateWorkItem(item.id, { status: 'done' }).then(refresh)}
-                        >
-                          Done
-                        </Button>,
-                      ]
-                    : []
-                }
-              >
-                <List.Item.Meta
-                  title={item.title}
-                  description={`${assigneeName(item, members)}${item.claimedByMemberId ? ' · claimed' : ''}`}
-                />
-              </List.Item>
-            )}
+            renderItem={(item) => <WorkItemRow item={item} members={members} onChanged={() => void refresh()} />}
           />
         </div>
       ))}
@@ -144,11 +123,6 @@ export function WorkSection({ members }: { members: { id: string; name: string }
       </Space.Compact>
     </Card>
   );
-}
-
-function assigneeName(item: WorkItem, members: { id: string; name: string }[]): string {
-  if (!item.assigneeId) return 'unassigned';
-  return members.find((m) => m.id === item.assigneeId)?.name ?? item.assigneeId.slice(0, 8);
 }
 
 /** Schedules：只读列表，不做 Calendar 页。 */
