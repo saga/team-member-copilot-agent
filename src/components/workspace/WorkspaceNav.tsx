@@ -19,9 +19,9 @@ export function WorkspaceNav({
   onChange: (view: WorkspaceView) => void;
 }) {
   const items: Array<{ key: WorkspaceView; label: string; icon: React.ReactNode }> = [
-    { key: 'chat', label: 'Chat（日常对话）', icon: <MessageOutlined /> },
-    { key: 'team', label: 'Team（成员 / Work / Schedules）', icon: <TeamOutlined /> },
-    { key: 'settings', label: 'Settings（Capabilities）', icon: <SettingOutlined /> },
+    { key: 'chat', label: 'Chat', icon: <MessageOutlined /> },
+    { key: 'team', label: 'Team', icon: <TeamOutlined /> },
+    { key: 'settings', label: 'Settings', icon: <SettingOutlined /> },
   ];
 
   return (

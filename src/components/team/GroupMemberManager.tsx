@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Alert, Button, Card, Select, Space, Table, Tag } from 'antd';
+import { Alert, Button, Drawer, Select, Space, Table, Tag } from 'antd';
 import {
   api,
   type Conversation,
@@ -8,6 +8,7 @@ import {
 } from '../../lib/api';
 
 interface GroupMemberManagerProps {
+  open: boolean;
   conversation: Conversation;
   /** 全部可用成员，用来挑「还没进房间的人」。 */
   allMembers: Member[];
@@ -18,14 +19,15 @@ interface GroupMemberManagerProps {
 }
 
 /**
- * Team 成员管理：加人 / 移人 / 静音。
+ * Discussion 的 Participants 抽屉：加人 / 移人 / 静音。
  *
  * 约束在 UI 上也表达出来，而不是只在点下去之后等后端报错：
- * group 至少要两个成员。后端 `assertConversationKindShape()` 会拦，但把
+ * discussion 至少要两个成员。后端 `assertConversationKindShape()` 会拦，但把
  * 「移出」按钮留在那里让人点、再弹一个 400，是最差的交互。
  * 归档的 Member 保留在 roster 里（历史事实），但不能被重新加进来。
  */
 export function GroupMemberManager({
+  open,
   conversation,
   allMembers,
   states,
@@ -41,7 +43,7 @@ export function GroupMemberManager({
     (member) => member.status === 'active' && !rosterIds.has(member.id),
   );
 
-  // 移出后 roster 必须仍是合法 group（≥ 2）
+  // 移出后 roster 必须仍是合法 discussion（≥ 2）
   const removeDisabled = conversation.members.length <= 2;
 
   async function run(memberId: string, action: () => Promise<void>) {
@@ -82,7 +84,7 @@ export function GroupMemberManager({
   }
 
   return (
-    <Card size="small" title="Team Members" extra={<Button size="small" type="text" onClick={onClose}>Close</Button>} style={{ margin: '12px 18px 0' }}>
+    <Drawer open={open} title="Participants" width={480} onClose={onClose}>
       <Table
         size="small"
         pagination={false}
@@ -126,7 +128,7 @@ export function GroupMemberManager({
                     disabled={removeDisabled || hasWork}
                     title={
                       removeDisabled
-                        ? 'Team 至少需要两个成员'
+                        ? 'Discussion 至少需要两个成员'
                         : hasWork
                           ? `${member.name} 还有未完成的工作，等它跑完或先取消对应的 execution`
                           : `移出 ${member.name}`
@@ -155,9 +157,9 @@ export function GroupMemberManager({
       </div>
 
       {removeDisabled && (
-        <Alert type="info" showIcon message="Team 至少保留两个成员；要变单聊请直接和该成员开一个会话。" style={{ marginTop: 8 }} />
+        <Alert type="info" showIcon message="Discussion 至少保留两个成员；要变单聊请直接和该成员开一个会话。" style={{ marginTop: 8 }} />
       )}
       {error && <Alert type="error" showIcon message={error} style={{ marginTop: 8 }} />}
-    </Card>
+    </Drawer>
   );
 }

@@ -1,37 +1,32 @@
 import { useState } from 'react';
-import { Input } from 'antd';
-import type { Conversation, Member } from '../../lib/api';
+import { Button, Input, Space } from 'antd';
+import { PlusOutlined, ProjectOutlined } from '@ant-design/icons';
+import type { Conversation } from '../../lib/api';
 import { ConversationList } from '../team/ConversationList';
-import type { WorkDraft } from '../team/WorkCreator';
 
 interface ConversationSidebarProps {
-  members: Member[];
   conversations: Conversation[];
   selectedConversationId: string | null;
   onSelectConversation: (conversationId: string) => void;
-  showGroupCreator: boolean;
-  onToggleGroupCreator: () => void;
-  onCancelGroupCreator: () => void;
-  onCreateGroup: (input: {
-    title: string;
-    memberIds: string[];
-    externalWorkRef?: { provider?: 'jira'; key: string } | null;
-  }) => Promise<void>;
-  showWorkCreator: boolean;
-  onToggleWorkCreator: () => void;
-  onCancelWorkCreator: () => void;
-  onCreateWork: (input: WorkDraft) => Promise<void>;
+  onNewDiscussion: () => void;
+  onNewWork: () => void;
 }
 
 /**
  * 聊天工作面的第二列：只装会话。
  *
- * 这里只允许出现 Search、会话分组（Team discussions / Work / Direct）、
- * New Team、New Work。成员管理、Current Work、Schedules 都在 Team 管理面，
- * 不在这里。
+ * 这里只允许出现 Search、会话分组（Discussions / Work / Direct）、
+ * New discussion、New work。创建表单不在这里 —— 两个按钮只负责打开
+ * 挂在页面根部的 Modal。成员管理、Current Work、Automation
+ * 都在 Team 管理面，不在这里。
  */
-export function ConversationSidebar(props: ConversationSidebarProps) {
-  const { members, conversations, selectedConversationId, onSelectConversation } = props;
+export function ConversationSidebar({
+  conversations,
+  selectedConversationId,
+  onSelectConversation,
+  onNewDiscussion,
+  onNewWork,
+}: ConversationSidebarProps) {
   const [search, setSearch] = useState('');
 
   return (
@@ -50,18 +45,17 @@ export function ConversationSidebar(props: ConversationSidebarProps) {
           conversations={conversations}
           selectedId={selectedConversationId}
           onSelect={onSelectConversation}
-          members={members}
           search={search}
-          showCreator={props.showGroupCreator}
-          onToggleCreator={props.onToggleGroupCreator}
-          onCancelCreator={props.onCancelGroupCreator}
-          onCreateGroup={props.onCreateGroup}
-          showWorkCreator={props.showWorkCreator}
-          onToggleWorkCreator={props.onToggleWorkCreator}
-          onCancelWorkCreator={props.onCancelWorkCreator}
-          onCreateWork={props.onCreateWork}
         />
       </div>
+      <Space direction="vertical" style={{ width: '100%', marginTop: 8 }}>
+        <Button type="primary" block icon={<PlusOutlined />} onClick={onNewDiscussion}>
+          New discussion
+        </Button>
+        <Button block icon={<ProjectOutlined />} onClick={onNewWork}>
+          New work
+        </Button>
+      </Space>
     </div>
   );
 }

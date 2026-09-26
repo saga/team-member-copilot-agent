@@ -136,3 +136,20 @@ body {
   padding: 12px 18px;
   border-top: 1px solid #f0f0f0;
 }
+
+/* 会话头：标题区 + 头像/Participants 操作区同一行，窄屏换行。 */
+.conversation-header {
+  padding: 12px 18px 0;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.conversation-header-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}

@@ -1,6 +1,7 @@
+import { Select } from 'antd';
 import { Sender } from '@ant-design/x';
 import type { Conversation } from '../../lib/api';
-import { isMemberDm } from './constants';
+import { EVERYONE, isMemberDm } from './constants';
 
 interface MessageComposerProps {
   conversation: Conversation;
@@ -9,6 +10,9 @@ interface MessageComposerProps {
   onSend: () => void;
   busy: boolean;
   disabled: boolean;
+  /** group：这条消息发给谁（Everyone 空串 / 某个成员 id）。Header 不管这个。 */
+  recipientMemberId: string;
+  onRecipientChange: (memberId: string) => void;
 }
 
 /**
@@ -32,6 +36,8 @@ export function MessageComposer({
   onSend,
   busy,
   disabled,
+  recipientMemberId,
+  onRecipientChange,
 }: MessageComposerProps) {
   const readOnly = isMemberDm(conversation);
   const memberName = conversation.members[0]?.name ?? '成员';
@@ -39,7 +45,7 @@ export function MessageComposer({
   const placeholder = readOnly
     ? '这是 Member 之间的私聊，你可以旁观，但不能替他们发言。'
     : conversation.kind === 'group'
-      ? '对团队说点什么…（@handle 指名）'
+      ? '对讨论说点什么… 使用 @handle 指定成员'
       : conversation.kind === 'work'
         ? `围绕 ${workLabel} 给 ${memberName} 下指令…`
         : `给 ${memberName} 发消息…`;
@@ -54,6 +60,28 @@ export function MessageComposer({
         disabled={disabled || readOnly}
         placeholder={placeholder}
         submitType="enter"
+        prefix={
+          conversation.kind === 'group' ? (
+            <Select
+              size="small"
+              variant="borderless"
+              value={recipientMemberId}
+              onChange={onRecipientChange}
+              options={[
+                {
+                  value: EVERYONE,
+                  label: 'Everyone',
+                },
+                ...conversation.members
+                  .filter((member) => member.status === 'active')
+                  .map((member) => ({
+                    value: member.id,
+                    label: `@${member.handle}`,
+                  })),
+              ]}
+            />
+          ) : undefined
+        }
       />
     </div>
   );

@@ -22,23 +22,15 @@ import { MessageComposer } from './team/MessageComposer';
 import { MemberProfile } from './team/MemberProfile';
 import { TeamManagement } from './team/TeamManagement';
 import { CapabilitySettings } from './team/CapabilitySettings';
+import { GroupCreator } from './team/GroupCreator';
 import { ConversationSidebar } from './chat/ConversationSidebar';
 import { WorkspaceNav, type WorkspaceView } from './workspace/WorkspaceNav';
 import type { WorkDraft } from './team/WorkCreator';
+import { WorkCreator } from './team/WorkCreator';
 import { ResizableSider } from './ResizableSider';
 import { EVERYONE, type MemberStatus, type MemberStatusLookup } from './team/constants';
 
 const { Content } = Layout;
-
-/**
- * 左栏当前展开的是哪个「创建面板」。
- *
- * 用一个可空枚举而不是三个 boolean：三个 boolean 有 2³ 种组合，其中 5 种是
- * 「两个面板同时开着」这种无意义状态，只能靠在每个 toggle 里手工互相清除来维持
- * 不变量 —— 那种写法每加一个面板就要改所有旧的 handler，而且漏一处就会出现
- * 「点了 New Work，New Member 的表单还开着」。
- */
-type CreatorKind = 'member' | 'group' | 'work' | null;
 
 /** 还在推进中的 execution 状态；到了其它状态就说明这条 execution 已经收尾。 */
 const ACTIVE_STATUSES: ExecutionStatus[] = ['queued', 'running', 'waiting_for_member'];
@@ -94,12 +86,12 @@ function mergeMessages(
 }
 
 /**
- * Team UI 的容器：只持有「当前视图 / 会话 / 成员 / 实时状态」，排布交给各面。
+ * 整个页面的 controller：只持有「当前视图 / 会话 / 成员 / 实时状态」，排布交给各面。
  *
  * 三个面各管一层，互不掺和：
  *
  *   chat     —— 日常对话（第二列只有会话）
- *   team     —— 成员 / Current Work / Schedules
+ *   team     —— 成员 / Current Work / Automation
  *   settings —— Capabilities（Admin 面，不在聊天顶栏）
  *
  * 三条数据通道必须分清，混起来就会出现难查的不一致：
@@ -148,9 +140,10 @@ export function TeamChat() {
    * 用红色报这个会让人以为建房间失败了。
    */
   const [notice, setNotice] = useState<string | null>(null);
-  /** 左栏展开中的创建面板；同一时刻至多一个。 */
-  const [creator, setCreator] = useState<CreatorKind>(null);
-  const [showMemberManager, setShowMemberManager] = useState(false);
+  /** 三个创建窗口互不干扰：各管各的开关。 */
+  const [newDiscussionOpen, setNewDiscussionOpen] = useState(false);
+  const [newWorkOpen, setNewWorkOpen] = useState(false);
+  const [newMemberOpen, setNewMemberOpen] = useState(false);
   /**
    * 正在编辑档案的 Member。
    *
@@ -159,11 +152,6 @@ export function TeamChat() {
    * 「顺手开了一个新会话」。
    */
   const [editingMemberId, setEditingMemberId] = useState<string | null>(null);
-
-  // 子组件仍然收 boolean：只有左栏知道「面板是哪个」这件事，没必要把它扩散出去。
-  const showNewMember = creator === 'member';
-  const showGroupCreator = creator === 'group';
-  const showWorkCreator = creator === 'work';
 
   /**
    * 上一次发送的幂等键。
@@ -270,8 +258,6 @@ export function TeamChat() {
     setExecutions({});
     setConversationStates({});
     setError(null);
-    // 成员管理面板属于「当前房间」，切房间就收起，避免看起来像在管另一个 Team
-    setShowMemberManager(false);
 
     if (conversation?.kind === 'group') {
       setRecipientMemberId(EVERYONE);
@@ -507,16 +493,6 @@ export function TeamChat() {
     }
   }
 
-  async function toggleMuted(memberId: string): Promise<void> {    if (!conversationId) return;
-    const muted = !conversationStates[memberId]?.muted;
-    try {
-      const result = await api.setMemberMuted(conversationId, memberId, muted);
-      applyStateChanged({ memberId: result.state.memberId, state: result.state });
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    }
-  }
-
   /**
    * 切到另一个房间。
    *
@@ -560,8 +536,9 @@ export function TeamChat() {
   }
 
   /**
-   * 新建 Team。**不传 defaultMemberId** —— 收件人集合是全部成员，
-   * 由服务端 GroupDispatcher 决定每一轮唤醒谁。
+   * 新建 Discussion（临时多人协作房间，不是 Team）。
+   * 收件人集合是全部成员，由服务端 GroupDispatcher 按 @mention / everyone
+   * 规则决定每一轮唤醒谁。
    */
   async function createGroup(input: { title: string; memberIds: string[] }) {
     const result = await api.createConversation({
@@ -573,8 +550,9 @@ export function TeamChat() {
       result.conversation,
       ...current.filter((item) => item.id !== result.conversation.id),
     ]);
+    setNewDiscussionOpen(false);
     openConversation(result.conversation.id);
-    setCreator(null);
+    setView('chat');
   }
 
   /**
@@ -603,7 +581,7 @@ export function TeamChat() {
       ...current.filter((item) => item.id !== created.id),
     ]);
     openConversation(created.id);
-    setCreator(null);
+    setNewWorkOpen(false);
 
     if (!input.instruction) {
       setNotice(
@@ -642,7 +620,7 @@ export function TeamChat() {
       style: 'clear and concise',
     });
     setMembers((current) => [...current, result.member]);
-    setCreator(null);
+    setNewMemberOpen(false);
     // 新建只拿到 name + role，personality / system prompt / model 还是空的。
     // 直接开一个单聊等于让一个空壳人格开始干活，所以先把档案页打开。
     setEditingMemberId(result.member.id);
@@ -700,18 +678,11 @@ export function TeamChat() {
       {view === 'chat' && (
         <ResizableSider>
           <ConversationSidebar
-            members={members}
             conversations={conversations}
             selectedConversationId={conversationId}
             onSelectConversation={openConversation}
-            showGroupCreator={showGroupCreator}
-            onToggleGroupCreator={() => setCreator('group')}
-            onCancelGroupCreator={() => setCreator(null)}
-            onCreateGroup={createGroup}
-            showWorkCreator={showWorkCreator}
-            onToggleWorkCreator={() => setCreator('work')}
-            onCancelWorkCreator={() => setCreator(null)}
-            onCreateWork={createWork}
+            onNewDiscussion={() => setNewDiscussionOpen(true)}
+            onNewWork={() => setNewWorkOpen(true)}
           />
         </ResizableSider>
       )}
@@ -732,12 +703,10 @@ export function TeamChat() {
           <TeamManagement
             members={members}
             conversations={conversations}
-            showNewMember={showNewMember}
-            onToggleNewMember={() =>
-              setCreator((current) => (current === 'member' ? null : 'member'))
-            }
+            showNewMember={newMemberOpen}
+            onToggleNewMember={() => setNewMemberOpen((value) => !value)}
             onCreateMember={createMember}
-            onCancelNewMember={() => setCreator(null)}
+            onCancelNewMember={() => setNewMemberOpen(false)}
             onChatMember={(member) => void createDirect(member)}
             onViewMember={(member) => setEditingMemberId(member.id)}
             onManageMemberCapabilities={manageMemberCapabilities}
@@ -770,11 +739,6 @@ export function TeamChat() {
               allMembers={members}
               states={conversationStates}
               memberStatus={memberStatus}
-              recipientMemberId={recipientMemberId}
-              onRecipientChange={setRecipientMemberId}
-              onToggleMute={(memberId) => void toggleMuted(memberId)}
-              showMembers={showMemberManager}
-              onToggleMembers={() => setShowMemberManager((value) => !value)}
               onConversationChanged={applyConversationChanged}
               // 子组件只处理单个 state；状态「消失」只有 SSE 会带来，
               // 统一在边界上包成同一种变化对象。
@@ -823,6 +787,8 @@ export function TeamChat() {
               onSend={() => void send()}
               busy={busy}
               disabled={!conversationId}
+              recipientMemberId={recipientMemberId}
+              onRecipientChange={setRecipientMemberId}
             />
           </Content>
         )}
@@ -835,6 +801,20 @@ export function TeamChat() {
           onClose={() => setEditingMemberId(null)}
         />
       )}
+
+      <GroupCreator
+        open={newDiscussionOpen}
+        members={members}
+        onCreate={createGroup}
+        onCancel={() => setNewDiscussionOpen(false)}
+      />
+
+      <WorkCreator
+        open={newWorkOpen}
+        members={members}
+        onCreate={createWork}
+        onCancel={() => setNewWorkOpen(false)}
+      />
     </Layout>
   );
 }

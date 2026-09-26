@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Alert, Button, Card, Input, Select, Space } from 'antd';
+import { Alert, Input, Modal, Select, Space, Typography } from 'antd';
 import type { Member } from '../../lib/api';
 
 /**
@@ -11,7 +11,7 @@ import type { Member } from '../../lib/api';
  */
 const JIRA_KEY_SHAPE = /^[A-Za-z][A-Za-z0-9_]*-\d+$/;
 
-/** 表单收集到的原始输入；建会话 + 发第一条消息由调用方（TeamChat）完成。 */
+/** 表单收集到的原始输入；建会话 + 发第一条消息由调用方（Workspace）完成。 */
 export interface WorkDraft {
   title: string;
   memberId: string;
@@ -22,6 +22,7 @@ export interface WorkDraft {
 }
 
 interface WorkCreatorProps {
+  open: boolean;
   /** 候选成员（已归档的不会出现在这里）。 */
   members: Member[];
   onCreate: (input: WorkDraft) => Promise<void>;
@@ -29,21 +30,13 @@ interface WorkCreatorProps {
 }
 
 /**
- * 新建 Work。
+ * 新建 Work（Modal，挂在页面根部）。
  *
  * Work conversation 就是后端已有的 `kind = 'work'`：**一个 Member 围绕一条外部
  * 工作（Jira 工单）干活的房间**。所以它和后端一样只允许恰好一个成员 —— 需要多个
- * Member 一起看的东西是 Team，不是 Work。
- *
- * 「第一条指令」这一栏是刻意的，因为它回答了一个真实会踩到的疑问：
- *
- *   **只建房间，不会让 Current Work 出现任何东西。**
- *
- * Current Work 读的是活跃 execution，而 execution 只有在这个 Member 真的被唤醒
- * 时才产生。所以这里给两条路，并且把差别写在界面上：填了指令 → 建完立刻发出去，
- * 它马上开始干；留空 → 只建房间，并明确告诉你 Current Work 会是空的。
+ * Member 一起看的东西是 Discussion，不是 Work。
  */
-export function WorkCreator({ members, onCreate, onCancel }: WorkCreatorProps) {
+export function WorkCreator({ open, members, onCreate, onCancel }: WorkCreatorProps) {
   const [title, setTitle] = useState('');
   const [memberId, setMemberId] = useState<string | null>(null);
   const [jiraKey, setJiraKey] = useState('');
@@ -71,7 +64,7 @@ export function WorkCreator({ members, onCreate, onCancel }: WorkCreatorProps) {
         instruction: instruction.trim(),
       });
     } catch (e) {
-      // 失败时保持面板打开：调用方（TeamChat）成功后会自己把它收起来
+      // 失败时保持 Modal 打开：调用方成功后会自己把它收起来
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
@@ -79,7 +72,18 @@ export function WorkCreator({ members, onCreate, onCancel }: WorkCreatorProps) {
   }
 
   return (
-    <Card size="small" title="New Work" style={{ marginTop: 8 }}>
+    <Modal
+      open={open}
+      title="New work"
+      okText={instruction.trim() ? 'Create and start' : 'Create'}
+      cancelText="Cancel"
+      onCancel={onCancel}
+      onOk={() => void submit()}
+      confirmLoading={busy}
+      okButtonProps={{
+        disabled: !canCreate,
+      }}
+    >
       <Space direction="vertical" style={{ width: '100%' }} size={8}>
         <Input
           value={title}
@@ -107,14 +111,11 @@ export function WorkCreator({ members, onCreate, onCancel }: WorkCreatorProps) {
         />
 
         {trimmedKey && !title.trim() && (
-          <Button
-            type="link"
-            size="small"
-            style={{ padding: 0, height: 'auto', alignSelf: 'flex-start' }}
+          <Typography.Link
             onClick={() => setTitle(trimmedKey)}
           >
             用 {trimmedKey} 当标题
-          </Button>
+          </Typography.Link>
         )}
 
         {trimmedKey && !JIRA_KEY_SHAPE.test(trimmedKey) && (
@@ -132,35 +133,16 @@ export function WorkCreator({ members, onCreate, onCancel }: WorkCreatorProps) {
           autoSize={{ minRows: 3, maxRows: 6 }}
         />
 
-        {canCreate && !instruction.trim() && (
-          <Alert
-            type="info"
-            showIcon
-            message="留空只会建房间，不会开始执行 —— Current Work 里暂时不会出现它。建好后在房间里发第一条消息才会开始。"
-          />
-        )}
+        <Typography.Text type="secondary">
+          留空 instruction 只创建 Work；填写后会立即开始执行。
+        </Typography.Text>
 
         {activeMembers.length === 0 && (
           <Alert type="warning" showIcon message="还没有可用的 Member，先去建一个。" />
         )}
 
         {error && <Alert type="error" showIcon message={error} />}
-
-        <Space>
-          <Button
-            type="primary"
-            size="small"
-            onClick={() => void submit()}
-            disabled={!canCreate}
-            loading={busy}
-          >
-            Create Work
-          </Button>
-          <Button size="small" onClick={onCancel} disabled={busy}>
-            Cancel
-          </Button>
-        </Space>
       </Space>
-    </Card>
+    </Modal>
   );
 }

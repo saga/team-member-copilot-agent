@@ -1,127 +1,106 @@
-import { } from 'react';
-import { Avatar, Badge, Button, Select, Space, Tag, Tooltip, Typography } from 'antd';
+import { useState } from 'react';
+import { Avatar, Badge, Button, Space, Tag, Tooltip, Typography } from 'antd';
+import { TeamOutlined } from '@ant-design/icons';
 import type { Conversation, ConversationMemberState, Member } from '../../lib/api';
 import { GroupMemberManager } from './GroupMemberManager';
-import { EVERYONE, EVERYONE_LABEL, isMemberDm, type MemberStatusLookup } from './constants';
-
-const { Title, Text } = Typography;
+import { isMemberDm, type MemberStatusLookup } from './constants';
 
 interface ConversationHeaderProps {
   conversation: Conversation;
-  /** 全部可用成员，供成员管理面板挑「还没进房间的人」。 */
+  /** 全部可用成员，供 Participants 抽屉挑「还没进房间的人」。 */
   allMembers: Member[];
-  /** 转交给成员管理面板（静音开关要读它）；header 自己不再用它做展示。 */
   states: Record<string, ConversationMemberState>;
   memberStatus: MemberStatusLookup;
-
-  /** group：Everyone（空串）或某个成员的 id；direct：房间里那唯一一个成员。 */
-  recipientMemberId: string;
-  onRecipientChange: (memberId: string) => void;
-  onToggleMute: (memberId: string) => void;
-
-  showMembers: boolean;
-  onToggleMembers: () => void;
   onConversationChanged: (conversation: Conversation) => void;
   onStateChanged: (state: ConversationMemberState) => void;
 }
 
 /**
- * 会话头：成员头像组（含 wakeStatus / muted）+ 收件人选择器 + 成员管理面板。
+ * 会话头：只负责「识别房间」。
  *
- * 收件人默认是 Everyone，而不是 `conversation.defaultMemberId` —— 后者是
- * 「这个房间默认归谁」，拿它当 group 的默认收件人会把多成员讨论降级成单人聊天。
+ *   Title / kind / Jira / avatars / Participants button
+ *
+ * 「这条消息发给谁」是 MessageComposer 的事（输入框前缀的选择器），
+ * 静音/移人/加人是 Participants 抽屉的事。Avatar 只显示人 + 状态，
+ * 点击不再静音 —— 误触一次就把 Agent  ban 掉是最差的交互。
  */
 export function ConversationHeader({
   conversation,
   allMembers,
   states,
   memberStatus,
-  recipientMemberId,
-  onRecipientChange,
-  onToggleMute,
-  showMembers,
-  onToggleMembers,
   onConversationChanged,
   onStateChanged,
 }: ConversationHeaderProps) {
   const isGroup = conversation.kind === 'group';
   const isDm = isMemberDm(conversation);
+  const [participantsOpen, setParticipantsOpen] = useState(false);
 
   return (
     <>
-      <div style={{ padding: '12px 18px 0' }}>
-        <Space align="center" wrap>
-          <Title level={4} style={{ margin: 0 }}>
-            {conversation.title}
-          </Title>
-          <Tag color={conversation.kind === 'group' ? 'blue' : conversation.kind === 'work' ? 'gold' : 'default'}>
-            {conversation.kind}
-          </Tag>
-          {conversation.externalWorkRef && (
-            <Tag color="cyan">Jira: {conversation.externalWorkRef.key}</Tag>
-          )}
-        </Space>
+      <div className="conversation-header">
+        <div className="conversation-header-main">
+          <Space size={8} align="center">
+            <Typography.Title level={4} style={{ margin: 0 }}>
+              {conversation.title}
+            </Typography.Title>
 
-        <div style={{ marginTop: 8, display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
-          <Avatar.Group max={{ count: 8 }}>
+            {conversation.kind === 'work' && <Tag color="gold">Work</Tag>}
+            {conversation.kind === 'group' && <Tag color="blue">discussion</Tag>}
+
+            {conversation.externalWorkRef?.key && (
+              <Tag color="cyan">{conversation.externalWorkRef.key}</Tag>
+            )}
+          </Space>
+
+          <Typography.Text type="secondary">
+            {isDm
+              ? conversation.members.map((member) => member.name).join(' ↔ ')
+              : isGroup
+                ? `${conversation.members.length} participants`
+                : (conversation.members[0]?.name ?? '')}
+          </Typography.Text>
+        </div>
+
+        <Space>
+          <Avatar.Group max={{ count: 5 }}>
             {conversation.members.map((member) => {
               const status = memberStatus(member.id);
-              const dot = status.className === 'working' ? 'processing' : status.className === 'muted' ? 'default' : 'success';
+
+              const dot =
+                status.className === 'working'
+                  ? 'processing'
+                  : status.className === 'muted'
+                    ? 'default'
+                    : 'success';
+
               return (
-                <Tooltip key={member.id} title={`${member.name} · ${status.label}（点击静音切换）`}>
-                  <span onClick={isGroup ? () => onToggleMute(member.id) : undefined} style={{ cursor: isGroup ? 'pointer' : 'default' }}>
-                    <Badge dot status={dot as 'processing' | 'default' | 'success'}>
-                      <Avatar>
-                        {member.name.slice(0, 1).toUpperCase()}
-                      </Avatar>
-                    </Badge>
-                  </span>
+                <Tooltip key={member.id} title={`${member.name} · ${status.label}`}>
+                  <Badge dot status={dot}>
+                    <Avatar>{member.name.slice(0, 1).toUpperCase()}</Avatar>
+                  </Badge>
                 </Tooltip>
               );
             })}
           </Avatar.Group>
 
-          <Space>
-            {isGroup && (
-              <Button size="small" onClick={onToggleMembers}>
-                Members
-              </Button>
-            )}
-            {isGroup ? (
-              <Select
-                size="small"
-                style={{ minWidth: 140 }}
-                value={recipientMemberId}
-                onChange={onRecipientChange}
-                aria-label="选择这条消息的收件人"
-                options={[
-                  { value: EVERYONE, label: EVERYONE_LABEL },
-                  ...conversation.members
-                    .filter((member) => member.status === 'active')
-                    .map((member) => ({ value: member.id, label: `@${member.handle}` })),
-                ]}
-              />
-            ) : (
-              <Text type="secondary">
-                {isDm
-                  ? conversation.members.map((member) => member.name).join(' ↔ ')
-                  : conversation.members[0]
-                    ? `To ${conversation.members[0].name}`
-                    : 'No member'}
-              </Text>
-            )}
-          </Space>
-        </div>
+          {isGroup && (
+            <Button icon={<TeamOutlined />} onClick={() => setParticipantsOpen(true)}>
+              Participants
+            </Button>
+          )}
+        </Space>
       </div>
 
-      {showMembers && isGroup && (
+      {isGroup && (
         <GroupMemberManager
+          open={participantsOpen}
           conversation={conversation}
           allMembers={allMembers}
           states={states}
           onConversationChanged={onConversationChanged}
           onStateChanged={onStateChanged}
-          onClose={onToggleMembers}
+          onClose={() => setParticipantsOpen(false)}
         />
       )}
     </>

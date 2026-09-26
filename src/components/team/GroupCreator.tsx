@@ -1,25 +1,23 @@
 import { useState } from 'react';
-import { Alert, Button, Card, Checkbox, Input, Space } from 'antd';
+import { Alert, Checkbox, Input, Modal, Space, Typography } from 'antd';
 import type { Member } from '../../lib/api';
 
 interface GroupCreatorProps {
-  /** 可选的候选成员（已归档的不出现在这里）。 */
+  open: boolean;
   members: Member[];
   onCreate: (input: { title: string; memberIds: string[] }) => Promise<void>;
   onCancel: () => void;
 }
 
 /**
- * 新建 Team。
+ * 新建 Discussion（Modal，挂在页面根部）。
  *
- * 关键差异：**不传 defaultMemberId**。
- *
- * 「这个房间默认归谁」和「这条消息发给谁」是两件事。给 group 指定一个默认成员
- * 只会在 UI 里造出一个「看起来有主」的房间，然后把共享讨论降回单人聊天。
- * 房间的收件人集合是全部成员，由服务端 GroupDispatcher 按 @mention /
- * open_discussion 规则决定唤醒谁。
+ * 这不是创建 Team：它调的是 `POST /api/conversations`（kind=group），
+ * 只是一个临时多人协作房间。关键差异：**不传 defaultMemberId** ——
+ * 收件人集合是全部成员，由服务端 GroupDispatcher 按 @mention /
+ * everyone 规则决定唤醒谁。
  */
-export function GroupCreator({ members, onCreate, onCancel }: GroupCreatorProps) {
+export function GroupCreator({ open, members, onCreate, onCancel }: GroupCreatorProps) {
   const [title, setTitle] = useState('');
   const [selected, setSelected] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
@@ -34,7 +32,7 @@ export function GroupCreator({ members, onCreate, onCancel }: GroupCreatorProps)
     try {
       await onCreate({ title: title.trim(), memberIds: selected });
     } catch (e) {
-      // 失败时保持面板打开：调用方（TeamChat）成功后会自己把它收起来
+      // 失败时保持 Modal 打开：调用方成功后会自己把它收起来
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
@@ -42,34 +40,49 @@ export function GroupCreator({ members, onCreate, onCancel }: GroupCreatorProps)
   }
 
   return (
-    <Card size="small" title="New Team" style={{ marginTop: 8 }}>
-      <Space direction="vertical" style={{ width: '100%' }}>
-        <Input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Investment Review" autoFocus />
-        <Checkbox.Group
-          value={selected}
-          onChange={(values) => setSelected(values as string[])}
-          style={{ width: '100%' }}
-        >
-          <Space direction="vertical" style={{ width: '100%' }}>
-            {members.map((member) => (
-              <Checkbox key={member.id} value={member.id}>
-                {member.name} <span style={{ color: '#999' }}>{member.role}</span>
-              </Checkbox>
-            ))}
-          </Space>
-        </Checkbox.Group>
-        {members.length < 2 && <Alert type="warning" showIcon message="至少需要 2 个 Member 才能建 Team。" />}
-        {selected.length === 1 && <Alert type="info" showIcon message="Team 至少两个成员 —— 一个成员就是单聊。" />}
+    <Modal
+      open={open}
+      title="New discussion"
+      okText="Create discussion"
+      cancelText="Cancel"
+      onCancel={onCancel}
+      onOk={() => void submit()}
+      okButtonProps={{
+        disabled: !canCreate,
+        loading: busy,
+      }}
+    >
+      <Space direction="vertical" style={{ width: '100%' }} size={12}>
+        <Input
+          value={title}
+          onChange={(e) => setTitle(e.target.value)}
+          placeholder="例如：Security architecture review"
+          autoFocus
+        />
+
+        <div>
+          <Typography.Text type="secondary">Participants</Typography.Text>
+
+          <Checkbox.Group
+            value={selected}
+            onChange={(values) => setSelected(values as string[])}
+            style={{ width: '100%', marginTop: 8 }}
+          >
+            <Space direction="vertical" style={{ width: '100%' }}>
+              {members.map((member) => (
+                <Checkbox key={member.id} value={member.id}>
+                  {member.name}
+                  <Typography.Text type="secondary"> · {member.role}</Typography.Text>
+                </Checkbox>
+              ))}
+            </Space>
+          </Checkbox.Group>
+        </div>
+
+        {selected.length < 2 && <Alert type="info" showIcon message="至少选择 2 个 Member。" />}
+
         {error && <Alert type="error" showIcon message={error} />}
-        <Space>
-          <Button type="primary" size="small" onClick={() => void submit()} disabled={!canCreate} loading={busy}>
-            Create Team
-          </Button>
-          <Button size="small" onClick={onCancel} disabled={busy}>
-            Cancel
-          </Button>
-        </Space>
       </Space>
-    </Card>
+    </Modal>
   );
 }
