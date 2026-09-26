@@ -100,7 +100,7 @@ function mergeMessages(
  *   execution.updated     —— 谁在跑、跑到哪一步（runtime 状态条）
  *   conversation_member_state —— 每个成员在房间里的读游标 / 唤醒状态 / 静音
  */
-export function TeamChat() {
+export function Workspace() {
   /** 当前在哪个面：工作面 / 管理面 / 设置面。 */
   const [view, setView] = useState<WorkspaceView>('chat');
   /**

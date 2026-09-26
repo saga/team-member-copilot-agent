@@ -35,5 +35,5 @@ export interface MemberStatus {
   label: string;
 }
 
-/** 由 TeamChat 提供：把 memberId 映射成 ●idle / ●working / 🔇muted。 */
+/** 由 Workspace 提供：把 memberId 映射成 ●idle / ●working / 🔇muted。 */
 export type MemberStatusLookup = (memberId: string) => MemberStatus;

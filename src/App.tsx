@@ -1,6 +1,6 @@
 import { ConfigProvider, Layout, Space, theme } from 'antd';
 import { HealthBadge } from './components/HealthBadge';
-import { TeamChat } from './components/TeamChat';
+import { Workspace } from './components/Workspace';
 
 const { Header, Content } = Layout;
 
@@ -18,7 +18,7 @@ export default function App() {
           </Space>
         </Header>
         <Content style={{ minHeight: 0 }}>
-          <TeamChat />
+          <Workspace />
         </Content>
       </Layout>
     </ConfigProvider>
