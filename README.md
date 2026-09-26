@@ -74,11 +74,23 @@ Provider ID 是稳定契约，实现可以替换：把 `local.filesystem-knowled
 
 ## Core model
 
+- **Team** — stable organizational and authorization boundary.
+- **Member** — long-lived AI participant with stable identity and memory.
+- **Discussion** — temporary multi-member conversation.
+- **Work** — a focused business work context, optionally linked to Jira.
+- **Direct** — one-to-one conversation.
+- **Execution** — one concrete runtime turn.
+
+A Discussion is not a Team entity.
+A Member is not recreated for each Discussion.
+Members do not automatically wake each other after every reply.
+Agent-to-agent collaboration is explicit through `ask_member` and `message_member`.
+
 | 概念 | 含义 |
 |------|------|
 | **Member** | 业务上的长期 AI 同事。持久身份 + role + style + system prompt + model + 能力组成 + 全局长期记忆 + Team 上下文。身份跨 Team 稳定（同一个人），记忆按 Team 隔离。 |
 | **Capability** | 三层能力引用：`global` / `team` / `member`，存在同一张 `capability_binding` 表里（`scope_type` + `scope_id`）。**`effective = global + team + member` 才是「能用什么」的唯一答案**，任何单层都不是。 |
-| **Conversation** | 聊天/协作空间。`direct`（一个 Member）/ `group`（多个 Member）/ `work`（独立工作会话）。 |
+| **Conversation** | 聊天/协作空间。`direct`（和一个 Member 的单聊）/ `group`（Discussion：临时多人协作房间，不是 Team 实体）/ `work`（一个 Member 围绕一条外部工作的业务上下文，可挂 Jira）。 |
 | **MemberRuntime** | 某 Member 在某 Conversation 中的运行实例。一个 runtime 拥有一个稳定的 Copilot Session 和一个独立 workspace。 |
 | **CopilotSession** | Runtime 的执行引擎状态。**内部实现细节，不是业务对象。** |
 | **Execution** | Agent 实际跑了一轮。记录 `parent_execution_id` / `delegation_path` / `external_work_ref`（开始时从 conversation 快照）/ `external_work_snapshot`（开始时向外部系统取证），构成完整审计链。状态：`queued` / `running` / `waiting_for_member` / `completed` / `failed` / `cancelled` / `interrupted`。 |
@@ -359,7 +371,7 @@ scheduler 的入队单位**就是**落库的重放单位：
 interface PendingWake {
   conversationId: string;
   memberId: string;
-  reason: WakeReason;      // mention | direct | open_discussion | follow_up
+  reason: WakeReason;      // mention | direct | everyone
   triggerSequence: number; // 是哪条消息唤起的
 }
 ```
@@ -381,28 +393,25 @@ interface PendingWake {
 - **区分「跑失败了」与「连跑都没跑起来」。** 后者要清掉 durable 标记，否则每次重启
   都会重派一条注定失败的唤醒。scheduler 通过 `run(wake, markStarted)` 回调拿到这个区分。
 
-**用户对着房间说话时，房间欠一个回答。** 「允许沉默」只能给**顺带被唤醒**的人：全体都
-被允许沉默时，每个人单独看都做了合理判断（「别人会说」），合起来是房间一个字都不回。
-真实发生过 —— 用户提问，三条 execution 全部 `completed / decision = skip`、没有一条报错。
+**Discussion 里没有默认的接话人。** 用户发一条无 mention 的消息，全体以
+`everyone` 被唤醒，每个人都拿到「没东西补就 `<NO_REPLY>`」的出口 ——
+想推进靠显式协作（`@mention` / `ask_member` / `message_member`），
+不靠平台指定应答者。Member 自己的发言**不**自动唤醒任何人：
+A 回复 → 唤醒 B → B 回复 → 唤醒 A 是没有终点的自动接龙。
 
-所以 reason 分档，**指令也跟着分档**，两件事缺一不可：
+所以 reason 只有三档，**指令也跟着分档**，两件事缺一不可：
 
 ```
-mention           用户 @ 了它
-direct            平台指定它当这一轮的应答者（最久没发言的优先，平手按 id 定序）
-open_discussion   顺带被唤醒，可以沉默
-follow_up         同上
+mention           用户 @ 了它，必须回答
+direct            1:1 房间 / 显式 targetMemberId，必须回答
+everyone          用户对 discussion 说话、没 @ 任何人，可以沉默
 ```
 
-只改路由是无效的：reason 标成 `direct`、指令里却仍写着「没东西可补就 `<NO_REPLY>`」，
-模型会挑更省力的那个。两处细节：
-
-- **用户消息必须有人负责回答。** `pickPrimaryResponder()` 按「最久没发言」指定唯一
-  一名应答者并明确告诉它「必须回答」—— 否则三个 Member 各自认为「别人会说」，
-  全体沉默，而每个成员单独看都做了合理判断。
-- **合并时更明确的理由必须赢**：`mention(3) > direct(2) > follow_up(1) >
-  open_discussion(0)`。一次 @ 和一条顺带唤醒撞在同一个人身上时，点名输了就
-  被悄悄降级成「顺带看看」。
+- **@ 了不存在的人不广播。** 用户明确想找某个人，把消息广播给全员是更糟的
+  误解 —— 服务端不唤醒任何人，只把没认领的 @ 原样回给调用方。
+- **合并时更明确的理由必须赢**：`mention(2) > direct(1) > everyone(0)`。
+  一次 @ 和一条顺带唤醒撞在同一个人身上时，点名输了就被悄悄降级成「顺带看看」。
+- 只改路由是无效的：reason 标对了、指令里却仍写着别的，模型会挑更省力的那个。
 
 `<NO_REPLY>` 是控制信号，不是内容，**绝不能到达客户端**。流式路径上由 `NoReplyStreamGate`
 扣住前缀与哨兵一致的部分，一旦分叉就原样放行（正常回复零额外延迟）；收尾时
@@ -1112,7 +1121,6 @@ scripts/
 | `MAX_DELEGATION_DEPTH` | `4` | `delegation_path` 最大长度 |
 | `EXECUTION_TIMEOUT_MS` | `600000` | 单次 turn 上限（SDK 默认 60s 对带工具的真实任务太短） |
 | `RECOVER_ON_STARTUP` | `true` | 启动时跑 `RecoveryService`（单进程独占 DB 才安全） |
-| `GROUP_AUTO_WAKE_ROUNDS` | `2` | 无 `@mention` 的 member 发言最多连着唤醒几轮 |
 | `MAX_CONTEXT_MESSAGES` | `100` | 注入 prompt 的 shared message 条数上限（从最新往前取，至少 1 条） |
 | `MAX_CONTEXT_CHARS` | `60000` | 注入 prompt 的字符数上限（含每条 32 字符的固定开销），与条数上限同时生效 |
 | `HOST_CODING_TOOLS` | `false` | 是否允许 `bash` / `edit` / `grep` / `web_fetch`。**不随能力绑定打开** |
