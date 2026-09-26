@@ -1,6 +1,7 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Alert, Empty, Layout, Space, Tag } from 'antd';
 import type { Member } from '../lib/api';
+import { useRoute } from '../lib/router';
 import { ConversationHeader } from './team/ConversationHeader';
 import { ConversationMessages } from './team/ConversationMessages';
 import { MessageComposer } from './team/MessageComposer';
@@ -9,7 +10,7 @@ import { TeamManagement } from './team/TeamManagement';
 import { CapabilitySettings } from './team/CapabilitySettings';
 import { GroupCreator } from './team/GroupCreator';
 import { ConversationSidebar } from './chat/ConversationSidebar';
-import { WorkspaceNav, type WorkspaceView } from './workspace/WorkspaceNav';
+import { WorkspaceNav } from './workspace/WorkspaceNav';
 import { WorkCreator } from './team/WorkCreator';
 import { ResizableSider } from './ResizableSider';
 import { STATUS_LABEL, useWorkspaceData } from './workspace/useWorkspaceData';
@@ -31,16 +32,12 @@ const { Content } = Layout;
  *   settings —— Capabilities（Admin 面，不在聊天顶栏）
  */
 export function Workspace() {
-  /** 当前在哪个面：工作面 / 管理面 / 设置面。 */
-  const [view, setView] = useState<WorkspaceView>('chat');
   /**
-   * 从 Member 行点进 Settings 时的落点（哪一层、哪个人）。
-   * CapabilitySettings 只在挂载时读一次，切人时用 key 换 key 强制重挂。
+   * 视图与关键上下文都在 URL 里（见 lib/router.ts）：切面 / 切会话 / 切配置对象
+   * 都会改变地址，刷新和深链能还原现场，浏览器前进后退可用。
    */
-  const [capabilityTarget, setCapabilityTarget] = useState<{
-    scope: 'global' | 'team' | 'member';
-    memberId: string | null;
-  } | null>(null);
+  const [route, navigate] = useRoute();
+  const view = route.view;
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -53,9 +50,11 @@ export function Workspace() {
    *
    * 刻意和「进入单聊」分开：member row 上 Chat / Edit 是两个独立动作。
    * 把二者塞进同一个 handler，会让「想改一下它的 system prompt」变成
-   * 「顺手开了一个新会话」。
+   * 「顺手开了一个新会话」。编辑是瞬态模态，不进 URL。
    */
   const [editingMemberId, setEditingMemberId] = useState<string | null>(null);
+  /** 首载默认落点只决定一次，标记防止后续路由变化重新触发。 */
+  const bootstrappedRef = useRef(false);
 
   const data = useWorkspaceData({ onError: setError });
   const actions = useWorkspaceActions({
@@ -64,7 +63,7 @@ export function Workspace() {
     setInput,
     setBusy,
     setError,
-    setView,
+    navigate,
     setEditingMemberId,
     setNewDiscussionOpen,
     setNewWorkOpen,
@@ -98,25 +97,64 @@ export function Workspace() {
 
   const editingMember = editingMemberId ? (memberById.get(editingMemberId) ?? null) : null;
 
+  // URL → data：跟随路由切会话。等会话列表到位后再动作 —— 深链直进时路由
+  // 先到、roster 后到，提前打开没有意义。路由指明的会话不存在（过期链接）就
+  // 停在空态，不报错也不瞎猜一个会话。
+  useEffect(() => {
+    if (route.view !== 'chat' || conversations.length === 0) return;
+    if (route.conversationId && !conversations.some((item) => item.id === route.conversationId)) {
+      return;
+    }
+    if (route.conversationId !== conversationId) {
+      openConversation(route.conversationId);
+    }
+  }, [route, conversations, conversationId, openConversation]);
+
+  // 默认落点：首次加载时 URL 没指明会话（/ 或 /chat），自动落到第一个会话并把
+  // 地址补全（replace，不塞历史）。只做这一次，之后选会话永远是用户说了算。
+  useEffect(() => {
+    if (bootstrappedRef.current || view !== 'chat' || conversations.length === 0) return;
+    bootstrappedRef.current = true;
+    if (!route.conversationId) {
+      navigate({ view: 'chat', conversationId: conversations[0].id }, { replace: true });
+    }
+  }, [view, route, conversations, navigate]);
+
+  /** 用户点侧栏切会话：立即打开并写入历史（后退可以回到上一个会话）。 */
+  function selectConversation(id: string) {
+    openConversation(id);
+    navigate({ view: 'chat', conversationId: id });
+  }
+
   /**
    * 从 Member 行进 Settings：落在「这个人」的增量能力上。
    * Settings 是 Admin 面，入口在管理面和小菜单，不在聊天顶栏。
    */
   function manageMemberCapabilities(member: Member) {
-    setCapabilityTarget({ scope: 'member', memberId: member.id });
-    setView('settings');
+    navigate({ view: 'settings', scope: 'member', memberId: member.id });
   }
 
   return (
     <Layout style={{ height: '100%', flexDirection: 'row' }}>
-      <WorkspaceNav view={view} onChange={setView} />
+      <WorkspaceNav
+        view={view}
+        onChange={(next) => {
+          if (next === 'chat') {
+            navigate({ view: 'chat', conversationId });
+          } else if (next === 'team') {
+            navigate({ view: 'team' });
+          } else {
+            navigate({ view: 'settings', scope: 'global', memberId: null });
+          }
+        }}
+      />
 
       {view === 'chat' && (
         <ResizableSider>
           <ConversationSidebar
             conversations={conversations}
             selectedConversationId={conversationId}
-            onSelectConversation={openConversation}
+            onSelectConversation={selectConversation}
             onNewDiscussion={() => setNewDiscussionOpen(true)}
             onNewWork={() => setNewWorkOpen(true)}
           />
@@ -153,11 +191,14 @@ export function Workspace() {
         {view === 'settings' && (
           <div style={{ padding: '12px 18px', overflowY: 'auto', height: '100%' }}>
             <CapabilitySettings
-              key={`${capabilityTarget?.scope ?? 'global'}:${capabilityTarget?.memberId ?? ''}`}
+              key={`${route.scope}:${route.memberId ?? ''}`}
               inline
-              initialScope={capabilityTarget?.scope ?? 'global'}
-              initialMemberId={capabilityTarget?.memberId ?? null}
-              onClose={() => setView('chat')}
+              initialScope={route.scope}
+              initialMemberId={route.memberId}
+              onTargetChange={(scope, memberId) =>
+                navigate({ view: 'settings', scope, memberId }, { replace: true })
+              }
+              onClose={() => navigate({ view: 'chat', conversationId })}
             />
           </div>
         )}

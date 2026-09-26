@@ -87,7 +87,7 @@ export interface WorkspaceData {
   memberStatus: MemberStatusLookup;
   scrollRef: React.RefObject<HTMLDivElement | null>;
   refresh: () => Promise<void>;
-  openConversation: (id: string) => void;
+  openConversation: (id: string | null) => void;
   /** 把刚建好的会话顶到列表前面（去重）。 */
   upsertConversation: (conversation: Conversation) => void;
   addMember: (member: Member) => void;
@@ -198,7 +198,8 @@ export function useWorkspaceData({ onError }: { onError: (message: string | null
     ]);
     setMembers(membersResult.members);
     setConversations(conversationsResult.conversations);
-    setConversationId((current) => current ?? conversationsResult.conversations[0]?.id ?? null);
+    // 不在这里自动选中第一个会话：选哪个会话由路由决定（Workspace 负责把
+    // 「URL 没指明会话」时的默认落点写回 URL），数据层自己选会和路由打架。
   }
 
   useEffect(() => {
@@ -446,7 +447,7 @@ export function useWorkspaceData({ onError }: { onError: (message: string | null
    * 同一次渲染里，effect 随后执行就会把刚设好的提示擦掉。
    * （error 没有这个问题：它总是在一次 await 之后才被设置。）
    */
-  function openConversation(id: string) {
+  function openConversation(id: string | null) {
     setNotice(null);
     setConversationId(id);
   }

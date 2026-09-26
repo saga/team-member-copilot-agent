@@ -6,6 +6,8 @@
 /dist-server/
 *.tsbuildinfo
 
+.playwright-mcp/
+
 # Env
 .env
 !.env.example

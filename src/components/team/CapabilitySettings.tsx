@@ -62,6 +62,11 @@ interface CapabilitySettingsProps {
   /** 从 Member 行的 `... → Manage capabilities` 进来时，直接落在那个人身上。 */
   initialScope?: Scope;
   initialMemberId?: string | null;
+  /**
+   * 配置对象变化（切页签 / 换成员）时上报，让 URL 跟着走。
+   * 只在用户主动切换时触发，首载不触发。
+   */
+  onTargetChange?: (scope: Scope, memberId: string | null) => void;
 }
 
 /** 服务端目录 → 本地草稿：勾选态即 enabled。 */
@@ -85,6 +90,7 @@ export function CapabilitySettings({
   inline = false,
   initialScope = 'global',
   initialMemberId = null,
+  onTargetChange,
 }: CapabilitySettingsProps) {
   const [members, setMembers] = useState<Member[]>([]);
   const [scope, setScope] = useState<Scope>(initialScope);
@@ -562,9 +568,10 @@ export function CapabilitySettings({
                   label: `${member.name} · @${member.handle} · ${member.role}`,
                 }))}
                 onChange={(next) =>
-                  guardDirty(['member'], '切换成员后，当前这位成员上未保存的改动会丢失。', () =>
-                    setMemberId(next),
-                  )
+                  guardDirty(['member'], '切换成员后，当前这位成员上未保存的改动会丢失。', () => {
+                    setMemberId(next);
+                    onTargetChange?.('member', next);
+                  })
                 }
               />
               <div style={{ color: '#999', fontSize: 12, marginTop: 4 }}>
@@ -663,7 +670,11 @@ export function CapabilitySettings({
 
         <Tabs
           activeKey={scope}
-          onChange={(key) => setScope(key as Scope)}
+          onChange={(key) => {
+            const next = key as Scope;
+            setScope(next);
+            onTargetChange?.(next, memberId);
+          }}
           items={[
             {
               key: 'global',

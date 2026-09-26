@@ -1,7 +1,7 @@
 import { useRef } from 'react';
 import { api, type Member } from '../../lib/api';
+import type { Route } from '../../lib/router';
 import type { WorkDraft } from '../team/WorkCreator';
-import type { WorkspaceView } from './WorkspaceNav';
 import { newRequestId, type WorkspaceData } from './useWorkspaceData';
 
 export interface WorkspaceActionDeps {
@@ -11,7 +11,8 @@ export interface WorkspaceActionDeps {
   setInput: (value: string) => void;
   setBusy: (busy: boolean) => void;
   setError: (error: string | null) => void;
-  setView: (view: WorkspaceView) => void;
+  /** 建完房间后跳转落点（/chat/:id），由 Workspace 的路由 hook 提供。 */
+  navigate: (route: Route, options?: { replace?: boolean }) => void;
   setEditingMemberId: (id: string | null) => void;
   setNewDiscussionOpen: (open: boolean) => void;
   setNewWorkOpen: (open: boolean) => void;
@@ -49,7 +50,7 @@ export function useWorkspaceActions(deps: WorkspaceActionDeps) {
     );
     if (existing) {
       data.openConversation(existing.id);
-      deps.setView('chat');
+      deps.navigate({ view: 'chat', conversationId: existing.id });
       return;
     }
 
@@ -60,7 +61,7 @@ export function useWorkspaceActions(deps: WorkspaceActionDeps) {
     });
     data.upsertConversation(result.conversation);
     data.openConversation(result.conversation.id);
-    deps.setView('chat');
+    deps.navigate({ view: 'chat', conversationId: result.conversation.id });
   }
 
   /**
@@ -77,7 +78,7 @@ export function useWorkspaceActions(deps: WorkspaceActionDeps) {
     data.upsertConversation(result.conversation);
     deps.setNewDiscussionOpen(false);
     data.openConversation(result.conversation.id);
-    deps.setView('chat');
+    deps.navigate({ view: 'chat', conversationId: result.conversation.id });
   }
 
   /**
@@ -104,6 +105,7 @@ export function useWorkspaceActions(deps: WorkspaceActionDeps) {
     data.upsertConversation(created);
     data.openConversation(created.id);
     deps.setNewWorkOpen(false);
+    deps.navigate({ view: 'chat', conversationId: created.id });
 
     if (!input.instruction) {
       data.setNotice(
