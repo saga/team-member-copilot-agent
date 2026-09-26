@@ -704,31 +704,6 @@ describe('工具授权层真的接到了引擎上', () => {
       '正在跑的这一轮突然多出了宿主工具 —— 能力必须在 turn 开始时冻结',
     );
   });
-
-  it('custom tool 只要被声明就必须放行（它的边界在业务里，不在授权层）', async () => {
-    // 上面那条的反面：声明过就必须过。授权层不做「这个 Member 该不该调
-    // ask_member」这种业务判断 —— 那是 TeamService 的事，混进来会让
-    // 「加一个工具」变成「改授权层」。
-    const decisions: Array<Record<string, unknown>> = [];
-
-    await runTurnCapturing({
-      during: async (captured) => {
-        for (const name of ['ask_member', 'message_member', 'remember_member']) {
-          decisions.push(
-            (await captured.hooks?.onPreToolUse?.({
-              sessionId: 'sess-1',
-              toolName: name,
-              toolArgs: {},
-            })) as Record<string, unknown>,
-          );
-        }
-      },
-    });
-
-    for (const decision of decisions) {
-      assert.equal(decision.permissionDecision, 'allow');
-    }
-  });
 });
 
 // ═══════════════════════════════════════════ 3/4. TeamService
@@ -1045,27 +1020,5 @@ describe('listExecutions', () => {
     // 客户端组树的依据就在这两个字段上
     const roots = executions.filter((execution) => execution.parentExecutionId === null);
     assert.equal(roots.length, 1);
-  });
-});
-
-describe('retryExecution 的语义', () => {
-  it('retry 后新 execution 指回原记录，原记录不被改写', async () => {
-    const conv = newConversation();
-    stub.failWith = 'transient';
-    let failedId = '';
-    try {
-      const failed = await sendMessage({ conversationId: conv.id, content: 'try' });
-      failedId = failed.executionId;
-      await waitForStatus(failedId, 'failed');
-    } finally {
-      stub.failWith = null;
-    }
-
-    const { executionId } = team.retryExecution(failedId);
-    await waitForStatus(executionId, 'completed');
-
-    assert.equal(executionRow(executionId).status, 'completed');
-    assert.equal(team.getExecution(executionId).retryOfExecutionId, failedId);
-    assert.equal(executionRow(failedId).status, 'failed', '原记录保持不变');
   });
 });

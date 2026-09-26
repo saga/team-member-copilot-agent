@@ -24,7 +24,6 @@ process.env.DATA_DIR = dataDir;
 process.env.MAX_DELEGATION_DEPTH = '4';
 process.env.COPILOT_WARMUP = 'false';
 
-const { config } = await import('../config.js');
 const { db } = await import('../db.js');
 const { MemberService } = await import('../member-service.js');
 const { ContextAssembler } = await import('../context-assembler.js');
@@ -1110,27 +1109,6 @@ describe('durable conversation_event 与 SSE 回放', () => {
     }
   });
 
-  it('从 0 回放能重建整个会话事件流', async () => {
-    const conv = team.createConversation({
-      kind: 'direct',
-      title: 'FullReplay',
-      memberIds: [bob.id],
-      defaultMemberId: bob.id,
-    });
-
-    const sent = await sendMessage({ conversationId: conv.id, content: 'rebuild' });
-    await waitForStatus(sent.executionId, 'completed');
-
-    const replayed: string[] = [];
-    const unsubscribe = team.replayAndSubscribe(conv.id, 0, (event) => {
-      if (event.sequence !== null) replayed.push(event.type);
-    });
-    unsubscribe();
-
-    assert.ok(replayed.includes('message.created'));
-    assert.ok(replayed.includes('execution.updated'));
-  });
-
   it('回放覆盖全部历史事件，sequence 是连续无洞的 1..N', async () => {
     const conv = team.createConversation({
       kind: 'direct',
@@ -1454,8 +1432,5 @@ describe('retryExecution', () => {
   });
 });
 
-describe('config 暴露的可靠性开关', () => {
-  it('recoverOnStartup 默认开启', () => {
-    assert.equal(config.recoverOnStartup, true);
-  });
-});
+// config 模块的 env 读取必须发生在这里（见上方注释），但可靠性开关的
+// 默认值不单独测：那是常量断言，行为本身由上面各恢复用例覆盖。

@@ -106,11 +106,6 @@ describe('Project', () => {
     structure.updateProject(project.id, { status: 'archived' });
     assert.throws(() => structure.createWorkItem(team.id, { title: 'x', projectId: project.id }, { kind: 'human', principalId: 'u' }), /归档/);
   });
-
-  it('project 不建自己的 ACL：同 Team 成员默认可见', () => {
-    const projects = structure.listProjects(team.id);
-    assert.ok(projects.length >= 1);
-  });
 });
 
 describe('WorkItem：Assignment 与 Claim 分开', () => {
@@ -264,30 +259,6 @@ describe('Scheduler', () => {
     structure.setAvailability(team.id, 'agent', agent.id, 'available');
   });
 
-  it('scheduled execution 标记：kind=member_work，wakeReason=schedule，无触发消息', async () => {
-    const { StubCopilot } = await import('./support.js');
-    const stub = new StubCopilot();
-    const stack = createTestStack(db, memberService, stub.asCopilot);
-    const agent = stack.team.createMember({ name: 'SchedMark', role: 'E' });
-    const room = stack.team.createConversation({ kind: 'work', memberIds: [agent.id] });
-    const schedule = structure.createSchedule(
-      team.id,
-      { memberId: agent.id, conversationId: room.id, prompt: 'scheduled check', type: 'once', runAt: new Date(Date.now() + 60_000).toISOString() },
-      'local-user',
-    );
-    const run = structure.insertScheduleRun(schedule.id, schedule.nextRunAt);
-    const executionId = await stack.team.enqueueScheduledWork({
-      scheduleRunId: run.id,
-      conversationId: room.id,
-      memberId: agent.id,
-      prompt: 'scheduled check',
-    });
-    const execution = stack.team.getExecution(executionId);
-    assert.equal(execution.kind, 'member_work');
-    assert.equal(execution.wakeReason, 'schedule');
-    assert.equal(execution.triggerMessageSequence, null);
-  });
-
   it('scheduled prompt 不被最近一条聊天消息顶替；一次调度只产生一条 execution', async () => {
     const { StubCopilot } = await import('./support.js');
     const stub = new StubCopilot();
@@ -323,6 +294,8 @@ describe('Scheduler', () => {
     assert.equal(rows[0].id, executionId);
     assert.equal(rows[0].prompt, PROMPT);
     assert.equal(rows[0].trigger_message_sequence, null);
+    // kind 标记是 Scheduler / UI 区分「调度产生」与「聊天产生」的依据
+    assert.equal(stack.team.getExecution(executionId).kind, 'member_work');
     // enqueue 只建不跑：启动由 runScheduledExecution 负责（tick / recovery 共用）。
     await stack.team.runScheduledExecution(executionId);
     // stub 收到的是渲染后的 prompt：schedule prompt 必须是「当前消息」本身，

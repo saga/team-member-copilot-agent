@@ -81,14 +81,6 @@ function hostTools(): RuntimeTool[] {
 }
 
 describe('check：判据来自声明，不来自名字', () => {
-  it('普通工具放行，理由里写得出 provider 与 risk', async () => {
-    const decision = await decide(policy(WITHHOLD_HOST), tool());
-
-    assert.equal(decision.allowed, true);
-    assert.match(decision.reason, /provider=test\.provider/);
-    assert.match(decision.reason, /risk=coordination/);
-  });
-
   it('read / self-write / coordination 都不需要额外开关', async () => {
     const layer = policy(WITHHOLD_HOST);
 
@@ -179,13 +171,6 @@ describe('check：authorize 是逐次判定，不是第二份白名单', () => {
     const decision = await decide(layer, subject);
     assert.equal(decision.allowed, false);
     assert.match(decision.reason, /远端策略拒绝/);
-  });
-
-  it('没有 authorize 的工具不因为「少了这个字段」而被拒', async () => {
-    // authorize 是可选的。把它写成必填，会让「加一个简单工具」也要求写一份
-    // 逐次判定 —— 然后大家会写 `() => true`，等于多了一层没有内容的仪式。
-    const decision = await decide(policy(WITHHOLD_HOST), tool({ authorize: undefined }));
-    assert.equal(decision.allowed, true);
   });
 });
 

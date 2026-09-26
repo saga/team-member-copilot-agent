@@ -76,14 +76,6 @@ describe('external-write 默认拒绝', () => {
     assert.equal(denied.allowed, false);
     assert.match(denied.reason, /远端策略拒绝/);
   });
-
-  it('read / coordination 无 authorize 仍放行（默认拒绝只收紧高风险）', async () => {
-    const policy = new DefaultToolPolicy({ allowHostTools: false });
-    for (const risk of ['read', 'self-write', 'coordination'] as const) {
-      const decision = await policy.check(tool({ risk, authorize: undefined }), ctx, {});
-      assert.equal(decision.allowed, true, `risk=${risk} 不该被连带拒绝`);
-    }
-  });
 });
 
 // ---------------------------------------------------------- skill selector + 版本

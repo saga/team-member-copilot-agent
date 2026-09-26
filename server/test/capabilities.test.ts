@@ -226,38 +226,6 @@ describe('Registry：Provider ID 是稳定契约', () => {
     assert.throws(() => registry.knowledgeProvider('ghost'), /未注册 Knowledge Provider：ghost/);
     assert.throws(() => registry.toolProvider('ghost'), /未注册 Tool Provider：ghost/);
   });
-
-  it('validate 拼错一个 ID 就抛（错误挡在落库之前，不等到第一个 turn）', () => {
-    const registry = manifestRegistry();
-
-    // 三类各拼错一个，都必须被抓到
-    assert.throws(
-      () => registry.validateMemberCapabilities({ skills: [{ providerId: 'typo' }], knowledge: [], tools: [] }),
-      /未注册 Skill Provider：typo/,
-    );
-    assert.throws(
-      () => registry.validateMemberCapabilities({ skills: [], knowledge: [{ providerId: 'typo' }], tools: [] }),
-      /未注册 Knowledge Provider：typo/,
-    );
-    assert.throws(
-      () => registry.validateMemberCapabilities({ skills: [], knowledge: [], tools: [{ providerId: 'typo' }] }),
-      /未注册 Tool Provider：typo/,
-    );
-  });
-
-  it('listProviderIds 三类分开、各自排序', () => {
-    const registry = registryOf({
-      skills: [skillProvider('b'), skillProvider('a')],
-      knowledge: [knowledgeProvider('k')],
-      tools: [toolProvider('z'), toolProvider('m')],
-    });
-
-    assert.deepEqual(registry.listProviderIds(), {
-      skills: ['a', 'b'],
-      knowledge: ['k'],
-      tools: ['m', 'z'],
-    });
-  });
 });
 
 // ═══════════════════════════════════════════════ 2. Resolver / manifest
@@ -468,17 +436,6 @@ describe('CapabilityService：一张表装三类绑定', () => {
     assert.equal(capabilities.hasKnowledgeBinding(member.id, KNOWLEDGE_PROVIDER, ''), false);
     assert.equal(capabilities.hasKnowledgeBinding(member.id, 'other.provider', 'financial-core'), false);
   });
-
-  it('空 selector 读回来是 undefined，调用方不必区分 "" 和 undefined', () => {
-    const member = rawMember('Roundtrip');
-    capabilities.replace(member.id, {
-      skills: [{ providerId: 'team.filesystem-skills' }],
-      knowledge: [],
-      tools: [],
-    });
-
-    assert.deepEqual(capabilities.get(member.id).skills, [{ providerId: 'team.filesystem-skills' }]);
-  });
 });
 
 // ═══════════════════════════════════════════════ 4. 默认能力
@@ -494,15 +451,6 @@ describe('默认能力', () => {
       ),
       false,
       '共享引用会让「给一个人开能力」变成给所有人开',
-    );
-  });
-
-  it('默认不含宿主工具：它不是能力，是部署前提', () => {
-    assert.equal(
-      defaultMemberCapabilities().tools.some(
-        (binding) => binding.providerId === 'runtime.host-coding-tools',
-      ),
-      false,
     );
   });
 

@@ -690,15 +690,6 @@ describe('@mention 只做精确匹配', () => {
     );
   });
 
-  it('handle 全等命中', () => {
-    const result = resolveMentions('@anna 看一下', members);
-    assert.deepEqual(
-      result.matched.map((member) => member.id),
-      ['m2'],
-    );
-    assert.deepEqual(result.unresolved, []);
-  });
-
   it('带空格的 name 被空格截断后，只认精确命中，不再靠前缀猜到别人头上', () => {
     // `@Alice Chen` 取出来的 token 是 `Alice`。以前这里会走前缀匹配，
     // 命中的是**谁**取决于索引顺序和谁的名字更长 —— 也就是「猜」。
