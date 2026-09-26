@@ -3,7 +3,13 @@ import { z } from 'zod';
 import type { TeamStructureService } from '../team-structure-service.js';
 import { sendError } from '../middleware/errorHandler.js';
 import { isAdminAuthorized } from '../middleware/apiScope.js';
-import { currentTeamId, isTeamAdmin } from '../middleware/teamScope.js';
+import {
+  currentTeamId,
+  requireTeamMember,
+  isTeamAdmin,
+  resolveActor,
+} from '../middleware/teamScope.js';
+import type { TeamParticipantKind, TeamRole } from '../domain.js';
 import { config } from '../config.js';
 
 /**
@@ -33,8 +39,6 @@ const assignSchema = z.object({
 });
 
 const claimSchema = z.object({
-  memberId: z.string().min(1),
-  executionId: z.string().min(1).nullable().optional(),
   expectedVersion: z.number().int().positive().optional(),
 });
 
@@ -57,10 +61,21 @@ function adminOrRole(req: { headers: unknown; query: unknown } & { [k: string]: 
   return isTeamAdmin(asRequest, 'owner', 'admin');
 }
 
+function actorTeamRole(
+  structure: TeamStructureService,
+  actor: { kind: TeamParticipantKind; principalId: string },
+): TeamRole | undefined {
+  try {
+    return structure.getMembership(currentTeamId(), actor.kind, actor.principalId).role;
+  } catch {
+    return undefined;
+  }
+}
+
 export function teamRouter(structure: TeamStructureService) {
   const router = Router();
 
-  router.get('/', (_req, res) => {
+  router.get('/', requireTeamMember(), (_req, res) => {
     try {
       res.json({ team: structure.getTeam(currentTeamId()) });
     } catch (error) {
@@ -68,7 +83,7 @@ export function teamRouter(structure: TeamStructureService) {
     }
   });
 
-  router.get('/members', (_req, res) => {
+  router.get('/members', requireTeamMember(), (_req, res) => {
     try {
       res.json({ members: structure.listMemberships(currentTeamId()) });
     } catch (error) {
@@ -89,13 +104,13 @@ export function teamRouter(structure: TeamStructureService) {
     }
     try {
       const kind = req.params.kind as 'human' | 'agent';
-      res.json({ member: structure.updateMembership(currentTeamId(), kind, req.params.id, parsed.data) });
+      res.json({ member: structure.updateMembership(currentTeamId(), kind, (req.params.id as string), parsed.data) });
     } catch (error) {
       sendError(res, error);
     }
   });
 
-  router.get('/projects', (_req, res) => {
+  router.get('/projects', requireTeamMember(), (_req, res) => {
     try {
       res.json({ projects: structure.listProjects(currentTeamId()) });
     } catch (error) {
@@ -133,13 +148,13 @@ export function teamRouter(structure: TeamStructureService) {
       return;
     }
     try {
-      res.json({ project: structure.updateProject(req.params.id, parsed.data) });
+      res.json({ project: structure.updateProject((req.params.id as string), parsed.data) });
     } catch (error) {
       sendError(res, error);
     }
   });
 
-  router.get('/work-items', (req, res) => {
+  router.get('/work-items', requireTeamMember(), (req, res) => {
     try {
       const query = req.query as Record<string, string>;
       res.json({
@@ -153,45 +168,44 @@ export function teamRouter(structure: TeamStructureService) {
     }
   });
 
-  router.post('/work-items', (req, res) => {
+  router.post('/work-items', requireTeamMember(), (req, res) => {
     const parsed = workItemSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
       res.status(400).json({ error: 'title 必填' });
       return;
     }
     try {
-      res.status(201).json({ workItem: structure.createWorkItem(currentTeamId(), parsed.data, config.localActorId) });
+      const actor = resolveActor(req);
+      res.status(201).json({ workItem: structure.createWorkItem(currentTeamId(), parsed.data, actor.principalId) });
     } catch (error) {
       sendError(res, error);
     }
   });
 
-  router.get('/work-items/:id', (req, res) => {
+  router.get('/work-items/:id', requireTeamMember(), (req, res) => {
     try {
-      res.json({ workItem: structure.getWorkItem(req.params.id) });
+      res.json({ workItem: structure.getWorkItem((req.params.id as string)) });
     } catch (error) {
       sendError(res, error);
     }
   });
 
-  router.patch('/work-items/:id', (req, res) => {
+  router.patch('/work-items/:id', requireTeamMember(), (req, res) => {
     const parsed = updateWorkItemSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
       res.status(400).json({ error: '参数不合法' });
       return;
     }
     try {
-      // actor 取 human 占位；agent 经 tool 路径带 claimer 身份（见 core-tools）。
-      const actor = { kind: 'human' as const, principalId: config.localActorId, teamRole: undefined as 'owner' | 'admin' | undefined };
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      if (adminOrRole(req as any)) actor.teamRole = 'admin';
-      res.json({ workItem: structure.updateWorkItem(req.params.id, parsed.data, actor) });
+      const actor = resolveActor(req);
+      const teamRole = actorTeamRole(structure, actor);
+      res.json({ workItem: structure.updateWorkItem((req.params.id as string), parsed.data, { ...actor, teamRole }) });
     } catch (error) {
       sendError(res, error);
     }
   });
 
-  router.post('/work-items/:id/assign', (req, res) => {
+  router.post('/work-items/:id/assign', requireTeamMember(), (req, res) => {
     const parsed = assignSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
       res.status(400).json({ error: 'assignee 不合法' });
@@ -202,39 +216,49 @@ export function teamRouter(structure: TeamStructureService) {
         parsed.data.kind && parsed.data.principalId
           ? { kind: parsed.data.kind, principalId: parsed.data.principalId }
           : null;
-      res.json({ workItem: structure.assignWorkItem(req.params.id, assignee) });
+      res.json({ workItem: structure.assignWorkItem((req.params.id as string), assignee) });
     } catch (error) {
       sendError(res, error);
     }
   });
 
-  router.post('/work-items/:id/claim', (req, res) => {
+  router.post('/work-items/:id/claim', requireTeamMember(), (req, res) => {
     const parsed = claimSchema.safeParse(req.body ?? {});
-    if (!parsed.success) {
-      res.status(400).json({ error: 'memberId 必填' });
-      return;
-    }
-    try {
-      res.json({ workItem: structure.claimWorkItem(req.params.id, parsed.data) });
-    } catch (error) {
-      sendError(res, error);
-    }
-  });
-
-  router.post('/work-items/:id/release', (req, res) => {
-    const parsed = z.object({ memberId: z.string().min(1).optional() }).safeParse(req.body ?? {});
     if (!parsed.success) {
       res.status(400).json({ error: '参数不合法' });
       return;
     }
     try {
-      res.json({ workItem: structure.releaseWorkItem(req.params.id, parsed.data.memberId) });
+      const actor = resolveActor(req);
+      // HTTP claim 只接受 Agent 身份：body 里的 memberId 不再被信任。
+      if (actor.kind !== 'agent') {
+        res.status(403).json({ error: '只有 Agent 可以 claim WorkItem' });
+        return;
+      }
+      res.json({
+        workItem: structure.claimWorkItem((req.params.id as string), {
+          memberId: actor.principalId,
+          expectedVersion: parsed.data.expectedVersion,
+        }),
+      });
     } catch (error) {
       sendError(res, error);
     }
   });
 
-  router.get('/presence', (_req, res) => {
+  router.post('/work-items/:id/release', requireTeamMember(), (req, res) => {
+    try {
+      const actor = resolveActor(req);
+      const teamRole = actorTeamRole(structure, actor);
+      res.json({
+        workItem: structure.releaseWorkItem((req.params.id as string), { ...actor, teamRole }),
+      });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  router.get('/presence', requireTeamMember(), (_req, res) => {
     try {
       res.json({ presence: structure.listPresence(currentTeamId()) });
     } catch (error) {
@@ -242,22 +266,32 @@ export function teamRouter(structure: TeamStructureService) {
     }
   });
 
-  router.patch('/presence/:kind/:id', (req, res) => {
+  router.patch('/presence/:kind/:id', requireTeamMember(), (req, res) => {
     const parsed = z.object({ availability: z.enum(['available', 'away', 'paused']) }).safeParse(req.body ?? {});
     if (!parsed.success) {
       res.status(400).json({ error: 'availability 不合法' });
       return;
     }
+    // 本人改本人，Admin 改别人：Human A 不能暂停 Agent B，Agent 也不能改别人。
+    const actor = resolveActor(req);
+    const targetKind = req.params.kind as TeamParticipantKind;
+    const targetId = req.params.id as string;
+    const isSelf = actor.kind === targetKind && actor.principalId === targetId;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    if (!isSelf && !isTeamAdmin(req as any, 'owner', 'admin')) {
+      res.status(403).json({ error: '只能修改自己的 Presence' });
+      return;
+    }
     try {
       res.json({
-        presence: structure.setAvailability(currentTeamId(), req.params.kind as 'human' | 'agent', req.params.id, parsed.data.availability),
+        presence: structure.setAvailability(currentTeamId(), targetKind, targetId, parsed.data.availability),
       });
     } catch (error) {
       sendError(res, error);
     }
   });
 
-  router.get('/schedules', (_req, res) => {
+  router.get('/schedules', requireTeamMember(), (_req, res) => {
     try {
       res.json({ schedules: structure.listSchedules(currentTeamId()) });
     } catch (error) {
@@ -291,7 +325,7 @@ export function teamRouter(structure: TeamStructureService) {
         return;
       }
       try {
-        res.json({ schedule: structure.updateScheduleStatus(req.params.id, status) });
+        res.json({ schedule: structure.updateScheduleStatus((req.params.id as string), status) });
       } catch (error) {
         sendError(res, error);
       }
@@ -310,7 +344,7 @@ export function teamRouter(structure: TeamStructureService) {
       return;
     }
     try {
-      res.json({ schedule: structure.updateScheduleStatus(req.params.id, parsed.data.status) });
+      res.json({ schedule: structure.updateScheduleStatus((req.params.id as string), parsed.data.status) });
     } catch (error) {
       sendError(res, error);
     }

@@ -305,6 +305,9 @@ CREATE TABLE scheduled_wake_run (
     REFERENCES execution(id)
 );
 
+CREATE INDEX idx_scheduled_wake_run_execution
+  ON scheduled_wake_run(execution_id);
+
 CREATE TABLE conversation (
   id TEXT PRIMARY KEY,
   team_id TEXT NOT NULL,

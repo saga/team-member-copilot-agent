@@ -143,10 +143,9 @@ function keyOf(conversationId: string, memberId: string): string {
  * 合并时保留更具体的那一个：被 @ 到比「顺带唤醒」更值得回答，
  * 反过来降级会让一次明确的点名被吞掉。
  */
-const REASON_PRIORITY: Record<WakeReason, number> = {
+const REASON_PRIORITY: Record<Exclude<WakeReason, 'schedule'>, number> = {
   mention: 3,
   direct: 2,
-  schedule: 2,
   follow_up: 1,
   open_discussion: 0,
 };

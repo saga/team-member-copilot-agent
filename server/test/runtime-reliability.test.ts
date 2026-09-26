@@ -466,6 +466,7 @@ describe('schema 就位（PRAGMA user_version）', () => {
         'idx_project_team_status',
         'idx_scheduled_wake_due',
         'idx_scheduled_wake_member',
+        'idx_scheduled_wake_run_execution',
         'idx_team_membership_principal',
         'idx_team_membership_team',
         'idx_work_item_assignee',

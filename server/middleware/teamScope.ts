@@ -24,13 +24,10 @@ export function initTeamScope(service: TeamStructureService, teamId: string): vo
   defaultTeamId = teamId;
 }
 
-/** 解析当前调用方。internal 路径由调用方显式带 agent 身份，其余一律 human。 */
+/** 解析当前调用方。agent 身份只能由 /api/internal 认证中间件注入，其余一律 human。 */
 export function resolveActor(req: Request): ActorContext {
   const agentId = (req as { agentMemberId?: unknown }).agentMemberId;
   if (typeof agentId === 'string' && agentId) return { kind: 'agent', principalId: agentId };
-  const header = req.headers['x-agent-id'];
-  const headerValue = Array.isArray(header) ? header[0] : header;
-  if (typeof headerValue === 'string' && headerValue) return { kind: 'agent', principalId: headerValue };
   return { kind: 'human', principalId: config.localActorId };
 }
 

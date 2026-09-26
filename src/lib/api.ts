@@ -732,11 +732,11 @@ export const api = {
     }).then(json<{ workItem: WorkItem }>);
   },
 
-  claimWorkItem(id: string, memberId: string): Promise<{ workItem: WorkItem }> {
+  claimWorkItem(id: string): Promise<{ workItem: WorkItem }> {
     return fetch(`${API_BASE}/api/team/work-items/${encodeURIComponent(id)}/claim`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ memberId }),
+      body: JSON.stringify({}),
     }).then(json<{ workItem: WorkItem }>);
   },
 

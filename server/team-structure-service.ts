@@ -4,6 +4,7 @@ import { config } from './config.js';
 import { now } from './db.js';
 import { badRequest, conflict, forbidden, notFound } from './http-error.js';
 import type {
+  ExecutionStatus,
   PresenceAvailability,
   PrincipalRef,
   Project,
@@ -87,6 +88,15 @@ export class TeamStructureService {
   requireActiveMembership(teamId: string, kind: TeamParticipantKind, principalId: string): TeamMembership {
     const membership = this.getMembership(teamId, kind, principalId);
     if (membership.status !== 'active') throw forbidden(`Team 成员已停用：${kind}/${principalId}`);
+    // Member 归档后 membership 不会自动变，两边不能漂移成「已归档但仍 active」。
+    if (kind === 'agent') {
+      const row = this.db.prepare(`SELECT status FROM member WHERE id = ?`).get(principalId) as
+        | { status: string }
+        | undefined;
+      if (!row || row.status !== 'active') {
+        throw forbidden(`Agent 已归档：${principalId}`);
+      }
+    }
     return membership;
   }
 
@@ -99,6 +109,31 @@ export class TeamStructureService {
     const current = this.getMembership(teamId, kind, principalId);
     const role = patch.role ?? current.role;
     const status = patch.status ?? current.status;
+    // Agent 只能是 member：权限角色与职业角色绝不合并，Agent 永不做 owner。
+    if (kind === 'agent' && role === 'owner') {
+      throw badRequest('Agent 不能成为 Team owner');
+    }
+    // 最后一个 active owner 不能被降级/停用，否则 Team 进入无主状态。
+    if (current.role === 'owner' && (role !== 'owner' || status !== 'active')) {
+      const row = this.db
+        .prepare(
+          `
+          SELECT COUNT(*) AS n
+          FROM team_membership
+          WHERE team_id = ?
+            AND kind = 'human'
+            AND role = 'owner'
+            AND status = 'active'
+            AND NOT (
+              principal_id = ?
+            )
+          `,
+        )
+        .get(teamId, principalId) as { n: number };
+      if (row.n === 0) {
+        throw conflict('Team 至少必须保留一个 active owner');
+      }
+    }
     this.db
       .prepare(
         `UPDATE team_membership SET role = ?, status = ?, updated_at = ? WHERE team_id = ? AND kind = ? AND principal_id = ?`,
@@ -241,16 +276,32 @@ export class TeamStructureService {
     actor: PrincipalRef & { teamRole?: TeamRole },
   ): WorkItem {
     const current = this.getWorkItem(id);
-    if (patch.status && ['done', 'cancelled'].includes(patch.status)) {
-      // done/cancelled 必须是 claimer 或 Admin/owner，普通路过不能结别人的单。
-      const isClaimer =
-        actor.kind === 'agent' && current.claimedByMemberId === actor.principalId;
-      const isAdmin = actor.teamRole === 'owner' || actor.teamRole === 'admin';
-      // human 创建者本人结自己的单也允许（claim 为空时的个人任务）。
-      const isCreatorHuman =
-        actor.kind === 'human' && current.createdBy === actor.principalId && !current.claimedByMemberId;
-      if (!isClaimer && !isAdmin && !isCreatorHuman) {
-        throw forbidden('只有当前 claimer 或 Team admin/owner 能 done/cancelled');
+    // 对象级授权：admin、当前 claimer、未被 claim 时的人类创建者，三者之外一律拒绝。
+    const isAdmin = actor.teamRole === 'owner' || actor.teamRole === 'admin';
+    const isAgentClaimer =
+      actor.kind === 'agent' && current.claimedByMemberId === actor.principalId;
+    const isHumanCreator =
+      actor.kind === 'human' && current.createdBy === actor.principalId;
+    if (!isAdmin && !isAgentClaimer && !isHumanCreator) {
+      throw forbidden('没有修改这个 WorkItem 的权限');
+    }
+    if (patch.status) {
+      // 工作状态流转只属于 claimer 与 admin：路过不能把别人的任务改成 blocked。
+      if (
+        ['in_progress', 'blocked', 'done', 'cancelled'].includes(patch.status) &&
+        !isAdmin &&
+        !isAgentClaimer
+      ) {
+        throw forbidden('只有当前 claimer 或 Team admin/owner 可以改变工作状态');
+      }
+      // 已被 claim 的任务不能由其他人退回 todo。
+      if (
+        patch.status === 'todo' &&
+        current.claimedByMemberId &&
+        !isAdmin &&
+        !isAgentClaimer
+      ) {
+        throw forbidden('已被 claim 的 WorkItem 不能由其他人退回 todo');
       }
     }
     const title = patch.title?.trim() || current.title;
@@ -277,6 +328,9 @@ export class TeamStructureService {
     assignee: { kind: TeamParticipantKind; principalId: string } | null,
   ): WorkItem {
     const current = this.getWorkItem(id);
+    if (current.status === 'done' || current.status === 'cancelled') {
+      throw conflict(`WorkItem 已经结束：${current.status}`);
+    }
     if (current.claimedByMemberId) {
       throw conflict('WorkItem 已被 claim，先 release 再重新 assign');
     }
@@ -321,6 +375,34 @@ export class TeamStructureService {
       throw forbidden('这项工作已指派给 Human，Agent 不能 claim');
     }
 
+    // execution 绑定校验：claim 必须由一条真实、可执行的 execution 发起，
+    // 且一条 execution 不能同时绑两个 WorkItem。
+    if (input.executionId) {
+      const execution = this.db
+        .prepare(
+          `
+          SELECT id, member_id, status, work_item_id
+          FROM execution
+          WHERE id = ?
+          `,
+        )
+        .get(input.executionId) as
+        | { id: string; member_id: string; status: ExecutionStatus; work_item_id: string | null }
+        | undefined;
+      if (!execution) {
+        throw notFound(`Execution 不存在：${input.executionId}`);
+      }
+      if (execution.member_id !== input.memberId) {
+        throw forbidden('Execution 不属于当前 Member');
+      }
+      if (!['queued', 'running'].includes(execution.status)) {
+        throw conflict('当前 Execution 不能 claim WorkItem');
+      }
+      if (execution.work_item_id && execution.work_item_id !== id) {
+        throw conflict('Execution 已绑定另一个 WorkItem');
+      }
+    }
+
     const expectedVersion = input.expectedVersion ?? current.version;
     const timestamp = now();
     const result = this.db
@@ -341,14 +423,23 @@ export class TeamStructureService {
     if (Number(result.changes) !== 1) {
       throw conflict('Claim 失败：已被抢先、状态不允许或版本过期');
     }
+    // 双向绑定：execution.work_item_id 与 work_item.claimed_execution_id 保持一致。
+    if (input.executionId) {
+      this.db
+        .prepare(`UPDATE execution SET work_item_id = ? WHERE id = ? AND work_item_id IS NULL`)
+        .run(id, input.executionId);
+    }
     return this.getWorkItem(id);
   }
 
-  releaseWorkItem(id: string, memberId?: string): WorkItem {
+  releaseWorkItem(id: string, actor: PrincipalRef & { teamRole?: TeamRole }): WorkItem {
     const current = this.getWorkItem(id);
     if (!current.claimedByMemberId) return current;
-    if (memberId && current.claimedByMemberId !== memberId) {
-      throw forbidden('只有 claimer 能 release');
+    const isClaimer =
+      actor.kind === 'agent' && current.claimedByMemberId === actor.principalId;
+    const isAdmin = actor.teamRole === 'owner' || actor.teamRole === 'admin';
+    if (!isClaimer && !isAdmin) {
+      throw forbidden('只有 claimer 或 Team admin/owner 能 release WorkItem');
     }
     this.db
       .prepare(
@@ -450,6 +541,20 @@ export class TeamStructureService {
     if (!conversation) throw notFound(`Conversation 不存在：${input.conversationId}`);
     if (conversation.team_id !== teamId) throw badRequest('Conversation 不属于这个 Team');
     if (conversation.kind !== 'work') throw badRequest('Schedule 只能绑定 work conversation');
+    // 被调度的 Member 必须属于绑定的 work conversation，否则运行时才炸。
+    const memberInConversation = this.db
+      .prepare(
+        `
+        SELECT 1
+        FROM conversation_member
+        WHERE conversation_id = ?
+          AND member_id = ?
+        `,
+      )
+      .get(input.conversationId, input.memberId);
+    if (!memberInConversation) {
+      throw badRequest('Schedule 的 Member 必须属于绑定的 work conversation');
+    }
     const prompt = input.prompt.trim();
     if (!prompt) throw badRequest('Schedule prompt 不能为空');
     if (input.type === 'interval' && (!input.intervalSeconds || input.intervalSeconds <= 0)) {
@@ -464,6 +569,12 @@ export class TeamStructureService {
     if (workItemId) {
       const work = this.getWorkItem(workItemId);
       if (work.teamId !== teamId) throw badRequest('WorkItem 不属于这个 Team');
+      if (work.status === 'done' || work.status === 'cancelled') {
+        throw badRequest('已结束的 WorkItem 不能建立自动任务');
+      }
+      if (projectId && work.projectId && work.projectId !== projectId) {
+        throw badRequest('Schedule 的 projectId 与 WorkItem 的 projectId 不一致');
+      }
     }
     const id = randomUUID();
     const timestamp = now();
@@ -507,7 +618,11 @@ export class TeamStructureService {
   }
 
   updateScheduleStatus(id: string, status: ScheduledWakeStatus): ScheduledWake {
-    this.getSchedule(id);
+    const current = this.getSchedule(id);
+    // 已完成的 once 不能 resume：它的一次性语义已经兑现。
+    if (current.status === 'completed' && status === 'active') {
+      throw conflict('已完成的 once schedule 不能 resume');
+    }
     this.db.prepare(`UPDATE scheduled_wake SET status = ?, updated_at = ? WHERE id = ?`).run(status, now(), id);
     return this.getSchedule(id);
   }

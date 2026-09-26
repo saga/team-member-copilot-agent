@@ -73,7 +73,7 @@ export class GroupDispatcher {
           .filter((member) => member.id !== input.authorMemberId)
           .map((member) => ({
             memberId: member.id,
-            reason: 'mention' as WakeReason,
+            reason: 'mention' as Exclude<WakeReason, 'schedule'>,
             triggerSequence: message.messageSequence,
           })),
         unresolvedMentions: unresolved,
@@ -83,7 +83,8 @@ export class GroupDispatcher {
     // 提到了人但一个都没匹配上 —— 不广播，交给调用方提示。
     if (unresolved.length > 0) return { wakes: [], unresolvedMentions: unresolved };
 
-    const reason: WakeReason = message.senderType === 'member' ? 'follow_up' : 'open_discussion';
+    const reason: Exclude<WakeReason, 'schedule'> =
+      message.senderType === 'member' ? 'follow_up' : 'open_discussion';
 
     // member 消息的自动唤醒有轮次上限；超了就只有 @mention 能唤醒人。
     if (reason === 'follow_up' && this.consecutiveMemberMessages(conversation.id) > this.autoWakeRounds) {
@@ -140,7 +141,7 @@ export class GroupDispatcher {
 
 export interface WakePlan {
   memberId: string;
-  reason: WakeReason;
+  reason: Exclude<WakeReason, 'schedule'>;
   triggerSequence: number;
 }
 

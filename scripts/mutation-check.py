@@ -161,7 +161,7 @@ MUTATIONS = [
         "steps": [
             (
                 "server/team-structure-service.ts",
-                "      if (!isClaimer && !isAdmin && !isCreatorHuman) {\n        throw forbidden('只有当前 claimer 或 Team admin/owner 能 done/cancelled');\n      }\n",
+                "      if (\n        ['in_progress', 'blocked', 'done', 'cancelled'].includes(patch.status) &&\n        !isAdmin &&\n        !isAgentClaimer\n      ) {\n        throw forbidden('只有当前 claimer 或 Team admin/owner 可以改变工作状态');\n      }",
                 "",
             )
         ],
@@ -184,6 +184,165 @@ MUTATIONS = [
             (
                 "server/scheduler-service.ts",
                 "        if (presence.availability === 'paused') continue;\n",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "scheduled run 不随 execution 收口（run 永远停在 running）",
+        "test": "server/test/team-v1.test.ts",
+        "steps": [
+            (
+                "server/team-service.ts",
+                "    } finally {\n      this.settleScheduleRun(executionId);\n    }",
+                "    }",
+            )
+        ],
+    },
+    {
+        "name": "恢复时 completed 的 execution 不收口 run",
+        "test": "server/test/team-v1.test.ts",
+        "steps": [
+            (
+                "server/scheduler-service.ts",
+                "        if (execution.status === 'completed') {\n          this.structure.updateScheduleRun(run.id, { status: 'completed' });\n          continue;\n        }",
+                "        if (execution.status === 'completed') {\n          continue;\n        }",
+            )
+        ],
+    },
+    {
+        "name": "claim 不回写 execution.work_item_id（双向绑定断一面）",
+        "test": "server/test/team-v1.test.ts",
+        "steps": [
+            (
+                "server/team-structure-service.ts",
+                "    if (input.executionId) {\n      this.db\n        .prepare(`UPDATE execution SET work_item_id = ? WHERE id = ? AND work_item_id IS NULL`)\n        .run(id, input.executionId);\n    }",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "claim 不校验 execution 归属（两层检查一起拆）",
+        "test": "server/test/team-v1.test.ts",
+        "steps": [
+            (
+                "server/team-service.ts",
+                "    if (execution.memberId !== input.memberId) {\n      throw forbidden('execution 不属于当前 Member');\n    }",
+                "",
+            ),
+            (
+                "server/team-structure-service.ts",
+                "      if (execution.member_id !== input.memberId) {\n        throw forbidden('Execution 不属于当前 Member');\n      }",
+                "",
+            ),
+        ],
+    },
+    {
+        "name": "一条 execution 可以绑第二个 WorkItem",
+        "test": "server/test/team-v1.test.ts",
+        "steps": [
+            (
+                "server/team-structure-service.ts",
+                "      if (execution.work_item_id && execution.work_item_id !== id) {\n        throw conflict('Execution 已绑定另一个 WorkItem');\n      }",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "release 不验 claimer/admin（谁都能释放别人的 claim）",
+        "test": "server/test/team-v1.test.ts",
+        "steps": [
+            (
+                "server/team-structure-service.ts",
+                "    if (!isClaimer && !isAdmin) {\n      throw forbidden('只有 claimer 或 Team admin/owner 能 release WorkItem');\n    }",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "createSchedule 不查 Member 是否在 conversation 里",
+        "test": "server/test/team-v1.test.ts",
+        "steps": [
+            (
+                "server/team-structure-service.ts",
+                "    if (!memberInConversation) {\n      throw badRequest('Schedule 的 Member 必须属于绑定的 work conversation');\n    }",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "已完成的 once schedule 可以 resume",
+        "test": "server/test/team-v1.test.ts",
+        "steps": [
+            (
+                "server/team-structure-service.ts",
+                "    if (current.status === 'completed' && status === 'active') {\n      throw conflict('已完成的 once schedule 不能 resume');\n    }",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "updateMember 不同步 TeamMembership（归档后仍 active）",
+        "test": "server/test/team-v1.test.ts",
+        "steps": [
+            (
+                "server/team-service.ts",
+                "    if (this.structure && input.status && input.status !== before.status) {\n      const team = this.defaultTeam();\n      this.structure.ensureAgentMembership(team.id, member.id);\n      this.structure.updateMembership(team.id, 'agent', member.id, {\n        status: member.status === 'active' ? 'active' : 'inactive',\n      });\n    }",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "requireActiveMembership 不查 agent 的 member 行（漂移放行）",
+        "test": "server/test/team-v1.test.ts",
+        "steps": [
+            (
+                "server/team-structure-service.ts",
+                "    if (kind === 'agent') {\n      const row = this.db.prepare(`SELECT status FROM member WHERE id = ?`).get(principalId) as\n        | { status: string }\n        | undefined;\n      if (!row || row.status !== 'active') {\n        throw forbidden(`Agent 已归档：${principalId}`);\n      }\n    }",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "updateMembership 不保护最后一个 active owner",
+        "test": "server/test/team-v1.test.ts",
+        "steps": [
+            (
+                "server/team-structure-service.ts",
+                "      if (row.n === 0) {\n        throw conflict('Team 至少必须保留一个 active owner');\n      }",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "Agent 可以被提为 Team owner",
+        "test": "server/test/team-v1.test.ts",
+        "steps": [
+            (
+                "server/team-structure-service.ts",
+                "    if (kind === 'agent' && role === 'owner') {\n      throw badRequest('Agent 不能成为 Team owner');\n    }",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "resolveActor 重新信任 X-Agent-Id 头（身份可伪造）",
+        "test": "server/test/team-v1.test.ts",
+        "steps": [
+            (
+                "server/middleware/teamScope.ts",
+                "  const agentId = (req as { agentMemberId?: unknown }).agentMemberId;",
+                "  const agentId = req.headers['x-agent-id'];",
+            )
+        ],
+    },
+    {
+        "name": "internal 路由不注入 agent 身份（HTTP claim 路径断掉）",
+        "test": "server/test/team-v1.test.ts",
+        "steps": [
+            (
+                "server/routes/internal.ts",
+                "  router.use('/members/:id', (req, _res, next) => {\n    (req as { agentMemberId?: string }).agentMemberId = req.params.id as string;\n    next();\n  });",
                 "",
             )
         ],

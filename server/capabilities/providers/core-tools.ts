@@ -34,7 +34,7 @@ export interface CoreToolHost {
     status?: string;
   }): Promise<string>;
 
-  claimWorkItem(input: { memberId: string; workItemId: string }): Promise<string>;
+  claimWorkItem(input: { memberId: string; executionId: string; workItemId: string }): Promise<string>;
 
   updateWorkItem(input: {
     memberId: string;
@@ -162,7 +162,11 @@ export class CoreTeamToolProvider implements ToolProvider {
           workItemId: z.string().min(1).describe('The work item to claim'),
         }),
         execute: (context, args) =>
-          this.host.claimWorkItem({ memberId: context.memberId, workItemId: String(args.workItemId) }),
+          this.host.claimWorkItem({
+            memberId: context.memberId,
+            executionId: context.executionId,
+            workItemId: String(args.workItemId),
+          }),
       },
       {
         providerId: this.id,

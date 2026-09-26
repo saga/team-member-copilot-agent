@@ -413,7 +413,7 @@ export class ConversationMemberService {
  * 所以读回来必须过这一层：认不出来的一律按最宽松的 open_discussion 处理。
  * RecoveryService 也用它，两处读同一列不能有两套判据。
  */
-export function asWakeReason(value: string | null): WakeReason {
+export function asWakeReason(value: string | null): Exclude<WakeReason, 'schedule'> {
   return value === 'direct' || value === 'mention' || value === 'follow_up'
     ? value
     : 'open_discussion';

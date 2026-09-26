@@ -379,15 +379,15 @@ export interface ConversationMemberState {
 /**
  * 一次还没被处理完的唤醒：谁、在哪个房间、因为哪条消息、为什么。
  *
- * 它是 scheduler 的入队单位，也是落库的重放单位 —— 两个用途共用同一个形状，
- * 这样「恢复出来的那一轮」与「当时那一轮」在结构上不可能不一致。
+ * 它只服务 conversation wake，不承载 schedule。Scheduled work 走
+ * ScheduledWakeRun → Execution → runScheduledExecution，不经过
+ * MemberTurnScheduler，两者不能被错误 coalesce。
  */
 export interface PendingWake {
   conversationId: string;
   memberId: string;
-  reason: WakeReason;
+  reason: Exclude<WakeReason, 'schedule'>;
   triggerSequence: number;
-  workItemId?: string | null;
 }
 
 /**

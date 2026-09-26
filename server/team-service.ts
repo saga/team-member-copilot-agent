@@ -10,7 +10,7 @@ import { ConversationMemberService } from './conversation-member-service.js';
 import { GroupDispatcher, type DispatchPlan, type WakePlan } from './group-dispatcher.js';
 import { MemberTurnScheduler } from './member-turn-scheduler.js';
 import { NO_REPLY_SENTINEL, parseMemberTurnOutcome } from './member-decision.js';
-import { badRequest, conflict, notFound } from './http-error.js';
+import { badRequest, conflict, forbidden, notFound } from './http-error.js';
 import { MemberConversationService, isMemberDm, type MemberDirectMessage } from './member-conversation-service.js';
 import {
   MemberService,
@@ -405,10 +405,21 @@ export class TeamService {
   updateMember(id: string, input: UpdateMemberInput): Member {
     // 归档意味着「不再接活」，所以它必须等手上的活干完再落地。不然会留下
     // 「消息有、wake 有、execution 没有」的洞 —— 见 assertMemberNotBusy。
-    if (input.status === 'archived' && this.members.get(id).status !== 'archived') {
+    const before = this.members.get(id);
+    if (input.status === 'archived' && before.status !== 'archived') {
       this.assertMemberNotBusy(id, '归档');
     }
-    return this.members.update(id, input);
+    const member = this.members.update(id, input);
+    // 成员归档/恢复后同步 TeamMembership：Member.status 与 membership.status
+    // 不能漂移成「已归档但仍 active」。
+    if (this.structure && input.status && input.status !== before.status) {
+      const team = this.defaultTeam();
+      this.structure.ensureAgentMembership(team.id, member.id);
+      this.structure.updateMembership(team.id, 'agent', member.id, {
+        status: member.status === 'active' ? 'active' : 'inactive',
+      });
+    }
+    return member;
   }
 
   // ---------------------------------------------------------- Conversation
@@ -951,7 +962,7 @@ export class TeamService {
       id: randomUUID(),
       conversationId: conversation.id,
       memberId: member.id,
-      workItemId: (wake as { workItemId?: string | null }).workItemId ?? null,
+      workItemId: null,
       runtimeId: null,
       parentExecutionId: null,
       delegationPath: [member.id],
@@ -1320,12 +1331,31 @@ export class TeamService {
     });
   }
 
-  async claimWorkItemForAgent(input: { memberId: string; workItemId: string }): Promise<string> {
+  async claimWorkItemForAgent(input: {
+    memberId: string;
+    executionId: string;
+    workItemId: string;
+  }): Promise<string> {
     if (!this.structure) throw notFound('Team 尚未初始化');
-    // 当前 execution 未知时传 null：claim 只锁工作，不绑定执行；scheduler/turn 侧
-    // 在建 execution 时再把 workItemId 写进 execution。
-    const item = this.structure.claimWorkItem(input.workItemId, { memberId: input.memberId });
-    return JSON.stringify({ workItemId: item.id, status: item.status, version: item.version });
+    const execution = this.getExecution(input.executionId);
+    if (execution.memberId !== input.memberId) {
+      throw forbidden('execution 不属于当前 Member');
+    }
+    if (!['queued', 'running'].includes(execution.status)) {
+      throw conflict(`execution 当前状态不能 claim：${execution.status}`);
+    }
+    // claimWorkItem 内会校验 execution 归属/状态并回写 execution.work_item_id。
+    const item = this.structure.claimWorkItem(input.workItemId, {
+      memberId: input.memberId,
+      executionId: input.executionId,
+    });
+    this.assertWorkItemExecutionLink(this.getExecution(input.executionId), item.id);
+    return JSON.stringify({
+      workItemId: item.id,
+      status: item.status,
+      version: item.version,
+      claimedExecutionId: item.claimedExecutionId,
+    });
   }
 
   async updateWorkItemForAgent(input: {
@@ -1615,12 +1645,14 @@ export class TeamService {
   }
 
   /**
-   * Scheduler 入口：为一次到期的 scheduled wake 建 execution 并入队。
+   * Scheduler 入口：为一次到期的 scheduled wake 建 execution。
    *
-   * 不自建 runtime：execution 落进绑定的 work conversation，复用 MemberTurnScheduler
-   * 的串行 + 合并。kind=member_work，wakeReason=schedule，trigger 无消息。
+   * 执行链：ScheduledWake → ScheduledWakeRun → Execution →
+   * runScheduledExecution → executeMemberTurn。不经过 MemberTurnScheduler：
+   * scheduled work 与「某条聊天消息触发的 turn」不是同一种 wake，不能 coalesce。
    */
   async enqueueScheduledWork(input: {
+    scheduleRunId: string;
     conversationId: string;
     memberId: string;
     prompt: string;
@@ -1631,13 +1663,14 @@ export class TeamService {
     if (conversation.kind !== 'work') throw badRequest('Schedule 只能绑定 work conversation');
     const member = this.requireActiveMember(conversation, input.memberId);
     // paused 只拦自动唤醒，@ 点名仍走聊天路径；这里是自动路径，必须检查。
-    try {
-      const team = this.defaultTeam();
-      const stored = this.structure?.getPresence(team.id, 'agent', member.id);
-      if (stored?.availability === 'paused') throw badRequest('Member 已暂停，不接受自动唤醒');
-    } catch (error) {
-      if (this.structure && error instanceof Error && error.message.includes('已暂停')) throw error;
+    const team = this.defaultTeam();
+    const presence = this.structure?.getPresence(team.id, 'agent', member.id);
+    if (presence?.availability === 'paused') {
+      throw badRequest('Member 已暂停，不接受自动唤醒');
     }
+
+    const prompt = input.prompt.trim();
+    if (!prompt) throw badRequest('Schedule prompt 不能为空');
 
     const execution: ExecutionRecord = {
       id: randomUUID(),
@@ -1649,7 +1682,7 @@ export class TeamService {
       delegationPath: [member.id],
       kind: 'member_work',
       status: 'queued',
-      prompt: input.prompt,
+      prompt,
       response: null,
       error: null,
       waitingForRuntimeId: null,
@@ -1662,16 +1695,104 @@ export class TeamService {
       endedAt: null,
       createdAt: now(),
     };
-    this.insertExecution(execution);
-    this.emitExecution(execution);
-    this.scheduler.enqueue({
-      conversationId: conversation.id,
-      memberId: member.id,
-      reason: 'schedule',
-      triggerSequence: conversation.messageSequence,
-      workItemId: execution.workItemId,
+
+    this.transaction(() => {
+      this.insertExecution(execution);
+      this.db
+        .prepare(
+          `
+          UPDATE scheduled_wake_run
+          SET
+            execution_id = ?,
+            status = 'queued'
+          WHERE id = ?
+            AND execution_id IS NULL
+            AND status = 'queued'
+          `,
+        )
+        .run(execution.id, input.scheduleRunId);
     });
+
+    this.emitExecution(execution);
+
+    void this.runScheduledExecution(execution.id);
+
     return execution.id;
+  }
+
+  async runScheduledExecution(executionId: string): Promise<void> {
+    const execution = this.getExecution(executionId);
+    if (execution.kind !== 'member_work' || execution.wakeReason !== 'schedule') {
+      throw badRequest(`不是 scheduled execution：${executionId}`);
+    }
+    if (execution.status !== 'queued') return;
+    const conversation = this.getConversation(execution.conversationId);
+    const member = this.requireActiveMember(conversation, execution.memberId);
+    try {
+      await this.executeMemberTurn({
+        conversation,
+        member,
+        execution,
+        prompt: execution.prompt,
+        triggerMessageSequence: null,
+        turnMode: 'direct',
+        wakeReason: 'schedule',
+      });
+    } catch (error) {
+      // executeMemberTurn 已经收口 execution 状态，这里不再重写终态，避免二次终态。
+      // eslint-disable-next-line no-console
+      console.error(
+        `[team] scheduled execution ${executionId} failed:`,
+        error instanceof Error ? error.message : error,
+      );
+    } finally {
+      this.settleScheduleRun(executionId);
+    }
+  }
+
+  /**
+   * 把 scheduled_wake_run 的终态对齐到 execution：run 停在 running 上没有下文，
+   * 事后审计「这次调度到底成没成」就断了。收口放在 runScheduledExecution 而不是
+   * SchedulerService，tick 与 recovery 两条入口共用同一份记账。
+   * waiting_for_member 等中间态不猜 —— 引擎收口后的下一次 recover 会再走到这里。
+   */
+  private settleScheduleRun(executionId: string): void {
+    const run = this.db
+      .prepare(
+        `SELECT id FROM scheduled_wake_run WHERE execution_id = ? ORDER BY created_at DESC LIMIT 1`,
+      )
+      .get(executionId) as { id: string } | undefined;
+    if (!run) return;
+    const execution = this.getExecution(executionId);
+    if (execution.status === 'completed') {
+      this.db
+        .prepare(
+          `UPDATE scheduled_wake_run SET status = 'completed', ended_at = ? WHERE id = ? AND status IN ('queued', 'running')`,
+        )
+        .run(now(), run.id);
+      return;
+    }
+    if (
+      execution.status === 'failed' ||
+      execution.status === 'cancelled' ||
+      execution.status === 'interrupted'
+    ) {
+      this.db
+        .prepare(
+          `UPDATE scheduled_wake_run SET status = 'failed', error = ?, ended_at = ? WHERE id = ? AND status IN ('queued', 'running')`,
+        )
+        .run(execution.error ?? execution.status, now(), run.id);
+    }
+  }
+
+  /**
+   * WorkItem 与 Execution 双向绑定的内部校验：两者不能漂移成两个独立事实源。
+   * interactive 允许 null；member_delegate 继承父；member_work 由 scheduler/claim 指定。
+   */
+  private assertWorkItemExecutionLink(execution: ExecutionRecord, workItemId: string): void {
+    if (execution.workItemId !== workItemId) {
+      throw conflict(`Execution ${execution.id} 没有绑定 WorkItem ${workItemId}`);
+    }
   }
 
   /** 是否有未结束的 execution（presence 的 busy 判据，不落库）。 */
