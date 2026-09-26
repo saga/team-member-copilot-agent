@@ -1,0 +1,98 @@
+- generic [ref=e3]:
+  - banner [ref=e4]:
+    - generic [ref=e5]:
+      - generic [ref=e6]: Team Member Copilot Agent
+      - generic [ref=e7]: Member → Conversation → Runtime → Copilot Session
+    - generic [ref=e8]: Copilot 已连接
+  - main [ref=e11]:
+    - generic [ref=e12]:
+      - complementary [ref=e13]:
+        - generic [ref=e15]:
+          - generic [ref=e16]:
+            - button "Team Members (3)" [expanded] [ref=e17] [cursor=pointer]
+            - generic [ref=e25]:
+              - button "user-add 新建 Member" [ref=e27] [cursor=pointer]:
+                - img "user-add" [ref=e29]
+                - generic [ref=e32]: 新建 Member
+              - generic [ref=e33]:
+                - generic [ref=e34]:
+                  - generic [ref=e35]:
+                    - generic [ref=e36]: S
+                    - superscript [ref=e38]
+                  - generic [ref=e39]:
+                    - generic [ref=e40]:
+                      - strong [ref=e42]: Security Reviewer
+                      - generic [ref=e43]: available
+                    - generic [ref=e44]: "@security · Financial Services Security & Architecture Reviewer"
+                    - generic [ref=e45]:
+                      - button "message Chat" [ref=e46] [cursor=pointer]:
+                        - img "message" [ref=e48]
+                        - generic [ref=e51]: Chat
+                      - button "setting Edit" [ref=e52] [cursor=pointer]:
+                        - img "setting" [ref=e54]
+                        - generic [ref=e57]: Edit
+                - generic [ref=e58]:
+                  - generic [ref=e59]:
+                    - generic [ref=e60]: S
+                    - superscript [ref=e62]
+                  - generic [ref=e63]:
+                    - generic [ref=e64]:
+                      - strong [ref=e66]: Senior Software Engineer
+                      - generic [ref=e67]: available
+                    - generic [ref=e68]: "@engineer · Senior Financial Services Software Engineer"
+                    - generic [ref=e69]:
+                      - button "message Chat" [ref=e70] [cursor=pointer]:
+                        - img "message" [ref=e72]
+                        - generic [ref=e75]: Chat
+                      - button "setting Edit" [ref=e76] [cursor=pointer]:
+                        - img "setting" [ref=e78]
+                        - generic [ref=e81]: Edit
+                - generic [ref=e82]:
+                  - generic [ref=e83]:
+                    - generic [ref=e84]: S
+                    - superscript [ref=e86]
+                  - generic [ref=e87]:
+                    - generic [ref=e88]:
+                      - strong [ref=e90]: Senior Solution Architect
+                      - generic [ref=e91]: available
+                    - generic [ref=e92]: "@architect · Senior Financial Services Solution Architect"
+                    - generic [ref=e93]:
+                      - button "message Chat" [ref=e94] [cursor=pointer]:
+                        - img "message" [ref=e96]
+                        - generic [ref=e99]: Chat
+                      - button "setting Edit" [ref=e100] [cursor=pointer]:
+                        - img "setting" [ref=e102]
+                        - generic [ref=e105]: Edit
+          - button "Projects" [ref=e107] [cursor=pointer]
+          - button "Work" [ref=e114] [cursor=pointer]
+          - button "Schedules" [ref=e121] [cursor=pointer]
+          - generic [ref=e127]:
+            - button "Conversations (1)" [expanded] [ref=e128] [cursor=pointer]
+            - generic [ref=e136]:
+              - list [ref=e140]:
+                - listitem [ref=e141] [cursor=pointer]:
+                  - generic [ref=e143]:
+                    - heading "Security Reviewer" [level=4] [ref=e144]
+                    - generic [ref=e145]:
+                      - generic [ref=e146]: direct
+                      - text: Security Reviewer
+              - button "plus New Team" [ref=e147] [cursor=pointer]:
+                - img "plus" [ref=e149]
+                - generic [ref=e153]: New Team
+      - main [ref=e155]:
+        - generic [ref=e156]:
+          - generic [ref=e157]:
+            - heading "Security Reviewer" [level=4] [ref=e159]
+            - generic [ref=e160]: direct
+          - generic [ref=e162]:
+            - generic [ref=e165]:
+              - generic [ref=e166]: S
+              - superscript [ref=e168]
+            - generic [ref=e169]: To Security Reviewer
+        - generic [ref=e172]:
+          - img "No data" [ref=e174]
+          - generic [ref=e185]: Security Reviewer 会用你自己的记忆、人格和工作区回答；它也可以用 ask_member 把子任务委派给其他成员。
+        - generic [ref=e188]:
+          - textbox "给 Security Reviewer 发消息…" [ref=e189]
+          - button [ref=e192] [cursor=pointer]:
+            - img "arrow-up" [ref=e194]
