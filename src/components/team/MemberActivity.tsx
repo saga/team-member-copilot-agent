@@ -38,27 +38,44 @@ export function MemberActivity({ member }: { member: Member }) {
   const teamName = new Map(teams.map((team) => [team.id, team.name]));
   const recent = conversations.slice(0, 8);
 
+  // 按 Team 分组：先排 Team，再排时间。不建新表，纯展示层分组。
+  const byTeam = new Map<string, Conversation[]>();
+  for (const conversation of recent) {
+    const key = teamName.get(conversation.teamId) ?? 'Team';
+    const list = byTeam.get(key) ?? [];
+    list.push(conversation);
+    byTeam.set(key, list);
+  }
+
   return (
     <Collapse
       ghost
       items={[
         {
           key: 'activity',
-          label: `Recent activity (${conversations.length})`,
+          label: 'Recent activity',
           children:
             recent.length === 0 ? (
               <Typography.Text type="secondary">还没有参与过任何会话。</Typography.Text>
             ) : (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                {recent.map((conversation) => (
-                  <div key={conversation.id}>
-                    <Typography.Text strong ellipsis style={{ display: 'block' }}>
-                      {conversation.title}
-                    </Typography.Text>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                {[...byTeam.entries()].map(([name, items]) => (
+                  <div key={name}>
                     <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                      {teamName.get(conversation.teamId) ?? 'Team'} · {conversation.kind} ·{' '}
-                      {new Date(conversation.updatedAt).toLocaleString()}
+                      {name}
                     </Typography.Text>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 2 }}>
+                      {items.map((conversation) => (
+                        <div key={conversation.id}>
+                          <Typography.Text strong ellipsis style={{ display: 'block' }}>
+                            {conversation.title}
+                          </Typography.Text>
+                          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                            {conversation.kind} · {new Date(conversation.updatedAt).toLocaleString()}
+                          </Typography.Text>
+                        </div>
+                      ))}
+                    </div>
                   </div>
                 ))}
               </div>

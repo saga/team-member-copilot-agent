@@ -114,8 +114,8 @@ export function MemberMemory({ member, kind = 'global' }: MemberMemoryProps) {
     <Space direction="vertical" style={{ width: '100%' }}>
       <span style={{ color: '#666', fontSize: 13 }}>
         {isTeam
-          ? `这段内容只属于当前 Team，每轮都会注入 ${member.name} 的 system prompt，换 Team 后看不到。Agent 干活时也会往这里写 —— 保存时会检查版本，不会把它的写入覆盖掉。`
-          : `这段内容跨所有 Team 稳定，每轮都会注入 ${member.name} 的 system prompt，只放长期习惯，不放某个 Team 的项目事实。Agent 干活时也会往这里写 —— 保存时会检查版本，不会把它的写入覆盖掉。`}
+          ? '这段内容只属于当前 Team。用于记录当前 Team 的工作方式、成员关系、项目事实和长期上下文。Agent 可以在工作过程中记住这里的内容。'
+          : '这段内容跨所有 Team。只放这个 Member 长期稳定的工作习惯、偏好和原则。Agent 不会自动修改这里。'}
       </span>
 
       <Input.TextArea

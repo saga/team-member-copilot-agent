@@ -104,7 +104,11 @@ export function MemberEditor({ member, onSaved, onCancel }: MemberEditorProps) {
       <Form.Item name="description" label="Description">
         <Input.TextArea placeholder="负责投资研究和事实核查" autoSize />
       </Form.Item>
-      <Form.Item name="style" label="Personality / Style">
+      <Form.Item
+        name="style"
+        label="Personality / Style"
+        extra="稳定人格 / 工作风格。这个字段跨所有 Team。不要填写当前项目、客户或 Team 的临时要求。"
+      >
         <Input.TextArea placeholder="严谨、怀疑、证据优先、少说废话" autoSize />
       </Form.Item>
       <Form.Item name="systemPrompt" label="System Prompt">
@@ -122,7 +126,7 @@ export function MemberEditor({ member, onSaved, onCancel }: MemberEditorProps) {
           marginBottom: 16,
         }}
       >
-        Capabilities 在顶栏的 Capabilities 配置窗口里配（Member 页签）。Global / Team
+        Capabilities 在左侧 Settings 里配（Member 页签）。Global / Team
         两层能力会自动继承到这个 Member。
       </span>
 
