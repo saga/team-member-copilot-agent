@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import type { TeamService } from '../team-service.js';
+import type { CapabilityRegistry } from '../capabilities/registry.js';
 import { sendError } from '../middleware/errorHandler.js';
 import { isAdminAuthorized } from '../middleware/apiScope.js';
 import { isTeamAdmin } from '../middleware/teamScope.js';
@@ -36,8 +37,17 @@ const capabilitiesSchema = z.object({
   tools: z.array(bindingSchema).max(100),
 });
 
-export function capabilitiesRouter(team: TeamService) {
+export function capabilitiesRouter(team: TeamService, registry: CapabilityRegistry) {
   const router = Router();
+
+  // 平台装了哪些 Provider：管理界面列选项用，不暴露任何实现细节。
+  router.get('/providers', (req, res) => {
+    if (!canAdmin(req)) {
+      res.status(403).json({ error: '需要 Team owner/admin（或有效的 ADMIN_API_TOKEN）' });
+      return;
+    }
+    res.json({ providers: registry.listProviders() });
+  });
 
   router.get('/members/:memberId', (req, res) => {
     try {

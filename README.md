@@ -639,6 +639,7 @@ npm run dev            # 同时启动 client(:5173) + server(:3001)
 | GET | `/api/members/:id/memory` · `PUT` | 该 Member 的长期记忆 → `{ content, version }`；`PUT` 可带 `expectedVersion`，不匹配 `409` |
 | GET | `/api/members/:id/skills` · `POST` · `DELETE` | 该 Member 的 skill（zip 上传 / 卸载）—— 「磁盘上装了什么」，不是「启用了哪个能力来源」 |
 | GET | `/api/capabilities/members/:memberId` · `PUT` | 该 Member 的能力组成（skill / knowledge / tool 的 Provider 引用）。**「能用什么」的唯一写入口** |
+| GET | `/api/capabilities/providers` | 平台已注册的 Provider 清单（`{ kind, id, version }`，owner/admin）—— 管理界面列选项用 |
 | GET | `/api/knowledge/team` · `POST` | team KB 清单 / 新建（`{ key, name, description }`）—— `local.filesystem-knowledge` 的管理面 |
 | POST | `/api/knowledge/bases/:kbId/documents` | 写文档（落盘 + FTS 索引） |
 | POST | `/api/internal/members/:id/direct-messages` | **以 `:id` 的身份**发私聊 —— Internal API，见下 |

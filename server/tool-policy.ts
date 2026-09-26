@@ -1,4 +1,5 @@
 import type { RuntimeTool, ToolDecision, ToolExecutionContext } from './capabilities/types.js';
+import type { PolicyService } from './policy.js';
 
 /**
  * 工具授权层。
@@ -12,23 +13,20 @@ import type { RuntimeTool, ToolDecision, ToolExecutionContext } from './capabili
  * 权限提示」，也就是**无条件执行**；它是省一次交互，不是一次授权。所以真正的
  * 判据必须在每次调用时重新算一遍，而不是在装配 session 时算完就完。
  *
- * ── 这一层不再认识任何工具名 ──────────────────────────────────────────
+ * ── 判据只有四个，全部来自声明，没有一个看工具名 ─────────────────────
  *
- * 判据只有三个，全部来自 RuntimeTool 的声明：
+ *   requiresHostAccess + 部署开关      —— 会触达宿主机的工具要部署层放行
+ *   guard()                            —— Provider 的输入边界判定，只能拒绝
+ *   risk ∈ {external-write, privileged} —— 放行权在 PolicyService（见 policy.ts）
+ *   其余 risk                           —— guard 通过即放行
  *
- *   requiresHostAccess  + 部署开关   —— 会触达宿主机的工具要部署层放行
- *   risk === 'privileged' / 'external-write' —— 高风险动作必须有独立决策：
- *     没有 authorize() 直接拒绝，有则以它的结论为准
- *   authorize()                      —— Provider 自己的逐次判定（路径白名单等）
+ * guard 与 Policy 的分工：guard 是「工具自己最清楚的事」（这条路径在不在
+ * workspace 内），Policy 是「工具自己无资格回答的事」（这笔外部写入该不该发生）。
+ * guard 说不行就一定不行；guard 说行只对低风险工具有效 —— 否则每个 Provider
+ * 都能写一个 `() => ({ allowed: true })` 把自己升级成无限制工具。
  *
  * `if (toolName === 'bash')` 这种写法之所以必须消失：它让「新增一个工具」变成
- * 「改授权层」——于是第三方 / 新 Provider 提供的工具永远无法真正插件化，而且
- * 每加一个工具都要重新审一遍这个文件。现在新增工具只需要在 Provider 里声明
- * 它的 risk，授权层不动。
- *
- * 声明与放行的关系也随之变了：以前是「一份白名单同时喂两边」，现在是
- * 「可用集合 = 解析出来的工具集合」，声明与放行天然同源 —— 引擎看得见的东西
- * 就是解析器交出去的东西。
+ * 「改授权层」。现在新增工具只需要在 Provider 里声明 risk 与实现，授权层不动。
  *
  * ── 默认拒绝 ─────────────────────────────────────────────────────────
  *
@@ -64,7 +62,10 @@ export interface ToolPolicy {
 }
 
 export class DefaultToolPolicy implements ToolPolicy {
-  constructor(private readonly options: ToolPolicyOptions) {}
+  constructor(
+    private readonly options: ToolPolicyOptions,
+    private readonly policyService: PolicyService,
+  ) {}
 
   async check(
     tool: RuntimeTool,
@@ -77,26 +78,13 @@ export class DefaultToolPolicy implements ToolPolicy {
       );
     }
 
-    // privileged 一律拒绝：它要的是独立 Policy 服务的决策，不是 Provider 自己的
-    // authorize() 自证清白 —— 后者让「执行动作的人」同时当「批准动作的人」。
-    if (tool.risk === 'privileged') {
-      return deny('privileged Tool 必须经过独立 Policy 决策，授权层不直接放行');
+    if (tool.guard) {
+      const decision = await tool.guard(context, args);
+      if (!decision.allowed) return decision;
     }
 
-    // external-write 默认拒绝：必须有 authorize() 且它明确放行。
-    // 没有它时直接拒绝 —— 否则以后加一个 send_email（无 authorize）会默认允许。
-    if (tool.risk === 'external-write') {
-      if (!tool.authorize) {
-        return deny('external-write Tool 缺少独立 Policy 决策（authorize），默认拒绝');
-      }
-      const decision = await tool.authorize(context, args);
-      if (!decision.allowed) return decision;
-      return { allowed: true, reason: `policy allow: ${decision.reason}` };
-    }
-
-    if (tool.authorize) {
-      const decision = await tool.authorize(context, args);
-      if (!decision.allowed) return decision;
+    if (tool.risk === 'external-write' || tool.risk === 'privileged') {
+      return this.policyService.decide({ tool, context, args });
     }
 
     return { allowed: true, reason: `provider=${tool.providerId}, risk=${tool.risk}` };

@@ -29,7 +29,9 @@ const HOST_BUILTINS: ReadonlyArray<{
   { name: 'bash', description: 'Execute shell commands.', risk: 'host-execution' },
   { name: 'edit', description: 'Edit files.', risk: 'host-execution' },
   { name: 'grep', description: 'Search files.', risk: 'read' },
-  { name: 'web_fetch', description: 'Fetch web content.', risk: 'external-write' },
+  // 出网取回内容是读外部，不是写外部 —— 标成 external-write 会让它落到
+  // 「必须有独立 Policy 决策」的档位，与它实际做的事不符。
+  { name: 'web_fetch', description: 'Fetch web content.', risk: 'external-read' },
 ];
 
 export class HostCodingToolProvider implements ToolProvider {
@@ -42,6 +44,7 @@ export class HostCodingToolProvider implements ToolProvider {
   ): Promise<RuntimeTool[]> {
     return HOST_BUILTINS.map((tool) => ({
       providerId: this.id,
+      implementation: 'copilot-builtin' as const,
       kind: 'builtin' as const,
       name: tool.name,
       description: tool.description,

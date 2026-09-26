@@ -1,6 +1,12 @@
 import type { MemberCapabilities } from '../domain.js';
 import type { KnowledgeProvider, SkillProvider, ToolProvider } from './types.js';
 
+export interface ProviderDescriptor {
+  kind: 'skill' | 'knowledge' | 'tool';
+  id: string;
+  version: string;
+}
+
 /**
  * Provider 注册表。
  *
@@ -26,24 +32,37 @@ export class CapabilityRegistry {
   private readonly tools = new Map<string, ToolProvider>();
 
   registerSkillProvider(provider: SkillProvider): void {
-    if (this.skills.has(provider.id)) {
-      throw new Error(`重复 Skill Provider：${provider.id}`);
-    }
+    this.assertProviderIdAvailable(provider.id);
     this.skills.set(provider.id, provider);
   }
 
   registerKnowledgeProvider(provider: KnowledgeProvider): void {
-    if (this.knowledge.has(provider.id)) {
-      throw new Error(`重复 Knowledge Provider：${provider.id}`);
-    }
+    this.assertProviderIdAvailable(provider.id);
     this.knowledge.set(provider.id, provider);
   }
 
   registerToolProvider(provider: ToolProvider): void {
-    if (this.tools.has(provider.id)) {
-      throw new Error(`重复 Tool Provider：${provider.id}`);
-    }
+    this.assertProviderIdAvailable(provider.id);
     this.tools.set(provider.id, provider);
+  }
+
+  /**
+   * Provider ID 跨三类全局唯一。
+   *
+   * binding 里只有 `providerId`，没有类型 —— 类型由 binding 所在的数组表达。
+   * 同一个 ID 同时出现在两类里时，`providerId` 就不再指向唯一的实现，
+   * 「按 ID 谈论一个 Provider」这件事（审计、管理界面、远程策略）失去根基。
+   */
+  private assertProviderIdAvailable(id: string): void {
+    for (const [kind, map] of [
+      ['skill', this.skills],
+      ['knowledge', this.knowledge],
+      ['tool', this.tools],
+    ] as const) {
+      if (map.has(id)) {
+        throw new Error(`重复 Capability Provider：${id}（已被 ${kind} Provider 占用）`);
+      }
+    }
   }
 
   skillProvider(id: string): SkillProvider {
@@ -70,6 +89,23 @@ export class CapabilityRegistry {
       knowledge: [...this.knowledge.keys()].sort(),
       tools: [...this.tools.keys()].sort(),
     };
+  }
+
+  /** 平台当前装了哪些 Provider。管理界面据此列选项，而不是去猜 ID。 */
+  listProviders(): ProviderDescriptor[] {
+    const descriptors: ProviderDescriptor[] = [];
+    for (const [id, provider] of this.skills) {
+      descriptors.push({ kind: 'skill', id, version: provider.version });
+    }
+    for (const [id, provider] of this.knowledge) {
+      descriptors.push({ kind: 'knowledge', id, version: provider.version });
+    }
+    for (const [id, provider] of this.tools) {
+      descriptors.push({ kind: 'tool', id, version: provider.version });
+    }
+    return descriptors.sort((a, b) =>
+      `${a.kind}\u0000${a.id}`.localeCompare(`${b.kind}\u0000${b.id}`),
+    );
   }
 
   /**

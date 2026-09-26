@@ -40,7 +40,13 @@ const { createTestStack, capabilityContext, singleExecutionId, muteAllMembers, S
   await import('./support.js');
 
 import type { MemberCapabilities } from '../domain.js';
+import type { PolicyService } from '../policy.js';
 import type { ToolExecutionContext } from '../capabilities/types.js';
+
+/** 高风险拒绝桩：与生产 DenyHighRiskPolicyService 同语义，理由可断言。 */
+function denyHighRisk(): PolicyService {
+  return { decide: (input) => ({ allowed: false, reason: `risk=${input.tool.risk} 需要独立 Policy 决策` }) };
+}
 import type {
   CapabilityContext,
   KnowledgeProvider,
@@ -156,7 +162,7 @@ function builtinTool(
   name: string,
   overrides: Partial<RuntimeTool> = {},
 ): RuntimeTool {
-  return { providerId, kind: 'builtin', name, description: 'stub', risk: 'read', ...overrides };
+  return { providerId, implementation: 'app', kind: 'builtin', name, description: 'stub', risk: 'read', ...overrides };
 }
 
 /** 一份最小的三类能力组成，供 manifest 用例逐项微调。 */
@@ -208,15 +214,15 @@ describe('Registry：Provider ID 是稳定契约', () => {
   it('重复注册同一个 ID 直接抛 —— 否则「谁在用哪个实现」取决于注册顺序', () => {
     assert.throws(
       () => registryOf({ skills: [skillProvider('dupe'), skillProvider('dupe')] }),
-      /重复 Skill Provider：dupe/,
+      /重复 Capability Provider：dupe（已被 skill Provider 占用）/,
     );
     assert.throws(
       () => registryOf({ knowledge: [knowledgeProvider('dupe'), knowledgeProvider('dupe')] }),
-      /重复 Knowledge Provider：dupe/,
+      /重复 Capability Provider：dupe（已被 knowledge Provider 占用）/,
     );
     assert.throws(
       () => registryOf({ tools: [toolProvider('dupe'), toolProvider('dupe')] }),
-      /重复 Tool Provider：dupe/,
+      /重复 Capability Provider：dupe（已被 tool Provider 占用）/,
     );
   });
 
@@ -225,6 +231,32 @@ describe('Registry：Provider ID 是稳定契约', () => {
     assert.throws(() => registry.skillProvider('ghost'), /未注册 Skill Provider：ghost/);
     assert.throws(() => registry.knowledgeProvider('ghost'), /未注册 Knowledge Provider：ghost/);
     assert.throws(() => registry.toolProvider('ghost'), /未注册 Tool Provider：ghost/);
+  });
+
+  it('同一个 ID 跨三类冲突也直接抛（binding 里没有类型，ID 必须全局唯一）', () => {
+    // binding 只写 providerId，类型由所在数组表达。同一个 ID 出现在两类里时，
+    // 「按 ID 谈论一个 Provider」（审计、管理界面、远程策略）就失去了根基。
+    const registry = registryOf({ skills: [skillProvider('foo', '1', [])] });
+
+    assert.throws(
+      () => registry.registerKnowledgeProvider(knowledgeProvider('foo')),
+      /已被 skill Provider 占用/,
+    );
+    assert.throws(() => registry.registerToolProvider(toolProvider('foo', '1', [])), /已被 skill Provider 占用/);
+  });
+
+  it('listProviders 三类合一、带 kind 与 version', () => {
+    const registry = registryOf({
+      skills: [skillProvider('s.a', '1', [])],
+      knowledge: [knowledgeProvider('k.a')],
+      tools: [toolProvider('t.a', '2', [])],
+    });
+
+    assert.deepEqual(registry.listProviders(), [
+      { kind: 'knowledge', id: 'k.a', version: '1' },
+      { kind: 'skill', id: 's.a', version: '1' },
+      { kind: 'tool', id: 't.a', version: '2' },
+    ]);
   });
 });
 
@@ -276,6 +308,33 @@ describe('manifest：描述能力组成，不描述是谁', () => {
     );
 
     assert.notEqual(alpha, beta);
+  });
+
+  it('binding 变化 → 哈希变，即使解析结果一模一样（「配了但失效」不能伪装成「没配」）', async () => {
+    // Provider 的 resolve 忽略 selector 时，只记解析结果的话两条配置哈希相同 ——
+    // 审计分不清「没配」和「配了但指向的目标不存在」。declared bindings 进哈希。
+    const base = await manifestHash(manifestCapabilities());
+    const withSelector = await manifestHash(
+      manifestCapabilities({ tools: [{ providerId: 'stub.tools', selector: 'other' }] }),
+    );
+
+    assert.notEqual(base, withSelector);
+  });
+
+  it('工具的 implementation 变化 → 哈希变（audit 要能回答「这段代码跑在哪」）', async () => {
+    const base = await manifestHash(manifestCapabilities());
+    const asBuiltin = await manifestHash(
+      manifestCapabilities(),
+      manifestRegistry({
+        tools: [
+          toolProvider('stub.tools', '1', [
+            builtinTool('stub.tools', 'lookup', { implementation: 'copilot-builtin' }),
+          ]),
+        ],
+      }),
+    );
+
+    assert.notEqual(base, asBuiltin);
   });
 
   it('工具声明的形状变化 → 哈希变（名字 / risk / 是否需要宿主权限都算）', async () => {
@@ -462,7 +521,7 @@ describe('默认能力', () => {
 // ═══════════════════════════════════════════════ 5. Adapter
 
 describe('Adapter：声明与授权同源', () => {
-  const policy = new DefaultToolPolicy({ allowHostTools: false });
+  const policy = new DefaultToolPolicy({ allowHostTools: false }, denyHighRisk());
   const adapter = new CopilotCapabilityAdapter(policy);
   const context = capabilityContext('adapter-member');
 
@@ -508,12 +567,13 @@ describe('Adapter：声明与授权同源', () => {
         toolProvider('guarded.tools', '1', [
           {
             providerId: 'guarded.tools',
+            implementation: 'app',
             kind: 'custom',
             name: 'dangerous',
             description: 'stub',
             risk: 'external-write',
             parameters: {},
-            authorize: () => ({ allowed: false, reason: '策略拒绝' }),
+            guard: () => ({ allowed: false, reason: '策略拒绝' }),
             execute: () => {
               executed += 1;
               return 'did it';
@@ -540,6 +600,7 @@ describe('Adapter：声明与授权同源', () => {
         toolProvider('open.tools', '1', [
           {
             providerId: 'open.tools',
+            implementation: 'app',
             kind: 'custom',
             name: 'harmless',
             description: 'stub',

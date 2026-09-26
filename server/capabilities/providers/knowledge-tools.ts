@@ -41,6 +41,7 @@ export class KnowledgeToolProvider implements ToolProvider {
     return [
       {
         providerId: this.id,
+      implementation: 'app' as const,
         kind: 'custom',
         name: 'search_knowledge',
         description:
@@ -72,6 +73,7 @@ export class KnowledgeToolProvider implements ToolProvider {
       },
       {
         providerId: this.id,
+      implementation: 'app' as const,
         kind: 'custom',
         name: 'open_knowledge_document',
         description:

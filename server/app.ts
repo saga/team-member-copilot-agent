@@ -16,6 +16,7 @@ import { CoreTeamToolProvider } from './capabilities/providers/core-tools.js';
 import { KnowledgeToolProvider } from './capabilities/providers/knowledge-tools.js';
 import { HostCodingToolProvider } from './capabilities/providers/host-tools.js';
 import { DefaultToolPolicy } from './tool-policy.js';
+import { DenyHighRiskPolicyService } from './policy.js';
 import { TeamStructureService } from './team-structure-service.js';
 import { SchedulerService } from './scheduler-service.js';
 import { TeamEventService } from './team-event-service.js';
@@ -90,7 +91,10 @@ registry.registerToolProvider(new HostCodingToolProvider());
 const capabilityResolver = new CapabilityResolver(registry);
 
 const copilotService = new CopilotService({
-  toolPolicy: new DefaultToolPolicy({ allowHostTools: config.allowHostCodingTools }),
+  toolPolicy: new DefaultToolPolicy(
+    { allowHostTools: config.allowHostCodingTools },
+    new DenyHighRiskPolicyService(),
+  ),
 });
 
 teamService = new TeamService(
@@ -119,7 +123,7 @@ app.use(express.json({ limit: '1mb' }));
 
 app.use('/api/health', healthRouter);
 app.use('/api/members', membersRouter(teamService));
-app.use('/api/capabilities', capabilitiesRouter(teamService));
+app.use('/api/capabilities', capabilitiesRouter(teamService, registry));
 app.use('/api/knowledge', knowledgeRouter(localKnowledgeProvider));
 app.use('/api/team', teamRouter(structureService, teamEvents));
 app.use('/api/conversations', conversationsRouter(teamService));

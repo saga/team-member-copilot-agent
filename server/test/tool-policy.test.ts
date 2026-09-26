@@ -1,8 +1,14 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { DefaultToolPolicy } from '../tool-policy.js';
+import type { PolicyService } from '../policy.js';
 import { HOST_BUILTIN_NAMES } from '../capabilities/providers/host-tools.js';
-import type { RuntimeTool, ToolExecutionContext, ToolRisk } from '../capabilities/types.js';
+import type {
+  RuntimeTool,
+  ToolDecision,
+  ToolExecutionContext,
+  ToolRisk,
+} from '../capabilities/types.js';
 
 /**
  * 工具授权层。
@@ -13,17 +19,33 @@ import type { RuntimeTool, ToolExecutionContext, ToolRisk } from '../capabilitie
  *
  * ── 这一组用例真正在锁的东西 ──────────────────────────────────────────
  *
- * 判据只有三个，全部来自 RuntimeTool 的声明：`requiresHostAccess` + 部署开关、
- * `risk === 'privileged'`、`authorize()`。**没有一条看工具名**。
+ * 判据只有四个，全部来自 RuntimeTool 的声明：`requiresHostAccess` + 部署开关、
+ * `guard()`、`risk ∈ {external-write, privileged}` 是否走 PolicyService。
+ * **没有一条看工具名**。
  *
  * 「不看名字」这件事没法靠「bash 被拒了」来证明 —— 旧实现里 `if (name === 'bash')`
  * 同样会让那条断言通过。所以下面反复用同一个手法：**造一个名字从未出现过的工具**，
  * 用同样的声明走一遍，看结论是否与 `bash` 一致。反过来也造一个叫 `bash` 但声明
  * 是个普通读工具的家伙，它必须被放行。名字一旦参与判定，这两条立刻会红。
+ *
+ * ── guard 与 PolicyService 的边界 ─────────────────────────────────────
+ *
+ * guard 的「允许」只对低风险工具有效。高风险工具即使 guard 放行，也必须落到
+ * PolicyService —— 用例专门造一个「guard 说可以」的 privileged 工具，断言结论
+ * 仍由 PolicyService 给出。没有这条，任何 Provider 都能写一个
+ * `() => ({ allowed: true })` 把自己升级成无限制工具。
  */
 
-function policy(allowHostTools: boolean): DefaultToolPolicy {
-  return new DefaultToolPolicy({ allowHostTools });
+const DENY_HIGH_RISK: PolicyService = {
+  decide: (input) => ({ allowed: false, reason: `policy deny: risk=${input.tool.risk}` }),
+};
+
+const ALLOW_HIGH_RISK: PolicyService = {
+  decide: (input) => ({ allowed: true, reason: `policy allow: ${input.tool.name}` }),
+};
+
+function policy(allowHostTools: boolean, highRisk: PolicyService = DENY_HIGH_RISK): DefaultToolPolicy {
+  return new DefaultToolPolicy({ allowHostTools }, highRisk);
 }
 
 const ALLOW_HOST = true;
@@ -32,6 +54,7 @@ const WITHHOLD_HOST = false;
 function tool(overrides: Partial<RuntimeTool> = {}): RuntimeTool {
   return {
     providerId: 'test.provider',
+    implementation: 'app',
     kind: 'custom',
     name: 'ask_member',
     description: 'test tool',
@@ -54,7 +77,7 @@ async function decide(
   layer: DefaultToolPolicy,
   subject: RuntimeTool,
   args: Record<string, unknown> = {},
-) {
+): Promise<ToolDecision> {
   return layer.check(subject, context(subject.name), args);
 }
 
@@ -64,6 +87,7 @@ function hostTools(): RuntimeTool[] {
     ...HOST_BUILTIN_NAMES.map((name) =>
       tool({
         providerId: 'runtime.host-coding-tools',
+        implementation: 'copilot-builtin',
         kind: 'builtin',
         name,
         risk: 'host-execution',
@@ -72,6 +96,7 @@ function hostTools(): RuntimeTool[] {
     ),
     tool({
       providerId: 'someone.else',
+      implementation: 'copilot-builtin',
       kind: 'builtin',
       name: 'a_tool_invented_after_this_test_was_written',
       risk: 'host-execution',
@@ -81,10 +106,10 @@ function hostTools(): RuntimeTool[] {
 }
 
 describe('check：判据来自声明，不来自名字', () => {
-  it('read / self-write / coordination 都不需要额外开关', async () => {
+  it('read / self-write / coordination / external-read 都不需要额外开关', async () => {
     const layer = policy(WITHHOLD_HOST);
 
-    for (const risk of ['read', 'self-write', 'coordination'] as ToolRisk[]) {
+    for (const risk of ['read', 'self-write', 'coordination', 'external-read'] as ToolRisk[]) {
       const decision = await decide(layer, tool({ risk }));
       assert.equal(decision.allowed, true, `risk=${risk} 不该被拒：${decision.reason}`);
     }
@@ -120,34 +145,43 @@ describe('check：判据来自声明，不来自名字', () => {
     assert.equal(decision.allowed, true, `被按名字拒了：${decision.reason}`);
   });
 
-  it('privileged 一律拒绝 —— 部署全开、authorize 说可以也不行', async () => {
-    const layer = policy(ALLOW_HOST);
+  it('privileged 一律落 PolicyService —— guard 说可以也不行', async () => {
+    // Provider 不能批准自己的高风险动作：guard 的「允许」到 privileged 这里失效，
+    // 结论必须来自 PolicyService（这里给的是拒绝桩，理由必须出自它）。
+    const layer = policy(ALLOW_HOST, DENY_HIGH_RISK);
     const subject = tool({
       name: 'submit_trade',
       risk: 'privileged',
-      authorize: () => ({ allowed: true, reason: '这一笔在额度内' }),
+      guard: () => ({ allowed: true, reason: '这一笔在额度内' }),
     });
 
     const decision = await decide(layer, subject);
 
     assert.equal(decision.allowed, false);
-    assert.match(decision.reason, /privileged/);
+    assert.match(decision.reason, /policy deny/);
+    assert.doesNotMatch(decision.reason, /额度内/);
   });
 
-  it('privileged 也不需要部署开关就能拒绝（不依赖 HOST_CODING_TOOLS 恰好关着）', async () => {
+  it('privileged + PolicyService 放行 → 放行（决策权确实在 Policy 手里）', async () => {
+    const decision = await decide(policy(ALLOW_HOST, ALLOW_HIGH_RISK), tool({ risk: 'privileged' }));
+    assert.equal(decision.allowed, true);
+    assert.match(decision.reason, /policy allow/);
+  });
+
+  it('privileged 的拒绝不依赖部署开关恰好关着', async () => {
     const decision = await decide(policy(WITHHOLD_HOST), tool({ risk: 'privileged' }));
     assert.equal(decision.allowed, false);
-    assert.match(decision.reason, /privileged/);
+    assert.match(decision.reason, /policy deny/);
   });
 });
 
-describe('check：authorize 是逐次判定，不是第二份白名单', () => {
-  it('authorize 说不行 → 拒绝，理由原样带出来', async () => {
+describe('check：guard 是逐次判定，不是第二份白名单', () => {
+  it('guard 说不行 → 拒绝，理由原样带出来', async () => {
     const layer = policy(ALLOW_HOST);
     const subject = tool({
       name: 'read_file',
       risk: 'read',
-      authorize: (_context, args) =>
+      guard: (_context, args) =>
         String(args.path ?? '').startsWith('/workspace/')
           ? { allowed: true, reason: '在 workspace 内' }
           : { allowed: false, reason: `路径不在 workspace 内：${String(args.path)}` },
@@ -161,16 +195,52 @@ describe('check：authorize 是逐次判定，不是第二份白名单', () => {
     assert.match(outside.reason, /不在 workspace 内/);
   });
 
-  it('authorize 是 async 的也照常判（远端策略、查库都行）', async () => {
+  it('guard 是 async 的也照常判（查库、远端校验都行）', async () => {
     const layer = policy(ALLOW_HOST);
     const subject = tool({
-      risk: 'external-write',
-      authorize: async () => ({ allowed: false, reason: '远端策略拒绝' }),
+      risk: 'read',
+      guard: async () => ({ allowed: false, reason: '远端校验拒绝' }),
     });
 
     const decision = await decide(layer, subject);
     assert.equal(decision.allowed, false);
-    assert.match(decision.reason, /远端策略拒绝/);
+    assert.match(decision.reason, /远端校验拒绝/);
+  });
+
+  it('guard 的拒绝优先于 PolicyService（external-write 先被输入边界挡下）', async () => {
+    const layer = policy(ALLOW_HOST, ALLOW_HIGH_RISK);
+    const subject = tool({
+      risk: 'external-write',
+      guard: () => ({ allowed: false, reason: '参数越界' }),
+    });
+
+    const decision = await decide(layer, subject);
+    assert.equal(decision.allowed, false);
+    assert.match(decision.reason, /参数越界/);
+  });
+});
+
+describe('check：external-write 的放行权在 PolicyService', () => {
+  it('PolicyService 拒绝 → 拒绝（Provider 的 guard 批准不了它）', async () => {
+    const layer = policy(ALLOW_HOST, DENY_HIGH_RISK);
+    const subject = tool({
+      name: 'send_email',
+      risk: 'external-write',
+      guard: () => ({ allowed: true, reason: '收件人在白名单' }),
+    });
+
+    const decision = await decide(layer, subject);
+    assert.equal(decision.allowed, false);
+    assert.match(decision.reason, /policy deny/);
+  });
+
+  it('PolicyService 放行 → 放行', async () => {
+    const decision = await decide(
+      policy(ALLOW_HOST, ALLOW_HIGH_RISK),
+      tool({ name: 'send_email', risk: 'external-write' }),
+    );
+    assert.equal(decision.allowed, true);
+    assert.match(decision.reason, /policy allow/);
   });
 });
 

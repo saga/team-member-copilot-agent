@@ -22,6 +22,7 @@ process.env.HOST_CODING_TOOLS = 'false';
 const { db } = await import('../db.js');
 const { config } = await import('../config.js');
 const { DefaultToolPolicy } = await import('../tool-policy.js');
+import type { PolicyService } from '../policy.js';
 const { FilesystemSkillProvider } = await import('../capabilities/providers/filesystem-skill.js');
 const { KnowledgeToolProvider } = await import('../capabilities/providers/knowledge-tools.js');
 const { CapabilityRegistry } = await import('../capabilities/registry.js');
@@ -32,6 +33,11 @@ const { capabilitiesRouter } = await import('../routes/capabilities.js');
 const { knowledgeRouter } = await import('../routes/knowledge.js');
 import type { RuntimeTool } from '../capabilities/types.js';
 
+/** 高风险拒绝桩：与生产 DenyHighRiskPolicyService 同语义，理由可断言。 */
+function denyHighRisk(): PolicyService {
+  return { decide: (input) => ({ allowed: false, reason: `risk=${input.tool.risk} 需要独立 Policy 决策` }) };
+}
+
 after(() => {
   db.close();
   fs.rmSync(dataDir, { recursive: true, force: true });
@@ -39,10 +45,11 @@ after(() => {
 
 // ---------------------------------------------------------- tool policy
 
-describe('external-write 默认拒绝', () => {
+describe('external-write 的放行权在 PolicyService', () => {
   function tool(overrides: Partial<RuntimeTool> = {}): RuntimeTool {
     return {
       providerId: 'test.provider',
+      implementation: 'app',
       kind: 'custom',
       name: 'send_email',
       description: 'test',
@@ -52,27 +59,38 @@ describe('external-write 默认拒绝', () => {
   }
   const ctx = { memberId: 'm1', conversationId: 'c1', executionId: 'e1', userId: 'u1', toolName: 'send_email' };
 
-  it('没有 authorize 的 external-write 直接拒绝（以后加 send_email 不会默认允许）', async () => {
-    const policy = new DefaultToolPolicy({ allowHostTools: true });
-    const decision = await policy.check(tool({ authorize: undefined }), ctx, {});
+  it('没有 PolicyService 放行时直接拒绝（以后加 send_email 不会默认允许）', async () => {
+    const policy = new DefaultToolPolicy({ allowHostTools: true }, denyHighRisk());
+    const decision = await policy.check(tool({ guard: undefined }), ctx, {});
     assert.equal(decision.allowed, false);
     assert.match(decision.reason, /external-write/);
   });
 
-  it('有 authorize 且放行时才允许；拒绝时原样带回理由', async () => {
-    const policy = new DefaultToolPolicy({ allowHostTools: true });
-    const allowed = await policy.check(
-      tool({ authorize: () => ({ allowed: true, reason: '额度内' }) }),
+  it('guard 说可以也救不了它 —— Provider 不能批准自己的外部写入', async () => {
+    const policy = new DefaultToolPolicy({ allowHostTools: true }, denyHighRisk());
+    const decision = await policy.check(
+      tool({ guard: () => ({ allowed: true, reason: '收件人在白名单' }) }),
       ctx,
       {},
     );
+    assert.equal(decision.allowed, false);
+    assert.match(decision.reason, /external-write/);
+    assert.doesNotMatch(decision.reason, /白名单/);
+  });
+
+  it('PolicyService 放行才允许；拒绝时原样带回理由', async () => {
+    const allow: PolicyService = {
+      decide: (input) =>
+        String((input.args.to as string | undefined) ?? '') === 'allow@corp'
+          ? { allowed: true, reason: '额度内' }
+          : { allowed: false, reason: '远端策略拒绝' },
+    };
+    const policy = new DefaultToolPolicy({ allowHostTools: true }, allow);
+
+    const allowed = await policy.check(tool(), ctx, { to: 'allow@corp' });
     assert.equal(allowed.allowed, true);
 
-    const denied = await policy.check(
-      tool({ authorize: () => ({ allowed: false, reason: '远端策略拒绝' }) }),
-      ctx,
-      {},
-    );
+    const denied = await policy.check(tool(), ctx, { to: 'deny@corp' });
     assert.equal(denied.allowed, false);
     assert.match(denied.reason, /远端策略拒绝/);
   });
@@ -179,7 +197,7 @@ describe('Admin boundary：改 capability boundary 的写入要 token，读不�
   before(async () => {
     const app = express();
     app.use(express.json({ limit: '1mb' }));
-    app.use('/api/capabilities', capabilitiesRouter(stack.team));
+    app.use('/api/capabilities', capabilitiesRouter(stack.team, stack.registry));
     app.use('/api/knowledge', knowledgeRouter(stack.knowledge));
     server = app.listen(0);
     await once(server, 'listening');

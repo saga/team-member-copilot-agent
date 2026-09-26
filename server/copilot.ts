@@ -9,6 +9,7 @@ import type { Member, MemberRuntime } from './domain.js';
 import { CopilotCapabilityAdapter, type CopilotCapabilities } from './capabilities/copilot-adapter.js';
 import type { CapabilityContext, RuntimeCapabilities } from './capabilities/types.js';
 import { DefaultToolPolicy, type ToolPolicy } from './tool-policy.js';
+import { DenyHighRiskPolicyService } from './policy.js';
 
 /**
  * SDK 顶层没有导出 `PreToolUseHookInput` / `PreToolUseHookOutput`（它们在
@@ -154,7 +155,11 @@ export class CopilotService {
 
   constructor(private readonly options: CopilotServiceOptions = {}) {
     this.toolPolicy =
-      options.toolPolicy ?? new DefaultToolPolicy({ allowHostTools: config.allowHostCodingTools });
+      options.toolPolicy ??
+      new DefaultToolPolicy(
+        { allowHostTools: config.allowHostCodingTools },
+        new DenyHighRiskPolicyService(),
+      );
     this.capabilityAdapter = new CopilotCapabilityAdapter(this.toolPolicy);
   }
 

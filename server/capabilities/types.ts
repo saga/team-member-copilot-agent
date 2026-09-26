@@ -145,9 +145,19 @@ export type ToolRisk =
   | 'read'
   | 'self-write'
   | 'coordination'
+  | 'external-read'
   | 'external-write'
   | 'host-execution'
   | 'privileged';
+
+/**
+ * 工具的**实现来源** —— 这段代码跑在哪里、信任边界在谁手里。
+ *
+ * 不写它，audit 只能从 Provider ID 猜（`runtime.host-coding-tools` 是内置的还是
+ * 远端的？）；manifest 里有了它，「这一轮调用的工具由谁执行」才是一条可查的记录。
+ * 它是声明事实，不参与授权判定 —— 放不放行仍然只看 risk / guard / Policy。
+ */
+export type ToolImplementation = 'app' | 'copilot-builtin' | 'mcp' | 'http' | 'script' | 'sdk';
 
 export interface ToolDecision {
   allowed: boolean;
@@ -168,6 +178,8 @@ type ToolParameters = NonNullable<Parameters<typeof defineTool>[1]>['parameters'
 
 export interface RuntimeTool {
   providerId: string;
+  /** 实现来源（见 ToolImplementation）。audit 用，授权判定不看它。 */
+  implementation: ToolImplementation;
   kind: ToolKind;
   name: string;
   description: string;
@@ -184,8 +196,13 @@ export interface RuntimeTool {
     context: ToolExecutionContext,
     args: CapabilityToolArguments,
   ) => Promise<unknown> | unknown;
-  /** 比 risk 更细的逐次判定（比如「这条路径在允许范围内吗」）。 */
-  authorize?: (
+  /**
+   * Provider 对**输入边界**的逐次判定（路径是否在 workspace 内、参数格式是否
+   * 合法）。guard 可以拒绝任何一次调用，但它的「允许」只对低风险工具有效：
+   * external-write / privileged 的放行权在 PolicyService，Provider 不能自己
+   * 批准自己 —— 「执行动作的人」不能同时当「批准动作的人」。
+   */
+  guard?: (
     context: ToolExecutionContext,
     args: CapabilityToolArguments,
   ) => Promise<ToolDecision> | ToolDecision;

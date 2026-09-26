@@ -71,6 +71,7 @@ export class CoreTeamToolProvider implements ToolProvider {
     return [
       {
         providerId: this.id,
+      implementation: 'app' as const,
         kind: 'custom',
         name: 'ask_member',
         description:
@@ -94,6 +95,7 @@ export class CoreTeamToolProvider implements ToolProvider {
       },
       {
         providerId: this.id,
+      implementation: 'app' as const,
         kind: 'custom',
         name: 'message_member',
         description:
@@ -118,6 +120,7 @@ export class CoreTeamToolProvider implements ToolProvider {
       },
       {
         providerId: this.id,
+      implementation: 'app' as const,
         kind: 'custom',
         name: 'remember_member',
         description: 'Persist a durable memory that belongs to the current Team Member.',
@@ -133,6 +136,7 @@ export class CoreTeamToolProvider implements ToolProvider {
       },
       {
         providerId: this.id,
+      implementation: 'app' as const,
         kind: 'custom',
         name: 'list_work_items',
         description:
@@ -153,6 +157,7 @@ export class CoreTeamToolProvider implements ToolProvider {
       },
       {
         providerId: this.id,
+      implementation: 'app' as const,
         kind: 'custom',
         name: 'claim_work_item',
         description:
@@ -170,6 +175,7 @@ export class CoreTeamToolProvider implements ToolProvider {
       },
       {
         providerId: this.id,
+      implementation: 'app' as const,
         kind: 'custom',
         name: 'update_work_item',
         description:

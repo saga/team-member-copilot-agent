@@ -1,5 +1,5 @@
 import { hashText } from '../content-hash.js';
-import type { MemberCapabilities } from '../domain.js';
+import type { CapabilityBinding, MemberCapabilities } from '../domain.js';
 import type { CapabilityRegistry } from './registry.js';
 import type {
   CapabilityContext,
@@ -88,7 +88,7 @@ export class CapabilityResolver {
       knowledge,
       tools: dedupedTools,
       toolIndex: new Map(dedupedTools.map((tool) => [tool.name, tool])),
-      manifestHash: manifestHashOf(dedupedSkills, knowledge, dedupedTools),
+      manifestHash: manifestHashOf(capabilities, dedupedSkills, knowledge, dedupedTools),
     };
   }
 }
@@ -124,11 +124,16 @@ function dedupe<T>(items: T[], keyOf: (item: T) => string, label: string): T[] {
 /**
  * 这一轮能力组成的指纹。
  *
- * 覆盖三件事，缺一件就回答不了「这一轮到底用了哪个能力实现」：
+ * 覆盖四件事，缺一件就回答不了「这一轮到底用了哪个能力实现」：
  *
+ *   声明的 binding  —— Member 当时引用了哪些 Provider + selector
  *   Provider 版本   —— 同一个 ID 背后的实现换了一版
  *   selector        —— 同一个 Provider，指向了另一个资料源
- *   工具的声明形状   —— 名字 / risk / 是否需要宿主权限
+ *   工具的声明形状   —— 实现来源 / 名字 / risk / 是否需要宿主权限
+ *
+ * 只记解析结果有一个盲区：selector 指向不存在的目标时，Provider resolve()
+ * 返回空，「有 binding 但解析为空」与「根本没有 binding」哈希相同 —— 审计时
+ * 分不清「没配」和「配了但失效」。所以 declared bindings 必须单独进哈希。
  *
  * 刻意**不含 memberId**：这个指纹描述的是「能力组成」本身，所以两个配置相同的
  * Member 会得到同一个哈希。带着 memberId 会让「跨成员比较同一套能力」失去意义。
@@ -137,11 +142,17 @@ function dedupe<T>(items: T[], keyOf: (item: T) => string, label: string): T[] {
  * 能力只要 Provider 注册顺序变了就会算出不同的哈希。
  */
 function manifestHashOf(
+  capabilities: MemberCapabilities,
   skills: ResolvedSkill[],
   knowledge: ResolvedKnowledgeBinding[],
   tools: RuntimeTool[],
 ): string {
   const payload = {
+    bindings: {
+      skills: [...capabilities.skills].map(normalizeBinding).sort(byKey((b) => b)),
+      knowledge: [...capabilities.knowledge].map(normalizeBinding).sort(byKey((b) => b)),
+      tools: [...capabilities.tools].map(normalizeBinding).sort(byKey((b) => b)),
+    },
     skills: [...skills]
       .sort(byKey((entry) => `${entry.providerId}\u0000${entry.artifact.name}`))
       .map((entry) => ({
@@ -166,6 +177,7 @@ function manifestHashOf(
       .sort(byKey((tool) => `${tool.providerId}\u0000${tool.name}`))
       .map((tool) => ({
         providerId: tool.providerId,
+        implementation: tool.implementation,
         name: tool.name,
         kind: tool.kind,
         risk: tool.risk,
@@ -174,6 +186,10 @@ function manifestHashOf(
   };
 
   return hashText(JSON.stringify(payload));
+}
+
+function normalizeBinding(binding: CapabilityBinding): string {
+  return `${binding.providerId}\u0000${binding.selector ?? ''}`;
 }
 
 function byKey<T>(keyOf: (item: T) => string): (a: T, b: T) => number {
