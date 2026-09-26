@@ -3,6 +3,7 @@ import path from 'node:path';
 import { hashText } from '../../content-hash.js';
 import type { CapabilityBinding } from '../../domain.js';
 import type { CapabilityContext, SkillArtifact, SkillProvider } from '../types.js';
+import { parseSelectorList } from '../types.js';
 
 /**
  * 磁盘目录即 skill 的 Provider。
@@ -44,7 +45,7 @@ export class FilesystemSkillProvider implements SkillProvider {
 
     // selector 为空 = 全部；否则只加载点名的 skill（逗号/空白分隔）。
     // binding 看起来细粒度、实际全量返回等于没有边界，所以这里必须真的过滤。
-    const only = parseSkillSelector(binding.selector);
+    const only = parseSelectorList(binding.selector);
     const artifacts: SkillArtifact[] = [];
 
     for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
@@ -83,21 +84,6 @@ export class FilesystemSkillProvider implements SkillProvider {
 
     return artifacts.sort((a, b) => a.name.localeCompare(b.name));
   }
-}
-
-/**
- * selector 语义：空 = 全部；否则是 skill 目录名清单（逗号/空白分隔）。
- *
- * 逗号与空白都认：模板里写 `research, security-review` 与 `research security-review`
- * 都是同一件事，不值得为分隔符定第二种语法。
- */
-function parseSkillSelector(selector: string | undefined): Set<string> | null {
-  if (!selector?.trim()) return null;
-  const names = selector
-    .split(/[,\s]+/)
-    .map((name) => name.trim())
-    .filter(Boolean);
-  return names.length > 0 ? new Set(names) : null;
 }
 
 /**

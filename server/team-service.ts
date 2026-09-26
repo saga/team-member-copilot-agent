@@ -35,7 +35,6 @@ import {
   type ExternalWorkSnapshot,
 } from './work-management/types.js';
 import type {
-  CapabilityConfig,
   Conversation,
   ConversationEvent,
   ConversationEventType,
@@ -414,24 +413,10 @@ export class TeamService {
 
   // --------------------------------------------------------------- 能力
 
-  /** 这个 Member 的**私有增量**能力。不是 effective —— 要那一份用 getCapabilityConfig。 */
+  /** 这个 Member 的**私有增量**能力。上面两层继承来的不在这里，看目录接口。 */
   getMemberCapabilities(memberId: string): MemberCapabilities {
     this.members.get(memberId);
     return this.capabilities.getMember(memberId);
-  }
-
-  /**
-   * 三层声明 + 解析结果。
-   *
-   * 管理界面靠它同时回答两个问题：「这个人最终能用什么」（effective）和
-   * 「这些能力分别是哪一层给的」（global / team / member）。
-   */
-  getCapabilityConfig(teamId: string, memberId: string): CapabilityConfig {
-    this.members.get(memberId);
-    if (this.structure) {
-      this.structure.getTeam(teamId);
-    }
-    return this.capabilities.getConfig(teamId, memberId);
   }
 
   getGlobalCapabilities(): MemberCapabilities {

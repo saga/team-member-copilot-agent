@@ -24,6 +24,7 @@ const { db } = await import('../db.js');
 const { config } = await import('../config.js');
 const { FilesystemSkillProvider } = await import('../capabilities/providers/filesystem-skill.js');
 const { KnowledgeToolProvider } = await import('../capabilities/providers/knowledge-tools.js');
+const { SkillService } = await import('../skill-service.js');
 const { createTestStack, capabilityContext, StubCopilot } = await import('./support.js');
 const { MemberService } = await import('../member-service.js');
 const { capabilitiesRouter } = await import('../routes/capabilities.js');
@@ -134,9 +135,16 @@ describe('Admin boundary：改 capability boundary 的写入要 token，读不�
   const member = stack.team.createMember({ name: 'AdminProbe', role: 'T' });
 
   before(async () => {
+    const { initTeamScope } = await import('../middleware/teamScope.js');
+    initTeamScope(stack.structure, stack.structure.ensureDefaultTeam().id);
     const app = express();
     app.use(express.json({ limit: '1mb' }));
-    app.use('/api/capabilities', capabilitiesRouter(stack.team, stack.registry));
+    app.use(
+      '/api/capabilities',
+      capabilitiesRouter(stack.team, stack.registry, new SkillService(db), stack.knowledge, {
+        hostToolsEnabled: false,
+      }),
+    );
     app.use('/api/knowledge', knowledgeRouter(stack.knowledge));
     server = app.listen(0);
     await once(server, 'listening');
@@ -152,20 +160,20 @@ describe('Admin boundary：改 capability boundary 的写入要 token，读不�
   it('配置 ADMIN_API_TOKEN 后：读放行，写无 token 拒绝，带 token 才行', async () => {
     config.adminApiToken = 'admin-secret';
 
-    const read = await fetch(`${base}/api/capabilities/members/${member.id}`);
+    const read = await fetch(`${base}/api/capabilities/catalog?scope=member&memberId=${member.id}`);
     assert.equal(read.status, 200);
 
-    const noToken = await fetch(`${base}/api/capabilities/members/${member.id}`, {
+    const noToken = await fetch(`${base}/api/capabilities/catalog`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ skills: [], knowledge: [], tools: [] }),
+      body: JSON.stringify({ scope: 'member', memberId: member.id, skills: [], knowledge: [], tools: [] }),
     });
     assert.ok(noToken.status === 401 || noToken.status === 403, `期望 401/403，实际 ${noToken.status}`);
 
-    const withToken = await fetch(`${base}/api/capabilities/members/${member.id}`, {
+    const withToken = await fetch(`${base}/api/capabilities/catalog`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json', Authorization: 'Bearer admin-secret' },
-      body: JSON.stringify({ skills: [], knowledge: [], tools: [] }),
+      body: JSON.stringify({ scope: 'member', memberId: member.id, skills: [], knowledge: [], tools: [] }),
     });
     assert.equal(withToken.status, 200);
 

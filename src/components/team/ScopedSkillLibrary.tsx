@@ -18,12 +18,10 @@ interface Props {
  *   team    `.data/team/skills/<teamId>/`
  *   member  `.data/members/<memberId>/skills/`
  *
- * 所以这里只留一个组件、一个 `scope` 参数，而不是三份复制粘贴的实现 ——
- * 复制出来的三份里只要有一份漏了「上传后刷新」或「失败时回滚本地列表」，
- * 那个 scope 就会长期带着一个别人没有的 bug。
+ * 所以这里只留一个组件、一个 `scope` 参数，而不是三份复制粘贴的实现。
  *
- * 它和 `CapabilityBindingEditor` 是两件事：那个回答「启用了哪些 skill
- * 来源」，这个回答「磁盘上装了哪些 skill」。混在一起时界面上会出现
+ * 它回答「磁盘上装了哪些 skill」，启用关系归能力目录（`CapabilitySettings`）：
+ * 那边勾选了这里装的东西，Agent 才能用。两者混在一起时，界面上会出现
  * 「装了一个 skill 却不知道谁在用它」。
  */
 export function ScopedSkillLibrary({ scope, memberId, title }: Props) {

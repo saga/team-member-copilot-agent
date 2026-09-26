@@ -1,115 +1,101 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
-import { Alert, Badge, Button, Collapse, Modal, Select, Space, Spin, Tabs, Tag } from 'antd';
+import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import {
+  Alert,
+  Badge,
+  Button,
+  Checkbox,
+  Collapse,
+  Modal,
+  Popover,
+  Select,
+  Space,
+  Spin,
+  Tabs,
+  Tag,
+  Upload,
+} from 'antd';
+import {
+  DeleteOutlined,
   GlobalOutlined,
+  InfoCircleOutlined,
   ReloadOutlined,
   SaveOutlined,
   TeamOutlined,
+  UploadOutlined,
   UserOutlined,
 } from '@ant-design/icons';
-import { api, type CapabilityBinding, type CapabilityProvider, type Member, type MemberCapabilities } from '../../lib/api';
-import { CapabilityBindingEditor } from './CapabilityBindingEditor';
-import { ScopedSkillLibrary } from './ScopedSkillLibrary';
+import {
+  api,
+  type CatalogScope,
+  type CatalogTool,
+  type Member,
+  type ScopeCatalog,
+} from '../../lib/api';
 
-const EMPTY = (): MemberCapabilities => ({ skills: [], knowledge: [], tools: [] });
+type Scope = CatalogScope;
 
-type Scope = 'global' | 'team' | 'member';
-
-const KINDS = ['skills', 'knowledge', 'tools'] as const;
-
-/**
- * 类别的显示名。
- *
- * 刻意不写「Skills」而写「Skill sources」：这里配的是**启用了哪些来源**，
- * 不是「装了哪些 skill 文件」。磁盘内容在下面的 Skill Files 里。
- * 两个概念同名的话，界面上会出现「明明装了 skill，这里却是空的」这种
- * 看起来像 bug 的正常状态。
- */
-const KIND_LABEL: Record<(typeof KINDS)[number], string> = {
-  skills: 'Skill sources',
-  knowledge: 'Knowledge sources',
-  tools: 'Tools',
-};
-
-const SCOPE_LABEL: Record<Scope, string> = {
-  global: 'Global',
-  team: 'Team',
-  member: 'Member',
-};
-
-/**
- * 合并优先级：global → team → member，**先出现者胜**。
- *
- * 这个顺序同时也是「谁覆盖谁」的答案，下面的 Effective 面板靠它回答
- * 「这条能力是谁给的」。和 `CapabilityService.getEffective` 里的顺序必须一致。
- */
-const LAYER_ORDER: Scope[] = ['global', 'team', 'member'];
+interface Draft {
+  skills: string[];
+  knowledge: string[];
+  tools: string[];
+}
 
 const SCOPE_HINT: Record<Scope, ReactNode> = {
-  global: '公司级基线，所有 Team 与 Member 默认继承。这里的改动会影响所有人。',
-  team: 'Team 级基线，Team 内所有 Agent 继承。它叠在 Global 之上。',
+  global: '这些能力会自动提供给所有 Team 和 Member。这里的改动会影响所有人。',
+  team: '这个 Team 中的所有 Member 自动获得。它叠在公司默认之上。',
   member: (
     <>
-      这里配的是<strong>增量</strong>：这个人比团队多出来的部分。清空 = 退回团队基线，
+      这个 Member <strong>额外拥有</strong>的能力。清空 = 退回团队基线，
       不是变成什么都不会的人。
     </>
   ),
 };
 
+const LAYER_ORDER: Scope[] = ['global', 'team', 'member'];
+
 interface CapabilitySettingsProps {
   onClose: () => void;
 }
 
-/** binding 的合并键。与 `CapabilityService` 的去重键一致（selector 缺省 = 空串）。 */
-function bindingKey(binding: CapabilityBinding): string {
-  return `${binding.providerId}\u0000${binding.selector ?? ''}`;
-}
-
-function formatBinding(binding: CapabilityBinding): string {
-  return binding.selector ? `${binding.providerId} · ${binding.selector}` : binding.providerId;
+/** 服务端目录 → 本地草稿：勾选态即 enabled。 */
+function draftFromCatalog(catalog: ScopeCatalog): Draft {
+  return {
+    skills: catalog.skills.filter((item) => item.enabled).map((item) => item.id),
+    knowledge: catalog.knowledge.filter((item) => item.enabled).map((item) => item.id),
+    tools: catalog.tools.filter((item) => item.enabled).map((item) => item.id),
+  };
 }
 
 /**
- * 能力配置窗口：global / team / member 三层，一个窗口三个页签。
+ * 能力配置窗口：公司默认 / 团队默认 / 这个人，一个窗口三个页签。
  *
- * ── 为什么是「一个窗口」而不是侧栏里的一块 ─────────────────────────────
- *
- * 这三层是**同一件事的三个高度**，而不是三件独立的事。把它们放进同一个窗口的
- * 三个页签，层级关系是看得见的；散在侧栏各处时，「我改的是公司级还是这个人」
- * 只能靠记忆 —— 而这两者的影响面差着一个数量级。
- *
- * ── 编辑的是声明，看到的是结果 ────────────────────────────────────────
- *
- * Member 页签里同时呈现两层信息：上面是**声明**（这个人的增量），下面是
- * **effective**（三层叠加后的真实能力，每条标出是哪一层给的）。只给声明会让人
- * 以为「没配就是没有」—— 而它其实继承了公司级和团队级。
- *
- * ── 未保存的改动不许静默丢 ────────────────────────────────────────────
- *
- * 配置窗口最糟的失败不是「保存失败」，而是编辑被悄悄丢掉：在 Global 页改了
- * 半天，切到 Member 看一眼再关窗 —— 改的东西没了，且没有任何提示。所以关窗
- * 与换人这两处会丢改动的地方都要过一道确认。
+ * 三层是同一件事的三个高度 —— 放在一个窗口里，「我改的是公司级还是这个人」
+ * 才看得见。页签里只出现 Skill / Knowledge / Action 的名字与开关，
+ * providerId / selector 只存在后端。
  */
 export function CapabilitySettings({ onClose }: CapabilitySettingsProps) {
-  const [providers, setProviders] = useState<CapabilityProvider[]>([]);
   const [members, setMembers] = useState<Member[]>([]);
-
   const [scope, setScope] = useState<Scope>('global');
   const [memberId, setMemberId] = useState<string | null>(null);
 
-  const [globalCaps, setGlobalCaps] = useState<MemberCapabilities>(EMPTY);
-  const [teamCaps, setTeamCaps] = useState<MemberCapabilities>(EMPTY);
-  const [memberCaps, setMemberCaps] = useState<MemberCapabilities>(EMPTY);
-  const [effective, setEffective] = useState<MemberCapabilities>(EMPTY);
-
-  /** 有未保存改动的层。保存成功、或该层被服务端状态覆盖时移除。 */
+  const [catalogs, setCatalogs] = useState<Record<Scope, ScopeCatalog | null>>({
+    global: null,
+    team: null,
+    member: null,
+  });
+  const [drafts, setDrafts] = useState<Record<Scope, Draft | null>>({
+    global: null,
+    team: null,
+    member: null,
+  });
   const [dirty, setDirty] = useState<ReadonlySet<Scope>>(new Set());
 
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  /** 会丢改动的动作，等用户确认。null = 没有待确认的动作。 */
-  const [pendingAction, setPendingAction] = useState<{ message: string; run: () => void } | null>(null);
+  const [pendingAction, setPendingAction] = useState<{ message: string; run: () => void } | null>(
+    null,
+  );
 
   const markClean = useCallback((target: Scope) => {
     setDirty((current) => {
@@ -124,14 +110,20 @@ export function CapabilitySettings({ onClose }: CapabilitySettingsProps) {
     setDirty((current) => (current.has(target) ? current : new Set(current).add(target)));
   }, []);
 
-  const reloadMember = useCallback(async () => {
-    if (!memberId) return;
-    const result = await api.getCapabilityConfig(memberId);
-    setMemberCaps(result.config.member);
-    setEffective(result.config.effective);
-  }, [memberId]);
+  const loadScope = useCallback(
+    async (target: Scope, forMemberId: string | null): Promise<void> => {
+      const result = await api.getCapabilityCatalog(
+        target,
+        target === 'member' ? (forMemberId ?? undefined) : undefined,
+      );
+      setCatalogs((current) => ({ ...current, [target]: result.catalog }));
+      setDrafts((current) => ({ ...current, [target]: draftFromCatalog(result.catalog) }));
+      markClean(target);
+    },
+    [markClean],
+  );
 
-  // 首次装配：Provider 清单、两层基线、Member 列表。
+  // 首次装配：两层基线 + Member 列表。默认落在第一个 Member 上。
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
@@ -139,21 +131,25 @@ export function CapabilitySettings({ onClose }: CapabilitySettingsProps) {
 
     void (async () => {
       try {
-        const [providerResult, globalResult, teamResult, memberResult] = await Promise.all([
-          api.listCapabilityProviders(),
-          api.getGlobalCapabilities(),
-          api.getTeamCapabilities(),
-          api.listMembers(),
-        ]);
+        const memberResult = await api.listMembers();
         if (cancelled) return;
-
-        setProviders(providerResult.providers);
-        setGlobalCaps(globalResult.capabilities);
-        setTeamCaps(teamResult.capabilities);
         setMembers(memberResult.members);
-        // 默认落在第一个 Member 上：多数时候进来就是为了看某一个人的能力，
-        // 让人先点一次选择器只是多一步。
-        setMemberId(memberResult.members[0]?.id ?? null);
+        const first = memberResult.members[0]?.id ?? null;
+        setMemberId(first);
+        await Promise.all([
+          (async () => {
+            const result = await api.getCapabilityCatalog('global');
+            if (cancelled) return;
+            setCatalogs((current) => ({ ...current, global: result.catalog }));
+            setDrafts((current) => ({ ...current, global: draftFromCatalog(result.catalog) }));
+          })(),
+          (async () => {
+            const result = await api.getCapabilityCatalog('team');
+            if (cancelled) return;
+            setCatalogs((current) => ({ ...current, team: result.catalog }));
+            setDrafts((current) => ({ ...current, team: draftFromCatalog(result.catalog) }));
+          })(),
+        ]);
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : String(e));
       } finally {
@@ -166,50 +162,53 @@ export function CapabilitySettings({ onClose }: CapabilitySettingsProps) {
     };
   }, []);
 
-  // 换人 / 首次拿到 Member：把 member 层草稿换成这个人的服务端状态。
-  // 草稿被服务端状态覆盖，所以这一层的「未保存」也随之消失。
+  // 换人 / 首次拿到 Member：member 层草稿换成这个人的服务端状态。
   useEffect(() => {
     markClean('member');
     if (!memberId) {
-      setMemberCaps(EMPTY());
-      setEffective(EMPTY());
+      setCatalogs((current) => ({ ...current, member: null }));
+      setDrafts((current) => ({ ...current, member: null }));
       return;
     }
-    void reloadMember().catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)));
-  }, [memberId, reloadMember, markClean]);
+    void loadScope('member', memberId).catch((e: unknown) =>
+      setError(e instanceof Error ? e.message : String(e)),
+    );
+  }, [memberId, loadScope, markClean]);
 
-  function setCurrentCaps(next: (value: MemberCapabilities) => MemberCapabilities): void {
-    if (scope === 'global') setGlobalCaps(next);
-    else if (scope === 'team') setTeamCaps(next);
-    else setMemberCaps(next);
-    markDirty(scope);
+  function toggle(target: Scope, kind: keyof Draft, id: string): void {
+    setDrafts((current) => {
+      const draft = current[target];
+      if (!draft) return current;
+      const selected = draft[kind].includes(id)
+        ? draft[kind].filter((item) => item !== id)
+        : [...draft[kind], id];
+      return { ...current, [target]: { ...draft, [kind]: selected } };
+    });
+    markDirty(target);
   }
 
-  /**
-   * 保存**所有**有改动的层，而不是只保存当前页签。
-   *
-   * 只存当前页签会造出一个安静的陷阱：在 Global 改完、切到 Team 再点保存，
-   * Global 的改动留在草稿里，而用户已经看到「保存成功」。按钮上标出层数，
-   * 点了就是把待保存的都落地。
-   */
+  async function saveScope(target: Scope, draft: Draft): Promise<void> {
+    const result = await api.updateCapabilityCatalog({
+      scope: target,
+      memberId: target === 'member' ? (memberId ?? undefined) : undefined,
+      ...draft,
+    });
+    setCatalogs((current) => ({ ...current, [target]: result.catalog }));
+    setDrafts((current) => ({ ...current, [target]: draftFromCatalog(result.catalog) }));
+    markClean(target);
+  }
+
+  /** 保存所有有改动的层。只存当前页签会让人以为 Global 的改动丢了。 */
   async function saveAll(): Promise<void> {
     setBusy(true);
     setError(null);
     try {
-      if (dirty.has('global')) {
-        setGlobalCaps((await api.updateGlobalCapabilities(globalCaps)).capabilities);
-        markClean('global');
+      for (const target of LAYER_ORDER) {
+        const draft = drafts[target];
+        if (!dirty.has(target) || !draft) continue;
+        if (target === 'member' && !memberId) continue;
+        await saveScope(target, draft);
       }
-      if (dirty.has('team')) {
-        setTeamCaps((await api.updateTeamCapabilities(teamCaps)).capabilities);
-        markClean('team');
-      }
-      if (dirty.has('member') && memberId) {
-        setMemberCaps((await api.updateMemberCapabilities(memberId, memberCaps)).capabilities);
-        markClean('member');
-      }
-      // 改任何一层都会改变 effective —— 保存后立刻重算，别让界面显示旧结果。
-      await reloadMember();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -221,16 +220,12 @@ export function CapabilitySettings({ onClose }: CapabilitySettingsProps) {
     setBusy(true);
     setError(null);
     try {
-      const [providerResult, globalResult, teamResult] = await Promise.all([
-        api.listCapabilityProviders(),
-        api.getGlobalCapabilities(),
-        api.getTeamCapabilities(),
+      await Promise.all([
+        loadScope('global', null),
+        loadScope('team', null),
+        ...(memberId ? [loadScope('member', memberId)] : []),
       ]);
-      setProviders(providerResult.providers);
-      setGlobalCaps(globalResult.capabilities);
-      setTeamCaps(teamResult.capabilities);
       setDirty(new Set());
-      await reloadMember();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -238,7 +233,6 @@ export function CapabilitySettings({ onClose }: CapabilitySettingsProps) {
     }
   }
 
-  /** 会丢改动的动作先问一句；没有改动就直接执行。 */
   function guardDirty(scopes: Scope[], message: string, run: () => void): void {
     if (!scopes.some((item) => dirty.has(item))) {
       run();
@@ -247,91 +241,286 @@ export function CapabilitySettings({ onClose }: CapabilitySettingsProps) {
     setPendingAction({ message, run });
   }
 
-  const layers = useMemo(
-    () => ({ global: globalCaps, team: teamCaps, member: memberCaps }),
-    [globalCaps, teamCaps, memberCaps],
-  );
+  /**
+   * 上传即启用：装完立刻把新 skill 勾上并保存。
+   *
+   * 已经全选（后端 selector 缺省 = 全部）时新 skill 本来就在范围内，
+   * 重载目录即可；否则显式保存一次，避免「装了却没开」的中间态。
+   */
+  async function uploadSkill(target: Scope, file: File): Promise<void> {
+    setBusy(true);
+    setError(null);
+    try {
+      const uploaded = await api.uploadScopedSkill(
+        target,
+        file,
+        target === 'member' ? (memberId ?? undefined) : undefined,
+      );
+      const fresh = await api.getCapabilityCatalog(
+        target,
+        target === 'member' ? (memberId ?? undefined) : undefined,
+      );
+      const draft = draftFromCatalog(fresh.catalog);
+      const newId = `skill.${uploaded.skill.name}`;
+      const next: Draft = draft.skills.includes(newId)
+        ? draft
+        : { ...draft, skills: [...draft.skills, newId] };
+      const saved = await api.updateCapabilityCatalog({
+        scope: target,
+        memberId: target === 'member' ? (memberId ?? undefined) : undefined,
+        ...next,
+      });
+      setCatalogs((current) => ({ ...current, [target]: saved.catalog }));
+      setDrafts((current) => ({ ...current, [target]: draftFromCatalog(saved.catalog) }));
+      markClean(target);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
 
-  function renderBindings(target: Scope) {
-    const caps = target === 'global' ? globalCaps : target === 'team' ? teamCaps : memberCaps;
+  async function removeSkill(target: Scope, name: string): Promise<void> {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.deleteScopedSkill(
+        target,
+        name,
+        target === 'member' ? (memberId ?? undefined) : undefined,
+      );
+      const fresh = await api.getCapabilityCatalog(
+        target,
+        target === 'member' ? (memberId ?? undefined) : undefined,
+      );
+      setCatalogs((current) => ({ ...current, [target]: fresh.catalog }));
+      // 删掉的 id 从草稿里拿掉，其余未保存的改动保留。
+      setDrafts((current) => {
+        const draft = current[target];
+        if (!draft) return current;
+        const removed = `skill.${name}`;
+        return {
+          ...current,
+          [target]: {
+            ...draft,
+            skills: draft.skills.filter((id) => id !== removed),
+          },
+        };
+      });
+      markDirty(target);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function renderSkills(target: Scope) {
+    const catalog = catalogs[target];
+    const draft = drafts[target];
+    if (!catalog || !draft) return <Spin size="small" tip="Loading…" />;
+
     return (
-      <Collapse
-        defaultActiveKey={[...KINDS]}
-        items={KINDS.map((kind) => ({
-          key: kind,
-          label: (
-            <Space size={6}>
-              <span>{KIND_LABEL[kind]}</span>
-              <Tag style={{ marginInlineEnd: 0 }}>{caps[kind].length}</Tag>
-            </Space>
-          ),
-          children: (
-            <CapabilityBindingEditor
-              kind={kind}
-              value={caps[kind]}
-              providers={providers}
-              onChange={(bindings) => setCurrentCaps((value) => ({ ...value, [kind]: bindings }))}
-            />
-          ),
-        }))}
-      />
+      <Space direction="vertical" style={{ width: '100%' }} size="small">
+        {catalog.skills.length === 0 ? (
+          <div style={{ color: '#999', fontSize: 12 }}>还没有安装任何 Skill。</div>
+        ) : (
+          catalog.skills.map((skill) => (
+            <div key={skill.id} style={{ display: 'flex', alignItems: 'flex-start', gap: 8 }}>
+              <Checkbox
+                checked={draft.skills.includes(skill.id)}
+                onChange={() => toggle(target, 'skills', skill.id)}
+              >
+                <strong>{skill.name}</strong>
+                <div style={{ color: '#666', fontSize: 12 }}>
+                  {skill.description || '(no description)'}
+                </div>
+              </Checkbox>
+              <Button
+                danger
+                size="small"
+                icon={<DeleteOutlined />}
+                disabled={busy}
+                onClick={() => void removeSkill(target, skill.name)}
+                style={{ marginLeft: 'auto' }}
+              >
+                Remove
+              </Button>
+            </div>
+          ))
+        )}
+        <Upload
+          accept=".zip,application/zip"
+          showUploadList={false}
+          disabled={busy}
+          beforeUpload={(file) => {
+            void uploadSkill(target, file);
+            return false;
+          }}
+        >
+          <Button icon={<UploadOutlined />} loading={busy}>
+            Add skill
+          </Button>
+        </Upload>
+      </Space>
     );
   }
 
-  /**
-   * 三层叠加的结果，每条标出**是哪一层给的**。
-   *
-   * 这比只列一个合并后的清单多回答一个问题：「我在这里加的东西生效了吗」。
-   * 一条在 Member 层也声明了、但 effective 显示来自 Global 的能力，说明这次
-   * 声明是多余的 —— 不说出来，用户会以为自己的改动没保存。
-   */
-  function renderEffective() {
+  function renderKnowledge(target: Scope) {
+    const catalog = catalogs[target];
+    const draft = drafts[target];
+    if (!catalog || !draft) return <Spin size="small" tip="Loading…" />;
+
     return (
       <Space direction="vertical" style={{ width: '100%' }} size="small">
-        {KINDS.map((kind) => (
-          <div key={kind}>
-            <strong>{KIND_LABEL[kind]}</strong>
-            {effective[kind].length === 0 ? (
-              <div style={{ color: '#999', fontSize: 12 }}>（空）</div>
-            ) : (
-              <div>
-                {effective[kind].map((binding) => {
-                  const key = bindingKey(binding);
-                  const origin = LAYER_ORDER.find((layer) =>
-                    layers[layer][kind].some((item) => bindingKey(item) === key),
-                  );
-                  const shadowed = LAYER_ORDER.filter(
-                    (layer) =>
-                      layer !== origin &&
-                      layers[layer][kind].some((item) => bindingKey(item) === key),
-                  );
-                  return (
-                    <div key={key} style={{ marginBottom: 2 }}>
-                      <Tag color={origin === 'member' ? 'green' : origin === 'team' ? 'blue' : 'purple'}>
-                        {origin ? SCOPE_LABEL[origin] : '?'}
-                      </Tag>
-                      <span style={{ fontSize: 12 }}>{formatBinding(binding)}</span>
-                      {shadowed.length > 0 ? (
-                        <span style={{ color: '#999', fontSize: 12, marginLeft: 6 }}>
-                          （{shadowed.map((layer) => SCOPE_LABEL[layer]).join(' / ')} 层也声明了，被上层覆盖）
-                        </span>
-                      ) : null}
-                    </div>
-                  );
-                })}
-              </div>
-            )}
+        {catalog.knowledge.length === 0 ? (
+          <div style={{ color: '#999', fontSize: 12 }}>还没有可用的知识库。</div>
+        ) : (
+          catalog.knowledge.map((kb) => (
+            <Checkbox
+              key={kb.id}
+              checked={draft.knowledge.includes(kb.id)}
+              onChange={() => toggle(target, 'knowledge', kb.id)}
+            >
+              <strong>{kb.name}</strong>{' '}
+              <Tag style={{ marginInlineEnd: 0 }}>{kb.documentCount} documents</Tag>{' '}
+              <Tag style={{ marginInlineEnd: 0 }}>{kb.scope === 'personal' ? 'Personal' : 'Team'}</Tag>
+              <div style={{ color: '#666', fontSize: 12 }}>{kb.description}</div>
+            </Checkbox>
+          ))
+        )}
+        <div style={{ color: '#999', fontSize: 12 }}>
+          选中资料库后，Agent 自动获得检索与原文查看能力，无需单独配置。
+        </div>
+      </Space>
+    );
+  }
+
+  function toolDetails(tool: CatalogTool) {
+    return (
+      <Space direction="vertical" size="small" style={{ maxWidth: 320 }}>
+        <div>
+          <strong>What it does</strong>
+          <div>{tool.description}</div>
+        </div>
+        <div>
+          <strong>Risk</strong>
+          <div>{tool.risk}</div>
+        </div>
+        <div>
+          <strong>Requires approval</strong>
+          <div>{tool.needsApproval ? 'Yes — 每次调用要过 Policy 审批' : 'No'}</div>
+        </div>
+        {!tool.available ? (
+          <div>
+            <strong>Why unavailable</strong>
+            <div>{tool.unavailableReason}</div>
+          </div>
+        ) : null}
+      </Space>
+    );
+  }
+
+  function renderActions(target: Scope) {
+    const catalog = catalogs[target];
+    const draft = drafts[target];
+    if (!catalog || !draft) return <Spin size="small" tip="Loading…" />;
+
+    const groups = new Map<string, CatalogTool[]>();
+    for (const tool of catalog.tools) {
+      const list = groups.get(tool.group) ?? [];
+      list.push(tool);
+      groups.set(tool.group, list);
+    }
+
+    if (groups.size === 0) {
+      return <div style={{ color: '#999', fontSize: 12 }}>当前部署没有可用的 Action。</div>;
+    }
+
+    return (
+      <Space direction="vertical" style={{ width: '100%' }} size="middle">
+        {[...groups].map(([group, tools]) => (
+          <div key={group}>
+            <strong>{group}</strong>
+            <div style={{ marginTop: 4 }}>
+              {tools.map((tool) => (
+                <div key={tool.id} style={{ marginBottom: 6 }}>
+                  <Checkbox
+                    checked={draft.tools.includes(tool.id)}
+                    disabled={!tool.available}
+                    onChange={() => toggle(target, 'tools', tool.id)}
+                  >
+                    <strong>{tool.displayName}</strong>{' '}
+                    <Popover content={toolDetails(tool)} title={tool.displayName} trigger="click">
+                      <Button
+                        type="link"
+                        size="small"
+                        icon={<InfoCircleOutlined />}
+                        style={{ padding: 0, height: 'auto' }}
+                        onClick={(e) => e.stopPropagation()}
+                      />
+                    </Popover>{' '}
+                    {tool.needsApproval ? <Tag color="orange">Needs approval</Tag> : null}
+                    {!tool.available ? <Tag color="red">Unavailable</Tag> : null}
+                    <div style={{ color: '#666', fontSize: 12 }}>{tool.description}</div>
+                    {!tool.available && tool.unavailableReason ? (
+                      <div style={{ color: '#a00', fontSize: 12 }}>{tool.unavailableReason}</div>
+                    ) : null}
+                  </Checkbox>
+                </div>
+              ))}
+            </div>
           </div>
         ))}
-        <div style={{ color: '#999', fontSize: 12 }}>
-          同一条能力出现在多层时，以 Global → Team → Member 中<strong>最先声明</strong>
-          的那一层为准。
+      </Space>
+    );
+  }
+
+  function renderInherited(target: Scope) {
+    if (target !== 'member') return null;
+    const catalog = catalogs.member;
+    if (!catalog?.inherited) return null;
+    const { inherited } = catalog;
+
+    const renderRefs = (refs: Array<{ id: string; name: string; from: 'company' | 'team' }>) =>
+      refs.length === 0 ? (
+        <span style={{ color: '#999', fontSize: 12 }}>（无）</span>
+      ) : (
+        refs.map((ref) => (
+          <Tag key={`${ref.from}-${ref.id}`} style={{ marginBottom: 4 }}>
+            {ref.name} · {ref.from === 'company' ? 'Company' : 'Team'}
+          </Tag>
+        ))
+      );
+
+    return (
+      <Space direction="vertical" style={{ width: '100%' }} size="small">
+        <div>
+          <strong>Inherited from company & team</strong>
+          <div style={{ color: '#999', fontSize: 12 }}>
+            这些能力自动拥有，在上面两层里改，不在这里改。
+          </div>
+        </div>
+        <div>
+          <div style={{ fontSize: 12, color: '#666' }}>Skills</div>
+          <div>{renderRefs(inherited.skills)}</div>
+        </div>
+        <div>
+          <div style={{ fontSize: 12, color: '#666' }}>Knowledge</div>
+          <div>{renderRefs(inherited.knowledge)}</div>
+        </div>
+        <div>
+          <div style={{ fontSize: 12, color: '#666' }}>Actions</div>
+          <div>{renderRefs(inherited.tools)}</div>
         </div>
       </Space>
     );
   }
 
   function renderScopeBody(target: Scope) {
+    const catalog = catalogs[target];
+    const draft = drafts[target];
+
     return (
       <Space direction="vertical" style={{ width: '100%' }} size="middle">
         <Alert type="info" showIcon message={SCOPE_HINT[target]} />
@@ -359,31 +548,46 @@ export function CapabilitySettings({ onClose }: CapabilitySettingsProps) {
           )
         ) : null}
 
-        {renderBindings(target)}
-
-        {target === 'member' && memberId ? (
-          <Collapse
-            defaultActiveKey={['effective']}
-            items={[
-              {
-                key: 'effective',
-                label: 'Effective Capabilities（三层叠加）',
-                children: renderEffective(),
-              },
-            ]}
-          />
-        ) : null}
-
-        {/*
-          Skill 文件（内容投放）和上面的「启用了哪些来源」是两件事，
-          但作用域完全一样 —— 所以放在同一个页签里，用标题分开。
-        */}
         {target === 'member' && !memberId ? null : (
-          <ScopedSkillLibrary
-            scope={target}
-            memberId={target === 'member' ? (memberId ?? undefined) : undefined}
-            title={`${SCOPE_LABEL[target]} Skill Files（装到磁盘上的 skill）`}
-          />
+          <>
+            {renderInherited(target)}
+            <Collapse
+              defaultActiveKey={['skills', 'knowledge', 'actions']}
+              items={[
+                {
+                  key: 'skills',
+                  label: (
+                    <Space size={6}>
+                      <span>Skills</span>
+                      <Tag style={{ marginInlineEnd: 0 }}>{draft?.skills.length ?? 0} enabled</Tag>
+                    </Space>
+                  ),
+                  children: renderSkills(target),
+                },
+                {
+                  key: 'knowledge',
+                  label: (
+                    <Space size={6}>
+                      <span>Knowledge</span>
+                      <Tag style={{ marginInlineEnd: 0 }}>{draft?.knowledge.length ?? 0} enabled</Tag>
+                    </Space>
+                  ),
+                  children: renderKnowledge(target),
+                },
+                {
+                  key: 'actions',
+                  label: (
+                    <Space size={6}>
+                      <span>Actions</span>
+                      <Tag style={{ marginInlineEnd: 0 }}>{draft?.tools.length ?? 0} enabled</Tag>
+                    </Space>
+                  ),
+                  children: renderActions(target),
+                },
+              ]}
+            />
+            {catalog ? null : <Spin size="small" tip="Loading…" />}
+          </>
         )}
       </Space>
     );
@@ -394,11 +598,7 @@ export function CapabilitySettings({ onClose }: CapabilitySettingsProps) {
       <Modal
         open
         onCancel={() =>
-          guardDirty(
-            [...LAYER_ORDER],
-            '关闭后未保存的改动会丢失。',
-            onClose,
-          )
+          guardDirty([...LAYER_ORDER], '关闭后未保存的改动会丢失。', onClose)
         }
         footer={
           <Space>
@@ -424,22 +624,8 @@ export function CapabilitySettings({ onClose }: CapabilitySettingsProps) {
           </Space>
         }
         width={880}
-        /*
-         * 滚动放在**页签内容**里，不放在 modal body 上。
-         *
-         * 放在 body 上时页签栏会跟着内容一起滚走 —— 翻到下面看 Effective 时
-         * 就看不见自己在哪一层了，而「我在改哪一层」正是这个窗口最不该让人猜的
-         * 信息。所以 body 不滚，每个页签自己滚（见 `.capability-pane`）。
-         */
         styles={{ body: { paddingTop: 8 } }}
-        title={
-          <Space>
-            <span>Capabilities</span>
-            <span style={{ color: '#999', fontWeight: 400, fontSize: 12 }}>
-              effective = global + team + member
-            </span>
-          </Space>
-        }
+        title={<Space><span>Capabilities</span></Space>}
       >
         {loading ? (
           <Spin tip="Loading capabilities…" />
@@ -456,7 +642,7 @@ export function CapabilitySettings({ onClose }: CapabilitySettingsProps) {
                   label: (
                     <Space size={6}>
                       <GlobalOutlined />
-                      Global
+                      Company defaults
                       {dirty.has('global') ? <Badge status="warning" /> : null}
                     </Space>
                   ),
@@ -467,7 +653,7 @@ export function CapabilitySettings({ onClose }: CapabilitySettingsProps) {
                   label: (
                     <Space size={6}>
                       <TeamOutlined />
-                      Team
+                      Team defaults
                       {dirty.has('team') ? <Badge status="warning" /> : null}
                     </Space>
                   ),
@@ -478,7 +664,7 @@ export function CapabilitySettings({ onClose }: CapabilitySettingsProps) {
                   label: (
                     <Space size={6}>
                       <UserOutlined />
-                      Member
+                      This member
                       {dirty.has('member') ? <Badge status="warning" /> : null}
                     </Space>
                   ),
@@ -490,11 +676,6 @@ export function CapabilitySettings({ onClose }: CapabilitySettingsProps) {
         )}
       </Modal>
 
-      {/*
-        丢改动的确认。刻意用受控 Modal 而不是 `Modal.confirm` 静态方法：
-        静态方法渲染在 React 树之外，拿不到 ConfigProvider 的主题，
-        也会在 React 19 的并发渲染下出现「同一个确认框弹两次」。
-      */}
       <Modal
         open={pendingAction !== null}
         title="有未保存的改动"

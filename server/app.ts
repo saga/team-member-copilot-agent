@@ -173,7 +173,12 @@ app.use('/api/members', membersRouter(teamService));
 // 更具体的先挂：/api/capabilities/skills/* 是「磁盘上装了哪些 skill」，
 // /api/capabilities/* 是「启用了哪些能力来源」。两者刻意分开。
 app.use('/api/capabilities/skills', skillsRouter(skillService));
-app.use('/api/capabilities', capabilitiesRouter(teamService, registry));
+app.use(
+  '/api/capabilities',
+  capabilitiesRouter(teamService, registry, skillService, localKnowledgeProvider, {
+    hostToolsEnabled: config.allowHostCodingTools,
+  }),
+);
 app.use('/api/knowledge', knowledgeRouter(localKnowledgeProvider));
 app.use('/api/team', teamRouter(structureService, teamEvents));
 app.use('/api/work-management', workManagementRouter(teamService, workManagement));

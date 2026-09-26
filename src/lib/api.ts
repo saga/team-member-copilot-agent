@@ -47,42 +47,76 @@ export interface Member {
 }
 
 /**
- * Member 对某个能力 Provider 的一次引用。
+ * 能力目录里的一行 Skill：这一层装了什么、开没开。
  *
- * 存的是 Provider ID（稳定契约）+ selector，不是实现 —— 所以换掉本地资料库的
- * 实现时这里不变。`selector` 的含义由 Provider 定义（knowledge 用 KB key 或
- * `$personal`；skill / tool 通常为空）。
+ * id 形如 `skill.security-review`（目录名即身份）。上传即安装，
+ * 勾选即启用 —— 管理员不需要知道它落在哪个磁盘目录。
  */
-export interface CapabilityBinding {
-  providerId: string;
-  selector?: string;
-}
-
-export interface MemberCapabilities {
-  skills: CapabilityBinding[];
-  knowledge: CapabilityBinding[];
-  tools: CapabilityBinding[];
-}
-
-/** 平台注册了哪些能力 Provider（管理界面用它列可选项）。 */
-export interface CapabilityProvider {
-  kind: 'skill' | 'knowledge' | 'tool';
+export interface CatalogSkill {
   id: string;
-  version: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+}
+
+/** 能力目录里的一行 Knowledge：真实的资料库，不是 providerId。 */
+export interface CatalogKnowledge {
+  id: string;
+  name: string;
+  description: string;
+  scope: 'team' | 'personal';
+  documentCount: number;
+  enabled: boolean;
 }
 
 /**
- * 一个 Member 的能力全景：三层声明 + 合并结果。
+ * 能力目录里的一行 Action：真实的单个工具。
  *
- * `effective` 是「这个人最终能用什么」的唯一答案。只显示 `member` 层会让界面
- * 呈现出一个「什么都不会的人」—— 而它其实继承了公司级和团队级的能力。
+ * `id` 就是运行时工具名（`ask_member`），配置与执行共用同一个名字。
+ * 知识检索工具不在这里出现 —— 选了资料库就自动有检索入口。
  */
-export interface CapabilityConfig {
-  global: MemberCapabilities;
-  team: MemberCapabilities;
-  member: MemberCapabilities;
-  effective: MemberCapabilities;
+export interface CatalogTool {
+  id: string;
+  displayName: string;
+  group: string;
+  description: string;
+  risk: string;
+  requiresHostAccess: boolean;
+  /** true = 每次调用要过 Policy 审批。 */
+  needsApproval: boolean;
+  enabled: boolean;
+  /** false = 选了也用不了（部署没放行），看 unavailableReason。 */
+  available: boolean;
+  unavailableReason?: string;
 }
+
+/** 从上层继承来的能力（只读）：这个 Member 自动拥有的部分。 */
+export interface CatalogInheritedRef {
+  id: string;
+  name: string;
+  from: 'company' | 'team';
+}
+
+/**
+ * 某一层的能力目录。
+ *
+ * skills / knowledge / tools 只描述**这一层自己的选择**；
+ * member 层的 `inherited` 额外回答「上面两层给了什么」。
+ */
+export interface ScopeCatalog {
+  scope: 'global' | 'team' | 'member';
+  skills: CatalogSkill[];
+  knowledge: CatalogKnowledge[];
+  tools: CatalogTool[];
+  inherited?: {
+    skills: CatalogInheritedRef[];
+    knowledge: CatalogInheritedRef[];
+    tools: CatalogInheritedRef[];
+  };
+}
+
+/** 三个目录层，对应公司 / 团队 / 个人。 */
+export type CatalogScope = 'global' | 'team' | 'member';
 
 /** skill 内容投放的三个 scope。 */
 export type SkillScope = 'global' | 'team' | 'member';
@@ -474,86 +508,43 @@ export const api = {
   },
 
   /**
-   * Member 的能力组成。
+   * 某一层的能力目录：装了什么、开着什么。
    *
-   * 和 `/api/members/:id/skills` 是两件事：那个回答「磁盘上装了哪些 skill」
-   * （内容投放），这个回答「启用了哪些能力来源」。界面上必须分开显示 ——
-   * 否则会出现「装了一个 skill 却不知道谁在用它」。
+   * 和 skill 文件接口是两件事：那个回答「磁盘上有什么压缩包」，
+   * 这个回答「这一层启用了什么」。上传 skill 后这里会多出一行
+   * 且自动勾选 —— 安装与启用是同一个流程。
    */
-  getMemberCapabilities(id: string): Promise<{ capabilities: MemberCapabilities }> {
-    return fetch(`${API_BASE}/api/capabilities/members/${encodeURIComponent(id)}`).then(
-      json<{ capabilities: MemberCapabilities }>,
+  getCapabilityCatalog(
+    scope: CatalogScope,
+    memberId?: string,
+  ): Promise<{ teamId: string; catalog: ScopeCatalog }> {
+    const query =
+      scope === 'member' && memberId
+        ? `?scope=member&memberId=${encodeURIComponent(memberId)}`
+        : `?scope=${scope}`;
+    return fetch(`${API_BASE}/api/capabilities/catalog${query}`).then(
+      json<{ teamId: string; catalog: ScopeCatalog }>,
     );
   },
 
-  updateMemberCapabilities(
-    id: string,
-    input: MemberCapabilities,
-  ): Promise<{ capabilities: MemberCapabilities }> {
-    return fetch(`${API_BASE}/api/capabilities/members/${encodeURIComponent(id)}`, {
+  /**
+   * 全量替换某一层的选择：用户语言的 ID 数组，不含 providerId / selector。
+   *
+   * 空数组 = 这一类全关。member 层清空 = 退回团队基线，
+   * 不是变成什么都不会的人。
+   */
+  updateCapabilityCatalog(input: {
+    scope: CatalogScope;
+    memberId?: string;
+    skills: string[];
+    knowledge: string[];
+    tools: string[];
+  }): Promise<{ teamId: string; catalog: ScopeCatalog }> {
+    return fetch(`${API_BASE}/api/capabilities/catalog`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(input),
-    }).then(json<{ capabilities: MemberCapabilities }>);
-  },
-
-  /** 平台装了哪些 Provider。列选项用 —— 前端不该硬编码 provider id。 */
-  listCapabilityProviders(): Promise<{ providers: CapabilityProvider[] }> {
-    return fetch(`${API_BASE}/api/capabilities/providers`).then(
-      json<{ providers: CapabilityProvider[] }>,
-    );
-  },
-
-  /**
-   * 公司级能力基线。
-   *
-   * 它不属于任何 Team：改一次，**所有** Agent 都跟着变。所以这个入口在界面上
-   * 必须与 Team / Member 层分开呈现。
-   */
-  getGlobalCapabilities(): Promise<{ capabilities: MemberCapabilities }> {
-    return fetch(`${API_BASE}/api/capabilities/global`).then(
-      json<{ capabilities: MemberCapabilities }>,
-    );
-  },
-
-  updateGlobalCapabilities(
-    capabilities: MemberCapabilities,
-  ): Promise<{ capabilities: MemberCapabilities }> {
-    return fetch(`${API_BASE}/api/capabilities/global`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(capabilities),
-    }).then(json<{ capabilities: MemberCapabilities }>);
-  },
-
-  /** Team 级能力基线。teamId 由服务端解析（当前部署只有一个 Team）。 */
-  getTeamCapabilities(): Promise<{ teamId: string; capabilities: MemberCapabilities }> {
-    return fetch(`${API_BASE}/api/capabilities/team`).then(
-      json<{ teamId: string; capabilities: MemberCapabilities }>,
-    );
-  },
-
-  updateTeamCapabilities(
-    capabilities: MemberCapabilities,
-  ): Promise<{ teamId: string; capabilities: MemberCapabilities }> {
-    return fetch(`${API_BASE}/api/capabilities/team`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(capabilities),
-    }).then(json<{ teamId: string; capabilities: MemberCapabilities }>);
-  },
-
-  /**
-   * 三层声明 + 合并结果。
-   *
-   * 放在 `.../effective` 而不是复用 `getMemberCapabilities`：后者回答的是
-   * 「这个人的私有增量」，而界面要回答的是「它最终能用什么」以及「这些能力
-   * 分别是哪一层给的」。
-   */
-  getCapabilityConfig(memberId: string): Promise<{ teamId: string; config: CapabilityConfig }> {
-    return fetch(
-      `${API_BASE}/api/capabilities/members/${encodeURIComponent(memberId)}/effective`,
-    ).then(json<{ teamId: string; config: CapabilityConfig }>);
+    }).then(json<{ teamId: string; catalog: ScopeCatalog }>);
   },
 
   /**

@@ -1,6 +1,7 @@
 import { hashText } from '../content-hash.js';
 import type { CapabilityBinding, MemberCapabilities } from '../domain.js';
 import type { CapabilityRegistry } from './registry.js';
+import { parseSelectorList } from './types.js';
 import type {
   CapabilityContext,
   ResolvedKnowledgeBinding,
@@ -84,7 +85,29 @@ export class CapabilityResolver {
     for (const binding of capabilities.tools) {
       const provider = this.registry.toolProvider(binding.providerId);
       toolProviderVersions.set(provider.id, provider.version);
-      tools.push(...(await provider.resolve(toolContext, binding)));
+      // selector 为空 = 这个 Provider 的全部工具；否则只给点名的那几个。
+      // 和 skill 同一套切分。不认识的名字直接落空 —— 拼错一个工具名不该
+      // 让整轮失败，它只会让那个工具不存在。
+      const only = parseSelectorList(binding.selector);
+      const resolved = await provider.resolve(toolContext, binding);
+      tools.push(...(only ? resolved.filter((tool) => only.has(tool.name)) : resolved));
+    }
+
+    // 选了资料就自动有检索入口：search_knowledge / open_knowledge_document 是
+    // Knowledge 能力的实现，不是管理员需要理解的独立工具，所以不出现在配置里。
+    // 已显式绑定 knowledge.tools 的库跳过自注入 —— 否则同一个工具被解析两次，
+    // 在下面的重名检查里变成一次装配错误。
+    if (knowledge.length > 0 && !hasBinding(capabilities, KNOWLEDGE_TOOLS_ID)) {
+      try {
+        const provider = this.registry.toolProvider(KNOWLEDGE_TOOLS_ID);
+        toolProviderVersions.set(provider.id, provider.version);
+        tools.push(
+          ...(await provider.resolve(toolContext, { providerId: KNOWLEDGE_TOOLS_ID })),
+        );
+      } catch {
+        // 该 Provider 未注册时跳过：没有检索网关就没有检索工具，
+        // 不该让整轮失败。
+      }
     }
 
     const dedupedSkills = dedupe(skillEntries, (entry) => entry.artifact.name, 'Skill');
@@ -104,6 +127,16 @@ export class CapabilityResolver {
       ),
     };
   }
+}
+
+/**
+ * 知识检索网关的 Provider ID。它是 Knowledge 能力的内部实现，
+ * 管理界面不展示、配置里不出现 —— 由上面的自注入逻辑负责。
+ */
+const KNOWLEDGE_TOOLS_ID = 'knowledge.tools';
+
+function hasBinding(capabilities: MemberCapabilities, providerId: string): boolean {
+  return capabilities.tools.some((binding) => binding.providerId === providerId);
 }
 
 /**

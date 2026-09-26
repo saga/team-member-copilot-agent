@@ -28,12 +28,11 @@ effective = global + team + member
 ```
 
 ```
-Capability
+Capability（内部：Provider ID + selector，存在 `capability_binding` 表里）
 │
 ├── global     公司级基线，所有 Agent 默认继承
 │   ├── global.filesystem-skills      公司共用的程序化方法论
-│   ├── team.core-tools               ask_member / message_member / remember_member
-│   └── knowledge.tools               search_knowledge / open_knowledge_document
+│   └── team.core-tools               Ask another member / Message / Remember
 │
 ├── team       Team 级基线，Team 内所有 Agent 继承
 │   ├── team.filesystem-skills        团队共用的程序化方法论
@@ -42,8 +41,17 @@ Capability
 └── member     Member 专属**增量**能力
     ├── member.filesystem-skills      这个 Member 自己的专长
     ├── local.filesystem-knowledge    个人资料库（selector = $personal）
-    └── runtime.host-coding-tools     bash / edit / grep / web_fetch（需部署放行）
+    └── runtime.host-coding-tools     Search / Edit / Run / Fetch web（需部署放行）
 ```
+
+三层按顺序合并，按 `providerId\0selector` 去重，**先出现的赢**：global 是基线，
+member 是增量 —— member 不会覆盖 global，它只往上加。
+
+管理界面不直接暴露上面这套内部模型：`GET/PUT /api/capabilities/catalog` 返回的是
+Skill / Knowledge / Action 的名字与开关（`server/capabilities/catalog.ts` 翻译），
+`providerId` / `selector` 只存在后端。Tool 按单个工具开关（`selector` 即工具名清单）；
+`search_knowledge` / `open_knowledge_document` 是知识库自带的检索入口，
+选中资料库后自动可用，不出现在配置里。
 
 三层按顺序合并，按 `providerId\0selector` 去重，**先出现的赢**：global 是基线，
 member 是增量 —— member 不会覆盖 global，它只往上加。
@@ -626,7 +634,7 @@ SEED_DEFAULT_MEMBERS=false    # 代码带着模板，但不要自动建人
 
 所以模板不知道自己被哪个后端服务：把 `local.filesystem-knowledge` 的实现换成企业搜索，
 这三份模板一个字都不用改。绑定只发生在创建那一刻，之后完全归
-`PUT /api/capabilities/members/:id` 管 —— 重启不会把用户解绑的能力绑回去。
+`PUT /api/capabilities/catalog` 管 —— 重启不会把用户解绑的能力绑回去。
 
 ## Knowledge Base
 
@@ -727,11 +735,10 @@ npm run dev            # 同时启动 client(:5173) + server(:3001)
 | GET · POST · DELETE | `/api/capabilities/skills/global[/:name]` | global skill 文件（zip 上传 / 卸载）。**owner/admin** |
 | GET · POST · DELETE | `/api/capabilities/skills/team[/:name]` | team skill 文件。**owner/admin** |
 | GET · POST · DELETE | `/api/capabilities/skills/members/:memberId[/:name]` | member skill 文件。**owner/admin** |
-| GET | `/api/capabilities/global` · `PUT` | 公司级能力基线（`PUT` 需 owner/admin） |
-| GET · PUT | `/api/capabilities/team` | Team 级能力基线（`PUT` 需 owner/admin）。返回 `{ teamId, capabilities }` |
-| GET · PUT | `/api/capabilities/members/:memberId` | 该 Member 的**增量**能力（skill / knowledge / tool 的 Provider 引用） |
-| GET | `/api/capabilities/members/:memberId/effective` | `{ teamId, config }`，`config = { global, team, member, effective }` —— 管理界面靠它回答「最终能用什么」和「是哪一层给的」 |
-| GET | `/api/capabilities/providers` | 平台已注册的 Provider 清单（`{ kind, id, version }`，owner/admin）—— 管理界面列选项用 |
+| GET | `/api/capabilities/catalog?scope=global` | 公司级能力目录：Skill / Knowledge / Action 的名字与开关（`PUT` 需 owner/admin） |
+| GET | `/api/capabilities/catalog?scope=team` | Team 级能力目录（`PUT` 需 owner/admin）。返回 `{ teamId, catalog }` |
+| GET | `/api/capabilities/catalog?scope=member&memberId=:id` | 这个 Member 额外拥有的 + 从公司/团队继承来的（`inherited`） |
+| PUT | `/api/capabilities/catalog` | 全量替换某一层的选择 `{ scope, memberId?, skills: [], knowledge: [], tools: [] }`（用户语言的 ID，无 providerId / selector；`PUT` 需 owner/admin） |
 | GET | `/api/knowledge/team` · `POST` | team KB 清单 / 新建（`{ key, name, description }`）—— `local.filesystem-knowledge` 的管理面 |
 | POST | `/api/knowledge/bases/:kbId/documents` | 写文档（落盘 + FTS 索引） |
 | POST | `/api/internal/members/:id/direct-messages` | **以 `:id` 的身份**发私聊 —— Internal API，见下 |
@@ -768,7 +775,7 @@ INTERNAL_API_TOKEN 已配置  要求 Authorization: Bearer <token> 或 X-Interna
 普通 `/api` 路径没有任何中间件写它，所以「请求头塞个 agent id 就变成 Agent」
 在这条边界上不存在（Agent 身份一律由 Internal API token + 路径身份一致性校验，伪造不了）。
 
-Admin 写入（`PUT /api/capabilities/global` · `/team` · `/members/:id`、
+Admin 写入（`PUT /api/capabilities/catalog`、
 `POST/DELETE /api/capabilities/skills/**`、`POST /api/knowledge/team`、
 `POST /api/knowledge/bases/:id/documents`、
 `POST /api/members`、`PATCH /api/members/:id` 带 `status`）走 `ADMIN_API_TOKEN`：
@@ -849,19 +856,20 @@ Content-Type: application/json
 ```
 
 新建的 Member 自动获得默认能力组成（团队 skill、个人 skill、个人资料库、协作与检索
-工具）。要调整它（比如给它开宿主工具），走能力接口：
+工具）。要调整它（比如给它开宿主工具），走能力目录接口（用户语言的 ID，
+无 providerId / selector；拼错直接 `400`，而不是等到下一轮 turn 才发现
+「这个人少了检索能力」）：
 
 ```json
-PUT /api/capabilities/members/researcher-id
+PUT /api/capabilities/catalog
 {
-  "skills":    [{ "providerId": "team.filesystem-skills" }],
-  "knowledge": [{ "providerId": "local.filesystem-knowledge", "selector": "$personal" }],
-  "tools":     [{ "providerId": "team.core-tools" }, { "providerId": "knowledge.tools" }]
+  "scope": "member",
+  "memberId": "researcher-id",
+  "skills":    [],
+  "knowledge": ["kb.personal"],
+  "tools":     ["ask_member", "message_member", "remember_member"]
 }
 ```
-
-Provider ID 拼错会直接 `400`（写之前先对注册表校验），而不是等到下一轮 turn 才发现
-「这个人少了检索能力」。
 
 Direct Chat：
 
@@ -995,9 +1003,8 @@ src/                          # Vite + React + Ant Design 前端
     TeamChat.tsx              # 编排：conversation / SSE / 状态合并（Layout Content + Alert/Tag）
     team/                     # TeamChat 的拆分：list / messages / composer / 各编辑面板
       TeamSidebar.tsx         # Collapse 四分区：Members/Current Work/Schedules/Conversations
-      CapabilitySettings.tsx  # 能力配置**窗口**：Modal + 三页签（global / team / member）
-      CapabilityBindingEditor.tsx  # 一层 binding 的编辑（providerId + selector）
-      ScopedSkillLibrary.tsx  # skill 文件库（global / team / member 共用同一个组件）
+      CapabilitySettings.tsx  # 能力配置**窗口**：Modal + 三页签（Company defaults / Team defaults / This member），Skill / Knowledge / Action 的名字与开关
+      ScopedSkillLibrary.tsx  # skill 文件库（global / team / member 共用同一个组件；能力窗口里上传即启用）
       TeamSections.tsx        # CurrentWorkSection（active execution → Jira key）
       ConversationList.tsx    # antd List（Tag 区分 private/group/work/direct）+ New Team / New Work 入口
       WorkCreator.tsx         # 新建 Work：title + Member + Jira key + 第一条指令（建完可直接开跑）
@@ -1026,11 +1033,12 @@ server/                       # Express + Copilot SDK 后端
   member-template-seeder.ts   # Member 层模板 provisioning（不含任何业务内容，也不认识任何后端）
   skill-service.ts            # skill 内容投放的唯一入口（三个 scope + zip 安全闸）
   capabilities/               # 能力层：三层 binding → RuntimeCapabilities
-    types.ts                  #   SkillProvider / KnowledgeProvider / ToolProvider 契约
+    types.ts                  #   SkillProvider / KnowledgeProvider / ToolProvider 契约 + selector 切分
     registry.ts               #   Provider 注册表（重复注册 / 未注册都直接抛）
     service.ts                #   capability_binding 读写（global/team/member 三层）+ getEffective + ACL 判据
+    catalog.ts                #   管理员目录：用户语言的 Skill / Knowledge / Action ↔ 内部绑定
     provisioner.ts            #   config/capability-templates → global / team 两层 baseline
-    resolver.ts               #   binding → RuntimeCapabilities（含 manifestHash）
+    resolver.ts               #   binding → RuntimeCapabilities（含 manifestHash；Tool 按 selector 过滤；knowledge 自带检索工具）
     copilot-adapter.ts        #   RuntimeCapabilities → SDK session 配置（唯一认识 SDK 的地方）
     providers/
       filesystem-skill.ts     #     global / team / member 三级 skill 目录
@@ -1050,7 +1058,7 @@ server/                       # Express + Copilot SDK 后端
   routes/
     health.ts
     members.ts
-    capabilities.ts             # 三层能力组成（global / team / member + effective）
+    capabilities.ts             # 能力目录（GET/PUT /catalog：用户语言，无 providerId / selector）
     skills.ts                   # skill 内容投放（三个 scope 的 zip 上传 / 卸载）
     conversations.ts
     executions.ts               # 单条 / 列表 / retry / cancel
@@ -1059,6 +1067,7 @@ server/                       # Express + Copilot SDK 后端
   test/
     schemas.test.ts
     capabilities.test.ts           # Provider 隔离 / 未知 Provider / 同名冲突 / manifest hash / 三层合并与去重 / tool guard / open 二次 ACL
+    capability-catalog.test.ts     # Tool selector 过滤 / knowledge 自带检索工具 / 目录与绑定的翻译与校验
     tool-policy.test.ts            # 只看 risk 与部署许可，不看工具名 / 声明与放行不允许漂移
     internal-api.test.ts           # 路径归属 + token 门禁
     team-service.test.ts           # delegation cycle / depth / runtime 隔离 / kind 形状约束
@@ -1116,8 +1125,8 @@ runtime 仍然是宿主机上的进程 —— 没有沙箱时 `bash` 能走到 w
 `search_knowledge` / `open_knowledge_document` 由各自的 Provider 声明，SDK 的
 `BuiltInTools.Isolated` 恒可用；没被任何 Provider 声明过的名字一律拒绝。
 
-> Skill selector 语义：`selector` 为空 = 该 Provider 下全部 skill；否则是 skill 目录名
-> 清单（逗号/空白分隔，如 `research, security-review`），只加载点名的。Skill 版本是
+> Skill / Tool selector 语义：`selector` 为空 = 该 Provider 下全部；否则是名字
+> 清单（逗号/空白分隔，如 `research, security-review`），只给点名的。Skill 版本是
 > 整个目录（相对路径 + 文件内容）的指纹，`scripts/` / `references/` 变化也换版本。
 >
 > 启动时除模板校验外，还对已有 DB 里全部 Member 的 effective 能力（三层叠加）做一次

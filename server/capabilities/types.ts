@@ -232,6 +232,23 @@ export interface ToolProvider {
 // ----------------------------------------------------------------- Runtime
 
 /**
+ * selector 语义：空 = 全部；否则是名字清单（逗号/空白分隔）。
+ *
+ * skill 与 tool 共用这一套：模板里写 `research, security-review` 与
+ * `research security-review` 是同一件事，不值得为分隔符定第二种语法。
+ * 它放在这一层而不是某个 Provider 里，是因为「怎么切分」是契约，
+ * 「切出来的名字什么意思」才是各 Provider 自己的语义。
+ */
+export function parseSelectorList(selector: string | undefined): Set<string> | null {
+  if (!selector?.trim()) return null;
+  const names = selector
+    .split(/[,\s]+/)
+    .map((name) => name.trim())
+    .filter(Boolean);
+  return names.length > 0 ? new Set(names) : null;
+}
+
+/**
  * 一轮 turn 真正生效的能力。
  *
  * 它是「解析」与「执行」之间唯一的中间物：引擎只拿到这个，看不到任何 Provider。

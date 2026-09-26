@@ -8,9 +8,6 @@
   "tools": [
     {
       "providerId": "team.core-tools"
-    },
-    {
-      "providerId": "knowledge.tools"
     }
   ]
 }

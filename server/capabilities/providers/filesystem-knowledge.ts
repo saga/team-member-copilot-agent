@@ -200,6 +200,19 @@ export class LocalFilesystemKnowledgeProvider implements KnowledgeProvider {
     return rows.map(mapKnowledgeBase);
   }
 
+  /** 某个 Member 的个人库（只读：不存在返回 null，不在这里补建）。 */
+  personalKnowledgeBaseFor(memberId: string): KnowledgeBase | null {
+    return this.findByKey('personal', personalKeyOf(memberId));
+  }
+
+  /** 库里有多少份文档。管理界面显示「128 documents」用，不进授权判定。 */
+  countDocuments(knowledgeBaseId: string): number {
+    const row = this.db
+      .prepare(`SELECT COUNT(*) AS count FROM knowledge_document WHERE knowledge_base_id = ?`)
+      .get(knowledgeBaseId) as unknown as { count: number } | undefined;
+    return Number(row?.count ?? 0);
+  }
+
   createTeamKnowledgeBase(input: { key: string; name: string; description?: string }): KnowledgeBase {
     const key = safeSegment(input.key);
     if (this.findByKey('team', key)) {
