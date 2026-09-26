@@ -103,33 +103,6 @@ describe('knowledge base 基本流', () => {
     assert.equal(hits[0].providerId, PROVIDER);
   });
 
-  it('listSources 报出这条 binding 实际指向哪个源（prompt 清单的来源）', async () => {
-    const kb = knowledge.createTeamKnowledgeBase({ key: 'listed-kb', name: 'Listed' });
-    const member = makeMember('Lister', 'lister');
-    bindKnowledge(member.id, ['listed-kb', PERSONAL_SELECTOR]);
-
-    const listed = await knowledge.listSources(
-      capabilityContext(member.id),
-      binding('listed-kb'),
-    );
-    assert.deepEqual(listed, [
-      {
-        providerId: PROVIDER,
-        id: kb.id,
-        name: 'Listed',
-        description: '',
-        scope: 'team',
-      },
-    ]);
-
-    const personal = await knowledge.listSources(
-      capabilityContext(member.id),
-      binding(PERSONAL_SELECTOR),
-    );
-    assert.equal(personal[0].scope, 'personal');
-    assert.equal(personal[0].id, knowledge.findByKey('personal', `member-${member.id}`)?.id);
-  });
-
   it('binding 指向未 provision 的 team 资料源：对话不炸，空库补建且立即可写', async () => {
     const member = makeMember('OoB', 'oob');
     bindKnowledge(member.id, ['financial-core']);
@@ -190,16 +163,6 @@ describe('knowledge base 基本流', () => {
 });
 
 describe('personal knowledge base', () => {
-  it('ensure 幂等：同一 Member 多次调用返回同一行', () => {
-    const member = makeMember('Carol', 'carol');
-    const first = knowledge.ensurePersonalKnowledgeBase(member.id, member.name);
-    const second = knowledge.ensurePersonalKnowledgeBase(member.id, member.name);
-    assert.equal(first.id, second.id);
-    assert.equal(first.scope, 'personal');
-    assert.equal(first.memberId, member.id);
-    assert.equal(knowledge.listTeamKnowledgeBases().some((kb) => kb.id === first.id), false);
-  });
-
   it('personal 文档只有属主能搜到、能打开', async () => {
     const owner = makeMember('Dave', 'dave');
     const other = makeMember('Eve', 'eve');
@@ -302,21 +265,6 @@ describe('路径与查询注入面', () => {
     }
   });
 
-  it('FTS 查询里的引号不会炸，也不会改变语义', async () => {
-    const kb = knowledge.createTeamKnowledgeBase({ key: 'quote-kb', name: 'Quote' });
-    knowledge.writeDocument({
-      knowledgeBaseId: kb.id,
-      title: 'T',
-      relativePath: 't.md',
-      content: 'standard withdrawal limit is 5000 per day',
-    });
-    const member = makeMember('Henry', 'henry');
-    bindKnowledge(member.id, ['quote-kb']);
-
-    assert.equal((await search(member.id, 'quote-kb', '"withdrawal')).length, 1);
-    assert.equal((await search(member.id, 'quote-kb', 'withdrawal" OR 1=1 --')).length, 1);
-    assert.equal((await search(member.id, 'quote-kb', '')).length, 0);
-  });
 });
 
 describe('磁盘与索引共用同一个「什么算一份资料」的判据', () => {

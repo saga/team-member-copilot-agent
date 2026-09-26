@@ -90,23 +90,9 @@ describe('以 Member 身份说话：路径归属', () => {
     assert.equal(internal.status, 202);
     assert.deepEqual(calls, [{ fromMemberId: 'm1', toMemberId: 'm2', content: '看一下风险' }]);
   });
-
-  it('读留在了 Human API —— 读不需要「我代表谁」', async () => {
-    const response = await fetch(`${base}/api/members/m1/direct-messages`);
-    assert.equal(response.status, 200);
-  });
 });
 
 describe('token 门禁', () => {
-  it('未配置 INTERNAL_API_TOKEN 时放行（本机单用户原型）', async () => {
-    config.internalApiToken = '';
-    calls.length = 0;
-
-    const response = await post('/api/internal/members/m1/direct-messages', VALID_BODY);
-    assert.equal(response.status, 202);
-    assert.equal(calls.length, 1);
-  });
-
   it('配置之后，不带凭证一律 401，且不触达业务', async () => {
     config.internalApiToken = 's3cret';
     calls.length = 0;

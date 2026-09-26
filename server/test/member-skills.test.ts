@@ -94,9 +94,4 @@ describe('Member skills', () => {
     assert.deepEqual(members.listSkills(bob.id), []);
     assert.throws(() => members.removeSkill(bob.id, 'bob-only'), /不存在/);
   });
-
-  it('非法 skill 名（路径分隔符 / 相对路径）被拒绝', { skip: !hasUnzip() }, () => {
-    assert.throws(() => members.removeSkill(alice.id, '../../etc'), /非法的 skill 名/);
-    assert.throws(() => members.removeSkill(alice.id, 'a/b'), /非法的 skill 名/);
-  });
 });

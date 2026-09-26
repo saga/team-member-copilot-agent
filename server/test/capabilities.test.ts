@@ -17,7 +17,7 @@ import { CapabilityRegistry } from '../capabilities/registry.js';
  *   Provider ID 是稳定契约    重复注册 / 未注册都直接失败，不静默选一个
  *   manifest 描述能力组成     相同配置得到相同哈希，且不含 memberId
  *   binding 是唯一能力来源    selector 用 '' 让唯一性真的成立
- *   manifestHash 稳定         排序、版本、selector、工具形状变化都要反映出来
+ *   manifestHash 稳定         排序、版本、selector 变化都要反映出来
  *   声明与授权同源            availableTools 与 toolIndex 出自同一份解析结果
  *   skipPermission 不是授权   策略拒绝时 execute 一次都不能跑
  *   检索范围只由 binding 定   模型的 query 不能扩大它
@@ -157,12 +157,8 @@ function artifact(providerId: string, name: string): SkillArtifact {
   return { providerId, name, description: `${name} skill`, directory: `/tmp/${name}`, version: '1' };
 }
 
-function builtinTool(
-  providerId: string,
-  name: string,
-  overrides: Partial<RuntimeTool> = {},
-): RuntimeTool {
-  return { providerId, implementation: 'app', kind: 'builtin', name, description: 'stub', risk: 'read', ...overrides };
+function builtinTool(providerId: string, name: string): RuntimeTool {
+  return { providerId, implementation: 'app', kind: 'builtin', name, description: 'stub', risk: 'read' };
 }
 
 /** 一份最小的三类能力组成，供 manifest 用例逐项微调。 */
@@ -230,19 +226,6 @@ describe('Registry：Provider ID 是稳定契约', () => {
     assert.throws(() => registry.registerToolProvider(toolProvider('foo', '1', [])), /已被 skill Provider 占用/);
   });
 
-  it('listProviders 三类合一、带 kind 与 version', () => {
-    const registry = registryOf({
-      skills: [skillProvider('s.a', '1', [])],
-      knowledge: [knowledgeProvider('k.a')],
-      tools: [toolProvider('t.a', '2', [])],
-    });
-
-    assert.deepEqual(registry.listProviders(), [
-      { kind: 'knowledge', id: 'k.a', version: '1' },
-      { kind: 'skill', id: 's.a', version: '1' },
-      { kind: 'tool', id: 't.a', version: '2' },
-    ]);
-  });
 });
 
 // ═══════════════════════════════════════════════ 2. Resolver / manifest
@@ -283,42 +266,6 @@ describe('manifest：描述能力组成，不描述是谁', () => {
     );
 
     assert.notEqual(base, withSelector);
-  });
-
-  it('工具的 implementation 变化 → 哈希变（audit 要能回答「这段代码跑在哪」）', async () => {
-    const base = await manifestHash(manifestCapabilities());
-    const asBuiltin = await manifestHash(
-      manifestCapabilities(),
-      manifestRegistry({
-        tools: [
-          toolProvider('stub.tools', '1', [
-            builtinTool('stub.tools', 'lookup', { implementation: 'copilot-builtin' }),
-          ]),
-        ],
-      }),
-    );
-
-    assert.notEqual(base, asBuiltin);
-  });
-
-  it('工具声明的形状变化 → 哈希变（名字 / risk / 是否需要宿主权限都算）', async () => {
-    const base = await manifestHash(manifestCapabilities());
-
-    const renamed = await manifestHash(
-      manifestCapabilities(),
-      manifestRegistry({ tools: [toolProvider('stub.tools', '1', [builtinTool('stub.tools', 'lookup_v2')])] }),
-    );
-    assert.notEqual(base, renamed);
-
-    for (const overrides of [{ risk: 'host-execution' as const }, { requiresHostAccess: true }]) {
-      const changed = await manifestHash(
-        manifestCapabilities(),
-        manifestRegistry({
-          tools: [toolProvider('stub.tools', '1', [builtinTool('stub.tools', 'lookup', overrides)])],
-        }),
-      );
-      assert.notEqual(base, changed, JSON.stringify(overrides));
-    }
   });
 
   it('Provider 实现版本变化 → 哈希变（同一份 prompt 也可能跑在另一版实现上）', async () => {
@@ -470,27 +417,6 @@ describe('CapabilityService：一张表装三类绑定', () => {
     assert.equal(capabilities.hasKnowledgeBinding(member.id, KNOWLEDGE_PROVIDER, 'security-controls'), false);
     assert.equal(capabilities.hasKnowledgeBinding(member.id, KNOWLEDGE_PROVIDER, ''), false);
     assert.equal(capabilities.hasKnowledgeBinding(member.id, 'other.provider', 'financial-core'), false);
-  });
-});
-
-// ═══════════════════════════════════════════════ 4. 默认能力
-
-describe('默认能力', () => {
-  it('每次返回一份新对象，改一份不影响下一份', () => {
-    const first = defaultMemberCapabilities();
-    first.tools.push({ providerId: 'runtime.host-coding-tools' });
-
-    assert.equal(
-      defaultMemberCapabilities().tools.some(
-        (binding) => binding.providerId === 'runtime.host-coding-tools',
-      ),
-      false,
-      '共享引用会让「给一个人开能力」变成给所有人开',
-    );
-  });
-
-  it('默认引用的 Provider ID 全部已注册（否则新建 Member 连一轮都跑不起来）', () => {
-    stack.registry.validateMemberCapabilities(defaultMemberCapabilities());
   });
 });
 

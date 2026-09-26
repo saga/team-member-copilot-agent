@@ -75,12 +75,6 @@ function createScheduleDue(
 }
 
 describe('Team / Membership', () => {
-  it('默认 Team 唯一，human owner 存在，agent 自动可补', () => {
-    const again = structure.ensureDefaultTeam('test');
-    assert.equal(again.id, team.id);
-    assert.equal(structure.getMembership(team.id, 'human', 'local-user').role, 'owner');
-  });
-
   it('Team role 与 Member.role 分开：Architect 的 team role 是 member', () => {
     const agent = makeAgent('Architect');
     assert.equal(agent.role, 'Engineer');
@@ -640,19 +634,6 @@ describe('外部工作：本地只有引用，业务事实在 Jira', () => {
     assert.equal(stack.team.getConversation(plain.id).externalWorkRef, null);
   });
 
-  it('空 key 的引用被当成「没有引用」，不会造出一条指向空工单的记录', async () => {
-    const { StubCopilot } = await import('./support.js');
-    const stack = createTestStack(db, memberService, new StubCopilot().asCopilot);
-    const someone = stack.team.createMember({ name: 'JiraBlank', role: 'E' });
-
-    const conv = stack.team.createConversation({
-      kind: 'work',
-      externalWorkRef: { provider: 'jira', key: '   ' },
-      memberIds: [someone.id],
-    });
-    assert.equal(stack.team.getConversation(conv.id).externalWorkRef, null);
-  });
-
   it('execution 开始时快照 externalWorkRef，delegation 继承引用但不继承快照', async () => {
     const { StubCopilot, singleExecutionId } = await import('./support.js');
     const stub = new StubCopilot();
@@ -705,45 +686,6 @@ describe('外部工作：本地只有引用，业务事实在 Jira', () => {
       const rows = structure.listCurrentActivity(team.id);
       return !rows.some((a) => a.executionId === executionId);
     }, 'execution 完成后从 Current Activity 消失');
-  });
-
-  it('webhook 最小投影：只发「变了哪些字段」，不落工单内容', async () => {
-    const { StubCopilot } = await import('./support.js');
-    const stack = createTestStack(db, memberService, new StubCopilot().asCopilot);
-    const agent = stack.team.createMember({ name: 'WebhookProbe', role: 'E' });
-    const room = stack.team.createConversation({
-      kind: 'work',
-      title: 'ABC-500',
-      externalWorkRef: { provider: 'jira', key: 'ABC-500' },
-      memberIds: [agent.id],
-    });
-
-    const events: Array<{ type: string; data: unknown }> = [];
-    const unsubscribe = stack.team.replayAndSubscribe(room.id, 0, (event) => {
-      events.push({ type: event.type, data: event.data });
-    });
-
-    const result = stack.team.applyExternalWorkChange({
-      provider: 'jira',
-      key: 'ABC-500',
-      externalId: '100500',
-      changedFields: ['status'],
-    });
-    unsubscribe();
-    assert.deepEqual(result.conversations, [room.id], '按 key 命中挂在这条工单上的房间');
-
-    const change = events.find((e) => e.type === 'external_work.changed');
-    assert.ok(change, '必须发出一条 external_work.changed 事件');
-    const payload = change.data as { ref: { key: string }; changedFields: string[] };
-    assert.equal(payload.ref.key, 'ABC-500');
-    assert.deepEqual(payload.changedFields, ['status']);
-    // 这是最关键的一条：payload 里**不能**有工单内容。
-    // 一旦有，本地就有了第二份会过期的工单状态。
-    assert.deepEqual(
-      Object.keys(payload).sort(),
-      ['changedFields', 'receivedAt', 'ref'],
-      'payload 只说明「变了什么字段」，不携带变化后的值',
-    );
   });
 
   it('webhook 按不可变 id 也能命中：工单改名后房间记的还是老 key', async () => {

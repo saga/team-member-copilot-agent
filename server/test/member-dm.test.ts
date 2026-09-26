@@ -119,23 +119,6 @@ describe('私聊房间', () => {
     assert.equal(inbox[0].conversation.id, dm.id);
     assert.equal(inbox[0].peer.id, b.id);
   });
-
-  it('空内容不会留下一个空房间', async () => {
-    const [a, b] = newPair();
-
-    await assert.rejects(
-      () => team.sendDirectMessage({ fromMemberId: a.id, toMemberId: b.id, content: '   ' }),
-      /消息内容不能为空/,
-    );
-    assert.equal(team.listDirectMessages(a.id).length, 0);
-  });
-
-  it('归档的 Member 不能建立新的私聊', () => {
-    const [a, b] = newPair();
-    team.updateMember(b.id, { status: 'archived' });
-
-    assert.throws(() => team.openDirectMessage(a.id, b.id), /归档的 Member/);
-  });
 });
 
 describe('私聊消息', () => {

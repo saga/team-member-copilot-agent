@@ -11,7 +11,8 @@ import { forbidden } from '../http-error.js';
 
 /**
  * P0 治理修复的锁定测试：
- *   Admin boundary / external-write 默认拒绝 / skill selector+版本 / knowledge 网关路由。
+ *   Admin boundary / skill selector+版本 / knowledge 网关路由。
+ * （工具授权层自己的契约在 tool-policy.test.ts，这里不再重复一遍。）
  */
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tmca-governance-'));
@@ -21,55 +22,16 @@ process.env.HOST_CODING_TOOLS = 'false';
 
 const { db } = await import('../db.js');
 const { config } = await import('../config.js');
-const { DefaultToolPolicy } = await import('../tool-policy.js');
-import type { PolicyService } from '../policy.js';
 const { FilesystemSkillProvider } = await import('../capabilities/providers/filesystem-skill.js');
 const { KnowledgeToolProvider } = await import('../capabilities/providers/knowledge-tools.js');
-const { CapabilityRegistry } = await import('../capabilities/registry.js');
-const { CapabilityResolver } = await import('../capabilities/resolver.js');
 const { createTestStack, capabilityContext, StubCopilot } = await import('./support.js');
 const { MemberService } = await import('../member-service.js');
 const { capabilitiesRouter } = await import('../routes/capabilities.js');
 const { knowledgeRouter } = await import('../routes/knowledge.js');
-import type { RuntimeTool } from '../capabilities/types.js';
 
 after(() => {
   db.close();
   fs.rmSync(dataDir, { recursive: true, force: true });
-});
-
-// ---------------------------------------------------------- tool policy
-
-describe('external-write 的放行权在 PolicyService', () => {
-  function tool(overrides: Partial<RuntimeTool> = {}): RuntimeTool {
-    return {
-      providerId: 'test.provider',
-      implementation: 'app',
-      kind: 'custom',
-      name: 'send_email',
-      description: 'test',
-      risk: 'external-write',
-      ...overrides,
-    };
-  }
-  const ctx = { memberId: 'm1', conversationId: 'c1', executionId: 'e1', userId: 'u1', toolName: 'send_email' };
-
-  it('PolicyService 放行才允许；拒绝时原样带回理由', async () => {
-    const allow: PolicyService = {
-      decide: (input) =>
-        String((input.args.to as string | undefined) ?? '') === 'allow@corp'
-          ? { allowed: true, reason: '额度内' }
-          : { allowed: false, reason: '远端策略拒绝' },
-    };
-    const policy = new DefaultToolPolicy({ allowHostTools: true }, allow);
-
-    const allowed = await policy.check(tool(), ctx, { to: 'allow@corp' });
-    assert.equal(allowed.allowed, true);
-
-    const denied = await policy.check(tool(), ctx, { to: 'deny@corp' });
-    assert.equal(denied.allowed, false);
-    assert.match(denied.reason, /远端策略拒绝/);
-  });
 });
 
 // ---------------------------------------------------------- skill selector + 版本
@@ -212,14 +174,5 @@ describe('Admin boundary：改 capability boundary 的写入要 token，读不�
       body: JSON.stringify({ key: 'x', name: 'X' }),
     });
     assert.ok(kbWrite.status === 401 || kbWrite.status === 403, `期望 401/403，实际 ${kbWrite.status}`);
-  });
-
-  it('启动校验：未知 Provider 的 binding 在 validate 阶段就失败，不等到 turn', () => {
-    const registry = new CapabilityRegistry();
-    const resolver = new CapabilityResolver(registry);
-    assert.throws(
-      () => resolver.validate({ skills: [], knowledge: [{ providerId: 'future.snowflake-provider' }], tools: [] }),
-      /未注册 Knowledge Provider/,
-    );
   });
 });

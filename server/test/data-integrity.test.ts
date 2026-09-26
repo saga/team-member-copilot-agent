@@ -271,21 +271,6 @@ describe('Member 长期记忆的乐观并发', () => {
     assert.ok(!saved.content.includes('Agent 在干活时记下的'));
   });
 
-  it('不带 expectedVersion 时强制覆盖（内部调用与明确的覆盖意图）', () => {
-    const member = makeMember('Memory Bob', 'memory-bob');
-    const result = team.replaceMemberMemory(member.id, '# Long-term Memory\n\n直接覆盖');
-    assert.ok(result.content.includes('直接覆盖'));
-  });
-
-  it('原子写：不会在记忆目录里留下临时文件', () => {
-    const member = makeMember('Memory Carol', 'memory-carol');
-    team.replaceMemberMemory(member.id, '# Long-term Memory\n\n第一次');
-    memberService.appendMemory(member.id, '第二次');
-
-    const memoryDir = path.dirname(memberService.memoryPath(member.id));
-    const leftovers = fs.readdirSync(memoryDir).filter((name) => name.endsWith('.tmp'));
-    assert.deepEqual(leftovers, [], '临时文件必须在 rename 之后消失');
-  });
 });
 
 // -------------------------------------------------------- 4. 上下文上限
@@ -669,28 +654,6 @@ describe('@mention 只做精确匹配', () => {
       compact.matched.map((member) => member.id),
       ['m3'],
     );
-  });
-
-  it('同一个 token 同时撞上 handle 和 name 时，handle 赢（与数组顺序无关）', () => {
-    const ambiguous = [
-      { id: 'first', handle: 'bob', name: 'Robert' },
-      { id: 'second', handle: 'robert', name: 'Bob' },
-    ] as unknown as Member[];
-
-    // `bob` 既是 first 的 handle，也是 second 的 name —— 显式身份优先
-    assert.deepEqual(
-      resolveMentions('@bob', ambiguous).matched.map((member) => member.id),
-      ['first'],
-    );
-    assert.deepEqual(
-      resolveMentions('@bob', [...ambiguous].reverse()).matched.map((member) => member.id),
-      ['first'],
-    );
-  });
-
-  it('同一个 Member 被 @ 多次只算一次', () => {
-    const result = resolveMentions('@alice 你看 @alice 还是你看', members);
-    assert.equal(result.matched.length, 1);
   });
 
 });

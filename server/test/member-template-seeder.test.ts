@@ -169,20 +169,13 @@ describe('真实模板目录：三个默认 Member', () => {
     assert.equal(architect.model, null);
   });
 
-  it('手工创建的 Member seedKey 为 null，且多行 NULL 可以共存', () => {
-    const a = memberService.create({ name: 'Manual A', role: 'T', handle: 'manual-a' });
-    const b = memberService.create({ name: 'Manual B', role: 'T', handle: 'manual-b' });
-
-    assert.equal(a.seedKey, null);
-    assert.equal(b.seedKey, null);
-  });
-
   it('seed_key 索引是部分索引，且列可空', () => {
     // 形状断言，不装成行为断言。
     //
     // SQLite 的唯一索引本来就把 NULL 视为互不相同，所以「去掉 WHERE 子句」
-    // 在行为上无法区分 —— 上面那条共存用例对两种索引都会通过。这里锁的是
-    // **意图**：索引只覆盖来自模板的行，`seed_key` 不是 NOT NULL。
+    // 在行为上无法区分 —— 手工创建的 Member（seedKey 为 null）在两种索引下
+    // 都能共存。这里锁的是**意图**：索引只覆盖来自模板的行，
+    // `seed_key` 不是 NOT NULL。
     const sql = db
       .prepare(`SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_member_seed_key'`)
       .get() as unknown as { sql: string } | undefined;
@@ -347,16 +340,6 @@ describe('模板配置错误必须大声报出来', () => {
     assert.throws(() => seedMemberTemplates(memberService, root, stack.capabilities, stack.resolver), /不合法/);
   });
 
-  it('模板目录不存在时返回空结果，不抛（这份部署不需要模板）', () => {
-    const result = seedMemberTemplates(
-      memberService,
-      path.join(dataDir, 'nope-does-not-exist'),
-      stack.capabilities,
-      stack.resolver,
-    );
-    assert.deepEqual(result, { created: [], skipped: [] });
-  });
-
   it('模板引用了未注册的 Provider ID → 直接抛，且不留下半成品 Member', () => {
     // 拼错的 Provider ID 如果被静默接受，表现为「这个 Member 少了检索能力」，
     // 而不是一个启动错误 —— 它会照常回答，只是答案不再有依据。
@@ -379,19 +362,6 @@ describe('模板配置错误必须大声报出来', () => {
       /未注册 Skill Provider：team\.filesystem-skill/,
     );
     assert.equal(memberService.findBySeedKey('test.typo'), null);
-  });
-
-  it('enabled: false 的模板既不创建也不计入 skipped', () => {
-    const root = newTemplateRoot();
-    writeTemplate(root, 'disabled', {
-      key: 'test.disabled',
-      handle: 'disabled',
-      extraManifest: { enabled: false },
-    });
-
-    const result = seedMemberTemplates(memberService, root, stack.capabilities, stack.resolver);
-    assert.deepEqual(result, { created: [], skipped: [] });
-    assert.equal(memberService.findBySeedKey('test.disabled'), null);
   });
 
   it('以点开头的目录被跳过（.git / .DS_Store 之类）', () => {

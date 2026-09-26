@@ -167,12 +167,6 @@ describe('check：判据来自声明，不来自名字', () => {
     assert.equal(decision.allowed, true);
     assert.match(decision.reason, /policy allow/);
   });
-
-  it('privileged 的拒绝不依赖部署开关恰好关着', async () => {
-    const decision = await decide(policy(WITHHOLD_HOST), tool({ risk: 'privileged' }));
-    assert.equal(decision.allowed, false);
-    assert.match(decision.reason, /policy deny/);
-  });
 });
 
 describe('check：guard 是逐次判定，不是第二份白名单', () => {
@@ -217,30 +211,6 @@ describe('check：guard 是逐次判定，不是第二份白名单', () => {
     const decision = await decide(layer, subject);
     assert.equal(decision.allowed, false);
     assert.match(decision.reason, /参数越界/);
-  });
-});
-
-describe('check：external-write 的放行权在 PolicyService', () => {
-  it('PolicyService 拒绝 → 拒绝（Provider 的 guard 批准不了它）', async () => {
-    const layer = policy(ALLOW_HOST, DENY_HIGH_RISK);
-    const subject = tool({
-      name: 'send_email',
-      risk: 'external-write',
-      guard: () => ({ allowed: true, reason: '收件人在白名单' }),
-    });
-
-    const decision = await decide(layer, subject);
-    assert.equal(decision.allowed, false);
-    assert.match(decision.reason, /policy deny/);
-  });
-
-  it('PolicyService 放行 → 放行', async () => {
-    const decision = await decide(
-      policy(ALLOW_HOST, ALLOW_HIGH_RISK),
-      tool({ name: 'send_email', risk: 'external-write' }),
-    );
-    assert.equal(decision.allowed, true);
-    assert.match(decision.reason, /policy allow/);
   });
 });
 

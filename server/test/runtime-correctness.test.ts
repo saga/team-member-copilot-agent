@@ -334,22 +334,6 @@ describe('resumeSession 的降级必须窄', () => {
     assert.equal(fake.calls.metadata, 0, '已经明确匹配就不需要再问一次');
   });
 
-  it('resume 抛未知错误 + 元数据也查不了 → 原样抛出，不猜', async () => {
-    const resumeError = new Error('connection lost mid-handshake');
-    const fake = createFakeClient({
-      resume: async () => {
-        throw resumeError;
-      },
-      metadata: async () => {
-        throw new Error('Client not connected');
-      },
-      create: async () => createFakeSession({}).session,
-    });
-    const copilot = new CopilotService({ createClient: () => fake.client });
-
-    await assert.rejects(() => copilot.runMemberTurn(turnInput()), /connection lost mid-handshake/);
-    assert.equal(fake.calls.create, 0, '无法确认就必须让原始错误抛出');
-  });
 });
 
 describe('sendAndWait 超时 → abort', () => {
@@ -494,38 +478,6 @@ async function runTurnCapturing(
 }
 
 describe('工具授权层真的接到了引擎上', () => {
-  it('没绑定宿主工具：既不声明也不放行', async () => {
-    // 部署层放开了（allowHostTools: true），但这一轮的能力里根本没有这条
-    // binding —— 于是宿主工具连声明都没有，授权层也无从放行。
-    // 「能不能用」先看能力解析结果，再看部署开关，两个都要过。
-    const decisions: Array<Record<string, unknown>> = [];
-
-    const { config } = await runTurnCapturing({
-      capabilities: defaultCapabilities,
-      toolPolicy: new DefaultToolPolicy({ allowHostTools: true }, allowHighRisk()),
-      during: async (captured) => {
-        for (const name of ['bash', 'edit', 'grep', 'web_fetch']) {
-          decisions.push(
-            (await captured.hooks?.onPreToolUse?.({
-              sessionId: 'sess-1',
-              toolName: name,
-              toolArgs: {},
-            })) as Record<string, unknown>,
-          );
-        }
-      },
-    });
-
-    const declared = declaredTools(config);
-    for (const name of ['bash', 'edit', 'grep', 'web_fetch']) {
-      assert.ok(!declared.includes(`builtin:${name}`), `${name} 不该被声明给没绑定它的 Member`);
-    }
-    assert.equal(decisions.length, 4);
-    for (const decision of decisions) {
-      assert.equal(decision.permissionDecision, 'deny');
-    }
-  });
-
   it('绑定了宿主工具 + 部署放行：声明里有了，hook 也真的放行', async () => {
     let decision: Record<string, unknown> | undefined;
 

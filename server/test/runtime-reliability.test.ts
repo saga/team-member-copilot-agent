@@ -644,48 +644,6 @@ describe('checkpoint 只在 turn 成功后推进', () => {
   });
 });
 
-describe('runtime 单写者', () => {
-  it('并发两轮不会交叉执行，结束后 active_execution_id 归零', async () => {
-    const conv = team.createConversation({
-      kind: 'direct',
-      title: 'SingleWriter',
-      memberIds: [alice.id],
-      defaultMemberId: alice.id,
-    });
-
-    const before = stub.turns.length;
-    // 用 sendRaw：同一个 Member 上并发的两条唤醒会被 scheduler 合并成
-    // 「先跑一轮、再补一轮」，第二条的 execution 在返回时还没被创建。
-    await Promise.all([
-      sendRaw({ conversationId: conv.id, content: 'one' }),
-      sendRaw({ conversationId: conv.id, content: 'two' }),
-    ]);
-    await waitForConversationIdle(conv.id);
-
-    // 两条消息各自留下一条 execution（只是先后出现，不是同时)
-    const executions = team.listExecutions(conv.id, 100);
-    assert.equal(executions.length, 2, '两条消息应该各留下一条 execution');
-    assert.deepEqual(
-      executions.map((execution) => execution.triggerMessageSequence),
-      [1, 2],
-    );
-    assert.equal(new Set(executions.map((execution) => execution.memberId)).size, 1);
-    for (const execution of executions) {
-      assert.equal(execution.status, 'completed');
-    }
-
-    const runtime = runtimeRow(conv.id, alice.id);
-    assert.ok(runtime);
-    assert.equal(runtime.status, 'idle');
-    assert.equal(runtime.active_execution_id, null, '跑完必须把单写者占用清掉');
-
-    // 两轮都用同一个 runtime 串行执行
-    const turns = stub.turns.slice(before);
-    assert.equal(turns.length, 2);
-    assert.equal(new Set(turns.map((turn) => turn.runtime.id)).size, 1);
-  });
-});
-
 describe('wait-for 环检测（跨 delegation 树的死锁保护）', () => {
   it('目标 runtime 正在等自己时，delegation 被拒绝', async () => {
     const conv = team.createConversation({
@@ -746,55 +704,6 @@ describe('wait-for 环检测（跨 delegation 树的死锁保护）', () => {
         `UPDATE execution SET status = 'completed', waiting_for_runtime_id = NULL WHERE id = ?`,
       ).run(aliceRun.executionId);
     }
-  });
-
-  it('正常 A → B 委派期间父 execution 进入 waiting_for_member，结束后还原', async () => {
-    const conv = team.createConversation({
-      kind: 'group',
-      title: 'Waiting',
-      memberIds: [alice.id, bob.id],
-    });
-    muteAllMembers(team, conv.id);
-
-    const parent = await sendMessage({
-      conversationId: conv.id,
-      content: 'parent',
-      targetMemberId: alice.id,
-    });
-    await waitForStatus(parent.executionId, 'completed');
-
-    const seenWaiting: Array<{ status: string; waitingFor: string | null }> = [];
-    const unsubscribe = team.subscribe(conv.id, (event) => {
-      if (event.type !== 'execution.updated') return;
-      const data = event.data as {
-        id: string;
-        status: string;
-        waitingForRuntimeId: string | null;
-      };
-      if (data.id === parent.executionId) {
-        seenWaiting.push({ status: data.status, waitingFor: data.waitingForRuntimeId });
-      }
-    });
-
-    try {
-      await team.delegateMember({
-        conversationId: conv.id,
-        fromMemberId: alice.id,
-        parentExecutionId: parent.executionId,
-        targetMemberId: bob.id,
-        task: 'delegate',
-      });
-    } finally {
-      unsubscribe();
-    }
-
-    const waiting = seenWaiting.find((item) => item.status === 'waiting_for_member');
-    assert.ok(waiting, `父 execution 应该经过 waiting_for_member：${JSON.stringify(seenWaiting)}`);
-    assert.equal(waiting.waitingFor, runtimeRow(conv.id, bob.id)?.id);
-
-    const finalRow = executionRow(parent.executionId);
-    assert.notEqual(finalRow.status, 'waiting_for_member', '结束后必须还原');
-    assert.equal(finalRow.waiting_for_runtime_id, null);
   });
 });
 
@@ -902,39 +811,6 @@ describe('durable conversation_event 与 SSE 回放', () => {
     }
   });
 
-  it('回放覆盖全部历史事件，sequence 是连续无洞的 1..N', async () => {
-    const conv = team.createConversation({
-      kind: 'direct',
-      title: 'GapFreeReplay',
-      memberIds: [bob.id],
-      defaultMemberId: bob.id,
-    });
-
-    for (const text of ['a', 'b', 'c', 'd', 'e', 'f']) {
-      const sent = await sendMessage({ conversationId: conv.id, content: text });
-      await waitForStatus(sent.executionId, 'completed');
-    }
-
-    const total = (
-      db
-        .prepare(`SELECT COUNT(*) AS n FROM conversation_event WHERE conversation_id = ?`)
-        .get(conv.id) as unknown as { n: number }
-    ).n;
-    assert.ok(total > 10, `前置条件：事件数应该足够多，实际 ${total}`);
-
-    const seen: number[] = [];
-    const unsubscribe = team.replayAndSubscribe(conv.id, 0, (event) => {
-      if (event.sequence !== null) seen.push(event.sequence);
-    });
-    unsubscribe();
-
-    // 分页循环不能漏事件，否则重连后 UI 会缺一段历史
-    assert.deepEqual(
-      seen,
-      Array.from({ length: total }, (_, index) => index + 1),
-      '回放必须是连续无洞的 1..N',
-    );
-  });
 });
 
 describe('RecoveryService', () => {

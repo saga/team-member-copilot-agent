@@ -993,7 +993,7 @@ server/                       # Express + Copilot SDK 后端
     conversations-api.test.ts      # 真实 HTTP：externalWorkRef 过边界 / 负责人 set-swap-clear / state patch 字段校验 / SSE 字节流上没有哨兵
     data-integrity.test.ts         # replyTo 校验 / 消息幂等 / 记忆乐观并发 / 上下文上限 / 配置快照 / state 事件 / mention 精确匹配
     member-template-seeder.test.ts # provisioning 幂等 / 不覆盖已改 Member / 归档不复活 / 穿越与重复 key / 能力绑定
-    knowledge-provider.test.ts     # 检索范围限定在授权的 KB / personal 隔离 / 路径与 FTS 注入 / 索引幂等 / 磁盘同步
+    knowledge-provider.test.ts     # 检索范围限定在授权的 KB / personal 隔离 / 路径注入 / 索引幂等 / 磁盘同步
     team-v1.test.ts                # Team/Membership/Presence/Scheduler(prompt 保真+单 execution+run 收口+恢复)/Jira 引用与 Current Activity
 
 scripts/

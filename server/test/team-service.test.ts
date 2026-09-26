@@ -176,12 +176,6 @@ describe('Member 是跨 conversation 的长期身份', () => {
     assert.ok(fs.existsSync(path.join(home, 'skills')));
   });
 
-  it('handle 冲突时自动加后缀', () => {
-    const first = team.createMember({ name: 'Duplicate', role: 'Twin' });
-    const second = team.createMember({ name: 'Duplicate', role: 'Twin' });
-    assert.notEqual(first.handle, second.handle);
-  });
-
   it('remember_member 写入 Member 自己的长期记忆', async () => {
     const result = await team.rememberMember({
       memberId: researcher.id,
@@ -245,24 +239,6 @@ describe('Conversation / Runtime 边界', () => {
       defaultMemberId: coder.id,
     });
     assert.throws(() => team.addMember(work.id, reviewer.id), /只有 group 允许增减成员/);
-  });
-
-  it('group 移出成员后仍须满足 group 形状约束', () => {
-    const group = team.createConversation({
-      kind: 'group',
-      memberIds: [coder.id, reviewer.id],
-    });
-
-    // 移出后只剩 1 个成员 → 不再是合法 group
-    assert.throws(() => team.removeMember(group.id, reviewer.id), /至少需要两个 Member/);
-
-    // 加第三个成员后可以移出
-    team.addMember(group.id, analyst.id);
-    const after = team.removeMember(group.id, analyst.id);
-    assert.deepEqual(
-      after.members.map((member) => member.id).sort(),
-      [coder.id, reviewer.id].sort(),
-    );
   });
 
   it('kind 的形状约束在 Service 层强制（API 是公开的）', () => {

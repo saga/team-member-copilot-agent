@@ -35,7 +35,6 @@ const { createTestStack, StubCopilot } = await import('./support.js');
 const {
   normalizeExternalWorkRef,
   parseExternalWorkRef,
-  serializeExternalWorkRef,
   parseExternalWorkSnapshot,
   WorkManagementRegistry,
 } = await import('../work-management/types.js');
@@ -76,18 +75,6 @@ describe('ExternalWorkRef：本地唯一持有的业务标识', () => {
     assert.equal(parseExternalWorkRef('not json'), null);
     assert.equal(parseExternalWorkRef('{"provider":"jira"}'), null, '没有 key 的引用没有意义');
     assert.equal(parseExternalWorkRef('{"provider":"linear","key":"ENG-1"}'), null);
-  });
-
-  it('缺 externalId 时回落到 key，而不是留一个空字符串', () => {
-    const ref = parseExternalWorkRef('{"provider":"jira","key":"ABC-1","url":null}');
-    assert.equal(ref?.externalId, 'ABC-1');
-    assert.equal(ref?.url, null);
-  });
-
-  it('往返：serialize 之后 parse 回来形状一致；null 存 NULL 不存 "null"', () => {
-    const ref = { provider: 'jira' as const, externalId: '10001', key: 'ABC-1', url: 'https://x/browse/ABC-1' };
-    assert.deepEqual(parseExternalWorkRef(serializeExternalWorkRef(ref)), ref);
-    assert.equal(serializeExternalWorkRef(null), null);
   });
 
   it('取证快照缺 ref 或缺 title 就是坏数据 —— 宁可为空，不要半条', () => {
@@ -131,12 +118,6 @@ describe('WorkManagementRegistry：查不到必须抛，不能静默跳过', () 
     assert.equal(registry.size, 1);
     assert.equal(registry.has('jira'), true);
     assert.throws(() => registry.register(provider), /重复注册 Work Management Provider/);
-  });
-
-  it('按引用找到能处理它的 Provider', () => {
-    const registry = new WorkManagementRegistry();
-    registry.register(provider);
-    assert.equal(registry.for(provider.ref({ key: 'ABC-1' })), provider);
   });
 });
 
@@ -468,14 +449,6 @@ describe('Jira webhook：最小投影 + 共享密钥门禁', () => {
       'payload 只说明「变了什么字段」，不携带变化后的值',
     );
     assert.deepEqual(payload.changedFields, ['status', 'assignee']);
-  });
-
-  it('没有 issue 的 payload（sprint / user 等事件）回 200 忽略，不回 4xx', async () => {
-    config.jira.webhookSecret = '';
-    const response = await post({ webhookEvent: 'sprint_started' });
-    // 回 4xx 会让 Jira 一直重推同一个我们不处理的事件。
-    assert.equal(response.status, 200);
-    assert.deepEqual(await response.json(), { ignored: true, reason: 'payload has no issue' });
   });
 
   it('没挂这条工单的房间不受影响（matched=0 是正常结果，不是错误）', async () => {

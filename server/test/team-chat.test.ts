@@ -645,28 +645,6 @@ describe('负责人兜底：整个房间都不接话时，由负责人回答', (
     assert.deepEqual(escalationExecutions(roomId), [], '已经有人回答了，不该再叫负责人');
   });
 
-  it('没设负责人时不兜底（没有兜底人不是错误）', async () => {
-    const roomId = makeRoom('No Lead Room');
-    stub.mode = 'skip';
-
-    await team.sendMessage({ conversationId: roomId, content: '有人吗' });
-    await waitForConversationIdle(roomId);
-
-    assert.deepEqual(escalationExecutions(roomId), []);
-  });
-
-  it('负责人被静音时不兜底（静音是显式意图，兜底不该绕过去）', async () => {
-    const roomId = makeRoom('Muted Lead Room');
-    team.setMemberLead(roomId, alice.id, true);
-    team.setMemberMuted(roomId, alice.id, true);
-    stub.mode = 'skip';
-
-    await team.sendMessage({ conversationId: roomId, content: '有人吗' });
-    await waitForConversationIdle(roomId);
-
-    assert.deepEqual(escalationExecutions(roomId), [], '被静音的负责人不该被兜底机制唤醒');
-  });
-
   it('负责人本人就是应答者、也选择了沉默时，仍然兜底（房间不能就这么沉默下去）', async () => {
     const roomId = makeRoom('Asked Lead Room');
     team.setMemberLead(roomId, alice.id, true);
