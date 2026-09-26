@@ -292,17 +292,17 @@ function assertConversationKindShape(kind: ConversationKind, memberCount: number
   switch (kind) {
     case 'direct':
       if (memberCount < 1 || memberCount > 2) {
-        throw badRequest('direct conversation 需要一个 Member（用户单聊）或两个 Member（Member 私聊）');
+        throw badRequest('单聊需要一个成员（你和他聊），或两个成员（他们俩聊）');
       }
       return;
     case 'group':
       if (memberCount < 2) {
-        throw badRequest('group conversation 至少需要两个 Member');
+        throw badRequest('群聊至少需要两个成员');
       }
       return;
     case 'work':
       if (memberCount !== 1) {
-        throw badRequest('work conversation 当前必须只有一个 Member');
+        throw badRequest('work 会话只能有一个成员');
       }
       return;
   }
@@ -594,14 +594,14 @@ export class TeamService {
     // 多人共享讨论被悄悄降级成单人聊天 —— 而且从数据上看不出这是错的。
     // 显式传了就报错，而不是默默忽略：静默忽略会让调用方以为自己设置成功了。
     if (kind === 'group' && input.defaultMemberId) {
-      throw badRequest('group conversation 不接受 defaultMemberId，收件人由 GroupDispatcher 决定');
+      throw badRequest('群聊不需要也不能指定默认收件人，消息由服务端自动派发');
     }
 
     const defaultMemberId =
       kind === 'group' ? null : (input.defaultMemberId ?? (memberIds.length === 1 ? memberIds[0] : null));
 
     if (defaultMemberId && !memberIds.includes(defaultMemberId)) {
-      throw badRequest('defaultMemberId 必须属于 conversation member');
+      throw badRequest('指定的默认收件人必须在这个会话里');
     }
 
     const title =
@@ -1573,12 +1573,11 @@ export class TeamService {
 
     if (execution.status === 'cancelled') return execution;
     if (TERMINAL_STATUSES.has(execution.status)) {
-      throw conflict(`execution 已经结束（${execution.status}），不能 cancel`);
+      throw conflict(`这条任务已经结束（${execution.status}），无法取消`);
     }
     if (execution.status === 'waiting_for_member') {
       throw conflict(
-        'execution 正在等待其他 Member（waiting_for_member），暂不支持 cancel：' +
-          '取消等待中的子树需要处理整棵树的取消传播',
+        '这条任务正在等其他成员回话，暂时不能取消：取消它需要连带取消一串相关任务，目前还不支持',
       );
     }
 
@@ -1760,7 +1759,7 @@ export class TeamService {
     prompt: string;
   }): Promise<string> {
     const conversation = this.getConversation(input.conversationId);
-    if (conversation.kind !== 'work') throw badRequest('Schedule 只能绑定 work conversation');
+    if (conversation.kind !== 'work') throw badRequest('定时任务只能挂在 work 会话上');
     const member = this.requireActiveMember(conversation, input.memberId);
     // paused 只拦自动唤醒，@ 点名仍走聊天路径；这里是自动路径，必须检查。
     const team = this.defaultTeam();
@@ -1816,7 +1815,7 @@ export class TeamService {
         )
         .run(execution.id, input.scheduleRunId);
       if (Number(result.changes) !== 1) {
-        throw conflict('ScheduledWakeRun 已绑定其他 Execution 或状态已改变');
+        throw conflict('这条定时记录已被其他任务认领，或状态刚刚发生了变化');
       }
     });
 

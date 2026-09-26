@@ -67,6 +67,12 @@ export function MessageComposer({
               variant="borderless"
               value={recipientMemberId}
               onChange={onRecipientChange}
+              // 下拉宽度不能跟随触发器：prefix 里 borderless Select 很窄，
+              // 跟随宽度会把 @handle 全部截成省略号。
+              popupMatchSelectWidth={false}
+              // 输入区在屏幕底部，弹出层固定向上、左缘与触发器对齐，
+              // 避免自动翻转时左右跳动。
+              placement="topLeft"
               options={[
                 {
                   value: EVERYONE,

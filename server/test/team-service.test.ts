@@ -295,7 +295,7 @@ describe('Conversation / Runtime 边界', () => {
           kind: 'direct',
           memberIds: [coder.id, reviewer.id, analyst.id],
         }),
-      /direct conversation 需要一个 Member/,
+      /单聊需要一个成员/,
     );
     assert.equal(
       team.createConversation({ kind: 'direct', memberIds: [coder.id, reviewer.id] }).members.length,
@@ -304,11 +304,11 @@ describe('Conversation / Runtime 边界', () => {
     );
     assert.throws(
       () => team.createConversation({ kind: 'group', memberIds: [coder.id] }),
-      /group conversation 至少需要两个 Member/,
+      /群聊至少需要两个成员/,
     );
     assert.throws(
       () => team.createConversation({ kind: 'work', memberIds: [coder.id, reviewer.id] }),
-      /work conversation 当前必须只有一个 Member/,
+      /work 会话只能有一个成员/,
     );
   });
 
@@ -321,7 +321,7 @@ describe('Conversation / Runtime 边界', () => {
           memberIds: [coder.id, reviewer.id],
           defaultMemberId: 'not-in-conversation',
         }),
-      /defaultMemberId 必须属于 conversation member/,
+      /指定的默认收件人必须在这个会话里/,
     );
 
     // group：这个字段在这里没有语义，显式传了要报错而不是被默默忽略 ——
@@ -333,7 +333,7 @@ describe('Conversation / Runtime 边界', () => {
           memberIds: [coder.id, reviewer.id],
           defaultMemberId: coder.id,
         }),
-      /group conversation 不接受 defaultMemberId/,
+      /群聊不需要也不能指定默认收件人/,
     );
 
     const group = team.createConversation({

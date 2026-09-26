@@ -147,7 +147,7 @@ export class TeamStructureService {
         )
         .get(teamId, principalId) as { n: number };
       if (row.n === 0) {
-        throw conflict('Team 至少必须保留一个 active owner');
+        throw conflict('团队至少要保留一个未归档的 owner');
       }
     }
     this.db
@@ -324,8 +324,8 @@ export class TeamStructureService {
       .prepare(`SELECT id, kind, team_id FROM conversation WHERE id = ?`)
       .get(input.conversationId) as unknown as { id: string; kind: string; team_id: string } | undefined;
     if (!conversation) throw notFound(`Conversation 不存在：${input.conversationId}`);
-    if (conversation.team_id !== teamId) throw badRequest('Conversation 不属于这个 Team');
-    if (conversation.kind !== 'work') throw badRequest('Schedule 只能绑定 work conversation');
+    if (conversation.team_id !== teamId) throw badRequest('这个会话不属于当前团队');
+    if (conversation.kind !== 'work') throw badRequest('定时任务只能挂在 work 会话上');
     // 被调度的 Member 必须属于绑定的 work conversation，否则运行时才炸。
     const memberInConversation = this.db
       .prepare(
@@ -338,12 +338,12 @@ export class TeamStructureService {
       )
       .get(input.conversationId, input.memberId);
     if (!memberInConversation) {
-      throw badRequest('Schedule 的 Member 必须属于绑定的 work conversation');
+      throw badRequest('定时任务的执行成员必须在这个 work 会话里');
     }
     const prompt = input.prompt.trim();
-    if (!prompt) throw badRequest('Schedule prompt 不能为空');
+    if (!prompt) throw badRequest('定时任务的指令内容不能为空');
     if (input.type === 'interval' && (!input.intervalSeconds || input.intervalSeconds <= 0)) {
-      throw badRequest('interval 类型必须给正整数 intervalSeconds');
+      throw badRequest('按间隔调度时，intervalSeconds 必须是正整数');
     }
     // runAt 在创建时就验证：非法时间会变成一条永远跑不到的 schedule（once），
     // 只有用户在列表里看到 next_run_at 是空/乱码时才发现。
@@ -399,7 +399,7 @@ export class TeamStructureService {
     const current = this.getSchedule(id);
     // 已完成的 once 不能 resume：它的一次性语义已经兑现。
     if (current.status === 'completed' && status === 'active') {
-      throw conflict('已完成的 once schedule 不能 resume');
+      throw conflict('一次性定时任务已经跑完，不能重新开启');
     }
     this.db.prepare(`UPDATE scheduled_wake SET status = ?, updated_at = ? WHERE id = ?`).run(status, now(), id);
     const schedule = this.getSchedule(id);
@@ -444,7 +444,7 @@ export class TeamStructureService {
         .run(id, scheduleId, scheduledFor, timestamp);
     } catch (error) {
       if (String(error).includes('UNIQUE constraint failed')) {
-        throw conflict('同一时间点已有一条 scheduled run（幂等跳过）');
+        throw conflict('这个时间点已经跑过一次了，重复请求被忽略');
       }
       throw error;
     }

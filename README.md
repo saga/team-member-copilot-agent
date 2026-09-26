@@ -1106,7 +1106,7 @@ server/                       # Express + Copilot SDK 后端
     team-v1.test.ts                # Team/Membership/Presence/Scheduler(prompt 保真+单 execution+run 收口+恢复)/Jira 引用与 Current Activity
 
 scripts/
-  mutation-check.py           # 变异验证：把跨层不变量改回错误写法，确认断言真的变红（AGENTS.md §7）
+  mutation-check.py           # 变异验证：把跨层不变量改回错误写法，确认断言真的变红（AGENTS.md §8）
 ```
 
 ## 环境变量

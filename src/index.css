@@ -118,11 +118,54 @@ body {
 /*
  * 每个页签自己的滚动容器。放在这里而不是 modal body 上，是为了让页签栏
  * 始终留在视野里 —— 翻到下面看 Effective 时，仍然看得见自己在配哪一层。
+ * 58vh 是按 Modal 弹窗的高度设计的；内嵌 Settings 页时走下面的
+ * .capability-inline，撑满剩余高度而不是被 58vh 截断。
  */
 .capability-pane {
   max-height: 58vh;
   overflow-y: auto;
   padding-right: 4px;
+}
+
+/*
+ * 内嵌 Settings 页的 Capabilities：整页 flex 列，页签栏固定，
+ * 滚动交给页签内容区。逐层放开高度约束，任何一层被压住都会
+ * 退回「内容截断 + 底部留白」的形态。
+ */
+.capability-inline {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.capability-inline > .ant-space {
+  flex: 1;
+  min-height: 0;
+}
+
+.capability-inline > .ant-space > .ant-space-item:has(> .ant-tabs) {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.capability-inline .ant-tabs {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.capability-inline .ant-tabs-body-holder {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.capability-inline .capability-pane {
+  max-height: none;
 }
 
 .chat-scroll {
@@ -135,6 +178,18 @@ body {
 .sender-bar {
   padding: 12px 18px;
   border-top: 1px solid #f0f0f0;
+}
+
+/*
+ * prefix 里的收件人 Select 和输入框文字要在同一行。
+ * Sender 的 content 是 align-items: flex-end：textarea（32px）和小号
+ * Select（24px）底部对齐后，Select 的中心比 textarea 文字中心低 4px。
+ * 让 prefix 撑满行高再垂直居中，两边中心线才一致。
+ */
+.sender-bar .ant-sender-prefix {
+  align-self: stretch;
+  display: flex;
+  align-items: center;
 }
 
 /* 会话头：标题区 + 头像/Participants 操作区同一行，窄屏换行。 */

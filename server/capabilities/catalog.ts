@@ -255,7 +255,7 @@ function toCatalogTool(
       ? {}
       : {
           unavailableReason:
-            '当前部署未启用宿主工具（HOST_CODING_TOOLS），部署放行后才可用',
+            '这个工具会直接操作运行本服务的机器，管理员还没有打开总开关：在服务端设置 HOST_CODING_TOOLS=true 后才能使用',
         }),
   };
 }
@@ -313,7 +313,7 @@ export async function buildCatalog(
     knowledge.push({
       id: knowledgeIdOfKey(binding.selector),
       name: binding.selector,
-      description: '资料库尚未建立（首次使用时自动建立），当前 0 篇文档',
+      description: '还没有文档，第一次使用时会自动创建',
       scope: 'team' as const,
       documentCount: 0,
       enabled: true,

@@ -418,12 +418,12 @@ export class LocalFilesystemKnowledgeProvider implements KnowledgeProvider {
     // personal 的属主判断不能省：`$personal` 这条 binding 每个 Member 都有，
     // 光看 binding 会让 A 打开 B 的个人资料。
     if (kb.scope === 'personal' && kb.memberId !== memberId) {
-      throw forbidden('该 Member 没有访问这个 Knowledge Base 的权限');
+      throw forbidden('这是别人的个人资料库，没有权限查看');
     }
 
     const selector = kb.scope === 'personal' ? PERSONAL_SELECTOR : kb.key;
     if (!this.capabilities.hasEffectiveKnowledgeBinding(teamId, memberId, this.id, selector)) {
-      throw forbidden(`该 Member 未绑定 Knowledge source：${selector}`);
+      throw forbidden(`这个成员没有绑定资料库（${selector}），先在能力配置里勾选`);
     }
   }
 
@@ -561,7 +561,7 @@ export class LocalFilesystemKnowledgeProvider implements KnowledgeProvider {
     const root = path.resolve(this.rootOf(kb));
     const resolved = path.resolve(root, relativePath);
     if (!resolved.startsWith(`${root}${path.sep}`)) {
-      throw badRequest('Knowledge document 路径越界');
+      throw badRequest('文档路径不合法（指到了资料库目录之外）');
     }
     return resolved;
   }

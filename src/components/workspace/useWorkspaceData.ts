@@ -298,7 +298,7 @@ export function useWorkspaceData({ onError }: { onError: (message: string | null
 
       if (data.status === 'failed' && data.error) onError(data.error);
       if (data.status === 'interrupted') {
-        onError('有 execution 因服务重启而中断，未被自动重跑（避免重复执行）。');
+        onError('有任务因为服务重启被中断了，系统没有自动重跑（避免重复执行）。');
       }
       // 终态：清掉流式占位，避免残留一个永远转圈的半截回复
       if (!ACTIVE_STATUSES.includes(data.status)) {

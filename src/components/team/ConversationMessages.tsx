@@ -51,8 +51,8 @@ export function ConversationMessages({
         <Empty
           description={
             isGroup
-              ? '收件人保持 Everyone 时不点名，消息会派给房间里所有可用成员，各自判断要不要发言（可以沉默）；要指名就选具体成员，或在正文里 @handle。'
-              : `${conversation.members[0]?.name ?? '该成员'} 会用你自己的记忆、人格和工作区回答；它也可以用 ask_member 把子任务委派给其他成员。`
+              ? '收件人保持 Everyone 时，消息会发给房间里所有成员，由他们自己决定要不要回话；想指定某个人，就在这里选，或在正文里 @他。'
+              : `${conversation.members[0]?.name ?? '该成员'} 会带着自己的记忆和工作区来回答，需要时也可以把子任务交给其他成员帮忙。`
           }
         />
       </div>

@@ -41,12 +41,11 @@ interface Draft {
 }
 
 const SCOPE_HINT: Record<Scope, ReactNode> = {
-  global: '这些能力会自动提供给所有 Team 和 Member。这里的改动会影响所有人。',
-  team: '这个 Team 中的所有 Member 自动获得。它叠在公司默认之上。',
+  global: '这里的配置对整个系统默认生效，所有团队和成员都会拿到。',
+  team: '本团队的所有成员自动获得这一层配置，是在公司默认基础上追加的。',
   member: (
     <>
-      这个 Member <strong>额外拥有</strong>的能力。清空 = 退回团队基线，
-      不是变成什么都不会的人。
+      这位成员自己<strong>额外</strong>拥有的能力。清空只是回到团队默认，不会让他什么都干不了。
     </>
   ),
 };
@@ -410,7 +409,7 @@ export function CapabilitySettings({
           ))
         )}
         <div style={{ color: '#999', fontSize: 12 }}>
-          选中资料库后，Agent 自动获得检索与原文查看能力，无需单独配置。
+          勾选后，成员就能搜索和阅读这个资料库里的内容，不用再配别的。
         </div>
       </Space>
     );
@@ -429,7 +428,7 @@ export function CapabilitySettings({
         </div>
         <div>
           <strong>Requires approval</strong>
-          <div>{tool.needsApproval ? 'Yes — 每次调用要过 Policy 审批' : 'No'}</div>
+          <div>{tool.needsApproval ? '是，每次使用都会先请求确认' : '否'}</div>
         </div>
         {!tool.available ? (
           <div>
@@ -454,7 +453,7 @@ export function CapabilitySettings({
     }
 
     if (groups.size === 0) {
-      return <div style={{ color: '#999', fontSize: 12 }}>当前部署没有可用的 Action。</div>;
+      return <div style={{ color: '#999', fontSize: 12 }}>目前没有可配置的工具。</div>;
     }
 
     return (
@@ -518,7 +517,7 @@ export function CapabilitySettings({
         <div>
           <strong>Included by default</strong>
           <div style={{ color: '#999', fontSize: 12 }}>
-            这个 Member 自动拥有的部分，在 Company / Team 两层里改，不在这里改。
+            这些是成员从公司/团队默认里自动继承的，要改请切到对应页签，这里改不了。
           </div>
         </div>
         <div>
@@ -547,7 +546,7 @@ export function CapabilitySettings({
 
         {target === 'member' ? (
           members.length === 0 ? (
-            <Alert type="warning" showIcon message="还没有任何 Member，先建一个人再来配它的增量能力。" />
+            <Alert type="warning" showIcon message="还没有成员，先去 Team 页创建一个，再回来给他配能力。" />
           ) : (
             <Select
               style={{ width: '100%' }}
@@ -575,7 +574,7 @@ export function CapabilitySettings({
               <div>
                 <strong>Extra for this member</strong>
                 <div style={{ color: '#999', fontSize: 12 }}>
-                  只属于这个人的增量。清空 = 退回团队基线，不是变成什么都不会的人。
+                  只给这位成员的额外能力。清空只是回到团队默认，不会让他什么都干不了。
                 </div>
               </div>
             )}
@@ -700,7 +699,7 @@ export function CapabilitySettings({
 
   if (inline) {
     return (
-      <>
+      <div className="capability-inline">
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
           <h2 style={{ margin: 0, fontSize: 16 }}>Capabilities</h2>
           {renderSettingsActions()}
@@ -722,7 +721,7 @@ export function CapabilitySettings({
         >
           {pendingAction?.message}
         </Modal>
-      </>
+      </div>
     );
   }
 

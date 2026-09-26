@@ -114,8 +114,8 @@ export function MemberMemory({ member, kind = 'global' }: MemberMemoryProps) {
     <Space direction="vertical" style={{ width: '100%' }}>
       <span style={{ color: '#666', fontSize: 13 }}>
         {isTeam
-          ? '这段内容只属于当前 Team。用于记录当前 Team 的工作方式、成员关系、项目事实和长期上下文。Agent 可以在工作过程中记住这里的内容。'
-          : '这段内容跨所有 Team。只放这个 Member 长期稳定的工作习惯、偏好和原则。Agent 不会自动修改这里。'}
+          ? '这段记忆只属于当前团队：记录团队怎么协作、谁负责什么、项目进展，成员干活时会参考这里的内容。'
+          : '这段记忆在所有团队通用：只放这位成员长期稳定的工作习惯和偏好，系统不会自动改动。'}
       </span>
 
       <Input.TextArea

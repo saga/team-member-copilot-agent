@@ -139,7 +139,7 @@ describe('Scheduler', () => {
     assert.equal(await scheduler.tick(), 0);
 
     // UNIQUE(schedule_id, scheduled_for)：tick 已为 once 建过 run，重复 insert 直接冲突。
-    assert.throws(() => structure.insertScheduleRun(once.id, past), /幂等|UNIQUE|已有一条/);
+    assert.throws(() => structure.insertScheduleRun(once.id, past), /已经跑过一次|重复请求被忽略/);
 
     // interval：离线 8 小时只执行一次，next 跳到未来。
     const old = new Date(Date.now() - 8 * 3600_000).toISOString();
@@ -274,7 +274,7 @@ describe('Scheduler', () => {
           memberId: agent.id,
           prompt: 'again',
         }),
-      /绑定|改变/,
+      /认领|状态刚刚发生了变化/,
     );
   });
 
@@ -396,7 +396,7 @@ describe('Schedule 约束', () => {
           { memberId: outsider.id, conversationId: room.id, prompt: 'x', type: 'once', runAt: new Date(Date.now() + 60_000).toISOString() },
           'local-user',
         ),
-      /必须属于/,
+      /执行成员必须在这个 work 会话里/,
     );
   });
 
@@ -435,7 +435,7 @@ describe('Schedule 约束', () => {
     const room = stack.team.createConversation({ kind: 'work', memberIds: [agent.id] });
     const schedule = structure.createSchedule(team.id, { memberId: agent.id, conversationId: room.id, prompt: 'once', type: 'once', runAt: new Date(Date.now() + 60_000).toISOString() }, 'local-user');
     structure.updateScheduleStatus(schedule.id, 'completed');
-    assert.throws(() => structure.updateScheduleStatus(schedule.id, 'active'), /resume|已完成/);
+    assert.throws(() => structure.updateScheduleStatus(schedule.id, 'active'), /已经跑完|重新开启/);
   });
 });
 

@@ -74,7 +74,7 @@ export class DefaultToolPolicy implements ToolPolicy {
   ): Promise<ToolDecision> {
     if (tool.requiresHostAccess && !this.options.allowHostTools) {
       return deny(
-        `${tool.name} 会触达宿主机，而宿主工具当前未启用（HOST_CODING_TOOLS != true）`,
+        `${tool.name} 需要直接操作运行服务的机器，但宿主工具开关没有打开（需要 HOST_CODING_TOOLS=true），已拒绝执行`,
       );
     }
 

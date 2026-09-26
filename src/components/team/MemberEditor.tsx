@@ -107,7 +107,7 @@ export function MemberEditor({ member, onSaved, onCancel }: MemberEditorProps) {
       <Form.Item
         name="style"
         label="Personality / Style"
-        extra="稳定人格 / 工作风格。这个字段跨所有 Team。不要填写当前项目、客户或 Team 的临时要求。"
+        extra="这位成员的长期角色与工作风格，所有团队通用。不要填某个项目或团队的临时要求。"
       >
         <Input.TextArea placeholder="严谨、怀疑、证据优先、少说废话" autoSize />
       </Form.Item>

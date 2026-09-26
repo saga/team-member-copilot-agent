@@ -122,7 +122,7 @@ export function WorkCreator({ open, members, onCreate, onCancel }: WorkCreatorPr
           <Alert
             type="warning"
             showIcon
-            message="看起来不像 Jira issue key（通常是 ABC-123 这种形状）。仍然可以建，只是执行时去 Jira 取证会拿不到工单。"
+            message="看起来不像 Jira issue key（通常是 ABC-123 这种格式）。仍然可以创建，只是执行时可能找不到对应的 Jira 工单。"
           />
         )}
 

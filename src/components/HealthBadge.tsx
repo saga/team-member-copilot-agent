@@ -24,7 +24,7 @@ export function HealthBadge() {
   }
   if (health.copilot === 'idle') {
     return (
-      <Tooltip title="首个会话时建连">
+      <Tooltip title="第一次发起会话时会自动连接">
         <Badge status="warning" text={<span style={{ color: '#fff' }}>Copilot 待连接</span>} />
       </Tooltip>
     );
