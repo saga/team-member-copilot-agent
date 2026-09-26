@@ -17,7 +17,9 @@ interface MessageComposerProps {
  * Enter 发送 / Shift+Enter 换行由 Sender 处理。
  *
  * 占位文案按房间类型分开 —— group 里「发给谁」和 direct 里完全不同，
- * 用同一句会让用户以为自己在跟一个人说话。
+ * 用同一句会让用户以为自己在跟一个人说话。Work 也要单独一句：它虽然也是
+ * 一对一，但「给这个人发消息」和「围绕一张工单给这个人下指令」不是一回事，
+ * 后者才是这个房间存在的理由。
  *
  * Member 之间的私聊是只读的：那句话里两个 Member 是主角，用户插进去会掉进
  * dispatcher 的「非 group」分支去取 active[0]，唤醒谁取决于 roster 顺序。
@@ -32,11 +34,15 @@ export function MessageComposer({
   disabled,
 }: MessageComposerProps) {
   const readOnly = isMemberDm(conversation);
+  const memberName = conversation.members[0]?.name ?? '成员';
+  const workLabel = conversation.externalWorkRef?.key ?? conversation.title;
   const placeholder = readOnly
     ? '这是 Member 之间的私聊，你可以旁观，但不能替他们发言。'
     : conversation.kind === 'group'
       ? '对团队说点什么…（@handle 指名）'
-      : `给 ${conversation.members[0]?.name ?? '成员'} 发消息…`;
+      : conversation.kind === 'work'
+        ? `围绕 ${workLabel} 给 ${memberName} 下指令…`
+        : `给 ${memberName} 发消息…`;
 
   return (
     <div className="sender-bar">

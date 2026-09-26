@@ -21,10 +21,21 @@ import {
 import { MessageComposer } from './team/MessageComposer';
 import { MemberProfile } from './team/MemberProfile';
 import { TeamSidebar } from './team/TeamSidebar';
+import type { WorkDraft } from './team/WorkCreator';
 import { ResizableSider } from './ResizableSider';
 import { EVERYONE, type MemberStatus, type MemberStatusLookup } from './team/constants';
 
 const { Content } = Layout;
+
+/**
+ * 左栏当前展开的是哪个「创建面板」。
+ *
+ * 用一个可空枚举而不是三个 boolean：三个 boolean 有 2³ 种组合，其中 5 种是
+ * 「两个面板同时开着」这种无意义状态，只能靠在每个 toggle 里手工互相清除来维持
+ * 不变量 —— 那种写法每加一个面板就要改所有旧的 handler，而且漏一处就会出现
+ * 「点了 New Work，New Member 的表单还开着」。
+ */
+type CreatorKind = 'member' | 'group' | 'work' | null;
 
 /** 还在推进中的 execution 状态；到了其它状态就说明这条 execution 已经收尾。 */
 const ACTIVE_STATUSES: ExecutionStatus[] = ['queued', 'running', 'waiting_for_member'];
@@ -111,8 +122,15 @@ export function TeamChat() {
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [showNewMember, setShowNewMember] = useState(false);
-  const [showGroupCreator, setShowGroupCreator] = useState(false);
+  /**
+   * 中性提示（蓝色 Alert）。和 error 分开是因为语义不同：error 是「刚才那件事
+   * 失败了」，notice 是「事情做成了，但你得知道接下来会发生什么」——
+   * 比如「Work 房间建好了，但没下指令，所以它还没开始跑」。
+   * 用红色报这个会让人以为建房间失败了。
+   */
+  const [notice, setNotice] = useState<string | null>(null);
+  /** 左栏展开中的创建面板；同一时刻至多一个。 */
+  const [creator, setCreator] = useState<CreatorKind>(null);
   const [showMemberManager, setShowMemberManager] = useState(false);
   /**
    * 正在编辑档案的 Member。
@@ -122,6 +140,11 @@ export function TeamChat() {
    * 「顺手开了一个新会话」。
    */
   const [editingMemberId, setEditingMemberId] = useState<string | null>(null);
+
+  // 子组件仍然收 boolean：只有左栏知道「面板是哪个」这件事，没必要把它扩散出去。
+  const showNewMember = creator === 'member';
+  const showGroupCreator = creator === 'group';
+  const showWorkCreator = creator === 'work';
 
   /**
    * 上一次发送的幂等键。
@@ -458,6 +481,20 @@ export function TeamChat() {
     }
   }
 
+  /**
+   * 切到另一个房间。
+   *
+   * notice 属于「刚刚建好的那个房间」，切走之后它就没有指代对象了 —— 但这个清理
+   * 必须挂在**用户主动切房间**这个动作上，不能挂在「conversationId 变了」这个
+   * effect 上：createWork 在建完房间之后紧接着 setNotice(...)，两者被 React 批到
+   * 同一次渲染里，effect 随后执行就会把刚设好的提示擦掉。
+   * （error 没有这个问题：它总是在一次 await 之后才被设置。）
+   */
+  function openConversation(id: string) {
+    setNotice(null);
+    setConversationId(id);
+  }
+
   async function createDirect(member: Member) {
     // 必须限定「房间里只有这一个 Member」：Member 之间的私聊同样是 kind='direct'，
     // 只看 kind 的话，点 Alice 的 [Chat] 会一头撞进 Alice 和 Bob 的私聊。
@@ -468,7 +505,7 @@ export function TeamChat() {
         item.members[0].id === member.id,
     );
     if (existing) {
-      setConversationId(existing.id);
+      openConversation(existing.id);
       return;
     }
 
@@ -481,7 +518,7 @@ export function TeamChat() {
       result.conversation,
       ...current.filter((item) => item.id !== result.conversation.id),
     ]);
-    setConversationId(result.conversation.id);
+    openConversation(result.conversation.id);
   }
 
   /**
@@ -498,8 +535,65 @@ export function TeamChat() {
       result.conversation,
       ...current.filter((item) => item.id !== result.conversation.id),
     ]);
-    setConversationId(result.conversation.id);
-    setShowGroupCreator(false);
+    openConversation(result.conversation.id);
+    setCreator(null);
+  }
+
+  /**
+   * 新建 Work：建房间 + （可选）立刻下第一条指令。
+   *
+   * 顺序是「先建 → 再切过去 → 再发消息」，不是「先建 → 先发 → 再切」。
+   * 切房间会触发打开会话的 effect，那个 effect 会清掉 error / notice；
+   * 把发消息放在切之后，才能保证发送失败的提示**不会**被那次清理吃掉。
+   * 这也顺带让房间立刻出现在界面上，而不是等消息发完才跳过去。
+   *
+   * 只建房间是合法用法（比如先开会话、晚点再下指令），但那时这个 Member 没有
+   * 任何 execution，Current Work 会是空的 —— 这正好是最容易被误解成 bug 的地方，
+   * 所以这里用一条 notice 把它说清楚，而不是让人对着空面板猜。
+   */
+  async function createWork(input: WorkDraft) {
+    const result = await api.createConversation({
+      kind: 'work',
+      title: input.title,
+      // work conversation 只允许恰好一个成员（服务端 assertConversationKindShape）
+      memberIds: [input.memberId],
+      externalWorkRef: input.jiraKey ? { provider: 'jira', key: input.jiraKey } : null,
+    });
+    const created = result.conversation;
+    setConversations((current) => [
+      created,
+      ...current.filter((item) => item.id !== created.id),
+    ]);
+    openConversation(created.id);
+    setCreator(null);
+
+    if (!input.instruction) {
+      setNotice(
+        'Work 房间建好了，但还没有下指令 —— 这个 Member 没有开始执行，Current Work 里暂时看不到它。在下面发第一条消息就会开始。',
+      );
+      return;
+    }
+
+    try {
+      const sent = await api.sendMessage(created.id, {
+        content: input.instruction,
+        // 房间里只有它一个；显式点名是为了让「这条指令给谁」不依赖 roster 顺序
+        targetMemberId: input.memberId,
+        clientRequestId: newRequestId(),
+      });
+      // 必须乐观插入：房间是先切过去的，那条 GET /messages 在发消息**之前**就
+      // 返回了（当时房间里还没有消息）。不插的话，用户得等 SSE 或下次刷新才能
+      // 看见自己刚下的指令 —— 而这条指令正是他刚刚亲手打的字。
+      setMessages((current) => mergeMessages(current, [sent.message]));
+    } catch (e) {
+      // 房间已经建好了，别把它一起丢掉：把指令放回输入框，重发一次即可
+      setInput(input.instruction);
+      setError(
+        `Work 房间已建好，但第一条指令没有发出去：${
+          e instanceof Error ? e.message : String(e)
+        }。指令已放回输入框，再点一次 Send 就行。`,
+      );
+    }
   }
 
   async function createMember(input: { name: string; role: string }): Promise<void> {
@@ -510,7 +604,7 @@ export function TeamChat() {
       style: 'clear and concise',
     });
     setMembers((current) => [...current, result.member]);
-    setShowNewMember(false);
+    setCreator(null);
     // 新建只拿到 name + role，personality / system prompt / model 还是空的。
     // 直接开一个单聊等于让一个空壳人格开始干活，所以先把档案页打开。
     setEditingMemberId(result.member.id);
@@ -529,6 +623,8 @@ export function TeamChat() {
 
     setBusy(true);
     setError(null);
+    // 「发第一条消息才会开始」这条提示在消息真的发出去之后就不成立了
+    setNotice(null);
     setInput('');
     try {
       const result = await api.sendMessage(conversationId, {
@@ -566,23 +662,23 @@ export function TeamChat() {
           members={members}
           conversations={conversations}
           selectedConversationId={conversationId}
-          onSelectConversation={setConversationId}
+          onSelectConversation={openConversation}
           showNewMember={showNewMember}
-          onToggleNewMember={() => {
-            setShowGroupCreator(false);
-            setShowNewMember((value) => !value);
-          }}
+          onToggleNewMember={() =>
+            setCreator((current) => (current === 'member' ? null : 'member'))
+          }
           onCreateMember={createMember}
-          onCancelNewMember={() => setShowNewMember(false)}
+          onCancelNewMember={() => setCreator(null)}
           onChatMember={(member) => void createDirect(member)}
           onEditMember={(member) => setEditingMemberId(member.id)}
           showGroupCreator={showGroupCreator}
-          onToggleGroupCreator={() => {
-            setShowNewMember(false);
-            setShowGroupCreator(true);
-          }}
-          onCancelGroupCreator={() => setShowGroupCreator(false)}
+          onToggleGroupCreator={() => setCreator('group')}
+          onCancelGroupCreator={() => setCreator(null)}
           onCreateGroup={createGroup}
+          showWorkCreator={showWorkCreator}
+          onToggleWorkCreator={() => setCreator('work')}
+          onCancelWorkCreator={() => setCreator(null)}
+          onCreateWork={createWork}
         />
       </ResizableSider>
 
@@ -634,6 +730,17 @@ export function TeamChat() {
               memberLabel={memberLabel}
               scrollRef={scrollRef}
             />
+
+            {notice && (
+              <Alert
+                type="info"
+                showIcon
+                closable
+                onClose={() => setNotice(null)}
+                message={notice}
+                style={{ margin: '0 18px' }}
+              />
+            )}
 
             {error && (
               <Alert

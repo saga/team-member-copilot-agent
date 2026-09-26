@@ -4,6 +4,7 @@ import { ConversationList } from './ConversationList';
 import { MemberList } from './MemberList';
 import { CurrentWorkSection } from './TeamSections';
 import { ScheduleSection } from './ScheduleSection';
+import type { WorkDraft } from './WorkCreator';
 
 interface TeamSidebarProps {
   members: Member[];
@@ -27,6 +28,11 @@ interface TeamSidebarProps {
     memberIds: string[];
     externalWorkRef?: { provider?: 'jira'; key: string } | null;
   }) => Promise<void>;
+
+  showWorkCreator: boolean;
+  onToggleWorkCreator: () => void;
+  onCancelWorkCreator: () => void;
+  onCreateWork: (input: WorkDraft) => Promise<void>;
 }
 
 /** 左栏 Team 管理、Current Work、Schedules、Conversations。只负责排布与转发。 */
@@ -46,6 +52,10 @@ export function TeamSidebar(props: TeamSidebarProps) {
     onToggleGroupCreator,
     onCancelGroupCreator,
     onCreateGroup,
+    showWorkCreator,
+    onToggleWorkCreator,
+    onCancelWorkCreator,
+    onCreateWork,
   } = props;
 
   return (
@@ -92,6 +102,10 @@ export function TeamSidebar(props: TeamSidebarProps) {
               onToggleCreator={onToggleGroupCreator}
               onCancelCreator={onCancelGroupCreator}
               onCreateGroup={onCreateGroup}
+              showWorkCreator={showWorkCreator}
+              onToggleWorkCreator={onToggleWorkCreator}
+              onCancelWorkCreator={onCancelWorkCreator}
+              onCreateWork={onCreateWork}
             />
           ),
         },

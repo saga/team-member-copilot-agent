@@ -77,7 +77,7 @@ Provider ID 是稳定契约，实现可以替换：把 `local.filesystem-knowled
 | **Execution** | Agent 实际跑了一轮。记录 `parent_execution_id` / `delegation_path` / `external_work_ref`（开始时从 conversation 快照）/ `external_work_snapshot`（开始时向外部系统取证），构成完整审计链。状态：`queued` / `running` / `waiting_for_member` / `completed` / `failed` / `cancelled` / `interrupted`。 |
 | **Team** | 顶层协作边界（单 Team 部署，`team_id` 为以后多 Team 留结构）。 |
 | **TeamMembership** | 谁属于 Team：`human`（`principalId=user id`，单机为 `LOCAL_ACTOR_ID`）/ `agent`（`principalId=member.id`），`role=owner/admin/member`。`Member.role` 是职业角色，两者绝不合并。 |
-| **Jira（外部事实源）** | 业务工作（工单、状态、负责人、工作流）以 Jira 为准，**本地不复制**。本地只有两个值对象：`ExternalWorkRef`（provider/externalId/key/url，挂在 Conversation 与 Execution 上）和 `ExternalWorkSnapshot`（execution 开始时向 Jira 取证的最小字段）。没有 Project / WorkItem / JiraIssue 这些本地业务对象。`Current Work` = active execution → 外部引用。Agent 通过 `atlassian.jira-tools` 读写工单；控制面（取证、webhook 定位房间）走 `WorkManagementProvider` 直连，**不经过 LLM**。 |
+| **Jira（外部事实源）** | 业务工作（工单、状态、负责人、工作流）以 Jira 为准，**本地不复制**。本地只有两个值对象：`ExternalWorkRef`（provider/externalId/key/url，挂在 Conversation 与 Execution 上）和 `ExternalWorkSnapshot`（execution 开始时向 Jira 取证的最小字段）。没有 Project / WorkItem / JiraIssue 这些本地业务对象。`Current Work` = active execution → 外部引用。**注意 `Current Work` 不是「工作列表」，它是「现在正在跑的 execution」**：只建一个 work conversation 不会让它出现任何东西，必须那个 Member 真的被唤醒（`queued → running`）才算在干活 —— 所以前端入口在左栏 Conversations 分区的 `New Work`（`WorkCreator.tsx`），建房间时可以直接带上第一条指令；不带指令时会明确提示 Current Work 会是空的。Agent 通过 `atlassian.jira-tools` 读写工单；控制面（取证、webhook 定位房间）走 `WorkManagementProvider` 直连，**不经过 LLM**。 |
 | **Presence** | Team 层可接工作状态：落库只有 `available/away/paused`，`busy/offline` 由 active execution / lastSeen 计算。`paused` 只拦自动唤醒，不拦 @ 点名。 |
 | **ScheduledWake** | `once` / `interval` 定时唤醒，必须绑定 `work` conversation，且被调度的 Member 必须在该 conversation 里；`UNIQUE(schedule_id, scheduled_for)` 幂等，周期不补历史。执行链固定为 `ScheduledWake → ScheduledWakeRun → Execution → executeMemberTurn`，**不经过 MemberTurnScheduler**（聊天 wake 与 schedule wake 不是同一种 wake，不能 coalesce）；run 的终态随 execution 收口（completed/failed），不停在 running 上没有下文。 |
 
@@ -999,7 +999,9 @@ src/                          # Vite + React + Ant Design 前端
       CapabilityBindingEditor.tsx  # 一层 binding 的编辑（providerId + selector）
       ScopedSkillLibrary.tsx  # skill 文件库（global / team / member 共用同一个组件）
       TeamSections.tsx        # CurrentWorkSection（active execution → Jira key）
-      ConversationList.tsx    # antd List（Tag 区分 private/group/work/direct）
+      ConversationList.tsx    # antd List（Tag 区分 private/group/work/direct）+ New Team / New Work 入口
+      WorkCreator.tsx         # 新建 Work：title + Member + Jira key + 第一条指令（建完可直接开跑）
+      GroupCreator.tsx        # 新建 Team（≥2 个成员；Work 是 1 个成员，所以是另一个入口）
       ConversationMessages.tsx  # @ant-design/x Bubble.List + Timeline（delegation）
       MessageComposer.tsx     # @ant-design/x Sender
       ConversationHeader.tsx  # Avatar.Group + Tag + Select

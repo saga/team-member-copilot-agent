@@ -1,7 +1,8 @@
-import { Button, List, Tag } from 'antd';
-import { PlusOutlined } from '@ant-design/icons';
+import { Button, List, Space, Tag } from 'antd';
+import { ProjectOutlined, TeamOutlined } from '@ant-design/icons';
 import type { Conversation, Member } from '../../lib/api';
 import { GroupCreator } from './GroupCreator';
+import { WorkCreator, type WorkDraft } from './WorkCreator';
 import { isMemberDm } from './constants';
 
 interface ConversationListProps {
@@ -17,6 +18,11 @@ interface ConversationListProps {
     memberIds: string[];
     externalWorkRef?: { provider?: 'jira'; key: string } | null;
   }) => Promise<void>;
+
+  showWorkCreator: boolean;
+  onToggleWorkCreator: () => void;
+  onCancelWorkCreator: () => void;
+  onCreateWork: (input: WorkDraft) => Promise<void>;
 }
 
 /**
@@ -33,6 +39,18 @@ function conversationTag(conversation: Conversation) {
   return <Tag>direct</Tag>;
 }
 
+/**
+ * Conversations 分区。
+ *
+ * 两个创建入口并排/堆叠在这里，而不是把 Work 塞进 Current Work：Current Work 是
+ * 「现在谁在跑」，是**结果**；Work 是「给谁挂一张工单」，是**输入**。把入口放进
+ * 结果面板会让人以为「建一个 Work 就会出现在 Current Work 里」—— 而它不会，
+ * 除非那个 Member 真的开始执行。
+ *
+ * 没有单独的「New Direct」：单聊入口就是 Members 里每一行的 Chat 按钮 ——
+ * 它复用已存在的 direct 房间（找不到才建），比在这里再放一个需要先选人的
+ * 入口更不容易建出重复房间。
+ */
 export function ConversationList({
   conversations,
   selectedId,
@@ -42,6 +60,10 @@ export function ConversationList({
   onToggleCreator,
   onCancelCreator,
   onCreateGroup,
+  showWorkCreator,
+  onToggleWorkCreator,
+  onCancelWorkCreator,
+  onCreateWork,
 }: ConversationListProps) {
   return (
     <div>
@@ -74,17 +96,25 @@ export function ConversationList({
 
       {showCreator ? (
         <GroupCreator members={members} onCreate={onCreateGroup} onCancel={onCancelCreator} />
+      ) : showWorkCreator ? (
+        <WorkCreator members={members} onCreate={onCreateWork} onCancel={onCancelWorkCreator} />
       ) : (
-        <Button
-          type="dashed"
-          block
-          size="small"
-          icon={<PlusOutlined />}
-          onClick={onToggleCreator}
-          style={{ marginTop: 8 }}
-        >
-          New Team
-        </Button>
+        // 竖排而不是并排：左栏最窄 240px，两个带图标的按钮并排会把
+        // 「New Team」折成两行。竖排在任何宽度下都是稳定的一行一个。
+        <Space direction="vertical" style={{ width: '100%', marginTop: 8 }} size={8}>
+          <Button type="dashed" block size="small" icon={<TeamOutlined />} onClick={onToggleCreator}>
+            New Team
+          </Button>
+          <Button
+            type="dashed"
+            block
+            size="small"
+            icon={<ProjectOutlined />}
+            onClick={onToggleWorkCreator}
+          >
+            New Work
+          </Button>
+        </Space>
       )}
     </div>
   );
