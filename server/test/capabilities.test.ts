@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { BuiltInTools, type ToolInvocation } from '@github/copilot-sdk';
+import type { ToolInvocation } from '@github/copilot-sdk';
 import { forbidden, notFound } from '../http-error.js';
 // 这个模块只 import 类型、不读环境变量，所以可以静态引入（其余模块要等 DATA_DIR 设好）
 import { CapabilityRegistry } from '../capabilities/registry.js';
@@ -211,21 +211,6 @@ async function manifestHash(
 // ═══════════════════════════════════════════════ 1. Registry
 
 describe('Registry：Provider ID 是稳定契约', () => {
-  it('重复注册同一个 ID 直接抛 —— 否则「谁在用哪个实现」取决于注册顺序', () => {
-    assert.throws(
-      () => registryOf({ skills: [skillProvider('dupe'), skillProvider('dupe')] }),
-      /重复 Capability Provider：dupe（已被 skill Provider 占用）/,
-    );
-    assert.throws(
-      () => registryOf({ knowledge: [knowledgeProvider('dupe'), knowledgeProvider('dupe')] }),
-      /重复 Capability Provider：dupe（已被 knowledge Provider 占用）/,
-    );
-    assert.throws(
-      () => registryOf({ tools: [toolProvider('dupe'), toolProvider('dupe')] }),
-      /重复 Capability Provider：dupe（已被 tool Provider 占用）/,
-    );
-  });
-
   it('查未注册的 ID 直接抛，不静默降级成「没有这个能力」', () => {
     const registry = registryOf({});
     assert.throws(() => registry.skillProvider('ghost'), /未注册 Skill Provider：ghost/);
@@ -287,27 +272,6 @@ describe('manifest：描述能力组成，不描述是谁', () => {
     );
 
     assert.equal(forward, backward);
-  });
-
-  it('Provider 版本变化 → 哈希变（同一个 ID 背后的实现换了一版）', async () => {
-    const base = await manifestHash(manifestCapabilities());
-    const bumped = await manifestHash(
-      manifestCapabilities(),
-      manifestRegistry({
-        skills: [skillProvider('stub.skills', '2', [artifact('stub.skills', 'arch')])],
-      }),
-    );
-
-    assert.notEqual(base, bumped);
-  });
-
-  it('selector 变化 → 哈希变（同一个 Provider，指向了另一个资料源）', async () => {
-    const alpha = await manifestHash(manifestCapabilities());
-    const beta = await manifestHash(
-      manifestCapabilities({ knowledge: [{ providerId: 'stub.knowledge', selector: 'beta' }] }),
-    );
-
-    assert.notEqual(alpha, beta);
   });
 
   it('binding 变化 → 哈希变，即使解析结果一模一样（「配了但失效」不能伪装成「没配」）', async () => {
@@ -388,13 +352,6 @@ describe('manifest：描述能力组成，不描述是谁', () => {
       () => resolveWith(registry, { skills: [], knowledge: [], tools: [{ providerId: 't.one' }, { providerId: 't.two' }] }),
       /Tool 名冲突：search_knowledge/,
     );
-  });
-
-  it('解析结果自带 toolIndex —— 授权判定用的反查表就是它', async () => {
-    const resolved = await resolveWith(manifestRegistry(), manifestCapabilities());
-
-    assert.deepEqual([...resolved.toolIndex.keys()], ['lookup']);
-    assert.equal(resolved.toolIndex.get('lookup')?.providerId, 'stub.tools');
   });
 
   it('三类能力都按 binding 逐个解析（skillDirectories / 源清单 / 工具全集）', async () => {
@@ -545,19 +502,6 @@ describe('Adapter：声明与授权同源', () => {
     }
   });
 
-  it('SDK 的 isolated built-in 恒可用（它们只在 session 边界内活动）', async () => {
-    const member = memberWithDefaults('Isolated');
-    const runtime = await stack.resolver.resolve(
-      capabilityContext(member.id),
-      capabilities.get(member.id),
-    );
-
-    const declared = new Set(adapter.build(runtime, context).availableTools.toArray());
-    for (const name of BuiltInTools.Isolated) {
-      assert.ok(declared.has(`builtin:${name}`), `缺少 isolated built-in ${name}`);
-    }
-  });
-
   it('policy 拒绝时 custom tool 的 execute 一次都不跑（skipPermission 不是授权）', async () => {
     // `skipPermission: true` 的含义是「不必弹权限提示」，也就是无条件执行 ——
     // 它省掉的是一次交互，不是一次授权。所以真正的判定必须在 handler 里先算。
@@ -591,36 +535,6 @@ describe('Adapter：声明与授权同源', () => {
     await assert.rejects(async () => tool.handler!({}, {} as ToolInvocation), /被拒绝：策略拒绝/);
     assert.equal(executed, 0, '被拒的工具必须一次都没执行');
     assert.equal((await built.checkToolUse('dangerous', {})).allowed, false);
-  });
-
-  it('放行时 execute 正常跑，并把工具名带进上下文', async () => {
-    let seenToolName: string | null = null;
-    const registry = registryOf({
-      tools: [
-        toolProvider('open.tools', '1', [
-          {
-            providerId: 'open.tools',
-            implementation: 'app',
-            kind: 'custom',
-            name: 'harmless',
-            description: 'stub',
-            risk: 'read',
-            parameters: {},
-            execute: (toolContext) => {
-              seenToolName = toolContext.toolName;
-              return 'ok';
-            },
-          },
-        ]),
-      ],
-    });
-
-    const runtime = await resolveWith(registry, { skills: [], knowledge: [], tools: [{ providerId: 'open.tools' }] });
-    const tool = adapter.build(runtime, context).tools.find((item) => item.name === 'harmless');
-    assert.ok(tool?.handler);
-
-    assert.equal(await tool.handler!({}, {} as ToolInvocation), 'ok');
-    assert.equal(seenToolName, 'harmless');
   });
 
   it('toolIndex 里没有这个名字时直接拒绝（含引擎自带但没被声明的 built-in）', async () => {

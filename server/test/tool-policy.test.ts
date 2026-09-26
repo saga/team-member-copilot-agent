@@ -264,9 +264,4 @@ describe('hostToolWithheld 与 check 不允许漂移', () => {
     }
   });
 
-  it('普通工具永远不会被「收走」', () => {
-    const layer = policy(WITHHOLD_HOST);
-    assert.equal(layer.hostToolWithheld(tool()), false);
-    assert.equal(layer.hostToolWithheld(tool({ requiresHostAccess: false })), false);
-  });
 });

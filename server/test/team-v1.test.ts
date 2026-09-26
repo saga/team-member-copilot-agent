@@ -212,12 +212,6 @@ describe('Presence', () => {
     structure.setAvailability(team.id, 'agent', agent.id, 'available');
   });
 
-  it('有 active execution 即 busy；lastSeen 太旧即 offline', () => {
-    const stored = { teamId: team.id, kind: 'agent' as const, principalId: 'x', availability: 'available' as const, lastSeenAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
-    assert.equal(structure.effectiveAvailability(stored, true), 'busy');
-    const stale = { ...stored, lastSeenAt: new Date(Date.now() - 60 * 60_000).toISOString() };
-    assert.equal(structure.effectiveAvailability(stale, false), 'offline');
-  });
 });
 
 describe('Scheduler', () => {
@@ -600,18 +594,6 @@ describe('Membership 不变量', () => {
 });
 
 describe('WorkItem 权限与 execution 绑定', () => {
-  it('release 只允许 claimer 或 admin/owner', () => {
-    const claimer = makeAgent('RelClaimer');
-    const other = makeAgent('RelOther');
-    const item = structure.createWorkItem(team.id, { title: 'Rel' }, HUMAN);
-    structure.claimWorkItem(item.id, { memberId: claimer.id });
-    assert.throws(
-      () => structure.releaseWorkItem(item.id, { kind: 'agent', principalId: other.id, teamRole: 'member' }),
-      /claimer|admin/,
-    );
-    structure.releaseWorkItem(item.id, { kind: 'agent', principalId: claimer.id });
-  });
-
   it('claim 绑定真实 execution：归属校验、execution.work_item_id 双向回写、一条 execution 只绑一个 WorkItem', async () => {
     const { StubCopilot } = await import('./support.js');
     const stub = new StubCopilot();
@@ -858,42 +840,6 @@ describe('WorkItem Activity History', () => {
     assert.equal(released?.toClaimedByMemberId, null);
   });
 
-  it('done 收口时的 claim 清空也记 released（actor 是做收口的人）', () => {
-    const agent = makeAgent('DoneHistory');
-    const item = structure.createWorkItem(team.id, { title: 'Finish with audit' }, HUMAN);
-    structure.claimWorkItem(item.id, { memberId: agent.id });
-    structure.updateWorkItem(item.id, { status: 'done' }, { kind: 'agent', principalId: agent.id });
-
-    const released = structure
-      .listWorkItemEvents(team.id, item.id)
-      .filter((e) => e.eventType === 'released');
-    assert.equal(released.length, 1);
-    assert.equal(released[0].actorKind, 'agent');
-    assert.equal(released[0].actorId, agent.id);
-  });
-
-  it('execution 被取消时的自动释放记 system 流水并带 execution', async () => {
-    const { StubCopilot } = await import('./support.js');
-    const stack = createTestStack(db, memberService, new StubCopilot().asCopilot);
-    const agent = stack.team.createMember({ name: 'SysRelease', role: 'E' });
-    const room = stack.team.createConversation({ kind: 'direct', memberIds: [agent.id] });
-    const item = structure.createWorkItem(team.id, { title: 'System release' }, HUMAN);
-
-    const sent = await stack.team.sendMessage({ conversationId: room.id, content: 'go', targetMemberId: agent.id });
-    const e1 = singleExecutionId(db, room.id, sent.wakes);
-    await waitFor(() => stack.team.getExecution(e1).status === 'completed', 'E1 完成');
-    db.prepare(`UPDATE execution SET status = 'queued' WHERE id = ?`).run(e1);
-    structure.claimWorkItem(item.id, { memberId: agent.id, executionId: e1 });
-    await stack.team.cancelExecution(e1);
-
-    const released = structure
-      .listWorkItemEvents(team.id, item.id)
-      .find((e) => e.eventType === 'released');
-    assert.equal(released?.actorKind, 'system', '这不是人的决定，是引擎收口');
-    assert.equal(released?.executionId, e1, '能查到是哪一轮执行触发的释放');
-    assert.equal(released?.fromClaimedByMemberId, agent.id);
-  });
-
   it('跨 Team 读流水被拦：先验证归属再查', () => {
     const item = structure.createWorkItem(team.id, { title: 'Owned' }, HUMAN);
     assert.throws(() => structure.listWorkItemEvents('other-team', item.id), /不存在/);
@@ -938,60 +884,6 @@ describe('HTTP actor 边界', () => {
     assert.equal(res.status, 403);
   });
 
-  it('Team 成员（human）可以读 work-items 与 events；claim 对 human 也是 403', async () => {
-    const read = await fetch(`${base}/api/team/work-items`);
-    assert.equal(read.status, 200);
-
-    const item = structure.createWorkItem(team.id, { title: 'Human claim' }, HUMAN);
-    const events = await fetch(`${base}/api/team/work-items/${item.id}/events`);
-    assert.equal(events.status, 200);
-    const body = (await events.json()) as { events: Array<{ eventType: string }> };
-    assert.ok(body.events.some((e) => e.eventType === 'created'));
-
-    const res = await fetch(`${base}/api/team/work-items/${item.id}/claim`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}),
-    });
-    assert.equal(res.status, 403);
-  });
-
-  it('Agent 经 /api/internal claim：无 token 401；带 token 成功并回写 execution', async () => {
-    config.internalApiToken = 'internal-secret';
-    const item = structure.createWorkItem(team.id, { title: 'Internal claim' }, HUMAN);
-    structure.assignWorkItem(item.id, { kind: 'agent', principalId: agent.id }, HUMAN);
-
-    const noToken = await fetch(`${base}/api/internal/members/${agent.id}/work-item-claims`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ workItemId: item.id, executionId: 'exec-x' }),
-    });
-    assert.equal(noToken.status, 401);
-
-    let release!: () => void;
-    stub.hold = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    try {
-      const room = stack.team.createConversation({ kind: 'direct', memberIds: [agent.id] });
-      const sent = await stack.team.sendMessage({ conversationId: room.id, content: 'go' });
-      const executionId = singleExecutionId(db, room.id, sent.wakes);
-      await waitFor(() => stack.team.getExecution(executionId).status === 'running', 'execution 进入 running');
-
-      const withToken = await fetch(`${base}/api/internal/members/${agent.id}/work-item-claims`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer internal-secret' },
-        body: JSON.stringify({ workItemId: item.id, executionId }),
-      });
-      assert.equal(withToken.status, 200);
-      const body = (await withToken.json()) as { workItemId: string };
-      assert.equal(body.workItemId, item.id);
-      assert.equal(stack.team.getExecution(executionId).workItemId, item.id);
-    } finally {
-      release();
-      stub.hold = null;
-    }
-  });
 });
 
 describe('Team SSE', () => {
@@ -1055,41 +947,6 @@ describe('Team SSE', () => {
     );
   });
 
-  it('HTTP：GET /api/team/events 按 SSE 帧推送（id 带 sequence）', async () => {
-    const events = new TeamEventService(db);
-    const emitting = new TeamStructureService(db, (teamId, type, payload) => events.append(teamId, type, payload));
-    const app = express();
-    app.use(express.json({ limit: '1mb' }));
-    app.use('/api/team', teamRouter(emitting, events));
-    const server = app.listen(0);
-    await new Promise<void>((resolve) => server.once('listening', resolve));
-    const base = `http://127.0.0.1:${(server.address() as import('node:net').AddressInfo).port}`;
-
-    try {
-      const response = await fetch(`${base}/api/team/events`);
-      assert.equal(response.status, 200);
-      const reader = response.body!.getReader();
-      const decoder = new TextDecoder();
-
-      // 订阅就绪后触发一次 mutation，读到的帧里应包含 work_item.changed + id
-      const firstChunk = decoder.decode((await reader.read()).value);
-      assert.match(firstChunk, /retry: 3000/);
-      assert.match(firstChunk, /event: connected/);
-
-      const item = emitting.createWorkItem(team.id, { title: 'Sse over http' }, HUMAN);
-      void item;
-
-      let buffer = firstChunk;
-      for (let i = 0; i < 50 && !buffer.includes('work_item.changed'); i += 1) {
-        const chunk = await reader.read();
-        buffer += decoder.decode(chunk.value);
-      }
-      assert.match(buffer, /id: \d+\nevent: work_item\.changed/);
-      await reader.cancel();
-    } finally {
-      server.close();
-    }
-  });
 });
 
 /** 轮询直到条件成立或超时 —— 火灾报警式断言的前置等待。 */

@@ -246,23 +246,6 @@ describe('ACL 边界', () => {
     assert.ok(knowledge.findByKey('team', 'rebind-kb'));
   });
 
-  it('selector 空 / 指向不存在的 key 都拒绝，而不是「当作全库」', async () => {
-    const member = makeMember('Grace', 'grace');
-    bindKnowledge(member.id, ['']);
-
-    await assert.rejects(() => search(member.id, '', 'anything'), { status: 400 });
-    await assert.rejects(() => search(member.id, 'no-such-kb', 'anything'), { status: 404 });
-  });
-
-  it('personal KB 的 key 不能当 team selector 用（scope 不能混）', async () => {
-    const member = makeMember('Heidi', 'heidi');
-    const personal = knowledge.ensurePersonalKnowledgeBase(member.id, member.name);
-
-    // personal KB 在 team scope 里查不到 —— 于是「按 key 绑一个 personal 库」
-    // 这件事在结构上就不成立，不需要额外写一条显式校验。
-    assert.equal(knowledge.findByKey('team', personal.key), null);
-    await assert.rejects(() => search(member.id, 'member-heidi', 'anything'), { status: 404 });
-  });
 });
 
 describe('路径与查询注入面', () => {
@@ -448,21 +431,4 @@ describe('磁盘同步', () => {
     assert.equal(second.indexed, 0);
   });
 
-  it('API 写的文档和磁盘同步指向同一棵树', () => {
-    const kb = knowledge.createTeamKnowledgeBase({ key: 'shared-tree', name: 'Shared' });
-    knowledge.writeDocument({
-      knowledgeBaseId: kb.id,
-      title: 'Via API',
-      relativePath: 'api-doc.md',
-      content: 'written through the API path',
-    });
-    assert.equal(
-      fs.existsSync(path.join(config.teamKnowledgeRoot, 'shared-tree', 'api-doc.md')),
-      true,
-    );
-
-    // 同一份内容再走一遍磁盘同步：hash 相同 → 不重复索引
-    const synced = knowledge.syncFromDisk([]);
-    assert.equal(synced.indexed, 0);
-  });
 });

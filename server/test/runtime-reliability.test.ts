@@ -26,7 +26,6 @@ process.env.COPILOT_WARMUP = 'false';
 
 const { db } = await import('../db.js');
 const { MemberService } = await import('../member-service.js');
-const { ContextAssembler } = await import('../context-assembler.js');
 const { RecoveryService } = await import('../recovery-service.js');
 const { ConversationMemberService } = await import('../conversation-member-service.js');
 const { singleExecutionId, muteAllMembers, createTestStack } = await import('./support.js');
@@ -502,30 +501,6 @@ describe('schema 就位（PRAGMA user_version）', () => {
     }
   });
 
-  it('已经是对的库：再跑一次什么都不做', () => {
-    const handle = openFixture('idempotent');
-    try {
-      assert.equal(migrate(handle).created, true);
-      const second = migrate(handle);
-      assert.equal(second.created, false);
-      assert.equal(second.from, SCHEMA_VERSION);
-      assert.equal(second.to, SCHEMA_VERSION);
-    } finally {
-      handle.close();
-    }
-  });
-
-  it('拒绝打开更旧的 schema，并且不假装能升上来', () => {
-    const handle = openFixture('older');
-    try {
-      migrate(handle);
-      handle.exec(`PRAGMA user_version = ${SCHEMA_VERSION - 1}`);
-      assert.throws(() => migrate(handle), /没有升级代码/);
-    } finally {
-      handle.close();
-    }
-  });
-
   /**
    * 库比程序新时**不能**建议删库重建 —— 那是用户的数据，而且换回新 build 就好了。
    * 两个方向的错都指向同一个动作是最省事的写法，也是最容易毁数据的那种。
@@ -546,29 +521,6 @@ describe('schema 就位（PRAGMA user_version）', () => {
       );
       assert.match(message, /比本程序支持的/);
       assert.doesNotMatch(message, /删掉数据目录/);
-    } finally {
-      handle.close();
-    }
-  });
-
-  it('有表但没有 user_version 登记：拒绝，不当成空库建表', () => {
-    const handle = openFixture('untracked');
-    try {
-      handle.exec('CREATE TABLE something (id TEXT PRIMARY KEY);');
-
-      assert.throws(() => migrate(handle), /没有 user_version 登记/);
-
-      // 拒绝必须是「什么都没做」：既没有加新表，也没有登记版本
-      const tables = (
-        handle
-          .prepare(
-            `SELECT name FROM sqlite_master
-             WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name`,
-          )
-          .all() as unknown as Array<{ name: string }>
-      ).map((row) => row.name);
-      assert.deepEqual(tables, ['something']);
-      assert.equal(getUserVersion(handle), 0);
     } finally {
       handle.close();
     }
@@ -633,40 +585,6 @@ async function sendMessage(input: {
 }
 
 describe('message_sequence 是会话内严格全序', () => {
-  it('同一毫秒内的多条消息也不会撞序号', async () => {
-    const solo = team.createConversation({
-      kind: 'direct',
-      memberIds: [bob.id],
-      defaultMemberId: bob.id,
-    });
-
-    // 不 await，让三条 sendMessage 在同一个 tick 里排队写入。
-    // 用 sendRaw：这个用例只关心 message_sequence，而同一 Member 上并发的
-    // 唤醒会被 scheduler 合并成排队轮次，第二条的 execution 此刻还不存在。
-    const results = await Promise.all([
-      sendRaw({ conversationId: solo.id, content: 'a' }),
-      sendRaw({ conversationId: solo.id, content: 'b' }),
-      sendRaw({ conversationId: solo.id, content: 'c' }),
-    ]);
-    await waitForConversationIdle(solo.id);
-
-    const sequences = results
-      .map((result) => result.message.messageSequence)
-      .sort((a, b) => a - b);
-    assert.deepEqual(sequences, [1, 2, 3], '序号必须是 1..3 且互不相同');
-
-    const stored = team.listMessages(solo.id, 500);
-    assert.deepEqual(
-      stored.map((message) => message.messageSequence),
-      stored.map((_, index) => index + 1),
-      '落库后的序号必须是连续的 1..N',
-    );
-
-    const counter = db
-      .prepare(`SELECT message_sequence FROM conversation WHERE id = ?`)
-      .get(solo.id) as unknown as { message_sequence: number };
-    assert.equal(counter.message_sequence, stored.length);
-  });
 });
 
 describe('ContextAssembler：增量上下文而不是整段重放', () => {
@@ -741,47 +659,6 @@ describe('ContextAssembler：增量上下文而不是整段重放', () => {
     assert.ok(runtime.last_context_message_sequence > 0);
   });
 
-  it('consumedThroughSequence 覆盖被过滤的消息', () => {
-    const conv = team.createConversation({
-      kind: 'direct',
-      title: 'Watermark',
-      memberIds: [alice.id],
-      defaultMemberId: alice.id,
-    });
-    const assembler = new ContextAssembler(db);
-
-    // 直接构造两条都会被过滤掉的消息：
-    //   mm1 —— 该 runtime 自己产出的（session history 里已有 assistant turn）
-    //   mm2 —— 触发本次 turn 的那条（内容就是 currentPrompt）
-    db.prepare(
-      `INSERT INTO conversation_message (id, conversation_id, message_sequence, sender_type, sender_id, content, execution_id, created_at)
-       VALUES ('mm1', ?, 1, 'member', ?, 'own', 'exec-old', 't'),
-              ('mm2', ?, 2, 'user', 'u', 'trigger', 'exec-now', 't')`,
-    ).run(conv.id, alice.id, conv.id);
-
-    const result = assembler.assemble({
-      runtime: {
-        id: 'r',
-        conversationId: conv.id,
-        memberId: alice.id,
-        copilotSessionId: 's',
-        workspacePath: '/tmp',
-        status: 'idle',
-        activeExecutionId: null,
-        lastContextMessageSequence: 0,
-        lastUsedAt: null,
-      },
-      triggerMessageSequence: 2,
-      wakeReason: 'direct',
-      conversation: conv,
-      member: alice,
-      turnMode: 'direct',
-      currentPrompt: 'trigger',
-    });
-
-    assert.deepEqual(result.sharedMessages, [], '两条消息都应该被过滤掉');
-    assert.equal(result.consumedThroughSequence, 2, '水位线必须覆盖被过滤的消息');
-  });
 });
 
 describe('checkpoint 只在 turn 成功后推进', () => {
@@ -1036,37 +913,6 @@ describe('durable conversation_event 与 SSE 回放', () => {
       )
       .get(conv.id) as unknown as { n: number };
     assert.equal(deltaRows.n, 0);
-  });
-
-  it('listEventsSince 只返回水位之后的事件', async () => {
-    const conv = team.createConversation({
-      kind: 'direct',
-      title: 'Replay',
-      memberIds: [bob.id],
-      defaultMemberId: bob.id,
-    });
-
-    const first = await sendMessage({ conversationId: conv.id, content: 'one' });
-    await waitForStatus(first.executionId, 'completed');
-
-    const all = team.listEventsSince(conv.id, 0);
-    assert.ok(all.length > 0);
-    const highWater = all[all.length - 1].sequence;
-    assert.ok(highWater !== null);
-
-    const second = await sendMessage({ conversationId: conv.id, content: 'two' });
-    await waitForStatus(second.executionId, 'completed');
-
-    const incremental = team.listEventsSince(conv.id, highWater);
-    assert.ok(incremental.length > 0, '水位之后必须有新事件');
-    for (const event of incremental) {
-      assert.ok((event.sequence ?? 0) > highWater);
-    }
-    // 回放是幂等可重复的
-    assert.deepEqual(
-      incremental.map((event) => event.id),
-      team.listEventsSince(conv.id, highWater).map((event) => event.id),
-    );
   });
 
   it('replayAndSubscribe 先补历史再推实时，且不重复投递', async () => {

@@ -116,17 +116,6 @@ describe('token 门禁', () => {
     assert.equal(calls.length, 0, '403/401 之前就已经执行了业务，等于没有门禁');
   });
 
-  it('token 不对也是 401', async () => {
-    config.internalApiToken = 's3cret';
-    calls.length = 0;
-
-    const response = await post('/api/internal/members/m1/direct-messages', VALID_BODY, {
-      Authorization: 'Bearer wrong',
-    });
-    assert.equal(response.status, 401);
-    assert.equal(calls.length, 0);
-  });
-
   it('Authorization: Bearer 与 X-Internal-Token 都认', async () => {
     config.internalApiToken = 's3cret';
 

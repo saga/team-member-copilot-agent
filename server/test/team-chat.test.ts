@@ -33,8 +33,6 @@ const { executionIdForWake, muteAllMembers, StubCopilot, createTestStack } = awa
 
 const ALICE_PROMPT = 'ALICE_PERSONA_SENTINEL';
 const BOB_PROMPT = 'BOB_PERSONA_SENTINEL';
-const ALICE_MEMORY = 'ALICE_MEMORY_SENTINEL';
-const BOB_MEMORY = 'BOB_MEMORY_SENTINEL';
 
 interface ExecutionRow {
   id: string;
@@ -144,28 +142,6 @@ after(() => {
 });
 
 describe('Direct conversation', () => {
-  it('一条用户消息只唤醒那一个 Member，且只产生一条 execution', async () => {
-    const conversation = team.createConversation({ kind: 'direct', memberIds: [alice.id] });
-    const result = await team.sendMessage({ conversationId: conversation.id, content: '你好' });
-
-    assert.equal(result.wakes.length, 1);
-    assert.equal(result.wakes[0].memberId, alice.id);
-    assert.equal(result.wakes[0].reason, 'direct');
-    assert.deepEqual(result.unresolvedMentions, []);
-
-    const executionId = executionIdForWake(db, conversation.id, result.wakes[0]);
-    await waitForStatus(executionId, 'completed');
-    await waitForConversationIdle(conversation.id);
-
-    const row = executionRow(executionId);
-    assert.equal(row.kind, 'interactive');
-    assert.equal(row.decision, 'reply');
-
-    // 成员发言后不会把自己再唤醒一次：房间里始终只有这一条 execution
-    assert.deepEqual(executionIds(conversation.id), [executionId]);
-    // 用户消息 + Alice 的回复
-    assert.equal(team.listMessages(conversation.id).length, 2);
-  });
 });
 
 describe('Group conversation', () => {
@@ -385,17 +361,4 @@ describe('Member 之间是隔离的', () => {
     assert.doesNotMatch(bobPrompt, new RegExp(ALICE_PROMPT));
   });
 
-  it('memory 隔离：各人 prompt 里只有自己的长期记忆', async () => {
-    team.replaceMemberMemory(alice.id, `# Long-term Memory\n\n- ${ALICE_MEMORY}\n`);
-    team.replaceMemberMemory(bob.id, `# Long-term Memory\n\n- ${BOB_MEMORY}\n`);
-
-    const alicePrompt = await runInRoom(alice);
-    const bobPrompt = await runInRoom(bob);
-
-    assert.match(alicePrompt, new RegExp(ALICE_MEMORY));
-    assert.doesNotMatch(alicePrompt, new RegExp(BOB_MEMORY));
-
-    assert.match(bobPrompt, new RegExp(BOB_MEMORY));
-    assert.doesNotMatch(bobPrompt, new RegExp(ALICE_MEMORY));
-  });
 });

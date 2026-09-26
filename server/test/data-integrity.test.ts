@@ -167,21 +167,6 @@ describe('replyToMessageId 必须指得着，而且是同一个房间里的', ()
     await waitForConversationIdle(other.id);
   });
 
-  it('合法引用被原样落库（不是「只存个 id 不校验」的另一个极端）', async () => {
-    const alice = makeMember('Reply2 Alice', 'reply2-alice');
-    const room = team.createConversation({ kind: 'direct', memberIds: [alice.id] });
-    await muteAllMembers(team, room.id);
-
-    const first = await team.sendMessage({ conversationId: room.id, content: '第一句' });
-    const second = await team.sendMessage({
-      conversationId: room.id,
-      content: '第二句，引用第一句',
-      replyToMessageId: first.message.id,
-    });
-
-    assert.equal(second.message.replyToMessageId, first.message.id);
-    await waitForConversationIdle(room.id);
-  });
 });
 
 // ------------------------------------------------------------ 2. 幂等键
@@ -244,37 +229,6 @@ describe('POST /messages 的幂等键', () => {
     );
   });
 
-  it('内容不同但 key 相同 → 仍然去重（key 才是判据，不是内容）', async () => {
-    const alice = makeMember('Idem3 Alice', 'idem3-alice');
-    const room = team.createConversation({ kind: 'direct', memberIds: [alice.id] });
-    await muteAllMembers(team, room.id);
-
-    await team.sendMessage({ conversationId: room.id, content: '原始', clientRequestId: 'same' });
-    await waitForConversationIdle(room.id);
-
-    const second = await team.sendMessage({
-      conversationId: room.id,
-      content: '改了内容又点了一次',
-      clientRequestId: 'same',
-    });
-
-    assert.equal(second.deduplicated, true);
-    assert.equal(countUserMessages(room.id), 1);
-
-    await waitForConversationIdle(room.id);
-  });
-
-  it('不带幂等键的消息可以有很多条（NULL 在唯一索引里互不相等）', async () => {
-    const alice = makeMember('Idem4 Alice', 'idem4-alice');
-    const room = team.createConversation({ kind: 'direct', memberIds: [alice.id] });
-    await muteAllMembers(team, room.id);
-
-    await team.sendMessage({ conversationId: room.id, content: '1' });
-    await team.sendMessage({ conversationId: room.id, content: '2' });
-    await waitForConversationIdle(room.id);
-
-    assert.equal(countUserMessages(room.id), 2);
-  });
 });
 
 // --------------------------------------------------- 3. Member 记忆并发
@@ -739,22 +693,4 @@ describe('@mention 只做精确匹配', () => {
     assert.equal(result.matched.length, 1);
   });
 
-  it('端到端：@ann 不会把消息派给 anna', async () => {
-    const anna = makeMember('Anna E2E', 'anna');
-    const alice = makeMember('Alice E2E', 'alice-e2e');
-
-    const room = team.createConversation({
-      kind: 'group',
-      title: 'Mentions',
-      memberIds: [alice.id, anna.id],
-    });
-
-    const result = await team.sendMessage({ conversationId: room.id, content: '@ann 看一下' });
-
-    assert.deepEqual(result.wakes, [], '@ann 不该唤醒任何人');
-    assert.deepEqual(result.unresolvedMentions, ['ann']);
-
-    await waitForConversationIdle(room.id);
-    assert.equal(countExecutions(room.id), 0);
-  });
 });

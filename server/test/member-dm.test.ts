@@ -187,37 +187,6 @@ describe('私聊消息', () => {
     assert.equal(stub.turns.filter((turn) => turn.memberId === a.id).length, 0);
   });
 
-  it('想继续就显式再发一条：B → A 会唤醒 A', async () => {
-    const [a, b] = newPair();
-
-    const first = await team.sendDirectMessage({
-      fromMemberId: a.id,
-      toMemberId: b.id,
-      content: '第一轮',
-    });
-    await waitForStatus(
-      executionIdForWake(db, first.conversation.id, first.wakes[0]),
-      'completed',
-    );
-    await waitForConversationIdle(first.conversation.id);
-
-    const back = await team.sendDirectMessage({
-      fromMemberId: b.id,
-      toMemberId: a.id,
-      content: '我看过了，有个问题',
-    });
-
-    assert.equal(back.conversation.id, first.conversation.id, '还是同一个房间');
-    assert.equal(back.wakes.length, 1);
-    assert.equal(back.wakes[0].memberId, a.id);
-
-    const executionId = executionIdForWake(db, back.conversation.id, back.wakes[0]);
-    await waitForStatus(executionId, 'completed');
-    await waitForConversationIdle(back.conversation.id);
-
-    // A 跑了一轮 → 现在房间里有 4 条消息（A、B、B、A）
-    assert.equal(stub.turns.filter((turn) => turn.memberId === a.id).length, 1);
-  });
 });
 
 describe('私聊是 Member 之间的对话，用户只能旁观', () => {

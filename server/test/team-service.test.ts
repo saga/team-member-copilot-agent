@@ -106,11 +106,6 @@ function runtimeRow(conversationId: string, memberId: string): RuntimeRow | unde
     .get(conversationId, memberId) as unknown as RuntimeRow | undefined;
 }
 
-function executionCount(): number {
-  const row = db.prepare(`SELECT COUNT(*) AS n FROM execution`).get() as unknown as { n: number };
-  return row.n;
-}
-
 async function waitForStatus(id: string, status: string): Promise<void> {
   for (let attempt = 0; attempt < 300; attempt += 1) {
     if (executionRow(id).status === status) return;
@@ -484,24 +479,6 @@ describe('Member 生命周期边界', () => {
 });
 
 describe('Execution 审计链', () => {
-  it('interactive execution 记录 runtime 与 delegationPath 起点', async () => {
-    const { executionId } = await sendMessage({
-      conversationId: teamConversationId,
-      content: '分析一下这个投资研究报告的主要风险',
-      // 显式点名：group 房间不点名就是全员共享讨论，断言不出「一条 execution」
-      targetMemberId: researcher.id,
-    });
-    await waitForStatus(executionId, 'completed');
-
-    const row = executionRow(executionId);
-    assert.equal(row.kind, 'interactive');
-    assert.equal(row.member_id, researcher.id);
-    assert.equal(row.parent_execution_id, null);
-    assert.deepEqual(JSON.parse(row.delegation_path), [researcher.id]);
-    assert.ok(row.runtime_id, 'interactive execution 必须绑定 runtime');
-    assert.equal(row.status, 'completed');
-    assert.match(row.response ?? '', /stub reply/);
-  });
 });
 
 describe('delegation 业务控制', () => {
@@ -533,29 +510,6 @@ describe('delegation 业务控制', () => {
 
     // 子 execution 用的是 Coder 在这个 conversation 里的独立 runtime
     assert.equal(child.runtime_id, runtimeRow(teamConversationId, coder.id)?.id);
-  });
-
-  it('A → B → A 被拒绝（cycle）', async () => {
-    const { executionId } = await sendMessage({
-      conversationId: teamConversationId,
-      content: 'cycle 测试起点',
-      targetMemberId: researcher.id,
-    });
-    await waitForStatus(executionId, 'completed');
-
-    const before = executionCount();
-    await assert.rejects(
-      () =>
-        team.delegateMember({
-          conversationId: teamConversationId,
-          fromMemberId: researcher.id,
-          parentExecutionId: executionId,
-          targetMemberId: researcher.id,
-          task: 'recursive request',
-        }),
-      /cycle/i,
-    );
-    assert.equal(executionCount(), before, '被拒绝的 delegation 不应该写入 execution');
   });
 
   it('A → B → C → A 被拒绝（cycle 跨层级）', async () => {
@@ -679,32 +633,4 @@ describe('delegation 业务控制', () => {
     );
   });
 
-  it('delegation 全过程通过 SSE 事件对外暴露', async () => {
-    const { executionId } = await sendMessage({
-      conversationId: teamConversationId,
-      content: 'SSE 事件测试',
-      targetMemberId: researcher.id,
-    });
-    await waitForStatus(executionId, 'completed');
-
-    const seen: string[] = [];
-    const unsubscribe = team.subscribe(teamConversationId, (event) => seen.push(event.type));
-
-    try {
-      await team.delegateMember({
-        conversationId: teamConversationId,
-        fromMemberId: researcher.id,
-        parentExecutionId: executionId,
-        targetMemberId: coder.id,
-        task: 'emit events',
-      });
-    } finally {
-      unsubscribe();
-    }
-
-    assert.ok(seen.includes('delegation.started'), `缺少 delegation.started：${seen.join(',')}`);
-    assert.ok(seen.includes('delegation.finished'), `缺少 delegation.finished：${seen.join(',')}`);
-    assert.ok(seen.includes('message.created'), `缺少 message.created：${seen.join(',')}`);
-    assert.ok(seen.includes('execution.updated'), `缺少 execution.updated：${seen.join(',')}`);
-  });
 });

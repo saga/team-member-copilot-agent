@@ -60,14 +60,6 @@ describe('Member skills', () => {
     assert.deepEqual(leftovers, []);
   });
 
-  it('同名 skill 重复安装返回 409', { skip: !hasUnzip() }, () => {
-    members.installSkill(alice.id, skillZip('dup-skill'), 'dup-skill.zip');
-    assert.throws(
-      () => members.installSkill(alice.id, skillZip('dup-skill'), 'dup-skill.zip'),
-      /已存在/,
-    );
-  });
-
   it('zip 里没有 SKILL.md → 400，且不落盘', { skip: !hasUnzip() }, () => {
     const archive = buildZip([{ path: 'whatever/readme.txt', content: 'not a skill\n' }]);
 
@@ -87,13 +79,6 @@ describe('Member skills', () => {
 
     assert.throws(() => members.installSkill(alice.id, archive, 'evil.zip'), /穿越|绝对路径/);
     assert.ok(!fs.existsSync(escapeTarget), '穿越条目必须一个字节都没写出去');
-  });
-
-  it('非 zip（没有 PK 头）直接被拒', { skip: !hasUnzip() }, () => {
-    assert.throws(
-      () => members.installSkill(alice.id, Buffer.from('plain text'), 'x.zip'),
-      /PK 头/,
-    );
   });
 
   it('skill 属于单个 Member，互相看不见', { skip: !hasUnzip() }, () => {

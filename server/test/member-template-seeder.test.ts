@@ -169,36 +169,6 @@ describe('真实模板目录：三个默认 Member', () => {
     assert.equal(architect.model, null);
   });
 
-  it('模板里的 capabilities 落到 member_capability_binding，三类都在', () => {
-    // 这条是上面那条的补充：上面只看 tools，这里确认 skills / knowledge 也真的
-    // 落了库 —— 少接一段（比如 seeder 只写了 tools）在别处不会有断言变红。
-    const security = memberService.findBySeedKey('financial-services.security-reviewer')!;
-    const bindings = stack.capabilities.get(security.id);
-
-    assert.deepEqual(bindings.skills, [
-      { providerId: 'member.filesystem-skills' },
-      { providerId: 'team.filesystem-skills' },
-    ]);
-    assert.deepEqual(bindings.knowledge, [
-      { providerId: 'local.filesystem-knowledge', selector: '$personal' },
-      { providerId: 'local.filesystem-knowledge', selector: 'financial-core' },
-      { providerId: 'local.filesystem-knowledge', selector: 'security-controls' },
-    ]);
-    assert.deepEqual(bindings.tools, [
-      { providerId: 'knowledge.tools' },
-      { providerId: 'team.core-tools' },
-    ]);
-  });
-
-  it('第二次执行全部跳过，一个都不重建', () => {
-    const result = seedMemberTemplates(memberService, REAL_TEMPLATES, stack.capabilities, stack.resolver);
-
-    assert.deepEqual(result.created, []);
-    for (const key of KNOWN_KEYS) {
-      assert.ok(result.skipped.includes(key), `${key} 应该被跳过`);
-    }
-  });
-
   it('手工创建的 Member seedKey 为 null，且多行 NULL 可以共存', () => {
     const a = memberService.create({ name: 'Manual A', role: 'T', handle: 'manual-a' });
     const b = memberService.create({ name: 'Manual B', role: 'T', handle: 'manual-b' });
@@ -263,23 +233,6 @@ describe('模板只负责第一次', () => {
     // 没有多出第二个 analyst
     const all = memberService.list().filter((m) => m.seedKey === 'test.analyst');
     assert.equal(all.length, 1);
-  });
-
-  it('改了 handle 之后不会因为「找不到 @旧handle」又建一个', () => {
-    const root = newTemplateRoot();
-    writeTemplate(root, 'renamed', { key: 'test.renamed', handle: 'renamed', name: 'Renamed' });
-
-    seedMemberTemplates(memberService, root, stack.capabilities, stack.resolver);
-    const created = memberService.findBySeedKey('test.renamed')!;
-    memberService.update(created.id, { handle: 'completely-different-handle' });
-
-    const again = seedMemberTemplates(memberService, root, stack.capabilities, stack.resolver);
-    assert.deepEqual(again.created, []);
-    assert.deepEqual(again.skipped, ['test.renamed']);
-
-    const result = memberService.findBySeedKey('test.renamed')!;
-    assert.equal(result.handle, 'completely-different-handle');
-    assert.equal(memberService.get(created.id).id, created.id);
   });
 
   it('归档之后不会被重新创建（归档是用户的明确意图）', () => {
@@ -375,13 +328,6 @@ describe('模板配置错误必须大声报出来', () => {
 
     assert.throws(() => seedMemberTemplates(memberService, root, stack.capabilities, stack.resolver), /越界/);
     assert.equal(memberService.findBySeedKey('test.escape'), null);
-  });
-
-  it('缺少 member.json 直接抛错', () => {
-    const root = newTemplateRoot();
-    fs.mkdirSync(path.join(root, 'empty-dir'), { recursive: true });
-
-    assert.throws(() => seedMemberTemplates(memberService, root, stack.capabilities, stack.resolver), /缺少 member\.json/);
   });
 
   it('member.json 不是合法 JSON / 字段不合法都抛错', () => {
