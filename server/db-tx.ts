@@ -49,6 +49,10 @@ export function runInTransaction<T>(db: DatabaseSync, fn: () => T, onCommit?: ()
   }
 
   state.depth += 1;
+  // 最外层的 hook 也要登记：它和嵌套 hook 一样都必须等 COMMIT 成功后才执行。
+  // 漏掉这一步，最外层调用方的「COMMIT 后再广播」会被静默丢掉 —— 事件已经
+  // 落库，订阅者却永远看不到它。
+  if (onCommit) state.hooks.push(onCommit);
   db.exec('BEGIN');
   try {
     const result = fn();

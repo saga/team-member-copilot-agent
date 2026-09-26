@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { config } from './config.js';
 import { hashText } from './content-hash.js';
+import { runInTransaction } from './db-tx.js';
 import { now } from './db.js';
 import { ContextAssembler } from './context-assembler.js';
 import { ConversationMemberService } from './conversation-member-service.js';
@@ -3085,28 +3086,27 @@ export class TeamService {
    *
    * 事务期间产生的事件先落库、攒起来，COMMIT 之后才广播；回滚就把它们一起丢掉。
    * 支持嵌套调用（内层不再 BEGIN）：recovery 之类的路径会从外面包一层，
-   * 而里面的写又各自想用事务。
+   * 而里面的写又各自想用事务。BEGIN/COMMIT 的深度由 db-tx 统一追踪 ——
+   * 结构服务的事务可能嵌在这层里面（execution 收口释放 claim），
+   * 各自维护 BEGIN 标志就会撞上「事务里再开事务」。
    */
   private transaction<T>(fn: () => T): T {
     if (this.inTransaction) return fn();
 
     this.inTransaction = true;
-    this.db.exec('BEGIN');
-    try {
-      const result = fn();
-      this.db.exec('COMMIT');
-      this.inTransaction = false;
-
+    this.deferredEvents = [];
+    const flush = () => {
       const pending = this.deferredEvents;
       this.deferredEvents = [];
       for (const event of pending) this.broadcast(event.conversationId, event);
-
-      return result;
-    } catch (error) {
-      this.db.exec('ROLLBACK');
+    };
+    try {
+      return runInTransaction(this.db, fn, flush);
+    } finally {
+      // onCommit 的 flush 在 COMMIT 之后、这里之前执行；回滚时 deferredEvents
+      // 由 db-tx 丢弃 hook（flush 不会执行），这里只负责还原标志并清空残留。
       this.inTransaction = false;
       this.deferredEvents = [];
-      throw error;
     }
   }
 }

@@ -130,6 +130,45 @@ export interface WorkItem {
   updatedAt: string;
 }
 
+export type WorkItemEventType =
+  | 'created'
+  | 'updated'
+  | 'assigned'
+  | 'unassigned'
+  | 'claimed'
+  | 'released'
+  | 'status_changed';
+
+/** 谁做的这次变更。system = 引擎自动行为（如 execution 被取消时释放 claim）。 */
+export type WorkItemActorKind = 'human' | 'agent' | 'system';
+
+/**
+ * WorkItem 的一条审计记录。
+ *
+ * 只记「什么变了」不记业务快照：from/to 成对出现，按时间重放可以还原
+ * 任意时刻的状态。没有 History 的 WorkItem 只能看到当前状态 —— 谁指派的、
+ * 什么时候被谁 claim、哪条 execution 在驱动、为什么结束，全部无从查证。
+ */
+export interface WorkItemEvent {
+  id: string;
+  teamId: string;
+  workItemId: string;
+  eventType: WorkItemEventType;
+  actorKind: WorkItemActorKind;
+  actorId: string;
+  /** claimed 事件记录发起 claim 的那一轮 execution。 */
+  executionId: string | null;
+  fromStatus: WorkItemStatus | null;
+  toStatus: WorkItemStatus | null;
+  fromAssigneeKind: TeamParticipantKind | null;
+  fromAssigneeId: string | null;
+  toAssigneeKind: TeamParticipantKind | null;
+  toAssigneeId: string | null;
+  fromClaimedByMemberId: string | null;
+  toClaimedByMemberId: string | null;
+  createdAt: string;
+}
+
 export type PresenceAvailability = 'available' | 'away' | 'paused';
 
 export interface TeamPresence {

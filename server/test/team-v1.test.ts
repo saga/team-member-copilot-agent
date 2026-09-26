@@ -103,7 +103,7 @@ describe('Project', () => {
     const project = structure.createProject(team.id, { name: 'Proxy Voting' }, 'local-user');
     assert.equal(project.teamId, team.id);
     structure.updateProject(project.id, { status: 'archived' });
-    assert.throws(() => structure.createWorkItem(team.id, { title: 'x', projectId: project.id }, 'u'), /归档/);
+    assert.throws(() => structure.createWorkItem(team.id, { title: 'x', projectId: project.id }, { kind: 'human', principalId: 'u' }), /归档/);
   });
 
   it('project 不建自己的 ACL：同 Team 成员默认可见', () => {
@@ -115,7 +115,7 @@ describe('Project', () => {
 describe('WorkItem：Assignment 与 Claim 分开', () => {
   it('创建默认 todo；assign 可换人；claimed 时换 assignee 409', () => {
     const agent = makeAgent('Worker');
-    const item = structure.createWorkItem(team.id, { title: 'Review proposal' }, 'local-user');
+    const item = structure.createWorkItem(team.id, { title: 'Review proposal' }, HUMAN);
     assert.equal(item.status, 'todo');
 
     const assigned = structure.assignWorkItem(item.id, { kind: 'agent', principalId: agent.id }, HUMAN);
@@ -134,10 +134,10 @@ describe('WorkItem：Assignment 与 Claim 分开', () => {
   it('未指定 assignee 时任何 active agent 可 claim；指定后只有它能 claim', () => {
     const a = makeAgent('ClaimA');
     const b = makeAgent('ClaimB');
-    const open = structure.createWorkItem(team.id, { title: 'Open task' }, 'u');
+    const open = structure.createWorkItem(team.id, { title: 'Open task' }, { kind: 'human', principalId: 'u' });
     assert.equal(structure.claimWorkItem(open.id, { memberId: b.id }).claimedByMemberId, b.id);
 
-    const assigned = structure.createWorkItem(team.id, { title: 'Assigned task' }, 'u');
+    const assigned = structure.createWorkItem(team.id, { title: 'Assigned task' }, { kind: 'human', principalId: 'u' });
     structure.assignWorkItem(assigned.id, { kind: 'agent', principalId: a.id }, HUMAN);
     assert.throws(() => structure.claimWorkItem(assigned.id, { memberId: b.id }), /指派/);
     structure.claimWorkItem(assigned.id, { memberId: a.id });
@@ -146,7 +146,7 @@ describe('WorkItem：Assignment 与 Claim 分开', () => {
   it('double claim 只赢一个（版本过期/已被占都 409）', () => {
     const a = makeAgent('RaceA');
     const b = makeAgent('RaceB');
-    const item = structure.createWorkItem(team.id, { title: 'Race' }, 'u');
+    const item = structure.createWorkItem(team.id, { title: 'Race' }, { kind: 'human', principalId: 'u' });
     const version = item.version;
     structure.claimWorkItem(item.id, { memberId: a.id, expectedVersion: version });
     // 旧版本号：version 守卫就能拦。
@@ -159,7 +159,7 @@ describe('WorkItem：Assignment 与 Claim 分开', () => {
   it('done 必须 claimer 或 admin；done 后 claim 自动清空', () => {
     const claimer = makeAgent('DoneClaimer');
     const other = makeAgent('DoneOther');
-    const item = structure.createWorkItem(team.id, { title: 'Finish me' }, 'u');
+    const item = structure.createWorkItem(team.id, { title: 'Finish me' }, { kind: 'human', principalId: 'u' });
     structure.claimWorkItem(item.id, { memberId: claimer.id });
     assert.throws(
       () =>
@@ -172,7 +172,7 @@ describe('WorkItem：Assignment 与 Claim 分开', () => {
 
     // 内层状态闸门的专属场景：人类创建者过得了顶层对象级授权，
     // 但工作状态流转只属于 claimer/admin —— 创建者不能把别人的任务改成 blocked。
-    const created = structure.createWorkItem(team.id, { title: 'Creator only' }, 'some-human');
+    const created = structure.createWorkItem(team.id, { title: 'Creator only' }, { kind: 'human', principalId: 'some-human' });
     structure.updateWorkItem(created.id, { title: 'Renamed' }, { kind: 'human', principalId: 'some-human' });
     assert.throws(
       () => structure.updateWorkItem(created.id, { status: 'blocked' }, { kind: 'human', principalId: 'some-human' }),
@@ -187,7 +187,7 @@ describe('WorkItem：Assignment 与 Claim 分开', () => {
     const agent = stack.team.createMember({ name: 'ExecAgent', role: 'E' });
     const room = stack.team.createConversation({ kind: 'direct', memberIds: [agent.id] });
     muteAllMembers(stack.team, room.id);
-    const item = structure.createWorkItem(team.id, { title: 'Linked work' }, 'u');
+    const item = structure.createWorkItem(team.id, { title: 'Linked work' }, { kind: 'human', principalId: 'u' });
     structure.assignWorkItem(item.id, { kind: 'agent', principalId: agent.id }, HUMAN);
     structure.claimWorkItem(item.id, { memberId: agent.id });
 
@@ -531,7 +531,7 @@ describe('Schedule 约束', () => {
     const projectA = structure.createProject(team.id, { name: 'ProjA' }, 'local-user');
     const projectB = structure.createProject(team.id, { name: 'ProjB' }, 'local-user');
 
-    const done = structure.createWorkItem(team.id, { title: 'Will finish' }, 'local-user');
+    const done = structure.createWorkItem(team.id, { title: 'Will finish' }, HUMAN);
     structure.updateWorkItem(done.id, { status: 'done' }, { kind: 'human', principalId: 'local-user', teamRole: 'owner' });
     assert.throws(
       () =>
@@ -539,7 +539,7 @@ describe('Schedule 约束', () => {
       /已结束/,
     );
 
-    const mismatch = structure.createWorkItem(team.id, { title: 'Mismatch', projectId: projectA.id }, 'local-user');
+    const mismatch = structure.createWorkItem(team.id, { title: 'Mismatch', projectId: projectA.id }, HUMAN);
     assert.throws(
       () =>
         structure.createSchedule(team.id, { memberId: agent.id, conversationId: room.id, workItemId: mismatch.id, projectId: projectB.id, prompt: 'x', type: 'once', runAt: new Date(Date.now() + 60_000).toISOString() }, 'local-user'),
@@ -548,7 +548,7 @@ describe('Schedule 约束', () => {
 
     // Schedule 明确属于某 Project 时，游离（无 project）的 WorkItem 也不接受：
     // 产出落在哪个 Project 必须无歧义。
-    const floating = structure.createWorkItem(team.id, { title: 'Floating' }, 'local-user');
+    const floating = structure.createWorkItem(team.id, { title: 'Floating' }, HUMAN);
     assert.throws(
       () =>
         structure.createSchedule(team.id, { memberId: agent.id, conversationId: room.id, workItemId: floating.id, projectId: projectA.id, prompt: 'x', type: 'once', runAt: new Date(Date.now() + 60_000).toISOString() }, 'local-user'),
@@ -629,7 +629,7 @@ describe('WorkItem 权限与 execution 绑定', () => {
   it('release 只允许 claimer 或 admin/owner', () => {
     const claimer = makeAgent('RelClaimer');
     const other = makeAgent('RelOther');
-    const item = structure.createWorkItem(team.id, { title: 'Rel' }, 'local-user');
+    const item = structure.createWorkItem(team.id, { title: 'Rel' }, HUMAN);
     structure.claimWorkItem(item.id, { memberId: claimer.id });
     assert.throws(
       () => structure.releaseWorkItem(item.id, { kind: 'agent', principalId: other.id, teamRole: 'member' }),
@@ -645,8 +645,8 @@ describe('WorkItem 权限与 execution 绑定', () => {
     const agent = stack.team.createMember({ name: 'ClaimExec', role: 'E' });
     const other = stack.team.createMember({ name: 'ClaimExecOther', role: 'E' });
     const room = stack.team.createConversation({ kind: 'direct', memberIds: [agent.id] });
-    const itemA = structure.createWorkItem(team.id, { title: 'A' }, 'local-user');
-    const itemB = structure.createWorkItem(team.id, { title: 'B' }, 'local-user');
+    const itemA = structure.createWorkItem(team.id, { title: 'A' }, HUMAN);
+    const itemB = structure.createWorkItem(team.id, { title: 'B' }, HUMAN);
     structure.assignWorkItem(itemA.id, { kind: 'agent', principalId: agent.id }, HUMAN);
     structure.assignWorkItem(itemB.id, { kind: 'agent', principalId: agent.id }, HUMAN);
 
@@ -687,7 +687,7 @@ describe('WorkItem 权限与 execution 绑定', () => {
 describe('Claim 生命周期', () => {
   it('Agent 不能 assign（Assignment 是协调动作，Agent 接活走 claim）', () => {
     const agent = makeAgent('AssignAgent');
-    const item = structure.createWorkItem(team.id, { title: 'Coordination only' }, 'local-user');
+    const item = structure.createWorkItem(team.id, { title: 'Coordination only' }, HUMAN);
     assert.throws(
       () =>
         structure.assignWorkItem(
@@ -711,7 +711,7 @@ describe('Claim 生命周期', () => {
     const room2 = stack.team.createConversation({ kind: 'direct', memberIds: [agent.id] });
     const room3 = stack.team.createConversation({ kind: 'direct', memberIds: [other.id] });
     // 未指派：其他 Member 的 claim 冲突才走「已被其他 Member claim」分支。
-    const item = structure.createWorkItem(team.id, { title: 'Retry me' }, 'local-user');
+    const item = structure.createWorkItem(team.id, { title: 'Retry me' }, HUMAN);
 
     let release!: () => void;
     const holdTurn = () => {
@@ -786,7 +786,7 @@ describe('Claim 生命周期', () => {
     const stack = createTestStack(db, memberService, stub.asCopilot);
     const agent = stack.team.createMember({ name: 'ReleaseAgent', role: 'E' });
     const room = stack.team.createConversation({ kind: 'direct', memberIds: [agent.id] });
-    const item = structure.createWorkItem(team.id, { title: 'Cancel releases' }, 'local-user');
+    const item = structure.createWorkItem(team.id, { title: 'Cancel releases' }, HUMAN);
 
     const sent = await stack.team.sendMessage({
       conversationId: room.id,
@@ -819,7 +819,7 @@ describe('Claim 生命周期', () => {
     const stack = createTestStack(db, memberService, stub.asCopilot);
     const agent = stack.team.createMember({ name: 'InterruptAgent', role: 'E' });
     const room = stack.team.createConversation({ kind: 'direct', memberIds: [agent.id] });
-    const item = structure.createWorkItem(team.id, { title: 'Interrupt releases' }, 'local-user');
+    const item = structure.createWorkItem(team.id, { title: 'Interrupt releases' }, HUMAN);
 
     let release!: () => void;
     stub.hold = new Promise<void>((resolve) => {
@@ -847,6 +847,83 @@ describe('Claim 生命周期', () => {
       }
     }
     stack.team.updateMember(agent.id, { status: 'active' });
+  });
+});
+
+describe('WorkItem Activity History', () => {
+  it('create/assign/claim/status/release 每一步都留下流水，顺序完整', () => {
+    const agent = makeAgent('HistoryAgent');
+    const item = structure.createWorkItem(team.id, { title: 'Audited' }, HUMAN);
+    structure.assignWorkItem(item.id, { kind: 'agent', principalId: agent.id }, HUMAN);
+    structure.claimWorkItem(item.id, { memberId: agent.id });
+    structure.updateWorkItem(item.id, { status: 'blocked' }, { kind: 'agent', principalId: agent.id });
+    structure.releaseWorkItem(item.id, { kind: 'agent', principalId: agent.id });
+
+    const events = structure.listWorkItemEvents(team.id, item.id);
+    assert.deepEqual(
+      events.map((e) => e.eventType),
+      ['created', 'assigned', 'claimed', 'status_changed', 'released'],
+      '流水按时间正序，且每类 mutation 各有一条',
+    );
+
+    const assigned = events.find((e) => e.eventType === 'assigned');
+    assert.equal(assigned?.actorKind, 'human');
+    assert.equal(assigned?.actorId, 'local-user');
+    assert.equal(assigned?.toAssigneeId, agent.id);
+
+    const claimed = events.find((e) => e.eventType === 'claimed');
+    assert.equal(claimed?.actorKind, 'agent');
+    assert.equal(claimed?.toClaimedByMemberId, agent.id);
+
+    const statusChange = events.find((e) => e.eventType === 'status_changed');
+    assert.equal(statusChange?.fromStatus, 'in_progress');
+    assert.equal(statusChange?.toStatus, 'blocked');
+
+    const released = events.find((e) => e.eventType === 'released');
+    assert.equal(released?.fromClaimedByMemberId, agent.id);
+    assert.equal(released?.toClaimedByMemberId, null);
+  });
+
+  it('done 收口时的 claim 清空也记 released（actor 是做收口的人）', () => {
+    const agent = makeAgent('DoneHistory');
+    const item = structure.createWorkItem(team.id, { title: 'Finish with audit' }, HUMAN);
+    structure.claimWorkItem(item.id, { memberId: agent.id });
+    structure.updateWorkItem(item.id, { status: 'done' }, { kind: 'agent', principalId: agent.id });
+
+    const released = structure
+      .listWorkItemEvents(team.id, item.id)
+      .filter((e) => e.eventType === 'released');
+    assert.equal(released.length, 1);
+    assert.equal(released[0].actorKind, 'agent');
+    assert.equal(released[0].actorId, agent.id);
+  });
+
+  it('execution 被取消时的自动释放记 system 流水并带 execution', async () => {
+    const { StubCopilot } = await import('./support.js');
+    const stack = createTestStack(db, memberService, new StubCopilot().asCopilot);
+    const agent = stack.team.createMember({ name: 'SysRelease', role: 'E' });
+    const room = stack.team.createConversation({ kind: 'direct', memberIds: [agent.id] });
+    const item = structure.createWorkItem(team.id, { title: 'System release' }, HUMAN);
+
+    const sent = await stack.team.sendMessage({ conversationId: room.id, content: 'go', targetMemberId: agent.id });
+    const e1 = singleExecutionId(db, room.id, sent.wakes);
+    await waitFor(() => stack.team.getExecution(e1).status === 'completed', 'E1 完成');
+    db.prepare(`UPDATE execution SET status = 'queued' WHERE id = ?`).run(e1);
+    structure.claimWorkItem(item.id, { memberId: agent.id, executionId: e1 });
+    await stack.team.cancelExecution(e1);
+
+    const released = structure
+      .listWorkItemEvents(team.id, item.id)
+      .find((e) => e.eventType === 'released');
+    assert.equal(released?.actorKind, 'system', '这不是人的决定，是引擎收口');
+    assert.equal(released?.executionId, e1, '能查到是哪一轮执行触发的释放');
+    assert.equal(released?.fromClaimedByMemberId, agent.id);
+  });
+
+  it('跨 Team 读流水被拦：先验证归属再查', () => {
+    const item = structure.createWorkItem(team.id, { title: 'Owned' }, HUMAN);
+    assert.throws(() => structure.listWorkItemEvents('other-team', item.id), /不存在/);
+    assert.throws(() => structure.listWorkItemEvents(team.id, 'no-such-item'), /不存在/);
   });
 });
 
@@ -878,7 +955,7 @@ describe('HTTP actor 边界', () => {
   });
 
   it('X-Agent-Id 头伪造不出 Agent 身份：HTTP claim 一律 403', async () => {
-    const item = structure.createWorkItem(team.id, { title: 'Spoof' }, 'local-user');
+    const item = structure.createWorkItem(team.id, { title: 'Spoof' }, HUMAN);
     const res = await fetch(`${base}/api/team/work-items/${item.id}/claim`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Agent-Id': agent.id },
@@ -887,11 +964,16 @@ describe('HTTP actor 边界', () => {
     assert.equal(res.status, 403);
   });
 
-  it('Team 成员（human）可以读 work-items；claim 对 human 也是 403', async () => {
+  it('Team 成员（human）可以读 work-items 与 events；claim 对 human 也是 403', async () => {
     const read = await fetch(`${base}/api/team/work-items`);
     assert.equal(read.status, 200);
 
-    const item = structure.createWorkItem(team.id, { title: 'Human claim' }, 'local-user');
+    const item = structure.createWorkItem(team.id, { title: 'Human claim' }, HUMAN);
+    const events = await fetch(`${base}/api/team/work-items/${item.id}/events`);
+    assert.equal(events.status, 200);
+    const body = (await events.json()) as { events: Array<{ eventType: string }> };
+    assert.ok(body.events.some((e) => e.eventType === 'created'));
+
     const res = await fetch(`${base}/api/team/work-items/${item.id}/claim`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -902,7 +984,7 @@ describe('HTTP actor 边界', () => {
 
   it('Agent 经 /api/internal claim：无 token 401；带 token 成功并回写 execution', async () => {
     config.internalApiToken = 'internal-secret';
-    const item = structure.createWorkItem(team.id, { title: 'Internal claim' }, 'local-user');
+    const item = structure.createWorkItem(team.id, { title: 'Internal claim' }, HUMAN);
     structure.assignWorkItem(item.id, { kind: 'agent', principalId: agent.id }, HUMAN);
 
     const noToken = await fetch(`${base}/api/internal/members/${agent.id}/work-item-claims`, {

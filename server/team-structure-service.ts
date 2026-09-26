@@ -19,6 +19,9 @@ import type {
   TeamPresence,
   TeamRole,
   WorkItem,
+  WorkItemActorKind,
+  WorkItemEvent,
+  WorkItemEventType,
   WorkItemStatus,
 } from './domain.js';
 
@@ -221,7 +224,7 @@ export class TeamStructureService {
   createWorkItem(
     teamId: string,
     input: { title: string; description?: string; projectId?: string | null },
-    createdBy: string,
+    actor: PrincipalRef,
   ): WorkItem {
     const title = input.title.trim();
     if (!title) throw badRequest('WorkItem 标题不能为空');
@@ -234,12 +237,21 @@ export class TeamStructureService {
     }
     const id = randomUUID();
     const timestamp = now();
-    this.db
-      .prepare(
-        `INSERT INTO work_item (id, team_id, project_id, title, description, status, version, created_by, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 'todo', 1, ?, ?, ?)`,
-      )
-      .run(id, teamId, projectId, title.slice(0, 300), (input.description ?? '').slice(0, 8000), createdBy, timestamp, timestamp);
+    this.transaction(() => {
+      this.db
+        .prepare(
+          `INSERT INTO work_item (id, team_id, project_id, title, description, status, version, created_by, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, 'todo', 1, ?, ?, ?)`,
+        )
+        .run(id, teamId, projectId, title.slice(0, 300), (input.description ?? '').slice(0, 8000), actor.principalId, timestamp, timestamp);
+      this.appendWorkItemEvent({
+        workItemId: id,
+        teamId,
+        eventType: 'created',
+        actor,
+        toStatus: 'todo',
+      });
+    });
     return this.getWorkItem(id);
   }
 
@@ -314,22 +326,51 @@ export class TeamStructureService {
       }
     }
     const title = patch.title?.trim() || current.title;
+    const description = patch.description ?? current.description;
+    const status = patch.status ?? current.status;
+    const contentChanged = title !== current.title || description !== current.description;
+    const statusChanged = status !== current.status;
     this.transaction(() => {
       this.db
         .prepare(`UPDATE work_item SET title = ?, description = ?, status = ?, version = version + 1, updated_at = ? WHERE id = ?`)
-        .run(
-          title.slice(0, 300),
-          (patch.description ?? current.description).slice(0, 8000),
-          patch.status ?? current.status,
-          now(),
-          id,
-        );
+        .run(title.slice(0, 300), description.slice(0, 8000), status, now(), id);
       // done/cancelled 后 claim 自动清空：业务结束，锁不应继续占着。
       // 必须和状态变更同事务：中间崩进程会留下「已结束却仍被 claim」的行。
-      if (patch.status === 'done' || patch.status === 'cancelled') {
+      const claimCleared =
+        (patch.status === 'done' || patch.status === 'cancelled') && !!current.claimedByMemberId;
+      if (claimCleared) {
         this.db
           .prepare(`UPDATE work_item SET claimed_by_member_id = NULL, claimed_execution_id = NULL, claimed_at = NULL WHERE id = ?`)
           .run(id);
+      }
+      // 内容与状态分开记：审计里「改了标题」和「todo → blocked」是两类事实。
+      if (contentChanged) {
+        this.appendWorkItemEvent({
+          workItemId: id,
+          teamId: current.teamId,
+          eventType: 'updated',
+          actor,
+        });
+      }
+      if (statusChanged) {
+        this.appendWorkItemEvent({
+          workItemId: id,
+          teamId: current.teamId,
+          eventType: 'status_changed',
+          actor,
+          fromStatus: current.status,
+          toStatus: status,
+        });
+      }
+      if (claimCleared) {
+        this.appendWorkItemEvent({
+          workItemId: id,
+          teamId: current.teamId,
+          eventType: 'released',
+          actor,
+          executionId: current.claimedExecutionId,
+          fromClaimedByMemberId: current.claimedByMemberId,
+        });
       }
     });
     return this.getWorkItem(id);
@@ -362,11 +403,26 @@ export class TeamStructureService {
         if (!member || member.status !== 'active') throw badRequest('不能指派给已归档的 Member');
       }
     }
-    this.db
-      .prepare(
-        `UPDATE work_item SET assignee_kind = ?, assignee_id = ?, version = version + 1, updated_at = ? WHERE id = ?`,
-      )
-      .run(assignee?.kind ?? null, assignee?.principalId ?? null, now(), id);
+    this.transaction(() => {
+      this.db
+        .prepare(
+          `UPDATE work_item SET assignee_kind = ?, assignee_id = ?, version = version + 1, updated_at = ? WHERE id = ?`,
+        )
+        .run(assignee?.kind ?? null, assignee?.principalId ?? null, now(), id);
+      // 取消一个本来就没有 assignee 的指派是 no-op，不记流水。
+      if (assignee || current.assigneeId) {
+        this.appendWorkItemEvent({
+          workItemId: id,
+          teamId: current.teamId,
+          eventType: assignee ? 'assigned' : 'unassigned',
+          actor,
+          fromAssigneeKind: current.assigneeKind,
+          fromAssigneeId: current.assigneeId,
+          toAssigneeKind: assignee?.kind ?? null,
+          toAssigneeId: assignee?.principalId ?? null,
+        });
+      }
+    });
     return this.getWorkItem(id);
   }
 
@@ -491,6 +547,16 @@ export class TeamStructureService {
           .prepare(`UPDATE execution SET work_item_id = ? WHERE id = ? AND work_item_id IS NULL`)
           .run(id, input.executionId);
       }
+      // 重绑时 from = to = 同一个 Member：流水上仍是一次 claim（换了驱动它的一轮）。
+      this.appendWorkItemEvent({
+        workItemId: id,
+        teamId: current.teamId,
+        eventType: 'claimed',
+        actor: { kind: 'agent', principalId: input.memberId },
+        executionId: input.executionId ?? null,
+        fromClaimedByMemberId: current.claimedByMemberId,
+        toClaimedByMemberId: input.memberId,
+      });
       return this.getWorkItem(id);
     });
   }
@@ -504,11 +570,21 @@ export class TeamStructureService {
     if (!isClaimer && !isAdmin) {
       throw forbidden('只有 claimer 或 Team admin/owner 能 release WorkItem');
     }
-    this.db
-      .prepare(
-        `UPDATE work_item SET claimed_by_member_id = NULL, claimed_execution_id = NULL, claimed_at = NULL, version = version + 1, updated_at = ? WHERE id = ?`,
-      )
-      .run(now(), id);
+    this.transaction(() => {
+      this.db
+        .prepare(
+          `UPDATE work_item SET claimed_by_member_id = NULL, claimed_execution_id = NULL, claimed_at = NULL, version = version + 1, updated_at = ? WHERE id = ?`,
+        )
+        .run(now(), id);
+      this.appendWorkItemEvent({
+        workItemId: id,
+        teamId: current.teamId,
+        eventType: 'released',
+        actor,
+        executionId: current.claimedExecutionId,
+        fromClaimedByMemberId: current.claimedByMemberId,
+      });
+    });
     return this.getWorkItem(id);
   }
 
@@ -524,18 +600,105 @@ export class TeamStructureService {
    * 重复调用安全。
    */
   releaseClaimForExecution(executionId: string): void {
+    // 先读再清：流水里要记「释放的是谁的锁」。
+    const claimed = this.db
+      .prepare(
+        `SELECT id, team_id, claimed_by_member_id FROM work_item
+         WHERE claimed_execution_id = ? AND claimed_by_member_id IS NOT NULL`,
+      )
+      .get(executionId) as unknown as
+      | { id: string; team_id: string; claimed_by_member_id: string }
+      | undefined;
+    if (!claimed) return;
+    this.transaction(() => {
+      this.db
+        .prepare(
+          `UPDATE work_item
+           SET claimed_by_member_id = NULL,
+               claimed_execution_id = NULL,
+               claimed_at = NULL,
+               version = version + 1,
+               updated_at = ?
+           WHERE claimed_execution_id = ?
+             AND claimed_by_member_id IS NOT NULL`,
+        )
+        .run(now(), executionId);
+      this.appendWorkItemEvent({
+        workItemId: claimed.id,
+        teamId: claimed.team_id,
+        eventType: 'released',
+        actor: { kind: 'system', principalId: 'system' },
+        executionId,
+        fromClaimedByMemberId: claimed.claimed_by_member_id,
+      });
+    });
+  }
+
+  /**
+   * WorkItem 的审计流水，时间正序（最新 limit 条）。
+   *
+   * 必须先验证 WorkItem 属于这个 Team 再查：直接按 work_item_id 查会把
+   * 跨 Team 的 id 当成合法输入，权限过滤就绕过去了。
+   */
+  listWorkItemEvents(teamId: string, workItemId: string, limit = 100): WorkItemEvent[] {
+    const item = this.getWorkItem(workItemId);
+    if (item.teamId !== teamId) throw notFound(`WorkItem 不存在：${workItemId}`);
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM work_item_event WHERE work_item_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?`,
+      )
+      .all(workItemId, limit) as unknown as WorkItemEventRow[];
+    return rows.reverse().map(mapWorkItemEvent);
+  }
+
+  /**
+   * WorkItem 审计流水的唯一写入口：所有 mutation 都从这里进。
+   * 必须在调用方的事务里执行（业务行与流水同生共死，拆开就会留下
+   * 「状态变了但没有流水」或反过来的半截事实）。
+   */
+  private appendWorkItemEvent(input: {
+    workItemId: string;
+    teamId: string;
+    eventType: WorkItemEventType;
+    actor: { kind: WorkItemActorKind; principalId: string };
+    executionId?: string | null;
+    fromStatus?: WorkItemStatus | null;
+    toStatus?: WorkItemStatus | null;
+    fromAssigneeKind?: TeamParticipantKind | null;
+    fromAssigneeId?: string | null;
+    toAssigneeKind?: TeamParticipantKind | null;
+    toAssigneeId?: string | null;
+    fromClaimedByMemberId?: string | null;
+    toClaimedByMemberId?: string | null;
+  }): void {
     this.db
       .prepare(
-        `UPDATE work_item
-         SET claimed_by_member_id = NULL,
-             claimed_execution_id = NULL,
-             claimed_at = NULL,
-             version = version + 1,
-             updated_at = ?
-         WHERE claimed_execution_id = ?
-           AND claimed_by_member_id IS NOT NULL`,
+        `INSERT INTO work_item_event (
+           id, team_id, work_item_id, event_type, actor_kind, actor_id, execution_id,
+           from_status, to_status, from_assignee_kind, from_assignee_id,
+           to_assignee_kind, to_assignee_id, from_claimed_by_member_id, to_claimed_by_member_id,
+           created_at
+         )
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(now(), executionId);
+      .run(
+        randomUUID(),
+        input.teamId,
+        input.workItemId,
+        input.eventType,
+        input.actor.kind,
+        input.actor.principalId,
+        input.executionId ?? null,
+        input.fromStatus ?? null,
+        input.toStatus ?? null,
+        input.fromAssigneeKind ?? null,
+        input.fromAssigneeId ?? null,
+        input.toAssigneeKind ?? null,
+        input.toAssigneeId ?? null,
+        input.fromClaimedByMemberId ?? null,
+        input.toClaimedByMemberId ?? null,
+        now(),
+      );
   }
 
   // --------------------------------------------------------------- Presence
@@ -829,6 +992,7 @@ interface TeamRow { id: string; name: string; description: string; created_by: s
 interface MembershipRow { team_id: string; kind: TeamParticipantKind; principal_id: string; role: TeamRole; status: 'active' | 'inactive'; joined_at: string; updated_at: string }
 interface ProjectRow { id: string; team_id: string; name: string; description: string; status: Project['status']; created_by: string; created_at: string; updated_at: string }
 interface WorkItemRow { id: string; team_id: string; project_id: string | null; title: string; description: string; status: WorkItemStatus; assignee_kind: TeamParticipantKind | null; assignee_id: string | null; claimed_by_member_id: string | null; claimed_execution_id: string | null; claimed_at: string | null; version: number; created_by: string; created_at: string; updated_at: string }
+interface WorkItemEventRow { id: string; team_id: string; work_item_id: string; event_type: WorkItemEventType; actor_kind: WorkItemActorKind; actor_id: string; execution_id: string | null; from_status: WorkItemStatus | null; to_status: WorkItemStatus | null; from_assignee_kind: TeamParticipantKind | null; from_assignee_id: string | null; to_assignee_kind: TeamParticipantKind | null; to_assignee_id: string | null; from_claimed_by_member_id: string | null; to_claimed_by_member_id: string | null; created_at: string }
 interface PresenceRow { team_id: string; kind: TeamParticipantKind; principal_id: string; availability: PresenceAvailability; last_seen_at: string; updated_at: string }
 interface ScheduledWakeRow { id: string; team_id: string; member_id: string; conversation_id: string; project_id: string | null; work_item_id: string | null; prompt: string; type: 'once' | 'interval'; run_at: string; interval_seconds: number | null; next_run_at: string; status: ScheduledWakeStatus; last_fired_at: string | null; last_error: string | null; created_by: string; created_at: string; updated_at: string }
 interface ScheduledWakeRunRow { id: string; schedule_id: string; scheduled_for: string; status: ScheduledWakeRun['status']; execution_id: string | null; created_at: string; started_at: string | null; ended_at: string | null; error: string | null }
@@ -844,6 +1008,9 @@ function mapProject(row: ProjectRow): Project {
 }
 function mapWorkItem(row: WorkItemRow): WorkItem {
   return { id: row.id, teamId: row.team_id, projectId: row.project_id, title: row.title, description: row.description, status: row.status, assigneeKind: row.assignee_kind, assigneeId: row.assignee_id, claimedByMemberId: row.claimed_by_member_id, claimedExecutionId: row.claimed_execution_id, claimedAt: row.claimed_at, version: row.version, createdBy: row.created_by, createdAt: row.created_at, updatedAt: row.updated_at };
+}
+function mapWorkItemEvent(row: WorkItemEventRow): WorkItemEvent {
+  return { id: row.id, teamId: row.team_id, workItemId: row.work_item_id, eventType: row.event_type, actorKind: row.actor_kind, actorId: row.actor_id, executionId: row.execution_id, fromStatus: row.from_status, toStatus: row.to_status, fromAssigneeKind: row.from_assignee_kind, fromAssigneeId: row.from_assignee_id, toAssigneeKind: row.to_assignee_kind, toAssigneeId: row.to_assignee_id, fromClaimedByMemberId: row.from_claimed_by_member_id, toClaimedByMemberId: row.to_claimed_by_member_id, createdAt: row.created_at };
 }
 function mapPresence(row: PresenceRow): TeamPresence {
   return { teamId: row.team_id, kind: row.kind, principalId: row.principal_id, availability: row.availability, lastSeenAt: row.last_seen_at, updatedAt: row.updated_at };

@@ -176,7 +176,7 @@ export function teamRouter(structure: TeamStructureService) {
     }
     try {
       const actor = resolveActor(req);
-      res.status(201).json({ workItem: structure.createWorkItem(currentTeamId(), parsed.data, actor.principalId) });
+      res.status(201).json({ workItem: structure.createWorkItem(currentTeamId(), parsed.data, actor) });
     } catch (error) {
       sendError(res, error);
     }
@@ -185,6 +185,22 @@ export function teamRouter(structure: TeamStructureService) {
   router.get('/work-items/:id', requireTeamMember(), (req, res) => {
     try {
       res.json({ workItem: structure.getWorkItem((req.params.id as string)) });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  /** Activity History：先验证 WorkItem 归属，再返回审计流水（时间正序）。 */
+  router.get('/work-items/:id/events', requireTeamMember(), (req, res) => {
+    try {
+      const limit = Number((req.query as Record<string, string | undefined>).limit ?? 100);
+      res.json({
+        events: structure.listWorkItemEvents(
+          currentTeamId(),
+          req.params.id as string,
+          Number.isFinite(limit) && limit > 0 ? Math.min(Math.floor(limit), 500) : 100,
+        ),
+      });
     } catch (error) {
       sendError(res, error);
     }

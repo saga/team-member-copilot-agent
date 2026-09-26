@@ -20,7 +20,7 @@ import type { DatabaseSync } from 'node:sqlite';
  *
  * 程序不认识任何别的编号 —— 没有升级代码，认出来也无从下手。
  */
-export const SCHEMA_VERSION = 9;
+export const SCHEMA_VERSION = 10;
 
 /**
  * 当前 schema 的完整定义，按最终形状写。
@@ -203,6 +203,56 @@ CREATE INDEX idx_work_item_assignee
 
 CREATE INDEX idx_work_item_claim
   ON work_item(claimed_by_member_id);
+
+-- WorkItem 的审计流水：每次 mutation 一行。全部列式存储、不做 JSON 大字段 ——
+-- 这个项目最看重可查询性：「谁在什么时候、用哪条 execution claim 了它」
+-- 必须能直接 WHERE event_type + actor_kind 出来，而不是解析一堆 JSON。
+-- from/to 成对出现：事后能还原任意时刻的完整状态。
+CREATE TABLE work_item_event (
+  id TEXT PRIMARY KEY,
+  team_id TEXT NOT NULL,
+  work_item_id TEXT NOT NULL,
+  event_type TEXT NOT NULL
+    CHECK (
+      event_type IN (
+        'created',
+        'updated',
+        'assigned',
+        'unassigned',
+        'claimed',
+        'released',
+        'status_changed'
+      )
+    ),
+  actor_kind TEXT NOT NULL
+    CHECK (actor_kind IN ('human', 'agent', 'system')),
+  actor_id TEXT NOT NULL,
+  -- claimed 事件记录发起 claim 的那一轮 execution。
+  execution_id TEXT,
+  from_status TEXT,
+  to_status TEXT,
+  from_assignee_kind TEXT,
+  from_assignee_id TEXT,
+  to_assignee_kind TEXT,
+  to_assignee_id TEXT,
+  from_claimed_by_member_id TEXT,
+  to_claimed_by_member_id TEXT,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (team_id)
+    REFERENCES team(id)
+    ON DELETE CASCADE,
+  FOREIGN KEY (work_item_id)
+    REFERENCES work_item(id)
+    ON DELETE CASCADE,
+  FOREIGN KEY (execution_id)
+    REFERENCES execution(id)
+);
+
+CREATE INDEX idx_work_item_event_item
+  ON work_item_event(work_item_id, created_at);
+
+CREATE INDEX idx_work_item_event_team
+  ON work_item_event(team_id, created_at);
 
 -- Presence 只存可配置的 availability（available/away/paused），busy/offline 由系统
 -- 按 active execution 与 lastSeen 计算，不落库，否则三边打架。
