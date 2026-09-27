@@ -975,6 +975,223 @@ describe('Task 生命周期补严', () => {
     }
   });
 
+  it('Lead 补一个缺失任务：依赖满足自动执行，非 Lead 被拒绝', async () => {
+    stub.reset();
+    const room = team.createConversation({
+      kind: 'task',
+      title: 'AddTask',
+      memberIds: [alice.id, bob.id],
+      leadMemberId: alice.id,
+    });
+    // 按住执行人：A 停在 running，工作区保持进行中，补任务环境才稳定
+    let release!: () => void;
+    stub.hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    stub.holdMemberIds = new Set([bob.id]);
+    try {
+      await team.planTasks({
+        conversationId: room.id,
+        memberId: alice.id,
+        objective: '补任务',
+        requirements: { facts: [], assumptions: [], constraints: [], successCriteria: [] },
+        tasks: [{ key: 'a', title: 'A', assigneeMemberId: bob.id }],
+      });
+      for (let attempt = 0; attempt < 400; attempt += 1) {
+        if (team.listTasks(room.id)[0]?.status === 'running') break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const taskA = team.listTasks(room.id)[0];
+
+      const waiting = await team.addTask({
+        conversationId: room.id,
+        memberId: alice.id,
+        title: 'B',
+        assigneeMemberId: bob.id,
+        dependencies: [taskA.id],
+      });
+      assert.match(waiting, /等待依赖完成/);
+
+      // 非 Lead 不能加
+      await assert.rejects(
+        team.addTask({ conversationId: room.id, memberId: bob.id, title: 'C', assigneeMemberId: bob.id }),
+        /只有负责这个工作的 Lead/,
+      );
+      // 不存在的依赖被拒绝
+      await assert.rejects(
+        team.addTask({
+          conversationId: room.id,
+          memberId: alice.id,
+          title: 'D',
+          assigneeMemberId: bob.id,
+          dependencies: ['no-such-task'],
+        }),
+        /Task 不存在/,
+      );
+      // 其它工作区的任务不能当依赖
+      const other = team.createConversation({
+        kind: 'task',
+        title: 'Other',
+        memberIds: [alice.id, bob.id],
+        leadMemberId: alice.id,
+      });
+      await team.planTasks({
+        conversationId: other.id,
+        memberId: alice.id,
+        objective: '隔壁',
+        requirements: { facts: [], assumptions: [], constraints: [], successCriteria: [] },
+        tasks: [{ key: 'z', title: 'Z', assigneeMemberId: alice.id }],
+      });
+      await assert.rejects(
+        team.addTask({
+          conversationId: room.id,
+          memberId: alice.id,
+          title: 'E',
+          assigneeMemberId: bob.id,
+          dependencies: [team.listTasks(other.id)[0].id],
+        }),
+        /不属于当前工作区/,
+      );
+      await waitForConversationIdle(other.id);
+
+      release();
+      stub.hold = null;
+      stub.holdMemberIds = null;
+      await waitForConversationIdle(room.id);
+      const tasks = team.listTasks(room.id);
+      assert.equal(tasks.length, 2);
+      assert.ok(tasks.every((task) => task.status === 'completed'), '补的任务依赖满足就该自动跑完');
+      assert.ok(tasks[1].sortOrder > tasks[0].sortOrder, '补的任务排在后面');
+
+      // 工作结束后不能再加
+      assert.equal(team.getConversation(room.id).status, 'completed');
+      await assert.rejects(
+        team.addTask({ conversationId: room.id, memberId: alice.id, title: 'F', assigneeMemberId: bob.id }),
+        /已经结束/,
+      );
+    } finally {
+      release();
+      stub.hold = null;
+      stub.holdMemberIds = null;
+      stub.reset();
+    }
+  });
+
+  it('Lead 给未开始任务换执行人：running/completed 换不动', async () => {
+    stub.reset();
+    const room = team.createConversation({
+      kind: 'task',
+      title: 'Reassign',
+      memberIds: [alice.id, bob.id, carol.id],
+      leadMemberId: alice.id,
+    });
+    // 执行人静音：任务不开跑，换人环境才稳定。A1 无依赖（ready），
+    // A 依赖 A1（pending）—— reassign 只收 pending / blocked / failed。
+    team.setMemberMuted(room.id, bob.id, true);
+    team.setMemberMuted(room.id, carol.id, true);
+    await team.planTasks({
+      conversationId: room.id,
+      memberId: alice.id,
+      objective: '换人',
+      requirements: { facts: [], assumptions: [], constraints: [], successCriteria: [] },
+      tasks: [
+        { key: 'a1', title: 'A1', assigneeMemberId: bob.id },
+        { key: 'a', title: 'A', assigneeMemberId: bob.id, dependencies: ['a1'] },
+      ],
+    });
+    const task = team.listTasks(room.id).find((item) => item.title === 'A')!;
+    assert.equal(task.status, 'pending');
+
+    const moved = await team.reassignTask({
+      conversationId: room.id,
+      memberId: alice.id,
+      taskId: task.id,
+      assigneeMemberId: carol.id,
+    });
+    assert.match(moved, /新的执行/);
+    assert.equal(team.getTask(task.id).assigneeMemberId, carol.id);
+
+    // 已经 ready 的任务换不动
+    const readyTask = team.listTasks(room.id).find((item) => item.title === 'A1')!;
+    await assert.rejects(
+      team.reassignTask({ conversationId: room.id, memberId: alice.id, taskId: readyTask.id, assigneeMemberId: carol.id }),
+      /不能重新分派/,
+    );
+
+    // 换给同一个人是 no-op
+    assert.equal(
+      (await team.reassignTask({
+        conversationId: room.id,
+        memberId: alice.id,
+        taskId: task.id,
+        assigneeMemberId: carol.id,
+      })),
+      `任务「${task.title}」已分派给新的执行 Member`,
+    );
+
+    // 非 Lead 不能换
+    await assert.rejects(
+      team.reassignTask({ conversationId: room.id, memberId: bob.id, taskId: task.id, assigneeMemberId: bob.id }),
+      /只有负责这个工作的 Lead/,
+    );
+    // 不在工作区里的人不能接
+    const stranger = team.createMember({ name: 'Task Stranger', role: 'X' });
+    await assert.rejects(
+      team.reassignTask({ conversationId: room.id, memberId: alice.id, taskId: task.id, assigneeMemberId: stranger.id }),
+      /不属于 conversation/,
+    );
+
+    await waitForConversationIdle(room.id);
+  });
+
+  it('跑起来 / 跑完的任务换不动执行人', async () => {
+    stub.reset();
+    const room = team.createConversation({
+      kind: 'task',
+      title: 'ReassignRunning',
+      memberIds: [alice.id, bob.id],
+      leadMemberId: alice.id,
+    });
+    let release!: () => void;
+    stub.hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    stub.holdMemberIds = new Set([bob.id]);
+    try {
+      await team.planTasks({
+        conversationId: room.id,
+        memberId: alice.id,
+        objective: '换跑起来的',
+        requirements: { facts: [], assumptions: [], constraints: [], successCriteria: [] },
+        tasks: [{ key: 'a', title: 'A', assigneeMemberId: bob.id }],
+      });
+      for (let attempt = 0; attempt < 400; attempt += 1) {
+        if (team.listTasks(room.id)[0]?.status === 'running') break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const task = team.listTasks(room.id)[0];
+      assert.equal(task.status, 'running');
+      await assert.rejects(
+        team.reassignTask({ conversationId: room.id, memberId: alice.id, taskId: task.id, assigneeMemberId: alice.id }),
+        /不能重新分派/,
+      );
+      release();
+      stub.hold = null;
+      stub.holdMemberIds = null;
+      await waitForConversationIdle(room.id);
+      assert.equal(team.getTask(task.id).status, 'completed');
+      await assert.rejects(
+        team.reassignTask({ conversationId: room.id, memberId: alice.id, taskId: task.id, assigneeMemberId: alice.id }),
+        /不能重新分派/,
+      );
+    } finally {
+      release();
+      stub.hold = null;
+      stub.holdMemberIds = null;
+      stub.reset();
+    }
+  });
+
   it('Task 全部完成直接 completed，不唤醒 Lead', async () => {
     stub.reset();
     const room = team.createConversation({

@@ -96,6 +96,92 @@ export class JiraProvider implements WorkManagementProvider {
       status: issue.fields.status?.name ?? null,
       // 显示名给模型和 UI 看；寻址要用 accountId，那是另一条路径（assign）。
       assignee: issue.fields.assignee?.displayName ?? null,
+      description: jiraDescriptionText(issue.fields.description),
     };
   }
+}
+
+/**
+ * Jira description 可能是纯文本，也可能是 ADF（Atlassian Document Format）
+ * 的 JSON 树。两种都收敛成纯文本，拿不到就返回 null —— 没有描述的工单
+ * 很常见，不能把它变成一次失败。
+ */
+function jiraDescriptionText(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'string') {
+    const text = value.trim();
+    return text || null;
+  }
+  if (Array.isArray(value)) {
+    const text = value
+      .map((item) => jiraDescriptionText(item))
+      .filter((item): item is string => Boolean(item))
+      .join(containsBlockNode(value) ? '\n' : '');
+    return normalizeJiraText(text);
+  }
+  if (typeof value !== 'object') return null;
+  const node = value as { type?: unknown; text?: unknown; content?: unknown };
+  // hardBreak 是行内换行符：它自己就是一次换行。
+  if (node.type === 'hardBreak') return '\n';
+  // text 原样返回、不在这里 normalize：段落内的 'Fix ' + 'the thing' 靠
+  // 原样拼接保住中间空格，整段的空白由上层的 normalizeJiraText 统一收。
+  if (typeof node.text === 'string') {
+    return node.text;
+  }
+  if (Array.isArray(node.content)) {
+    const text = node.content
+      .map((item) => jiraDescriptionText(item))
+      .filter((item): item is string => Boolean(item))
+      .join(containsBlockNode(node.content) ? '\n' : '');
+    return normalizeJiraText(text);
+  }
+  return null;
+}
+
+/** ADF 块级节点：子节点之间换行，行内节点直接拼接。 */
+const BLOCK_NODE_TYPES: ReadonlySet<string> = new Set([
+  'doc',
+  'paragraph',
+  'heading',
+  'bulletList',
+  'orderedList',
+  'listItem',
+  'blockquote',
+  'codeBlock',
+  'panel',
+  'rule',
+  'table',
+  'tableRow',
+  'tableCell',
+  'tableHeader',
+  'mediaSingle',
+  'mediaGroup',
+  'expand',
+  'taskList',
+  'taskItem',
+  'layoutSection',
+  'layoutColumn',
+]);
+
+/**
+ * 子节点里混进一个块级节点就按块排（换行分隔）。
+ *
+ * 只看子节点类型、不看父节点：doc 下的两个 paragraph 是兄弟关系，
+ * 问父节点（doc）永远得到“直接拼接”，'A' + 'B' 会粘成 'AB'。
+ */
+function containsBlockNode(content: unknown[]): boolean {
+  return content.some(
+    (item) =>
+      !!item &&
+      typeof item === 'object' &&
+      BLOCK_NODE_TYPES.has(String((item as { type?: unknown }).type ?? '')),
+  );
+}
+
+function normalizeJiraText(value: string): string | null {
+  const text = value
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  return text || null;
 }

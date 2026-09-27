@@ -1307,8 +1307,71 @@ export class TeamService {
       this.emit(conversation.id, { type: 'task.updated', data: task });
     }
     this.emit(conversation.id, { type: 'conversation.updated', data: this.getConversation(conversation.id) });
+    // 就绪任务在这里就启动，不等 Lead turn 结束 —— worker 和 Lead 并行，
+    // turn 结束时的收口再调一次 startReadyTasks 是幂等的 no-op。
     const started = this.orchestrator.startReadyTasks(conversation.id);
     return `已创建 ${created.length} 个任务，${started.length} 个已开始执行`;
+  }
+
+  /** CoreToolHost：Lead 在已有计划中补充一个真正缺失的任务。 */
+  async addTask(input: {
+    conversationId: string;
+    memberId: string;
+    title: string;
+    description?: string;
+    assigneeMemberId: string;
+    dependencies?: string[];
+    acceptanceCriteria?: string[];
+  }): Promise<string> {
+    const conversation = this.getConversation(input.conversationId);
+    this.requireActiveMember(conversation, input.memberId);
+    if (conversation.leadMemberId !== input.memberId) {
+      throw badRequest('只有负责这个工作的 Lead 才能增加任务');
+    }
+    this.requireActiveMember(conversation, input.assigneeMemberId);
+    const task = this.tasks.add({
+      conversationId: conversation.id,
+      title: input.title,
+      description: input.description,
+      assigneeMemberId: input.assigneeMemberId,
+      dependencies: input.dependencies,
+      acceptanceCriteria: input.acceptanceCriteria,
+    });
+    this.emit(conversation.id, { type: 'task.updated', data: task });
+    this.emit(conversation.id, { type: 'conversation.updated', data: this.getConversation(conversation.id) });
+    const started = this.orchestrator.startReadyTasks(conversation.id);
+    return started.some((item) => item.id === task.id)
+      ? `已增加任务「${task.title}」，已经开始执行`
+      : `已增加任务「${task.title}」，当前等待依赖完成`;
+  }
+
+  /** CoreToolHost：Lead 调整尚未开始任务的执行 Member。 */
+  async reassignTask(input: {
+    conversationId: string;
+    memberId: string;
+    taskId: string;
+    assigneeMemberId: string;
+  }): Promise<string> {
+    const conversation = this.getConversation(input.conversationId);
+    this.requireActiveMember(conversation, input.memberId);
+    if (conversation.leadMemberId !== input.memberId) {
+      throw badRequest('只有负责这个工作的 Lead 才能重新分派任务');
+    }
+    this.requireActiveMember(conversation, input.assigneeMemberId);
+    const task = this.tasks.get(input.taskId);
+    if (task.conversationId !== conversation.id) {
+      throw badRequest('这个任务不属于当前工作区');
+    }
+    const updated = this.tasks.reassign({ taskId: task.id, assigneeMemberId: input.assigneeMemberId });
+    this.emit(conversation.id, { type: 'task.updated', data: updated });
+    if (updated.status === 'pending') {
+      this.orchestrator.startReadyTasks(conversation.id);
+    }
+    const status = this.tasks.recomputeConversationStatus(conversation.id);
+    if (status) {
+      this.emit(conversation.id, { type: 'conversation.updated', data: this.getConversation(conversation.id) });
+    }
+    return `任务「${updated.title}」已分派给新的执行 Member`;
   }
 
   /** CoreToolHost：执行人上报自己任务的进展。 */

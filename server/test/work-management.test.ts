@@ -40,6 +40,7 @@ const {
 } = await import('../work-management/types.js');
 const { JiraProvider } = await import('../work-management/jira-provider.js');
 const { JiraClient } = await import('../jira/client.js');
+const { JiraToolProvider } = await import('../capabilities/providers/jira-tools.js');
 const { workManagementRouter } = await import('../routes/work-management.js');
 
 after(() => {
@@ -246,6 +247,123 @@ describe('JiraProvider：把五个动作翻译成 REST，不做本地建模', ()
     globalThis.fetch = (async () =>
       new Response('nope', { status: 404 })) as typeof fetch;
     await assert.rejects(() => provider.get(provider.ref({ key: 'ABC-404' })), /Jira API 404/);
+  });
+
+  it('get()：ADF description 收敛成纯文本，块之间换行', async () => {
+    stubFetch(() => ({
+      ...ISSUE,
+      fields: {
+        ...ISSUE.fields,
+        description: {
+          type: 'doc',
+          version: 1,
+          content: [
+            { type: 'heading', content: [{ type: 'text', text: 'Goal' }] },
+            {
+              type: 'paragraph',
+              content: [
+                { type: 'text', text: 'Fix ' },
+                { type: 'text', text: 'the thing' },
+              ],
+            },
+            {
+              type: 'bulletList',
+              content: [
+                {
+                  type: 'listItem',
+                  content: [{ type: 'paragraph', content: [{ type: 'text', text: 'one' }] }],
+                },
+                {
+                  type: 'listItem',
+                  content: [{ type: 'paragraph', content: [{ type: 'text', text: 'two' }] }],
+                },
+              ],
+            },
+          ],
+        },
+      },
+    }));
+    const summary = await provider.get(provider.ref({ key: 'ABC-1' }));
+    assert.equal(summary.description, 'Goal\nFix the thing\none\ntwo');
+  });
+
+  it('get()：纯文本 description 去空白，null 保持 null', async () => {
+    stubFetch(() => ({ ...ISSUE, fields: { ...ISSUE.fields, description: '  line one  ' } }));
+    assert.equal((await provider.get(provider.ref({ key: 'ABC-1' }))).description, 'line one');
+
+    stubFetch(() => ISSUE);
+    assert.equal((await provider.get(provider.ref({ key: 'ABC-1' }))).description, null);
+  });
+});
+
+describe('Jira tools：description 进出', () => {
+  const tools = new JiraToolProvider({
+    providerId: 'jira',
+    ref: ({ key }: { key: string }) => ({
+      provider: 'jira',
+      externalId: key,
+      key,
+      url: `https://acme.atlassian.net/browse/${key}`,
+    }),
+    search: async () => [
+      {
+        ref: { provider: 'jira', externalId: '10001', key: 'ABC-1', url: null },
+        title: 'Fix the thing',
+        status: 'In Progress',
+        assignee: 'Ada',
+        description: 'x'.repeat(9000),
+      },
+    ],
+    get: async () => ({
+      ref: {
+        provider: 'jira',
+        externalId: '10001',
+        key: 'ABC-1',
+        url: 'https://acme.atlassian.net/browse/ABC-1',
+      },
+      title: 'Fix the thing',
+      status: 'In Progress',
+      assignee: 'Ada',
+      description: 'y'.repeat(13000),
+    }),
+  } as unknown as import('../work-management/types.js').WorkManagementProvider);
+
+  async function run(name: string, args: Record<string, unknown>): Promise<unknown> {
+    const context = {
+      teamId: 't',
+      memberId: 'm',
+      conversationId: 'c',
+      executionId: 'e',
+      userId: 'u',
+      toolName: name,
+      memberCapabilities: { skills: [], knowledge: [], tools: [] },
+      knowledge: [],
+    } as unknown as import('../capabilities/types.js').ToolProviderContext;
+    const resolved = await tools.resolve(context, { providerId: 'atlassian.jira-tools' });
+    const tool = resolved.find((item) => item.name === name);
+    assert.ok(tool?.execute, `工具 ${name} 必须存在且可执行`);
+    const raw = await tool.execute(
+      { teamId: 't', memberId: 'm', conversationId: 'c', executionId: 'e', userId: 'u', toolName: name },
+      args as never,
+    );
+    return JSON.parse(String(raw));
+  }
+
+  it('jira_search 带 description（8000 截断），jira_get_issue 带 description 和深链', async () => {
+    const searched = (await run('jira_search', { jql: 'parent = ABC-1' })) as Array<{
+      key: string;
+      description: string | null;
+    }>;
+    assert.equal(searched[0].key, 'ABC-1');
+    assert.equal(searched[0].description?.length, 8000);
+
+    const issue = (await run('jira_get_issue', { issueKey: 'ABC-1' })) as {
+      key: string;
+      description: string | null;
+      url: string | null;
+    };
+    assert.equal(issue.description?.length, 12000);
+    assert.equal(issue.url, 'https://acme.atlassian.net/browse/ABC-1');
   });
 });
 

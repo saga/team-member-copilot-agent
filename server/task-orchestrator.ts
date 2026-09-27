@@ -18,7 +18,8 @@ export interface TaskEvents {
  *   Task 完成 → 刷新依赖 → 找下一批 ready → 重算工作区状态
  *   Task 阻塞/失败 → 唤醒 Lead 做整体判断
  *
- * 同一个 Member 同时只跑一个 Task：入队前看 scheduler.isBusy。
+ * 同一个 Member 同时只跑一个 Task：由 scheduler 按 (conversation, member)
+ * 排队串行保证，这里只管入队，不管忙闲。
  */
 export class TaskOrchestrator {
   constructor(
@@ -65,7 +66,11 @@ export class TaskOrchestrator {
     for (const task of changed.blocked) this.events.onTask(task);
     const started: ConversationTask[] = [];
     for (const task of this.tasks.findReady(conversationId)) {
-      if (this.scheduler.isBusy(conversationId, task.assigneeMemberId)) continue;
+      // 注意这里没有 isBusy 跳过：scheduler 本来就按 (conversation, member)
+      // 串行，忙时入队只是排进 pending，当前 turn 跑完接着跑。跳过等于丢弃 —
+      // 同一个成员的任务链（A 完成后 B 才能跑）会在 A 的 turn 内外各被跳过一次，
+      // 然后永远没人再 kick，B 烂在 ready。重复入队由 scheduler 的 mergeWake
+      // 合并（同 taskId 只留一条），不会跑重。
       if (this.hasActiveExecution(conversationId, task.assigneeMemberId)) continue;
       const state = this.states.get(conversationId, task.assigneeMemberId);
       if (state.muted) continue;

@@ -103,6 +103,8 @@ registry.registerToolProvider(
     messageMember: (input) => teamService.messageMember(input),
     requestClarification: (input) => teamService.requestClarification(input),
     planTasks: (input) => teamService.planTasks(input),
+    addTask: (input) => teamService.addTask(input),
+    reassignTask: (input) => teamService.reassignTask(input),
     updateTask: (input) => teamService.updateTask(input),
   }),
 );

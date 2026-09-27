@@ -58,7 +58,8 @@ export class JiraToolProvider implements ToolProvider {
         implementation: 'http',
         kind: 'custom',
         name: 'jira_search',
-        description: 'Search Jira issues with JQL. Returns key, summary, status, assignee.',
+        description:
+          'Search Jira issues with JQL. Returns key, summary, description, status and assignee.',
         risk: 'read',
         parameters: z.object({
           jql: z.string().min(1).max(2000).describe('JQL query, e.g. "assignee = currentUser() AND status != Done"'),
@@ -73,6 +74,7 @@ export class JiraToolProvider implements ToolProvider {
             issues.map((issue) => ({
               key: issue.ref.key,
               summary: issue.title,
+              description: issue.description?.slice(0, 8000) ?? null,
               status: issue.status,
               assignee: issue.assignee,
             })),
@@ -84,7 +86,9 @@ export class JiraToolProvider implements ToolProvider {
         implementation: 'http',
         kind: 'custom',
         name: 'jira_get_issue',
-        description: 'Get one Jira issue by key (e.g. ABC-123): summary, status, assignee.',
+        description:
+          'Get one Jira issue by key. Returns summary, description, status, assignee and URL. ' +
+          'Use jira_search with `parent = ISSUE-KEY` to inspect Jira subtasks.',
         risk: 'read',
         parameters: z.object({
           issueKey: z.string().min(3).max(30).describe('Issue key, e.g. ABC-123'),
@@ -94,6 +98,7 @@ export class JiraToolProvider implements ToolProvider {
           return JSON.stringify({
             key: issue.ref.key,
             summary: issue.title,
+            description: issue.description?.slice(0, 12000) ?? null,
             status: issue.status,
             assignee: issue.assignee,
             url: issue.ref.url,

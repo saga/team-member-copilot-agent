@@ -208,6 +208,91 @@ export class TaskService {
     return this.list(input.conversationId);
   }
 
+  /**
+   * 已有计划里补一个真正缺失的任务。plan() 只允许一次（初始规划），
+   * 之后的新增走这里 —— 重建整个计划会破坏 Task 历史与 Execution 关联。
+   *
+   * 只做形状校验（标题 / 依赖归属 / 上限 / 工作区未结束）：“谁能加、
+   * 分给谁” 是 TeamService 的事（Lead 身份 + roster），和 plan() 的分工一致。
+   */
+  add(input: {
+    conversationId: string;
+    title: string;
+    description?: string;
+    assigneeMemberId: string;
+    dependencies?: string[];
+    acceptanceCriteria?: string[];
+  }): ConversationTask {
+    if (this.list(input.conversationId).length >= MAX_TASKS) {
+      throw badRequest(`一个工作区最多 ${MAX_TASKS} 个任务`);
+    }
+    const conversation = this.db.prepare(`SELECT status FROM conversation WHERE id = ?`).get(input.conversationId) as
+      | { status: ConversationStatus }
+      | undefined;
+    if (!conversation) {
+      throw notFound(`Conversation 不存在：${input.conversationId}`);
+    }
+    if (conversation.status === 'completed' || conversation.status === 'cancelled') {
+      throw badRequest('工作已经结束，不能再增加任务');
+    }
+    const title = input.title.trim();
+    if (!title) throw badRequest('任务标题不能为空');
+    if (title.length > 300) throw badRequest('任务标题太长');
+    const dependencies = [...new Set(input.dependencies ?? [])];
+    for (const dependencyId of dependencies) {
+      const dependency = this.get(dependencyId);
+      if (dependency.conversationId !== input.conversationId) {
+        throw badRequest(`依赖的任务不属于当前工作区：${dependencyId}`);
+      }
+    }
+    const sortRow = this.db
+      .prepare(`SELECT COALESCE(MAX(sort_order), -1) + 1 AS sort_order FROM conversation_task WHERE conversation_id = ?`)
+      .get(input.conversationId) as { sort_order: number };
+    const id = randomUUID();
+    const createdAt = now();
+    this.db
+      .prepare(
+        `INSERT INTO conversation_task (
+          id, conversation_id, title, description, assignee_member_id, status,
+          dependencies_json, acceptance_criteria_json, result, blocker,
+          current_execution_id, sort_order, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, NULL, NULL, NULL, ?, ?, ?)`,
+      )
+      .run(
+        id,
+        input.conversationId,
+        title,
+        (input.description ?? '').slice(0, 8000),
+        input.assigneeMemberId,
+        JSON.stringify(dependencies),
+        JSON.stringify((input.acceptanceCriteria ?? []).slice(0, 20)),
+        sortRow.sort_order,
+        createdAt,
+        createdAt,
+      );
+    // 新任务进来，工作区回到 running：之前可能停在 blocked（等这个缺失的工作）。
+    this.db.prepare(`UPDATE conversation SET status = 'running', updated_at = ? WHERE id = ?`).run(createdAt, input.conversationId);
+    return this.get(id);
+  }
+
+  /**
+   * 给尚未开始的任务换执行人。ready / running 的已经进入调度，
+   * completed / cancelled 是历史事实，都不能换 —— 只能换还没跑起来的。
+   */
+  reassign(input: { taskId: string; assigneeMemberId: string }): ConversationTask {
+    const task = this.get(input.taskId);
+    if (task.assigneeMemberId === input.assigneeMemberId) {
+      return task;
+    }
+    if (!['pending', 'blocked', 'failed'].includes(task.status)) {
+      throw badRequest(`任务当前是 ${task.status}，不能重新分派；只有 pending / blocked / failed 可以重新分派`);
+    }
+    this.db
+      .prepare(`UPDATE conversation_task SET assignee_member_id = ?, updated_at = ? WHERE id = ?`)
+      .run(input.assigneeMemberId, now(), input.taskId);
+    return this.get(input.taskId);
+  }
+
   requestClarification(input: {
     conversationId: string;
     memberId: string;

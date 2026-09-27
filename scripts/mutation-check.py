@@ -758,6 +758,39 @@ MUTATIONS = [
             )
         ],
     },
+    {
+        "name": "同成员下游任务被 busy 跳过（任务链卡在 ready）",
+        "test": "server/test/task-service.test.ts",
+        "steps": [
+            (
+                "server/task-orchestrator.ts",
+                "      if (this.hasActiveExecution(conversationId, task.assigneeMemberId)) continue;",
+                "      if (this.scheduler.isBusy(conversationId, task.assigneeMemberId)) continue;\n      if (this.hasActiveExecution(conversationId, task.assigneeMemberId)) continue;",
+            )
+        ],
+    },
+    {
+        "name": "非 Lead 也能加任务（计划入口失守）",
+        "test": "server/test/task-service.test.ts",
+        "steps": [
+            (
+                "server/team-service.ts",
+                "    this.requireActiveMember(conversation, input.memberId);\n    if (conversation.leadMemberId !== input.memberId) {\n      throw badRequest('只有负责这个工作的 Lead 才能增加任务');\n    }\n",
+                "    this.requireActiveMember(conversation, input.memberId);\n",
+            )
+        ],
+    },
+    {
+        "name": "running 的任务也能换执行人（飞着的活被转手）",
+        "test": "server/test/task-service.test.ts",
+        "steps": [
+            (
+                "server/task-service.ts",
+                "    if (!['pending', 'blocked', 'failed'].includes(task.status)) {\n      throw badRequest(`任务当前是 ${task.status}，不能重新分派；只有 pending / blocked / failed 可以重新分派`);\n    }\n",
+                "",
+            )
+        ],
+    },
 ]
 
 

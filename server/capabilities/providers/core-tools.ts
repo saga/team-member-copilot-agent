@@ -72,6 +72,23 @@ export interface CoreToolHost {
     }>;
   }): Promise<string>;
 
+  addTask(input: {
+    conversationId: string;
+    memberId: string;
+    title: string;
+    description?: string;
+    assigneeMemberId: string;
+    dependencies?: string[];
+    acceptanceCriteria?: string[];
+  }): Promise<string>;
+
+  reassignTask(input: {
+    conversationId: string;
+    memberId: string;
+    taskId: string;
+    assigneeMemberId: string;
+  }): Promise<string>;
+
   updateTask(input: {
     conversationId: string;
     memberId: string;
@@ -199,7 +216,10 @@ export class CoreTeamToolProvider implements ToolProvider {
         kind: 'custom',
         name: 'plan_tasks',
         description:
-          'Lead only. Define the objective and the concrete task list for this workspace. ' +
+          'Lead only. Define the initial concrete task list for this workspace. ' +
+          'Use this only when the workspace has no tasks. ' +
+          'For an existing task plan, use add_task for genuinely missing work and ' +
+          'reassign_task when an unstarted task has the wrong assignee. ' +
           'Tasks start automatically once dependencies are met.',
         risk: 'coordination',
         parameters: z.object({
@@ -247,10 +267,61 @@ export class CoreTeamToolProvider implements ToolProvider {
         providerId: this.id,
         implementation: 'app' as const,
         kind: 'custom',
+        name: 'add_task',
+        description:
+          'Lead only. Add one genuinely missing task to an existing task plan. ' +
+          'Do not use this to duplicate an existing task or Jira subtask. ' +
+          'Dependencies are existing Conversation Task IDs. ' +
+          'The task starts automatically when its dependencies are satisfied.',
+        risk: 'coordination',
+        parameters: z.object({
+          title: z.string().min(1).max(300),
+          description: z.string().max(8000).optional(),
+          assigneeMemberId: z.string().min(1),
+          dependencies: z.array(z.string().min(1)).max(20).default([]),
+          acceptanceCriteria: z.array(z.string().min(1).max(1000)).max(20).default([]),
+        }),
+        execute: (context, args) =>
+          this.host.addTask({
+            conversationId: context.conversationId,
+            memberId: context.memberId,
+            title: String(args.title),
+            ...(args.description === undefined ? {} : { description: String(args.description) }),
+            assigneeMemberId: String(args.assigneeMemberId),
+            dependencies: ((args.dependencies ?? []) as unknown[]).map(String),
+            acceptanceCriteria: ((args.acceptanceCriteria ?? []) as unknown[]).map(String),
+          }),
+      },
+      {
+        providerId: this.id,
+        implementation: 'app' as const,
+        kind: 'custom',
+        name: 'reassign_task',
+        description:
+          'Lead only. Reassign a not-yet-running task to another active Member in this workspace. ' +
+          'Do not reassign a task that is already ready, running, completed or cancelled.',
+        risk: 'coordination',
+        parameters: z.object({
+          taskId: z.string().min(1),
+          assigneeMemberId: z.string().min(1),
+        }),
+        execute: (context, args) =>
+          this.host.reassignTask({
+            conversationId: context.conversationId,
+            memberId: context.memberId,
+            taskId: String(args.taskId),
+            assigneeMemberId: String(args.assigneeMemberId),
+          }),
+      },
+      {
+        providerId: this.id,
+        implementation: 'app' as const,
+        kind: 'custom',
         name: 'update_task',
         description:
-          'Report progress on your assigned task. Only the assignee can update it. ' +
-          'Call with completed when done, blocked when you cannot proceed.',
+          'Report progress on your assigned persistent task. ' +
+          'The assignee must call this tool with completed when the task is actually complete, ' +
+          'or blocked when it cannot proceed. Do not claim completion only by returning text.',
         risk: 'coordination',
         parameters: z.object({
           taskId: z.string().min(1),

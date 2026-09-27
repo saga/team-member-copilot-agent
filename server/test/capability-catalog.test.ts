@@ -81,9 +81,11 @@ describe('Resolver：Tool selector 只给点名的工具', () => {
       stack.capabilities.getEffective(defaultTeam.id, member.id),
     );
     assert.deepEqual(toolNamesOf(all.tools), [
+      'add_task',
       'ask_member',
       'message_member',
       'plan_tasks',
+      'reassign_task',
       'remember_member',
       'request_clarification',
       'update_task',

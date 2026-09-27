@@ -91,6 +91,13 @@ export interface ExternalWorkSummary {
   title: string;
   status: string | null;
   assignee: string | null;
+  /**
+   * 外部工作项描述。
+   *
+   * 可选：不是所有 Work Management Provider 都能提供 description。
+   * Jira 会填充；其它 Provider 可以不填。
+   */
+  description?: string | null;
 }
 
 /**

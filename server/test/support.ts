@@ -95,6 +95,8 @@ export function createCapabilityStack(
       messageMember: (input) => resolveTeam().messageMember(input),
       requestClarification: (input) => resolveTeam().requestClarification(input),
       planTasks: (input) => resolveTeam().planTasks(input),
+      addTask: (input) => resolveTeam().addTask(input),
+      reassignTask: (input) => resolveTeam().reassignTask(input),
       updateTask: (input) => resolveTeam().updateTask(input),
     }),
   );
