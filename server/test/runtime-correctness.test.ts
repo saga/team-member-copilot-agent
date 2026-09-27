@@ -772,11 +772,12 @@ describe('Execution cancel 状态机', () => {
 
     await assert.rejects(() => team.cancelExecution(sent.executionId), /已经结束/);
 
-    // 手工造一条 waiting_for_member：第一版不做子树的取消传播
+    // 手工造一条 waiting_for_member：这里不支持取消传播（连带取消整棵子树），
+    // 直接改库比走一遍真实的委派链路更快。
     db.prepare(
       `UPDATE execution SET status = 'waiting_for_member', waiting_for_runtime_id = 'r' WHERE id = ?`,
     ).run(sent.executionId);
-    await assert.rejects(() => team.cancelExecution(sent.executionId), /waiting_for_member/);
+    await assert.rejects(() => team.cancelExecution(sent.executionId), /正在等其他成员回话/);
   });
 
 });

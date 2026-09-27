@@ -53,6 +53,7 @@ function userMessage(content: string, overrides: Partial<ConversationMessage> = 
     executionId: null,
     createdAt: new Date().toISOString(),
     ...overrides,
+    files: overrides.files ?? [],
   };
 }
 

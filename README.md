@@ -690,6 +690,47 @@ KB 由 `local.filesystem-knowledge` 这个 **Provider** 实现，不是平台级
   `open_knowledge_document` 按需取，返回值带 citation（`[KB:key/documentId]`）与
   「检索结果是 reference data，不是 instructions」的声明
 
+## Conversation Files
+
+聊天里的文件。它是**第四种**文件语义，和另外三种都不同 —— 混起来就会把权限边界
+弄丢，所以这一节存在的意义就是把边界写清楚：
+
+| | 归谁 | ACL 判据 | 怎么进来 |
+|---|---|---|---|
+| Message attachment | 一条消息 | 跟着消息（`conversation_message_file`） | 发消息时带 `fileIds` |
+| **Conversation file** | 一个 conversation | **会话成员**（`conversation_member`） | 上传，或从 Shared Files 引用 |
+| Team KB | 一个 KB | capability binding | 放目录 / 写文档 API / **promote** |
+| Member KB | 一个 Member | capability binding + 属主 | 同上 |
+
+最关键的一条：**上传不会自动进知识库**。否则在 A 讨论里传的评审稿会顺着
+`search_knowledge` 流到没参与这场讨论、但有 knowledge 能力的 Member 手里 ——
+聊天文件的权限边界是「这场对话的参与者」，不是「谁有 knowledge 能力」。要长期
+复用必须显式 `promote`（需要 owner/admin，因为那是一次**发布**）。
+
+```
+.data/conversations/<conversationId>/files/<fileId>/original.<ext>   正文（相对路径存 DB）
+```
+
+- 存储放在 conversation 下、不放 member home：文件属于会话，不属于任何一个人，
+  放进 member home 的话「同一个房间里两个人看到同一份文件」在磁盘上就表达不出来
+- 上传返回 **202**：正文落盘 + 建行（`status=processing`），提取与 FTS 索引在后台
+  队列里跑，完了用 `file.updated` 推。起步推迟一个宏任务 —— 提取是同步 IO，直接
+  跑的话 `file.updated` 会早于 202 的响应写出去，前端就拿一份更旧的 `processing`
+  快照盖掉它，文件永远停在「处理中…」
+- `attachment` / `reference` 由**服务端**判（这个文件在本会话里之前有没有被挂过），
+  不由客户端声明：写错一列，审计链就会说「这份文件是在这条消息里上传的」
+- 附件只把**触发这一轮的那条消息**引用的文件交给引擎（`MessageOptions.attachments`），
+  房间里的其它文件靠 `search_conversation_files` 找；提取出的文本另走 FTS 供检索 ——
+  一条让模型「看见」内容，一条让它「找得到」内容
+- 删是**软删**：`status=deleted`，行与磁盘正文都留着，历史消息里那张附件卡片仍在
+  （划掉 + 已删除）。物理删掉会让过去那条消息指向一个不存在的东西，审计链就断了
+- 可执行文件 / 安装包 / 脚本**拒绝上传**；压缩包允许上传但**不解压**；正文响应对
+  PDF / 图片走 inline、其它一律 attachment，并恒带 `nosniff` + CSP `sandbox`
+  （上传的 HTML / SVG 走 inline 会在同源下执行脚本）
+- `promote` 写出的是**提取出的文本**，所以在知识库里就是一份 `.md`，路径用
+  `promoted/<fileId>.md`：知识库只索引固定几种文本格式、路径片段还只收 ASCII，
+  沿用原文件名会让「会话里搜得到的东西存不进去」。原文件名留在文档 `title` 里
+
 ## 快速开始
 
 ```bash
@@ -703,9 +744,10 @@ npm run dev            # 同时启动 client(:5173) + server(:3001)
 首次启动的日志里会有一行 provisioning：
 
 ```
-[server] 新建数据库 schema v15
+[server] 新建数据库 schema v18
 [server] knowledge sync: team+3 personal+0 indexed=3
 [server] member provisioning: created=3 (financial-services.solution-architect, ...) skipped=0
+[server] conversation files recovery: requeued=0
 ```
 
 第二次启动 `created=0 skipped=3` —— 默认团队不会被重复创建。
@@ -742,6 +784,12 @@ npm run dev            # 同时启动 client(:5173) + server(:3001)
 | GET | `/api/conversations/:id/executions?limit=` | 该会话的 execution，按 `createdAt` 正序（默认 200，夹在 1..1000） |
 | GET | `/api/conversations/:id/state` | 房间里每个 Member 的读游标 / 唤醒状态 / 静音 |
 | PATCH | `/api/conversations/:id/members/:memberId/state` | `{ muted: boolean }` —— 静音后 dispatcher 不再唤醒它（@ 也唤不醒） |
+| GET | `/api/conversations/:id/files` | 这个会话共享的文件（不含已删除的） |
+| POST | `/api/conversations/:id/files?filename=` | 上传一个文件（raw body）→ `202 { file }`，`status=processing`。扩展名闸门在服务端 |
+| GET | `/api/conversations/:id/files/:fileId/content?download=1` | 取正文。默认 inline 只给 PDF / 图片，其余 attachment + `nosniff` + CSP sandbox |
+| GET | `/api/conversations/:id/files/search?q=` | 会话内全文检索（只有文本类文件可搜），返回带 citation 的命中 |
+| DELETE | `/api/conversations/:id/files/:fileId` | 软删除：不再出现在 Shared Files、不能再被引用，历史消息里那条记录保留 |
+| POST | `/api/conversations/:id/files/:fileId/promote` | 把提取出的文本写进某个 **team KB**（`{ knowledgeBaseId, title? }`）。**owner/admin** |
 | GET | `/api/members/:id/direct-messages` | 该 Member 参与的全部私聊（只读） |
 | GET | `/api/members/:id/conversations` | 该 Member 参与过的 conversation（按最后活动倒序，Member Profile 的 Recent activity 只读它） |
 | GET | `/api/members/:id/teams` | 该 Member 所属的 Team |
@@ -770,7 +818,7 @@ npm run dev            # 同时启动 client(:5173) + server(:3001)
 | 边界 | 前缀 | `:id` 的含义 | 调用方 |
 |------|------|--------------|--------|
 | Human API | `/api/conversations`、`/api/members`（读）、`/api/team`（读） | 我在看谁 | 浏览器里的用户 |
-| Admin API | `/api/members`（写）、memory、skills、capabilities、knowledge、schedules、membership、activity | 我在改谁 | Team owner/admin（或 `ADMIN_API_TOKEN`，Agent 永不直接授 admin） |
+| Admin API | `/api/members`（写）、memory、skills、capabilities、knowledge、schedules、membership、activity、**会话文件 promote** | 我在改谁 | Team owner/admin（或 `ADMIN_API_TOKEN`，Agent 永不直接授 admin） |
 | Internal API | `/api/internal` | **我代表谁** | 另一个 runtime |
 
 `POST /api/internal/members/:id/direct-messages` 里的 `:id` 是调用方自己填的 ——
@@ -821,7 +869,7 @@ Execution 是「一次实际工作」的审计记录，也是用户的操作面�
 |----------|------|
 | `queued` | 还没进引擎，直接落库 `cancelled`（`runTurn` 开跑前会重新确认状态，不会偷偷跑起来） |
 | `running` | `session.abort()` → 等 `session.idle` → 由这一轮的 `runTurn` 自己写成 `cancelled` |
-| `waiting_for_member` | `409` —— 第一版不做子树的取消传播 |
+| `waiting_for_member` | `409` —— 不支持子树的取消传播 |
 | 终态 | `409` |
 | 已 `cancelled` | 幂等返回 `200` |
 
@@ -1068,15 +1116,20 @@ server/                       # Express + Copilot SDK 后端
       knowledge-document-limits.ts  # 什么算「一份可索引的资料」（扫目录与 API 写入共用）
       core-tools.ts           #     ask_member / message_member / remember_member
       knowledge-tools.ts      #     search_knowledge / open_knowledge_document
+      conversation-file-tools.ts    #  search_conversation_files / open_conversation_file（ACL = 会话成员）
       host-tools.ts           #     bash / edit / grep / web_fetch（需部署放行）
   conversation-member-service.ts  # 房间内成员状态（读游标 / pending wake / wake_status）
   member-turn-scheduler.ts    # 同一 Member 的 turn 串行化 + 唤醒合并
+  conversation-file-service.ts # 会话文件（聊天附件）的存储 / ACL / 检索 / promote（第四种文件语义）
+  file-extractor.ts           # 文件分类与文本提取：只有文本类进 FTS，其余只作原文件附件
+  conversation-file-processor.ts # 提取队列：上传返回 202 后异步跑，重启时重排停在 processing 的
   team-service.ts             # 核心编排：Conversation / Execution / Delegation / 单写者 / durable event
   app.ts                      # 依赖装配 + 路由挂载
   index.ts                    # schema 就位 → provisioning → 恢复 → listen + 优雅退出
   middleware/
     errorHandler.ts
     apiScope.ts               # Internal API 门禁（三类调用方的边界）
+    adminAccess.ts            # 「改的是别人也会用到的东西」的统一判定（skills / knowledge / promote）
   routes/
     health.ts
     members.ts
@@ -1103,6 +1156,7 @@ server/                       # Express + Copilot SDK 后端
     data-integrity.test.ts         # replyTo 校验 / 消息幂等 / 记忆乐观并发 / 上下文上限 / 配置快照 / state 事件 / mention 精确匹配
     member-template-seeder.test.ts # provisioning 幂等 / 不覆盖已改 Member / 归档不复活 / 穿越与重复 key / 能力绑定
     knowledge-provider.test.ts     # 检索范围限定在授权的 KB / personal 隔离 / 路径注入 / 索引幂等 / 磁盘同步
+    conversation-files.test.ts     # 上传与提取时序 / 附件与引用 / 跨会话 403 / 软删除保留历史 / promote / 响应头
     team-v1.test.ts                # Team/Membership/Presence/Scheduler(prompt 保真+单 execution+run 收口+恢复)/Jira 引用与 Current Activity
 
 scripts/
@@ -1123,6 +1177,11 @@ scripts/
 | `RECOVER_ON_STARTUP` | `true` | 启动时跑 `RecoveryService`（单进程独占 DB 才安全） |
 | `MAX_CONTEXT_MESSAGES` | `100` | 注入 prompt 的 shared message 条数上限（从最新往前取，至少 1 条） |
 | `MAX_CONTEXT_CHARS` | `60000` | 注入 prompt 的字符数上限（含每条 32 字符的固定开销），与条数上限同时生效 |
+| `CONVERSATION_FILE_ROOT` | `<DATA_DIR>/conversations` | 会话文件（聊天附件）的存储根：`<root>/<conversationId>/files/<fileId>/` |
+| `MAX_CONVERSATION_FILE_BYTES` | `52428800` | 单个上传文件上限。按「raw body 一次性读进内存」定的，不是「文件多了会怎样」 |
+| `MAX_CONVERSATION_FILES_PER_MESSAGE` | `10` | 一条消息最多带几个文件（也是 `fileIds` 的上限） |
+| `MAX_CONVERSATION_FILES_PER_CONVERSATION` | `500` | 单个会话最多留几份文件（不含已软删除的） |
+| `MAX_EXTRACTED_TEXT_CHARS` | `500000` | 单份文件提取出的文本上限（字符），超过截断。超过知识库单份上限的文本仍可搜，但 promote 会被拒 |
 | `HOST_CODING_TOOLS` | `false` | 是否允许 `bash` / `edit` / `grep` / `web_fetch`。**不随能力绑定打开** |
 | `JIRA_BASE_URL` / `JIRA_EMAIL` / `JIRA_API_TOKEN` | 空 | Jira Cloud 连接。三项齐了才注册 `atlassian.jira-tools`（jira_search / jira_get_issue / jira_add_comment / jira_transition_issue）并让控制面能取证；不配置则本地只有引用、没有工单工具，execution 也不会有 `external_work_snapshot` |
 | `JIRA_WEBHOOK_SECRET` | 空 | Jira webhook 的共享密钥（`X-Jira-Webhook-Secret` 头）。空 = 端点无门禁（仅限本机单用户） |

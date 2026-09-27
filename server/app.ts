@@ -14,6 +14,9 @@ import { SkillService } from './skill-service.js';
 import { FilesystemSkillProvider } from './capabilities/providers/filesystem-skill.js';
 import { LocalFilesystemKnowledgeProvider } from './capabilities/providers/filesystem-knowledge.js';
 import { CoreTeamToolProvider } from './capabilities/providers/core-tools.js';
+import { ConversationFileToolProvider, conversationFileToolHost } from './capabilities/providers/conversation-file-tools.js';
+import { ConversationFileService } from './conversation-file-service.js';
+import { ConversationFileProcessor } from './conversation-file-processor.js';
 import { KnowledgeToolProvider } from './capabilities/providers/knowledge-tools.js';
 import { HostCodingToolProvider } from './capabilities/providers/host-tools.js';
 import { JiraToolProvider } from './capabilities/providers/jira-tools.js';
@@ -55,6 +58,7 @@ import { initTeamScope } from './middleware/teamScope.js';
  */
 let teamService!: TeamService;
 let schedulerService!: SchedulerService;
+let conversationFileProcessor!: ConversationFileProcessor;
 
 const memberService = new MemberService(db);
 const capabilityService = new CapabilityService(db);
@@ -127,6 +131,35 @@ if (jiraConfigured) {
 
 const capabilityResolver = new CapabilityResolver(registry);
 
+/**
+ * 会话文件（聊天附件）。
+ *
+ * 它在 TeamService **之前**构造：TeamService 要用它挂附件、取附件。反向的那条
+ * 依赖（文件状态变化要广播到会话事件流）用箭头函数打断 —— 调用发生在文件真的
+ * 变化时，那时 TeamService 早就在了。
+ *
+ * 装配顺序上还有一处刻意：文件的 ACL 是 conversation membership，和 capability
+ * 无关，所以它在这里**不经过** capabilityResolver。绕一圈反而会让人以为
+ * 「看不到文件是因为没绑定能力」。
+ */
+const conversationFiles = new ConversationFileService(db, {
+  root: config.conversationFileRoot,
+  maxBytesPerFile: config.maxConversationFileBytes,
+  maxFilesPerConversation: config.maxConversationFilesPerConversation,
+  maxFilesPerMessage: config.maxConversationFilesPerMessage,
+  onEvent: (conversationId, type, file) =>
+    teamService.conversationFileChanged(conversationId, type, file),
+});
+
+conversationFileProcessor = new ConversationFileProcessor(
+  conversationFiles,
+  config.maxExtractedTextChars,
+);
+
+registry.registerToolProvider(
+  new ConversationFileToolProvider(conversationFileToolHost(conversationFiles)),
+);
+
 // Skill 内容的统一存储与安装。三个 scope（global / team / member）共用这一个
 // 服务 —— 它按 scope 决定落盘位置，并在这里统一执行 zip 的三道安全闸。
 const skillService = new SkillService(db);
@@ -148,6 +181,7 @@ teamService = new TeamService(
   // Member Activity：业务工作在 Jira，本地广播「谁在跑哪张工单的这一轮」。
   (teamId, type, payload) => teamEvents.append(teamId, type, payload),
   workManagement,
+  conversationFiles,
 );
 
 schedulerService = new SchedulerService(structureService, () => teamService);
@@ -162,6 +196,8 @@ schedulerService = new SchedulerService(structureService, () => teamService);
 fs.mkdirSync(config.globalSkillRoot, { recursive: true });
 fs.mkdirSync(config.teamSkillRoot, { recursive: true });
 fs.mkdirSync(config.teamKnowledgeRoot, { recursive: true });
+// 会话文件的根目录。每个会话的文件在 <root>/<conversationId>/files/ 下按需创建。
+fs.mkdirSync(config.conversationFileRoot, { recursive: true });
 
 export const app = express();
 
@@ -182,7 +218,7 @@ app.use(
 app.use('/api/knowledge', knowledgeRouter(localKnowledgeProvider));
 app.use('/api/team', teamRouter(structureService, teamEvents));
 app.use('/api/work-management', workManagementRouter(teamService, workManagement));
-app.use('/api/conversations', conversationsRouter(teamService));
+app.use('/api/conversations', conversationsRouter(teamService, conversationFiles, conversationFileProcessor, localKnowledgeProvider));
 app.use('/api/executions', executionsRouter(teamService));
 // 以某个 Member 的身份说话 —— 独立的命名空间 + token 门禁，见 middleware/apiScope.ts
 app.use('/api/internal', internalRouter(teamService));
@@ -219,6 +255,8 @@ export {
   teamService,
   structureService,
   schedulerService,
+  conversationFiles,
+  conversationFileProcessor,
   teamEvents,
   workManagement,
   describeWebhookBoundary,

@@ -48,7 +48,15 @@ before(async () => {
 
   const app = express();
   app.use(express.json({ limit: '1mb' }));
-  app.use('/api/conversations', conversationsRouter(stack.team));
+  app.use(
+    '/api/conversations',
+    conversationsRouter(
+      stack.team,
+      stack.conversationFiles,
+      stack.processor,
+      stack.knowledge,
+    ),
+  );
   server = app.listen(0);
   await once(server, 'listening');
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -171,7 +179,8 @@ describe('GET /events：客户端看到的东西里没有哨兵', () => {
    * **必须解析，不能在原始 body 上找字符串。** `message.delta` 是逐字符的，
    * 每个字符各自包在一帧 `data: {...}` 里，所以 `<NO_REPLY>` 这十个字符在原始
    * 字节流里**从来不会连续出现** —— `body.includes('NO_REPLY')` 永远为 false，
-   * **包括哨兵真的漏出去的时候**。第一版就是这么写的，变异验证发现它是空绿。
+   * **包括哨兵真的漏出去的时候** —— 在原始 body 上找字符串是一条空绿断言，
+   * 变异验证逮到过它。
    */
   function parseSse(body: string): SseFrame[] {
     const frames: SseFrame[] = [];

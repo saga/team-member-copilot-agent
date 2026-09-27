@@ -530,6 +530,99 @@ MUTATIONS = [
             )
         ],
     },
+    {
+        "name": "会话文件搜索不限定成员（非成员也能搜到别人的房间）",
+        "test": "server/test/conversation-files.test.ts",
+        "steps": [
+            (
+                "server/conversation-file-service.ts",
+                "AND cm.member_id = ?",
+                "AND ? IS NOT NULL",
+            )
+        ],
+    },
+    {
+        "name": "会话文件的成员校验被跳过（谁都能读这个房间的文件）",
+        "test": "server/test/conversation-files.test.ts",
+        "steps": [
+            (
+                "server/conversation-file-service.ts",
+                "if (!row) throw forbidden('你不是这个会话的成员，看不到这里的文件');",
+                "void row;",
+            )
+        ],
+    },
+    {
+        "name": "挂件不校验跨会话归属（在 B 讨论里引用 A 讨论的文件）",
+        "test": "server/test/conversation-files.test.ts",
+        "steps": [
+            (
+                "server/conversation-file-service.ts",
+                "      if (row.conversation_id !== conversationId) {\n        throw forbidden('这个文件属于别的会话，不能在这里引用');\n      }\n",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "上传去重不收敛（同一份文件在 Shared Files 里出现两份）",
+        "test": "server/test/conversation-files.test.ts",
+        "steps": [
+            (
+                "server/conversation-file-service.ts",
+                "WHERE conversation_id = ? AND content_hash = ? AND original_name = ?",
+                "WHERE conversation_id = ? AND content_hash != ? AND original_name = ?",
+            )
+        ],
+    },
+    {
+        "name": "软删除改成物理删除（历史消息里的附件卡片凭空消失）",
+        "test": "server/test/conversation-files.test.ts",
+        "steps": [
+            (
+                "server/conversation-file-service.ts",
+                "      .prepare(\"UPDATE conversation_file SET status = 'deleted', updated_at = ? WHERE id = ?\")\n      .run(now(), fileId);",
+                "      .prepare('DELETE FROM conversation_file WHERE id = ?')\n      .run(fileId);",
+            )
+        ],
+    },
+    {
+        "name": "上传后提取同步跑完（file.updated 先于 202 的响应写出）",
+        "test": "server/test/conversation-files.test.ts",
+        "steps": [
+            (
+                "server/conversation-file-processor.ts",
+                "    setImmediate(() => {\n      void this.drain();\n    });",
+                "    void this.drain();",
+            )
+        ],
+    },
+    {
+        "name": "第二次挂同一份文件仍记成 attachment（丢掉了「引用」这个事实）",
+        "test": "server/test/conversation-files.test.ts",
+        "steps": [
+            (
+                "server/team-service.ts",
+                "    return row ? 'reference' : 'attachment';",
+                "    return row && false ? 'reference' : 'attachment';",
+            )
+        ],
+    },
+    {
+        "name": "SCHEMA_SQL 少一列（形状契约与域模型脱节）",
+        "test": "server/test/runtime-reliability.test.ts",
+        "steps": [("server/db-migrations.ts", "  extraction_error TEXT,\n", "")],
+    },
+    {
+        "name": "SCHEMA_SQL 少一个索引（形状契约与域模型脱节）",
+        "test": "server/test/runtime-reliability.test.ts",
+        "steps": [
+            (
+                "server/db-migrations.ts",
+                "CREATE INDEX idx_message_file_file\n  ON conversation_message_file(file_id);\n\n",
+                "",
+            )
+        ],
+    },
 ]
 
 
@@ -569,11 +662,23 @@ def preflight(test_files: list[str]) -> bool:
 
 
 def main() -> int:
-    if not preflight(sorted({mutation["test"] for mutation in MUTATIONS})):
+    # §8 要求变异验证只跑「本次改动对应的断言、受影响的文件」，所以支持按名字/测试
+    # 路径过滤：`python3 scripts/mutation-check.py 会话文件`。不带参数就是全量。
+    only = sys.argv[1] if len(sys.argv) > 1 else None
+    selected = [
+        mutation
+        for mutation in MUTATIONS
+        if only is None or only in mutation["name"] or only in mutation["test"]
+    ]
+    if not selected:
+        print(f"没有名字或测试路径包含 {only!r} 的变异。")
+        return 1
+
+    if not preflight(sorted({mutation["test"] for mutation in selected})):
         return 1
 
     failures = []
-    for index, mutation in enumerate(MUTATIONS, start=1):
+    for index, mutation in enumerate(selected, start=1):
         print(f"[{index:>2}] {mutation['name']}")
         prepared = mutate(mutation)
         if prepared is None:
@@ -599,7 +704,7 @@ def main() -> int:
     if failures:
         print(f"变异验证有 {len(failures)} 条不成立：{', '.join(failures)}")
         return 1
-    print(f"全部 {len(MUTATIONS)} 条变异都被断言捕获。")
+    print(f"全部 {len(selected)} 条变异都被断言捕获。")
     return 0
 
 

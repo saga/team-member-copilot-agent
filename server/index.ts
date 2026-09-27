@@ -11,6 +11,7 @@ import {
   teamService,
   structureService,
   schedulerService,
+  conversationFileProcessor,
   workManagement,
   describeWebhookBoundary,
   initTeamScope,
@@ -130,6 +131,13 @@ async function bootstrap(): Promise<void> {
   for (const member of memberService.list()) {
     capabilityResolver.validate(capabilityService.getEffective(team.id, member.id));
   }
+
+  // 会话文件恢复：上次进程在提取途中挂掉时，那些文件停在 processing。
+  // 放在 execution recovery 之前 —— 一轮 turn 可能正等着某个文件的附件，
+  // 先把文件补完，恢复出来的 execution 才拿到它该拿的东西。
+  const recoveredFiles = conversationFileProcessor.recoverProcessing();
+  // eslint-disable-next-line no-console
+  console.log(`[server] conversation files recovery: requeued=${recoveredFiles}`);
 
   if (config.recoverOnStartup) {
     const report = new RecoveryService(db, new ConversationMemberService(db)).recover();

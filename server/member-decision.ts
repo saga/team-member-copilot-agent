@@ -7,9 +7,8 @@ import type { ExecutionDecision } from './domain.js';
  * 它可以说「我没有新信息，不重复 Bob 的结论」。把 skip 当失败处理会让
  * 房间里的每个 Member 都变成必须抢答的 chatbot。
  *
- * 第一版刻意不用 structured output：直接在 prompt 里约定一个哨兵字符串，
- * 服务器做**严格**解析。等真的需要 reply / skip / delegate 三态决策时，
- * 再换成 tool call 或 JSON schema —— 那时解析代码的边界已经由这里的测试固定住了。
+ * 刻意不用 structured output：直接在 prompt 里约定一个哨兵字符串，服务器做
+ * **严格**解析，边界由测试固定住。
  *
  * 解析必须严格：哨兵只在整个回复就是哨兵时才算数。如果模型在正常回复里
  * 提到了 `<NO_REPLY>`，那是一次真实发言，不能被吞掉。

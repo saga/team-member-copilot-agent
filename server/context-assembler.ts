@@ -91,6 +91,14 @@ export class ContextAssembler {
      * 它们是外部系统的数据。要细节就调 jira_get_issue。
      */
     work?: { provider: string; key: string; url: string | null } | null;
+    /**
+     * 触发这条 turn 的消息引用的会话文件。
+     *
+     * 只列名字，不插正文：原文件已经作为 attachment 交给引擎了，把它再抄一份
+     * 进 prompt 是同一份内容付两次 token。列出来的作用是**说清楚这一轮该看
+     * 什么** —— 房间里的其它文件是搜索的结果，不是默认上下文。
+     */
+    referencedFiles?: Array<{ originalName: string }>;
   }): MemberContext {
     const rows = this.db
       .prepare(
@@ -153,6 +161,7 @@ export class ContextAssembler {
       wakeReason: WakeReason | null;
       currentPrompt: string;
       work?: { provider: string; key: string; url: string | null } | null;
+      referencedFiles?: Array<{ originalName: string }>;
     },
   ): string {
     const sections: string[] = [];
@@ -174,6 +183,19 @@ export class ContextAssembler {
 
     if (input.turnMode === 'discussion') {
       sections.push(this.roomHeader(input.conversation, input.member));
+    }
+
+    const referenced = input.referencedFiles ?? [];
+    if (referenced.length > 0) {
+      sections.push(
+        [
+          'Files attached to the current message:',
+          ...referenced.map((file) => `- ${file.originalName}`),
+          'Read them directly. Other files shared in this room are NOT part of this ' +
+            'message — use search_conversation_files / open_conversation_file if you ' +
+            'need them, and cite a file by its name when you rely on it.',
+        ].join('\n'),
+      );
     }
 
     if (sharedMessages.length > 0) {
@@ -238,6 +260,9 @@ export class ContextAssembler {
             : message.senderType === 'user'
               ? 'User'
               : 'System';
+        // 历史消息的附件这里不标注：ContextAssembler 只读消息文本，附件归
+        // ConversationFileService。这一轮该看哪些文件由 referencedFiles 说清楚，
+        // 更早的文件用 search_conversation_files 找。
         return `[${actor}] ${message.content}`;
       })
       .join('\n\n');
@@ -347,6 +372,8 @@ function mapMessage(row: MessageRow): ConversationMessage {
     clientRequestId: row.client_request_id,
     content: row.content,
     executionId: row.execution_id,
+    // 附件由调用方在需要时单独装配（ContextAssembler 只读文本）。
+    files: [],
     createdAt: row.created_at,
   };
 }

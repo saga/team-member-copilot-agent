@@ -99,7 +99,7 @@ export function teamRouter(structure: TeamStructureService, teamEvents: TeamEven
   router.patch('/members/:kind/:id', (req, res) => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     if (!adminOrRole(req as any)) {
-      res.status(403).json({ error: '需要 Team owner/admin' });
+      res.status(403).json({ error: '需要 Team owner 或 admin 权限' });
       return;
     }
     const parsed = z.object({ role: z.enum(['owner', 'admin', 'member']).optional(), status: z.enum(['active', 'inactive']).optional() }).safeParse(req.body ?? {});
@@ -168,7 +168,7 @@ export function teamRouter(structure: TeamStructureService, teamEvents: TeamEven
   router.post('/schedules', (req, res) => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     if (!adminOrRole(req as any)) {
-      res.status(403).json({ error: '需要 Team owner/admin' });
+      res.status(403).json({ error: '需要 Team owner 或 admin 权限' });
       return;
     }
     const parsed = scheduleSchema.safeParse(req.body ?? {});
@@ -191,7 +191,7 @@ export function teamRouter(structure: TeamStructureService, teamEvents: TeamEven
     router.post(path, (req, res) => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       if (!adminOrRole(req as any)) {
-        res.status(403).json({ error: '需要 Team owner/admin' });
+        res.status(403).json({ error: '需要 Team owner 或 admin 权限' });
         return;
       }
       try {
@@ -205,7 +205,7 @@ export function teamRouter(structure: TeamStructureService, teamEvents: TeamEven
   router.patch('/schedules/:id', (req, res) => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     if (!adminOrRole(req as any)) {
-      res.status(403).json({ error: '需要 Team owner/admin' });
+      res.status(403).json({ error: '需要 Team owner 或 admin 权限' });
       return;
     }
     const parsed = z.object({ status: z.enum(['active', 'paused', 'completed', 'cancelled']) }).safeParse(req.body ?? {});

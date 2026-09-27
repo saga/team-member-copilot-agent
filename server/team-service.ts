@@ -13,6 +13,7 @@ import { MemberTurnScheduler } from './member-turn-scheduler.js';
 import { NoReplyStreamGate, NO_REPLY_SENTINEL, parseMemberTurnOutcome } from './member-decision.js';
 import { badRequest, conflict, notFound } from './http-error.js';
 import { MemberConversationService, isMemberDm, type MemberDirectMessage } from './member-conversation-service.js';
+import type { ConversationFileService } from './conversation-file-service.js';
 import {
   MemberService,
   type CreateMemberInput,
@@ -38,6 +39,7 @@ import type {
   Conversation,
   ConversationEvent,
   ConversationEventType,
+  ConversationFile,
   ConversationKind,
   ConversationMemberState,
   ConversationMessage,
@@ -373,6 +375,14 @@ export class TeamService {
      * 而是「这套部署接没接外部工作系统」的事实。
      */
     private readonly workManagement?: WorkManagementRegistry,
+    /**
+     * 聊天里的文件。
+     *
+     * 装配顺序上它必须早于 TeamService（TeamService 要用它挂附件、取附件），
+     * 而它广播状态变化要回到 TeamService 的事件流 —— 用箭头函数打断这个环：
+     * 事件发生在文件真的变化时，那时 TeamService 早就在了。
+     */
+    private readonly conversationFiles?: ConversationFileService,
   ) {
     this.contextAssembler = new ContextAssembler(db);
     this.states = new ConversationMemberService(db, (conversationId, change) => {
@@ -800,7 +810,23 @@ export class TeamService {
       )
       .all(conversationId, limit) as unknown as MessageRow[];
 
-    return rows.reverse().map(mapMessage);
+    return this.withMessageFiles(rows.reverse().map(mapMessage));
+  }
+
+  /**
+   * 给一页消息装配附件：一条 SQL 取完再分组，不是每条消息查一次。
+   *
+   * 绝大多数消息没有附件，而附件信息是 UI 的一部分（气泡里那张卡片），
+   * 所以它必须随消息一起来 —— 让前端拿 messageId 一个个去取，一页 100 条
+   * 就是 100 次请求。
+   */
+  private withMessageFiles(messages: ConversationMessage[]): ConversationMessage[] {
+    if (!this.conversationFiles || messages.length === 0) return messages;
+    const byMessage = this.conversationFiles.filesForMessages(messages.map((m) => m.id));
+    return messages.map((message) => ({
+      ...message,
+      files: byMessage.get(message.id) ?? [],
+    }));
   }
 
   /**
@@ -827,6 +853,14 @@ export class TeamService {
      * 客户端重试、双击发送都靠它收敛。
      */
     clientRequestId?: string;
+    /**
+     * 这条消息带 / 引用的会话文件。
+     *
+     * 「带」还是「引用」由服务端判断，不由调用方声明：文件第一次挂到消息上就是
+     * attachment，之后再次出现就是 reference。让客户端自己声明的话，一个写错的
+     * relation_type 会让审计链说「这份文件是在这条消息里上传的」——而它其实不是。
+     */
+    fileIds?: string[];
   }): Promise<SendMessageResult> {
     const conversation = this.getConversation(input.conversationId);
     const content = input.content.trim();
@@ -860,6 +894,10 @@ export class TeamService {
       input.replyToMessageId,
     );
 
+    // 文件校验必须在落库之前：跨会话的 fileId 是「B 讨论引用 A 讨论的文件」，
+    // 一旦放过去，聊天文件的权限边界当场就破了。
+    const files = this.requireConversationFiles(conversation.id, input.fileIds ?? []);
+
     const message: ConversationMessage = {
       id: randomUUID(),
       conversationId: conversation.id,
@@ -872,11 +910,26 @@ export class TeamService {
       content,
       // 一条消息可以唤醒多个 Member，外键装不下「触发它的 execution」
       executionId: null,
+      // 附件在同一次事务里挂上去（见 sendMessage 的事务块）。
+      files: [],
       createdAt: now(),
     };
 
     try {
-      this.insertMessage(message);
+      // 消息与附件关系同一个事务：message.created 一旦广播出去，收到的人就会
+      // 立刻渲染这条消息 —— 关系行晚一步落库的话，那条消息在别人屏幕上先是
+      // 「没有附件」，刷新后才长出附件卡片。
+      this.transaction(() => {
+        this.insertMessage(message);
+        files.forEach((file, index) => {
+          this.conversationFiles?.attachToMessage(
+            message.id,
+            file.id,
+            this.relationForNewMessage(conversation.id, message, file.id),
+            index,
+          );
+        });
+      });
     } catch (error) {
       // 并发重试：两个请求都通过了上面的检查，第二个撞上 UNIQUE 索引。
       // 这不是故障，是幂等键在起作用 —— 把先落库的那条返回给这一侧。
@@ -890,9 +943,12 @@ export class TeamService {
     }
 
     this.touchConversation(conversation.id);
-    this.emit(conversation.id, { type: 'message.created', data: message });
+    // 广播带上附件：附件是这条消息的一部分，前端不该收到一条「还没有附件」的
+    // 消息再去补查一次。
+    const created = { ...message, files };
+    this.emit(conversation.id, { type: 'message.created', data: created });
 
-    const plan = this.dispatcher.plan({ conversation, message });
+    const plan = this.dispatcher.plan({ conversation, message: created });
     for (const wake of plan.wakes) {
       this.scheduler.enqueue({
         conversationId: conversation.id,
@@ -903,11 +959,74 @@ export class TeamService {
     }
 
     return {
-      message,
+      message: created,
       wakes: plan.wakes,
       unresolvedMentions: plan.unresolvedMentions,
       deduplicated: false,
     };
+  }
+
+  /**
+   * 一条消息第一次挂某个文件 = attachment，再次挂 = reference。
+   *
+   * 判据是「这个文件在**本会话**里之前有没有被任何消息挂过」，而不是「这条消息
+   * 是不是第一条消息」：用户把同一份文件再拖一次，得到的应该是引用而不是
+   * 第二份副本（副本也进不来 —— UNIQUE(conversation_id, content_hash,
+   * original_name) 会把它收敛成同一行）。
+   */
+  private relationForNewMessage(
+    conversationId: string,
+    message: ConversationMessage,
+    fileId: string,
+  ): 'attachment' | 'reference' {
+    const row = this.db
+      .prepare(
+        `
+        SELECT 1 AS ok
+        FROM conversation_message_file mf
+        JOIN conversation_message m ON m.id = mf.message_id
+        WHERE m.conversation_id = ?
+          AND mf.file_id = ?
+          AND m.id != ?
+        LIMIT 1
+        `,
+      )
+      .get(conversationId, fileId, message.id) as unknown as { ok: number } | undefined;
+    return row ? 'reference' : 'attachment';
+  }
+
+  /** fileIds → 文件对象；没有会话文件服务时（测试装配）一律拒绝，不静默忽略。 */
+  private requireConversationFiles(conversationId: string, fileIds: string[]) {
+    if (fileIds.length === 0) return [];
+    if (!this.conversationFiles) {
+      throw badRequest('当前部署没有启用会话文件，不能带附件发送');
+    }
+    return this.conversationFiles.validateForMessage(conversationId, fileIds);
+  }
+
+  /**
+   * 触发这条 turn 的消息挂了哪些文件。
+   *
+   * 只认 `status = 'ready'` 的：还在提取中的文件交给引擎也是一个它读不了的路径，
+   * 而这一轮的回答会变成「文件好像没内容」。
+   */
+  private filesForTrigger(conversationId: string, triggerMessageSequence: number | null) {
+    if (!this.conversationFiles || triggerMessageSequence === null) return [];
+    return this.conversationFiles.filesForMessageSequence(conversationId, triggerMessageSequence);
+  }
+
+  /**
+   * 会话文件状态变化 → 走会话事件流广播。
+   *
+   * 文件服务不认识事件流（它只碰 DB 与磁盘），广播口在这里 —— 这样「哪些变化
+   * 该让前端知道」仍然只有一个地方决定，和 message / execution / 房间状态一样。
+   */
+  conversationFileChanged(
+    conversationId: string,
+    type: 'file.created' | 'file.updated' | 'file.deleted',
+    file: ConversationFile,
+  ): void {
+    this.emit(conversationId, { type, data: file });
   }
 
   /**
@@ -950,6 +1069,7 @@ export class TeamService {
       clientRequestId: null,
       content,
       executionId: null,
+      files: [],
       createdAt: now(),
     };
 
@@ -1561,12 +1681,12 @@ export class TeamService {
    * `UPDATE ... status = 'cancelled'` 会造出「DB 说已取消、Agent 还在跑」的假取消，
    * 比不取消更危险 —— 它让操作者以为副作用已经停了。
    *
-   * 第一版不支持 waiting_for_member 的 cascade cancel：
+   * 不支持 waiting_for_member 的 cascade cancel：
    *
    *   A → waiting B → waiting C
    *
-   * 取消一棵正在等待的子树属于 cancellation propagation，要连子树的执行体一起处理，
-   * 不值得在这一版扩大范围。先把 queued / running 做正确。
+   * 取消一棵正在等待的子树属于 cancellation propagation，要连子树的执行体一起处理。
+   * 这里的范围只覆盖 queued / running。
    */
   async cancelExecution(executionId: string): Promise<ExecutionRecord> {
     const execution = this.getExecution(executionId);
@@ -1577,7 +1697,7 @@ export class TeamService {
     }
     if (execution.status === 'waiting_for_member') {
       throw conflict(
-        '这条任务正在等其他成员回话，暂时不能取消：取消它需要连带取消一串相关任务，目前还不支持',
+        '这条任务正在等其他成员回话，不能直接取消：取消它要连带取消一串相关任务',
       );
     }
 
@@ -2105,6 +2225,12 @@ export class TeamService {
 
     // 只注入「自该 runtime 上次成功 turn 以来新增的 shared messages」。
     // Copilot session 自己已经记着这个 Member 的历史，整段重放会重复。
+    //
+    // 附件只取**触发这条 turn 的消息**引用的文件：把整个 Shared Files 每次都塞给
+    // 模型，会让「这一轮到底在看什么」变成没人说得清的问题，也很快撞上窗口上限。
+    // 房间里其它文件随时可以用 search_conversation_files 找。
+    const referencedFiles = this.filesForTrigger(input.conversation.id, input.triggerMessageSequence);
+
     const context = this.contextAssembler.assemble({
       runtime,
       conversation: input.conversation,
@@ -2116,6 +2242,7 @@ export class TeamService {
       // 优先用取证返回的规范引用：工单被改过 key 时，告诉 Agent 的是**现在**的
       // key，而不是建会话那天记下的那个。
       work: this.workContextFor(workSnapshot?.ref ?? input.execution.externalWorkRef),
+      referencedFiles: referencedFiles.map((file) => ({ originalName: file.originalName })),
     });
 
     // 被取消时把已产出的半截内容留在 execution.response 里，便于 UI 展示与排查。
@@ -2156,6 +2283,13 @@ export class TeamService {
         conversationId: input.conversation.id,
         teamId: input.conversation.teamId,
         capabilities: runtimeCapabilities,
+        // 原文件交给引擎（它能读 PDF / 图片），提取出的文本另走 FTS 供搜索 ——
+        // 两条路并存：一条让模型「看见」内容，一条让它「找得到」内容。
+        attachments: referencedFiles.map((file) => ({
+          path: this.conversationFiles?.absolutePathOf(file) ?? '',
+          displayName: file.originalName,
+          contentType: file.contentType,
+        })),
         onDelta: (delta) => {
           const visible = streamGate.push(delta);
           if (!visible) return;
@@ -2744,6 +2878,7 @@ export class TeamService {
       clientRequestId: null,
       content: input.content,
       executionId: input.executionId,
+      files: [],
       createdAt: now(),
     };
 
@@ -2788,7 +2923,7 @@ export class TeamService {
    *   conversation_member_state    pending_wake 或非 idle 的 wake_status
    *   scheduler 内存态             已入队但还没落库到 state 行的那一瞬
    *
-   * 第一版刻意选「拒绝操作」而不是「边跑边踢」：中断一个正在写文件的 Agent
+   * 刻意选「拒绝操作」而不是「边跑边踢」：中断一个正在写文件的 Agent
    * 需要取消传播（连同它的 delegation 子树），那是另一件事。
    */
   private assertMemberNotBusy(memberId: string, action: string, conversationId?: string): void {
@@ -3335,6 +3470,9 @@ function mapMessage(row: MessageRow): ConversationMessage {
     clientRequestId: row.client_request_id,
     content: row.content,
     executionId: row.execution_id,
+    // 附件不由这一层查：调用方用 ConversationFileService.filesForMessages 批量
+    // 装配（一条 SQL 拿一页），逐条查会变成 N+1。
+    files: [],
     createdAt: row.created_at,
   };
 }

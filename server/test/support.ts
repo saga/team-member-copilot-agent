@@ -12,6 +12,12 @@ import { CapabilityService } from '../capabilities/service.js';
 import { FilesystemSkillProvider } from '../capabilities/providers/filesystem-skill.js';
 import { LocalFilesystemKnowledgeProvider } from '../capabilities/providers/filesystem-knowledge.js';
 import { CoreTeamToolProvider } from '../capabilities/providers/core-tools.js';
+import {
+  ConversationFileToolProvider,
+  conversationFileToolHost,
+} from '../capabilities/providers/conversation-file-tools.js';
+import { ConversationFileService } from '../conversation-file-service.js';
+import { ConversationFileProcessor } from '../conversation-file-processor.js';
 import { KnowledgeToolProvider } from '../capabilities/providers/knowledge-tools.js';
 import { HostCodingToolProvider } from '../capabilities/providers/host-tools.js';
 import type { MemberService } from '../member-service.js';
@@ -35,11 +41,14 @@ export interface CapabilityStack {
   knowledge: LocalFilesystemKnowledgeProvider;
   registry: CapabilityRegistry;
   resolver: CapabilityResolver;
+  /** 会话文件（聊天附件）。工具注册与 TeamService 都用同一个实例。 */
+  conversationFiles: ConversationFileService;
 }
 
 export interface TestStack extends CapabilityStack {
   team: TeamService;
   structure: TeamStructureService;
+  processor: ConversationFileProcessor;
 }
 
 /**
@@ -90,7 +99,26 @@ export function createCapabilityStack(
   registry.registerToolProvider(new KnowledgeToolProvider());
   registry.registerToolProvider(new HostCodingToolProvider());
 
-  return { capabilities, knowledge, registry, resolver: new CapabilityResolver(registry) };
+  // 会话文件：和 app.ts 一样先建服务再注册工具 —— 全局能力模板引用了
+  // `conversation.file-tools`，注册表里没有它的话，模板 provisioning 会在
+  // 「Provider ID 未注册」这一步直接失败。
+  const conversationFiles = new ConversationFileService(db, {
+    root: config.conversationFileRoot,
+    maxBytesPerFile: config.maxConversationFileBytes,
+    maxFilesPerConversation: config.maxConversationFilesPerConversation,
+    maxFilesPerMessage: config.maxConversationFilesPerMessage,
+  });
+  registry.registerToolProvider(
+    new ConversationFileToolProvider(conversationFileToolHost(conversationFiles)),
+  );
+
+  return {
+    capabilities,
+    knowledge,
+    registry,
+    resolver: new CapabilityResolver(registry),
+    conversationFiles,
+  };
 }
 
 export function createTestStack(
@@ -107,6 +135,10 @@ export function createTestStack(
   let team!: TeamService;
   const stack = createCapabilityStack(db, members, () => team);
   const structure = new TeamStructureService(db);
+  const processor = new ConversationFileProcessor(
+    stack.conversationFiles,
+    config.maxExtractedTextChars,
+  );
   team = new TeamService(
     db,
     members,
@@ -116,8 +148,9 @@ export function createTestStack(
     structure,
     undefined,
     workManagement,
+    stack.conversationFiles,
   );
-  return { ...stack, team, structure };
+  return { ...stack, team, structure, processor };
 }
 
 /**

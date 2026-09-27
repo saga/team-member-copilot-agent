@@ -243,7 +243,55 @@ export interface ConversationMessage {
   clientRequestId: string | null;
   content: string;
   executionId: string | null;
+  /**
+   * 这条消息带 / 引用的文件。
+   *
+   * 一次查询就装配好（见 ConversationFileService.filesForMessages），不是让调用方
+   * 拿 messageId 一个个去取 —— 一页 100 条消息就是 100 次查询。
+   */
+  files: ConversationFile[];
   createdAt: string;
+}
+
+export type ConversationFileStatus = 'processing' | 'ready' | 'failed' | 'deleted';
+
+/**
+ * 一条消息在文件上的两种关系。
+ *
+ *   attachment —— 文件是在这条消息里上传的（它第一次出现在这里）
+ *   reference  —— 这条消息沿用了之前已经上传的文件，没有重新上传
+ *
+ * 分开记是为了审计：「这份文件从哪来」和「谁还在用它」是两个问题，
+ * 合成一个的话，删文件之后就说不清它原本属于谁的那条消息了。
+ */
+export type ConversationFileRelation = 'attachment' | 'reference';
+
+/**
+ * conversation 里的一份文件。
+ *
+ * 权限边界是 conversation membership —— 它**不**因为能被搜索就进入知识库。
+ * 要长期复用必须显式 promote（见 ConversationFileService.promote）。
+ *
+ * 这个类型里没有正文：提取出的文本可能到 maxExtractedTextChars 的量级，
+ * 放进每次 GET /messages 的响应里会把 payload 撑爆。正文走预览接口 /
+ * open_conversation_file 工具单独取。
+ */
+export interface ConversationFile {
+  id: string;
+  conversationId: string;
+  teamId: string;
+  uploadedBy: string;
+  originalName: string;
+  contentType: string;
+  sizeBytes: number;
+  status: ConversationFileStatus;
+  /** 相对 conversationFileRoot 的路径。 */
+  storagePath: string;
+  contentHash: string;
+  /** 提取失败时的原因（status='failed' 才有），成功为 null。 */
+  extractionError: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export type ExecutionKind = 'interactive' | 'member_delegate' | 'member_work';
@@ -487,6 +535,16 @@ export type ConversationEventType =
    * 有一份会过期的工单状态。
    */
   | 'external_work.changed'
+  /**
+   * 会话里的文件变了（新上传 / 提取完成 / 删除）。
+   *
+   * 沿用同一条会话事件流，而不是让前端去轮询 Shared Files：上传后提取是异步的，
+   * 「processing → ready」这一步只有服务端知道；轮询的代价是每个打开的页面都在
+   * 打这个接口，而状态变化其实很少。
+   */
+  | 'file.created'
+  | 'file.updated'
+  | 'file.deleted'
   | 'delegation.started'
   | 'delegation.finished';
 

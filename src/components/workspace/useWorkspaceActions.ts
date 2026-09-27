@@ -1,5 +1,5 @@
 import { useRef } from 'react';
-import { api, type Member } from '../../lib/api';
+import { api, type ConversationFile, type Member } from '../../lib/api';
 import type { Route } from '../../lib/router';
 import type { WorkDraft } from '../team/WorkCreator';
 import { newRequestId, type WorkspaceData } from './useWorkspaceData';
@@ -13,6 +13,9 @@ export interface WorkspaceActionDeps {
   setError: (error: string | null) => void;
   /** 建完房间后跳转落点（/chat/:id），由 Workspace 的路由 hook 提供。 */
   navigate: (route: Route, options?: { replace?: boolean }) => void;
+  /** 这条消息要带的文件（composer 上的 chip）。 */
+  selectedFileIds: string[];
+  setSelectedFileIds: (ids: string[]) => void;
   setEditingMemberId: (id: string | null) => void;
   setNewDiscussionOpen: (open: boolean) => void;
   setNewWorkOpen: (open: boolean) => void;
@@ -159,6 +162,38 @@ export function useWorkspaceActions(deps: WorkspaceActionDeps) {
     }
   }
 
+  /**
+   * 上传一份会话文件。
+   *
+   * 上传即选：用户刚从本机挑了一个文件，几乎总是紧接着要发一条用到它的消息 ——
+   * 让他上传完再去 Shared Files 里「引用」一次，是把同一个意图拆成两步。
+   * 文件同时也进了 Shared Files（服务端落盘 + file.created）。
+   */
+  async function uploadFile(file: File): Promise<void> {
+    if (!data.conversationId) return;
+    deps.setError(null);
+    try {
+      const result = await api.uploadConversationFile(data.conversationId, file);
+      // 只补不覆盖：这份快照是「请求发出那一刻」的状态，而提取与 file.updated
+      // 可能已经先通过 SSE 到了（小文件是同步提取完的）。
+      data.noteUploadedFile(result.file);
+      deps.setSelectedFileIds([...deps.selectedFileIds, result.file.id]);
+    } catch (e) {
+      deps.setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function deleteFile(file: ConversationFile): Promise<void> {
+    try {
+      await api.deleteConversationFile(file.conversationId, file.id);
+      data.removeConversationFile(file.id);
+      // 已选中的话也要撤掉：发出去会被服务端拒（文件已被删除）。
+      deps.setSelectedFileIds(deps.selectedFileIds.filter((id) => id !== file.id));
+    } catch (e) {
+      deps.setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
   async function send() {
     const content = deps.input.trim();
     if (!content || !data.conversationId) return;
@@ -174,6 +209,7 @@ export function useWorkspaceActions(deps: WorkspaceActionDeps) {
     deps.setError(null);
     // 「发第一条消息才会开始」这条提示在消息真的发出去之后就不成立了
     data.setNotice(null);
+    const fileIds = [...deps.selectedFileIds];
     deps.setInput('');
     try {
       const result = await api.sendMessage(data.conversationId, {
@@ -182,10 +218,13 @@ export function useWorkspaceActions(deps: WorkspaceActionDeps) {
         // 传一个具体 memberId = 点名，等价于一次 @mention。
         targetMemberId: data.recipientMemberId || undefined,
         clientRequestId,
+        ...(fileIds.length > 0 ? { fileIds } : {}),
       });
       // 发出去了才清掉：失败时保留，好让「再点一次」变成一次真正的重试。
       pendingSendRef.current = null;
-      // 202：消息已落库。乐观插入，SSE 到达时会按 id 去重。
+      // 附件跟着消息走了，chip 就没用了 —— 留着会让下一条消息莫名其妙又带上它们。
+      deps.setSelectedFileIds([]);
+      // 202：消息已落库。乐观插入（带附件），SSE 到达时会按 id 去重。
       data.appendMessages([result.message]);
 
       // 部分 @ 没认领：要分清「谁都没收到」和「认领的收到了、只有这几个没匹配到」。
@@ -207,5 +246,14 @@ export function useWorkspaceActions(deps: WorkspaceActionDeps) {
     }
   }
 
-  return { createDirect, createGroup, createWork, createMember, archiveMember, send };
+  return {
+    createDirect,
+    createGroup,
+    createWork,
+    createMember,
+    archiveMember,
+    uploadFile,
+    deleteFile,
+    send,
+  };
 }

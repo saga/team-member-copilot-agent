@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Avatar, Badge, Button, Space, Tag, Tooltip, Typography } from 'antd';
-import { TeamOutlined } from '@ant-design/icons';
+import { PaperClipOutlined, TeamOutlined } from '@ant-design/icons';
 import type { Conversation, ConversationMemberState, Member } from '../../lib/api';
 import { GroupMemberManager } from './GroupMemberManager';
 import { isMemberDm, type MemberStatusLookup } from './constants';
@@ -11,26 +11,34 @@ interface ConversationHeaderProps {
   allMembers: Member[];
   states: Record<string, ConversationMemberState>;
   memberStatus: MemberStatusLookup;
+  /** 这个会话里共享了多少份文件，显示在 Shared 按钮上。 */
+  fileCount: number;
   onConversationChanged: (conversation: Conversation) => void;
   onStateChanged: (state: ConversationMemberState) => void;
+  onOpenFiles: () => void;
 }
 
 /**
- * 会话头：只负责「识别房间」。
+ * 会话头：只负责「识别房间」与「这个房间有哪些共享物」。
  *
- *   Title / kind / Jira / avatars / Participants button
+ *   Title / kind / Jira / avatars / Shared / Participants
  *
  * 「这条消息发给谁」是 MessageComposer 的事（输入框前缀的选择器），
  * 静音/移人/加人是 Participants 抽屉的事。Avatar 只显示人 + 状态，
  * 点击不再静音 —— 误触一次就把 Agent  ban 掉是最差的交互。
+ *
+ * Shared 放在这里而不是塞进第二列：文件的归属是**这个会话**，它的入口就该和
+ * 会话标题在同一行；放进侧栏会让人以为是全局资料，而它只对房间里的人可见。
  */
 export function ConversationHeader({
   conversation,
   allMembers,
   states,
   memberStatus,
+  fileCount,
   onConversationChanged,
   onStateChanged,
+  onOpenFiles,
 }: ConversationHeaderProps) {
   const isGroup = conversation.kind === 'group';
   const isDm = isMemberDm(conversation);
@@ -83,6 +91,10 @@ export function ConversationHeader({
               );
             })}
           </Avatar.Group>
+
+          <Button icon={<PaperClipOutlined />} onClick={onOpenFiles}>
+            Shared{fileCount > 0 ? ` ${fileCount}` : ''}
+          </Button>
 
           {isGroup && (
             <Button icon={<TeamOutlined />} onClick={() => setParticipantsOpen(true)}>

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   api,
   type Conversation,
+  type ConversationFile,
   type ConversationMemberState,
   type ConversationMemberStateChange,
   type ConversationMessage,
@@ -77,6 +78,15 @@ export interface WorkspaceData {
   delegations: DelegationLog[];
   executions: Record<string, ExecutionRecord>;
   conversationStates: Record<string, ConversationMemberState>;
+  /** 当前会话共享的文件（不含已删除的）。 */
+  conversationFiles: ConversationFile[];
+  /**
+   * 把「上传接口返回的那份快照」记进来。
+   *
+   * 只补不覆盖，见函数体的说明 —— 它不是增量更新入口，SSE 才是。
+   */
+  noteUploadedFile: (file: ConversationFile) => void;
+  removeConversationFile: (fileId: string) => void;
   recipientMemberId: string;
   setRecipientMemberId: (memberId: string) => void;
   notice: string | null;
@@ -124,6 +134,14 @@ export function useWorkspaceData({ onError }: { onError: (message: string | null
   const [conversationStates, setConversationStates] = useState<
     Record<string, ConversationMemberState>
   >({});
+  /**
+   * 当前会话共享的文件。
+   *
+   * 和 messages 一样按会话切换重拉，之后靠 file.* 事件增量更新 —— 上传后的
+   * 「处理中 → 就绪」这一步只有服务端知道（提取是异步的），轮询会让每个打开的
+   * 页面都在打这个接口，而状态变化其实很少。
+   */
+  const [conversationFiles, setConversationFiles] = useState<ConversationFile[]>([]);
   /**
    * 中性提示（蓝色 Alert）。和 error 分开是因为语义不同：error 是「刚才那件事
    * 失败了」，notice 是「事情做成了，但你得知道接下来会发生什么」——
@@ -210,11 +228,15 @@ export function useWorkspaceData({ onError }: { onError: (message: string | null
 
   // 打开会话：拉历史 + 订阅 SSE
   useEffect(() => {
+    /** 切走后丢弃在途响应：否则慢的那个会把上一个房间的文件列表写回来。 */
+    let cancelled = false;
+
     if (!conversationId) {
       setMessages([]);
       setStreaming({});
       setDelegations([]);
       setExecutions({});
+      setConversationFiles([]);
       return;
     }
 
@@ -226,7 +248,16 @@ export function useWorkspaceData({ onError }: { onError: (message: string | null
     setDelegations([]);
     setExecutions({});
     setConversationStates({});
+    setConversationFiles([]);
     onError(null);
+
+    void api
+      .listConversationFiles(activeId)
+      .then((result) => {
+        // 切房间很快时，慢的那个响应会带着上一个房间的文件列表回来。
+        if (!cancelled) setConversationFiles(result.files);
+      })
+      .catch((e: unknown) => onError(e instanceof Error ? e.message : String(e)));
 
     if (conversation?.kind === 'group') {
       setRecipientMemberId(EVERYONE);
@@ -317,6 +348,23 @@ export function useWorkspaceData({ onError }: { onError: (message: string | null
       applyStateChanged(change);
     });
 
+    // 文件事件：新上传 / 提取完成 / 删除。提取是异步的，「处理中 → 就绪」
+    // 这一步只有服务端知道，所以它必须推过来，而不是让 UI 去轮询。
+    source.addEventListener('file.created', (event) => {
+      const file = parseEvent<ConversationFile>(event as MessageEvent);
+      if (file) applyFileChanged(file);
+    });
+
+    source.addEventListener('file.updated', (event) => {
+      const file = parseEvent<ConversationFile>(event as MessageEvent);
+      if (file) applyFileChanged(file);
+    });
+
+    source.addEventListener('file.deleted', (event) => {
+      const file = parseEvent<ConversationFile>(event as MessageEvent);
+      if (file) applyFileChanged(file);
+    });
+
     source.addEventListener('delegation.started', (event) => {
       const data = parseEvent<DelegationEvent>(event as MessageEvent);
       const fromMemberId = data?.fromMemberId;
@@ -351,6 +399,7 @@ export function useWorkspaceData({ onError }: { onError: (message: string | null
     };
 
     return () => {
+      cancelled = true;
       source.close();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -407,6 +456,65 @@ export function useWorkspaceData({ onError }: { onError: (message: string | null
       next[change.memberId] = change.state;
       return next;
     });
+  }
+
+  /**
+   * 收敛一条文件变化（来自 SSE）。
+   *
+   * 按 id upsert 而不是 append：同一个文件会被两条路各通知一次（POST 的响应 +
+   * file.created 事件），无脑 append 会让 Shared Files 里出现两份。
+   * 已删除的不进列表 —— 列表的口径是「现在有什么」。
+   *
+   * 覆盖是安全的，因为 SSE 是一条**有序**的流：同一份文件的 created → updated
+   * 一定按时间到达，后到的那条就是更新的那条。
+   *
+   * 同时更新**历史消息里那份快照**（`message.files`）：附件卡片读的是它，
+   * 不更新的话，删掉一份文件之后那条消息上的卡片还是一个指向 404 的活链接，
+   * 而不是「已删除」的样子 —— 而「记录保留、内容不再可用」正是软删除要表达的。
+   * 处理中就绪同理：卡片上的状态标签也得跟着走。
+   */
+  function applyFileChanged(file: ConversationFile) {
+    setMessages((current) => {
+      const affected = current.some((message) =>
+        message.files.some((item) => item.id === file.id),
+      );
+      if (!affected) return current;
+      return current.map((message) =>
+        message.files.some((item) => item.id === file.id)
+          ? {
+              ...message,
+              files: message.files.map((item) => (item.id === file.id ? file : item)),
+            }
+          : message,
+      );
+    });
+
+    if (file.status === 'deleted') {
+      setConversationFiles((current) => current.filter((item) => item.id !== file.id));
+      return;
+    }
+    setConversationFiles((current) => {
+      const exists = current.some((item) => item.id === file.id);
+      if (!exists) return [...current, file];
+      return current.map((item) => (item.id === file.id ? file : item));
+    });
+  }
+
+  /**
+   * 上传接口（202）返回的那份快照。
+   *
+   * 它描述的是**请求发出那一刻**的状态 —— `status: 'processing'`。而提取与
+   * `file.updated` 完全可能已经先一步通过 SSE 到了（小文件就是同步提取完的），
+   * 这时再用这份快照覆盖，会让文件在界面上永远停在「处理中…」，直到刷新。
+   *
+   * 所以它只往列表里**补**一条还没有的记录；有记录时一律以事件流为准。
+   * 这不是「兼容旧数据」：接口返回的是快照，事件流才是状态的权威来源。
+   */
+  function noteUploadedFile(file: ConversationFile) {
+    if (file.status === 'deleted') return;
+    setConversationFiles((current) =>
+      current.some((item) => item.id === file.id) ? current : [...current, file],
+    );
   }
 
   function applyConversationChanged(next: Conversation) {
@@ -477,6 +585,10 @@ export function useWorkspaceData({ onError }: { onError: (message: string | null
     delegations,
     executions,
     conversationStates,
+    conversationFiles,
+    noteUploadedFile,
+    removeConversationFile: (fileId: string) =>
+      setConversationFiles((current) => current.filter((item) => item.id !== fileId)),
     recipientMemberId,
     setRecipientMemberId,
     notice,

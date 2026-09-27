@@ -2,6 +2,7 @@ import type { RefObject } from 'react';
 import { Avatar, Empty, Timeline } from 'antd';
 import { Bubble } from '@ant-design/x';
 import type { Conversation, ConversationMessage } from '../../lib/api';
+import { FileAttachmentCard } from './FileAttachmentCard';
 
 export interface StreamState {
   executionId: string;
@@ -34,6 +35,9 @@ interface ConversationMessagesProps {
  * 三类内容按角色分：user 靠右、member（ai）靠左、system 居中。
  * 流式回复单独渲染成一条 typing 气泡而不是追加到已有消息上 ——
  * 它还没有 message_sequence，落库后会被 message.created 替换掉。
+ *
+ * 附件跟消息一起渲染：附件是这条消息的一部分（「请评估这个方案」里的「这个」
+ * 指的就是它），后置成一条独立的文件事件流会让人对不上是哪条消息在说它。
  */
 export function ConversationMessages({
   conversation,
@@ -64,7 +68,19 @@ export function ConversationMessages({
       key: message.id,
       role: message.senderType === 'user' ? ('user' as const) : message.senderType === 'member' ? ('ai' as const) : ('system' as const),
       placement: (message.senderType === 'user' ? 'end' : 'start') as 'end' | 'start',
-      content: message.content,
+      content:
+        message.files.length === 0 ? (
+          message.content
+        ) : (
+          <>
+            {message.content}
+            <div className="message-files">
+              {message.files.map((file) => (
+                <FileAttachmentCard key={file.id} file={file} compact />
+              ))}
+            </div>
+          </>
+        ),
       header:
         message.senderType === 'member'
           ? memberLabel(message.senderId)

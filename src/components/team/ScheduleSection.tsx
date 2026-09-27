@@ -15,7 +15,7 @@ const STATUS_COLORS: Record<ScheduledWake['status'], string> = {
  * Schedules 分区：全部 schedule（不只 active）+ 行内 Pause/Resume/Cancel。
  *
  * 之前是「只读列表」：后端有 durable scheduler、恢复、幂等 run，UI 却什么
- * 都不能运营。第一版只做 Create / Pause / Resume / Cancel，不做 Calendar。
+ * 都不能运营。这里只做 Create / Pause / Resume / Cancel，不做 Calendar。
  */
 export function ScheduleSection({
   members,

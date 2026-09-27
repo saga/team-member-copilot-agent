@@ -4,7 +4,7 @@ import dayjs from 'dayjs';
 import { api, type Conversation, type Member } from '../../lib/api';
 
 /**
- * Schedule 创建表单。第一版只做「需要做什么」：
+ * Schedule 创建表单。只做「需要做什么」：
  * Member / Conversation / Prompt / 类型 / 时间。不做 Calendar、cron 表达式、
  * 时区编辑器、recurrence designer —— 后端也只支持 once + interval，
  * UI 比后端复杂只会造出填不进去的字段。

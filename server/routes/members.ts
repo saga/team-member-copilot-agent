@@ -65,7 +65,7 @@ export function membersRouter(team: TeamService) {
   // 建 Member 自带一组默认能力，归档则决定它接不接活：都是 Admin 面的写入。
   router.post('/', (req, res) => {
     if (!canAdmin(req)) {
-      res.status(403).json({ error: '需要 Team owner/admin（或有效的 ADMIN_API_TOKEN）' });
+      res.status(403).json({ error: '需要 Team owner 或 admin 权限' });
       return;
     }
     const parsed = createMemberSchema.safeParse(req.body ?? {});
@@ -92,7 +92,7 @@ export function membersRouter(team: TeamService) {
   // 同一条 PATCH 上按 body 里有没有 status 分流，避免「改个名字也要 admin token」。
   router.patch('/:id', (req, res) => {
     if ((req.body as { status?: unknown } | undefined)?.status !== undefined && !canAdmin(req)) {
-      res.status(403).json({ error: '需要 Team owner/admin（或有效的 ADMIN_API_TOKEN）' });
+      res.status(403).json({ error: '需要 Team owner 或 admin 权限' });
       return;
     }
     const parsed = updateMemberSchema.safeParse(req.body ?? {});
@@ -131,7 +131,7 @@ export function membersRouter(team: TeamService) {
    */
   router.put('/:id/memory', (req, res) => {
     if (!canAdmin(req)) {
-      res.status(403).json({ error: '需要 Team owner/admin（或有效的 ADMIN_API_TOKEN）' });
+      res.status(403).json({ error: '需要 Team owner 或 admin 权限' });
       return;
     }
     const parsed = memorySchema.safeParse(req.body ?? {});
@@ -167,7 +167,7 @@ export function membersRouter(team: TeamService) {
 
   router.put('/:id/team-context', (req, res) => {
     if (!canAdmin(req)) {
-      res.status(403).json({ error: '需要 Team owner/admin（或有效的 ADMIN_API_TOKEN）' });
+      res.status(403).json({ error: '需要 Team owner 或 admin 权限' });
       return;
     }
     const parsed = memorySchema.safeParse(req.body ?? {});

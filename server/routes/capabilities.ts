@@ -95,7 +95,7 @@ export function capabilitiesRouter(
 
   router.put('/catalog', (req, res) => {
     if (!canAdmin(req)) {
-      res.status(403).json({ error: '需要 Team owner/admin（或有效的 ADMIN_API_TOKEN）' });
+      res.status(403).json({ error: '需要 Team owner 或 admin 权限' });
       return;
     }
     void (async () => {

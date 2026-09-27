@@ -43,7 +43,7 @@ export function executionsRouter(team: TeamService) {
    *
    *   queued             → 直接落库 cancelled
    *   running            → session.abort() → 等 session.idle → turn 自己写成 cancelled
-   *   waiting_for_member → 409（第一版不做子树的取消传播）
+   *   waiting_for_member → 409（不做子树的取消传播）
    *
    * 返回最终状态而不是「已受理」—— 因为「已受理」正是假取消的来源。
    */

@@ -1,8 +1,28 @@
-import { Router } from 'express';
+import express, { Router } from 'express';
 import { z } from 'zod';
 import type { TeamService } from '../team-service.js';
+import type {
+  ConversationFileProcessor,
+} from '../conversation-file-processor.js';
+import type { ConversationFileService } from '../conversation-file-service.js';
 import type { StoredConversationEvent } from '../domain.js';
+import { config } from '../config.js';
 import { sendError } from '../middleware/errorHandler.js';
+import { canAdmin } from '../middleware/adminAccess.js';
+import { FileTypeRejectedError } from '../file-extractor.js';
+
+/**
+ * 会话文件（聊天附件）的上传。
+ *
+ * 用 raw body（和装 skill 同一套）而不是 multipart：一次只传一个文件，引入
+ * multipart parser 只会多一层依赖和一个临时目录。文件名走 query —— `X-` 开头
+ * 的头在部分代理上会被吃掉，而文件名是这类接口最容易被中间层改坏的东西。
+ *
+ * Content-Type 不做白名单（附件本来就可能是任何类型），但 `express.raw` 必须
+ * 拿到 `*​/*` 才会解析出 Buffer，否则 body 会是一个普通对象 —— 路由里按 400
+ * 处理，而不是让 Buffer.isBuffer 静默失败。
+ */
+const rawFile = express.raw({ type: () => true, limit: config.maxConversationFileBytes });
 
 const createConversationSchema = z.object({
   title: z.string().trim().max(200).optional(),
@@ -49,6 +69,29 @@ const sendMessageSchema = z.object({
    * 的值只会把索引撑大，不会带来任何好处。
    */
   clientRequestId: z.string().trim().min(1).max(200).optional(),
+  /**
+   * 这条消息带 / 引用的会话文件。上限与 ServiceOptions 的
+   * maxConversationFilesPerMessage 保持一致 —— schema 是边界，service 是权威，
+   * 这里放宽只是不让一个明显过分的请求进到业务逻辑里。
+   */
+  fileIds: z.array(z.string().min(1)).max(50).optional(),
+});
+
+/** promote 的目标知识库：只接受 team KB，个人库不在这个入口的语义里。 */
+export interface PromotionTarget {
+  writeDocument(input: {
+    knowledgeBaseId: string;
+    title: string;
+    relativePath: string;
+    content: string;
+    sourceUri?: string | null;
+  }): { id: string; relativePath: string; title: string };
+  listTeamKnowledgeBases(): Array<{ id: string; key: string; name: string }>;
+}
+
+const promoteSchema = z.object({
+  knowledgeBaseId: z.string().min(1),
+  title: z.string().trim().min(1).max(300).optional(),
 });
 
 const addMemberSchema = z.object({
@@ -65,7 +108,12 @@ const setMemberStateSchema = z.object({
   muted: z.boolean(),
 });
 
-export function conversationsRouter(team: TeamService) {
+export function conversationsRouter(
+  team: TeamService,
+  files: ConversationFileService,
+  processor: ConversationFileProcessor,
+  knowledge: PromotionTarget,
+) {
   const router = Router();
 
   router.get('/', (_req, res) => {
@@ -184,6 +232,181 @@ export function conversationsRouter(team: TeamService) {
     try {
       const state = team.setMemberMuted(req.params.id, req.params.memberId, parsed.data.muted);
       res.json({ state });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  /**
+   * 这个会话里共享的文件。
+   *
+   * 权限边界是「会话成员」：拿到 conversation id 就能列，因为能拿到它的人本来
+   * 就在这场对话里（当前是单 Team 本地部署，没有跨租户的会话 id 泄露面）。
+   * 真正需要重新校验的是**按 fileId 取内容**那条路径 —— 见 /content。
+   */
+  router.get('/:id/files', (req, res) => {
+    try {
+      team.getConversation(req.params.id);
+      res.json({ files: files.list(req.params.id) });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  /**
+   * 上传一份文件。
+   *
+   * 返回 202：正文已落盘、行已建好（status=processing），但提取与 FTS 索引在
+   * 后台跑。让这个请求等 PDF 解析 / 长文本索引跑完，等于把上传耗时绑在文件内容
+   * 上 —— 而那是用户完全无从预期的东西。就绪状态通过 file.updated 事件推。
+   */
+  router.post('/:id/files', rawFile, (req, res) => {
+    if (!Buffer.isBuffer(req.body)) {
+      res.status(400).json({ error: '上传的内容不是原始文件：请直接发文件内容，不要包成 JSON' });
+      return;
+    }
+
+    const filename = typeof req.query.filename === 'string' ? req.query.filename : '';
+    if (!filename.trim()) {
+      res.status(400).json({ error: '这个请求没带文件名：请在地址后面加上 ?filename=文件名' });
+      return;
+    }
+
+    try {
+      const conversation = team.getConversation(req.params.id);
+      const file = files.create({
+        conversationId: conversation.id,
+        teamId: conversation.teamId,
+        uploadedBy: config.localUserId,
+        originalName: filename,
+        contentType: req.headers['content-type'] ?? 'application/octet-stream',
+        body: req.body,
+      });
+      processor.enqueue(file);
+      res.status(202).json({ file });
+    } catch (error) {
+      // 类型闸门抛的是普通 Error，不翻成 400 的话会变成 500 —— 而它其实只是
+      // 「这个文件不允许上传」，是调用方能自己改的那种错误。
+      if (error instanceof FileTypeRejectedError) {
+        res.status(400).json({ error: error.message });
+        return;
+      }
+      sendError(res, error);
+    }
+  });
+
+  /**
+   * 取出文件正文。
+   *
+   * 三条纪律：
+   *   1. 每次都用 (conversationId, fileId) 重新定位 —— fileId 是客户端输入，
+   *      不能拿它直接去读磁盘。
+   *   2. 默认 inline 的只有浏览器能安全渲染的格式（图片 / PDF）；其它一律
+   *      attachment。上传的 HTML / SVG 走 inline 会在同源下执行脚本。
+   *   3. 无论如何都带 nosniff + CSP sandbox：即使 Content-Type 被伪造，
+   *      浏览器也不会把它当可执行的东西跑起来。
+   */
+  router.get('/:id/files/:fileId/content', (req, res) => {
+    try {
+      const file = files.get(req.params.id, req.params.fileId);
+      const content = files.readContent(req.params.id, req.params.fileId);
+
+      const safelisted =
+        file.contentType === 'application/pdf' ||
+        (file.contentType.startsWith('image/') && file.contentType !== 'image/svg+xml');
+      const inline = safelisted && req.query.download !== '1';
+
+      res.setHeader('Content-Type', file.contentType || 'application/octet-stream');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Content-Security-Policy', "sandbox; default-src 'none'");
+      res.setHeader(
+        'Content-Disposition',
+        `${inline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(file.originalName)}`,
+      );
+      res.send(content);
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  /**
+   * 会话内文件搜索（人在界面上用）。
+   *
+   * `memberId` 传 null：人是通过会话级入口进来的，不是 conversation_member
+   * 里的一行。Agent 走的是另一个入口（tool provider），那条路径必须带 memberId，
+   * 让成员校验进 SQL。
+   */
+  router.get('/:id/files/search', (req, res) => {
+    const query = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    if (!query) {
+      res.status(400).json({ error: '没有要搜的内容：请在地址后面加上 ?q=关键词' });
+      return;
+    }
+    try {
+      team.getConversation(req.params.id);
+      res.json({
+        hits: files.search({
+          conversationId: req.params.id,
+          memberId: null,
+          query,
+          limit: 10,
+        }),
+      });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  /**
+   * 删除一份会话文件。
+   *
+   * 软删除：历史消息里那条附件仍然在（它发生过），只是不能再出现在 Shared
+   * Files 里、也不能再被引用。物理删掉会把过去那条消息变成一个指不到东西的
+   * 引用 —— 审计链就断了。
+   */
+  router.delete('/:id/files/:fileId', (req, res) => {
+    try {
+      files.softDelete(req.params.id, req.params.fileId);
+      res.json({ file: files.get(req.params.id, req.params.fileId) });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  /**
+   * 把聊天文件存进团队知识库（显式动作）。
+   *
+   * 这是「临时」变成「长期」的唯一入口，所以它是一次**发布**：需要 admin /
+   * owner。不这么做的话，任何参与私聊的人都能把里面的文件推成全团队可见的资料。
+   */
+  router.post('/:id/files/:fileId/promote', (req, res) => {
+    if (!canAdmin(req)) {
+      res.status(403).json({ error: '需要 Team owner 或 admin 权限' });
+      return;
+    }
+    const parsed = promoteSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues.map((i) => i.message).join('; ') });
+      return;
+    }
+
+    try {
+      const target = knowledge
+        .listTeamKnowledgeBases()
+        .find((base) => base.id === parsed.data.knowledgeBaseId);
+      if (!target) {
+        res.status(400).json({ error: '只能保存到团队知识库，请重新选择' });
+        return;
+      }
+
+      const document = files.promote({
+        conversationId: req.params.id,
+        fileId: req.params.fileId,
+        knowledgeBaseId: parsed.data.knowledgeBaseId,
+        knowledge,
+        ...(parsed.data.title === undefined ? {} : { title: parsed.data.title }),
+      });
+      res.status(201).json({ document });
     } catch (error) {
       sendError(res, error);
     }

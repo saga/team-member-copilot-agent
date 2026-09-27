@@ -231,6 +231,31 @@ export interface Conversation {
   members: Member[];
 }
 
+export type ConversationFileStatus = 'processing' | 'ready' | 'failed' | 'deleted';
+
+/**
+ * 会话里的一份文件。
+ *
+ * 没有正文字段：提取出的文本可能到 50 万字符量级，跟着消息列表一起返回会把
+ * 响应撑爆。看内容走预览（新窗口打开 content 接口）。
+ */
+export interface ConversationFile {
+  id: string;
+  conversationId: string;
+  teamId: string;
+  uploadedBy: string;
+  originalName: string;
+  contentType: string;
+  sizeBytes: number;
+  status: ConversationFileStatus;
+  storagePath: string;
+  contentHash: string;
+  /** 提取失败的原因（status='failed' 才有）。 */
+  extractionError: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface ConversationMessage {
   id: string;
   conversationId: string;
@@ -243,6 +268,8 @@ export interface ConversationMessage {
   clientRequestId: string | null;
   content: string;
   executionId: string | null;
+  /** 这条消息带 / 引用的文件（服务端批量装配，前端不再逐个查）。 */
+  files: ConversationFile[];
   createdAt: string;
 }
 
@@ -753,6 +780,99 @@ export const api = {
     ).then(json<{ messages: ConversationMessage[] }>);
   },
 
+  // ------------------------------------------------ Conversation Files
+
+  listConversationFiles(conversationId: string): Promise<{ files: ConversationFile[] }> {
+    return fetch(
+      `${API_BASE}/api/conversations/${encodeURIComponent(conversationId)}/files`,
+    ).then(json<{ files: ConversationFile[] }>);
+  },
+
+  /**
+   * 上传一份文件。
+   *
+   * raw body + 文件名走 query（服务端约定），而不是 multipart：一次一个文件，
+   * multipart 只会多一层解析和临时目录。Content-Type 用浏览器给的那个，服务端
+   * 不做白名单（附件本来就可能是任何类型）。
+   */
+  uploadConversationFile(
+    conversationId: string,
+    file: File,
+  ): Promise<{ file: ConversationFile }> {
+    return fetch(
+      `${API_BASE}/api/conversations/${encodeURIComponent(conversationId)}/files` +
+        `?filename=${encodeURIComponent(file.name)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': file.type || 'application/octet-stream' },
+        body: file,
+      },
+    ).then(json<{ file: ConversationFile }>);
+  },
+
+  deleteConversationFile(
+    conversationId: string,
+    fileId: string,
+  ): Promise<{ file: ConversationFile }> {
+    return fetch(
+      `${API_BASE}/api/conversations/${encodeURIComponent(conversationId)}/files/` +
+        encodeURIComponent(fileId),
+      { method: 'DELETE' },
+    ).then(json<{ file: ConversationFile }>);
+  },
+
+  /** 在会话内搜文件内容（只有文本类文件进了索引）。 */
+  searchConversationFiles(
+    conversationId: string,
+    query: string,
+  ): Promise<{ hits: Array<{ fileId: string; title: string; snippet: string }> }> {
+    return fetch(
+      `${API_BASE}/api/conversations/${encodeURIComponent(conversationId)}/files/search` +
+        `?q=${encodeURIComponent(query)}`,
+    ).then(json<{ hits: Array<{ fileId: string; title: string; snippet: string }> }>);
+  },
+
+  /** 把会话文件存进团队知识库（需要 admin/owner）。 */
+  promoteConversationFile(
+    conversationId: string,
+    fileId: string,
+    input: { knowledgeBaseId: string; title?: string },
+  ): Promise<{ document: { id: string; relativePath: string; title: string } }> {
+    return fetch(
+      `${API_BASE}/api/conversations/${encodeURIComponent(conversationId)}/files/` +
+        `${encodeURIComponent(fileId)}/promote`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(input),
+      },
+    ).then(json<{ document: { id: string; relativePath: string; title: string } }>);
+  },
+
+  /**
+   * 团队知识库列表。只用于「把聊天文件存进知识库」时选目标 ——
+   * 知识库本身的管理（建库、写文档）不在这套界面里。
+   */
+  listTeamKnowledgeBases(): Promise<{
+    knowledgeBases: Array<{ id: string; key: string; name: string; description: string }>;
+  }> {
+    return fetch(`${API_BASE}/api/knowledge/team`).then(
+      json<{ knowledgeBases: Array<{ id: string; key: string; name: string; description: string }> }>,
+    );
+  },
+
+  /** 文件正文地址（预览 / 下载）。取内容时服务端会重新校验它属于这个会话。 */
+  conversationFileContentUrl(
+    conversationId: string,
+    fileId: string,
+    options?: { download?: boolean },
+  ): string {
+    const base =
+      `${API_BASE}/api/conversations/${encodeURIComponent(conversationId)}/files/` +
+      `${encodeURIComponent(fileId)}/content`;
+    return options?.download ? `${base}?download=1` : base;
+  },
+
   /**
    * conversation 的 execution 列表（创建时间正序）。
    * 客户端按 `parentExecutionId` 自己组执行树。
@@ -809,6 +929,8 @@ export const api = {
       replyToMessageId?: string;
       /** 幂等键：同一次发送重试（响应丢了、双击）不会变成两条消息。 */
       clientRequestId?: string;
+      /** 这条消息带 / 引用的会话文件（attachment 还是 reference 由服务端判断）。 */
+      fileIds?: string[];
     },
   ): Promise<SendMessageResult> {
     return fetch(

@@ -45,6 +45,14 @@ export const config = {
    * Member 个人 KB 在 <memberHomeRoot>/<id>/knowledge/。
    */
   teamKnowledgeRoot: path.join(dataDir, 'team', 'knowledge'),
+  /**
+   * 会话文件（聊天里的附件）的存储根：<conversationFileRoot>/<conversationId>/files/<fileId>/。
+   *
+   * 刻意和 member home / workspace 分开：文件属于 conversation，不属于某个 Member。
+   * 放进 <memberHome> 的话，「同一个房间里两个人的视角看到同一份文件」这件事
+   * 在磁盘上就表达不出来。
+   */
+  conversationFileRoot: path.resolve(env('CONVERSATION_FILE_ROOT', path.join(dataDir, 'conversations'))),
   workspaceRoot: path.join(dataDir, 'workspaces'),
   /**
    * global / team 两层默认能力的配置目录（global.json / team.json）。
@@ -87,6 +95,23 @@ export const config = {
    * 两条都超的话按先到的那个截。见 context-assembler.ts 的 selectWindow()。
    */
   maxContextChars: intEnv('MAX_CONTEXT_CHARS', 60_000),
+  /**
+   * 会话文件（聊天附件）的四道闸。
+   *
+   * 单文件上限按「raw body 会被 express.raw 一次性读进内存」来定：50MB 是这台
+   * 机器能同时接住几个上传的上限，不是「文件多了会怎样」的问题。真要做到
+   * GB 级就得换成流式落盘 + 边写边算 hash，那时这个值也该跟着改实现。
+   */
+  maxConversationFileBytes: intEnv('MAX_CONVERSATION_FILE_BYTES', 50 * 1024 * 1024),
+  /** 一条消息最多挂几个附件 —— 也是 sendMessage 里 fileIds 的上限。 */
+  maxConversationFilesPerMessage: intEnv('MAX_CONVERSATION_FILES_PER_MESSAGE', 10),
+  /** 一个会话最多留多少份文件（不含已软删除的）。 */
+  maxConversationFilesPerConversation: intEnv('MAX_CONVERSATION_FILES_PER_CONVERSATION', 500),
+  /**
+   * 单份文件提取出的文本上限（字符）。超过就截断 —— FTS 里塞进一本 10MB 的
+   * 日志，搜索命中的会是「第 3 万行有个 error」，对 Agent 没有任何价值。
+   */
+  maxExtractedTextChars: intEnv('MAX_EXTRACTED_TEXT_CHARS', 500_000),
   /**
    * 是否允许 Member 使用会触达宿主机的 built-in（bash / edit / grep / web_fetch）。
    *

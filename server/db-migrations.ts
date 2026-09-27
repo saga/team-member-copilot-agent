@@ -20,7 +20,7 @@ import type { DatabaseSync } from 'node:sqlite';
  *
  * 程序不认识任何别的编号 —— 没有升级代码，认出来也无从下手。
  */
-export const SCHEMA_VERSION = 17;
+export const SCHEMA_VERSION = 18;
 
 /**
  * 当前 schema 的完整定义，按最终形状写。
@@ -596,6 +596,101 @@ CREATE VIRTUAL TABLE knowledge_document_fts
 
 CREATE INDEX idx_knowledge_document_kb
   ON knowledge_document(knowledge_base_id);
+
+-- ───────────────────────────────────────── Conversation File ────────────
+--
+-- 聊天里的文件。它和上面 knowledge_document 是**两种东西**：
+--
+--   conversation_file   ACL = conversation membership，随聊天存续
+--   knowledge_document  ACL = capability binding，长期复用
+--
+-- 所以这里没有「上传自动进知识库」这条路径：一份文件要变成长期资料，必须由人
+-- 显式 promote。否则在 A 讨论里传的机密评审稿会顺着 knowledge search 流到没参与
+-- 这场讨论的 Member 手里 —— 权限边界是聊天参与者，不是「谁有 knowledge 能力」。
+--
+-- 文件正文在 <conversationFileRoot>/<conversationId>/files/<fileId>/ 下，这里只
+-- 存元数据与提取出的文本。跟 knowledge 一样，storage_path 存相对路径，便于整
+-- 个 data 目录搬家。
+
+CREATE TABLE conversation_file (
+  id TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL,
+  team_id TEXT NOT NULL,
+  uploaded_by TEXT NOT NULL,
+
+  original_name TEXT NOT NULL,
+  content_type TEXT NOT NULL,
+  size_bytes INTEGER NOT NULL,
+
+  -- 相对 <conversationFileRoot> 的路径，不是绝对路径。
+  storage_path TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+
+  -- processing：正文已落盘，提取/索引还没跑完。进程在这中间挂掉时，启动的
+  -- recoverProcessing() 会把它们重新跑一遍，而不是永远停在 processing。
+  status TEXT NOT NULL
+    CHECK (status IN ('processing', 'ready', 'failed', 'deleted')),
+
+  extracted_text TEXT,
+  extraction_error TEXT,
+
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+
+  -- 同一个房间里同内容同文件名的重复上传收敛成一行：用户重试、浏览器重发、
+  -- 同一个文件被两个人先后拖进来，都不该在 Shared Files 里出现两份。
+  UNIQUE (conversation_id, content_hash, original_name),
+
+  FOREIGN KEY (conversation_id)
+    REFERENCES conversation(id)
+    ON DELETE CASCADE,
+  FOREIGN KEY (team_id)
+    REFERENCES team(id)
+    ON DELETE CASCADE
+);
+
+CREATE INDEX idx_conversation_file_conversation
+  ON conversation_file(conversation_id);
+
+CREATE INDEX idx_conversation_file_hash
+  ON conversation_file(content_hash);
+
+CREATE INDEX idx_conversation_file_status
+  ON conversation_file(status);
+
+-- 附件关系：一条消息挂了哪些文件。
+--
+-- relation_type 区分「这条消息传的」和「这条消息引用的」——
+-- 前者是文件第一次出现的地方，后者是「接着上次那份继续聊」。审计上这两件事
+-- 含义完全不同：删掉文件后，attachment 那条消息说明「它从哪来的」，
+-- reference 那条说明「谁在什么时候还在用它」。
+--
+-- 删除是软删除（status='deleted'），关系行一直留着，历史消息里的附件卡片因此
+-- 不会凭空消失；只有在整条会话被物理删除时，这里的 CASCADE 才真正生效。
+CREATE TABLE conversation_message_file (
+  message_id TEXT NOT NULL,
+  file_id TEXT NOT NULL,
+  relation_type TEXT NOT NULL
+    CHECK (relation_type IN ('attachment', 'reference')),
+  position INTEGER NOT NULL DEFAULT 0,
+
+  PRIMARY KEY (message_id, file_id),
+
+  FOREIGN KEY (message_id)
+    REFERENCES conversation_message(id)
+    ON DELETE CASCADE,
+  FOREIGN KEY (file_id)
+    REFERENCES conversation_file(id)
+    ON DELETE CASCADE
+);
+
+CREATE INDEX idx_message_file_file
+  ON conversation_message_file(file_id);
+
+-- 提取出的文本索引（只有文本类文件会进来；PDF / Office / 图片在这一版不进 FTS，
+-- 它们只作为原文件 attachment 交给模型）。
+CREATE VIRTUAL TABLE conversation_file_fts
+  USING fts5(file_id UNINDEXED, title, content);
 `;
 
 export function getUserVersion(db: DatabaseSync): number {

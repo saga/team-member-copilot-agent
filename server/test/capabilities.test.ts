@@ -836,7 +836,7 @@ describe('KnowledgeToolProvider：检索范围只由 binding 决定', () => {
     const open = toolOf(await runtimeFor(member.id), 'open_knowledge_document');
     await assert.rejects(
       () => Promise.resolve(open.execute!(toolContext(member.id, 'open_knowledge_document'), { documentRef: foreignDoc.id })),
-      /未绑定 Knowledge source/,
+      /没有绑定资料库/,
     );
   });
 

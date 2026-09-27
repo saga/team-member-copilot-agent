@@ -1,14 +1,8 @@
 import express, { Router } from 'express';
 import type { SkillService } from '../skill-service.js';
-import { currentTeamId, isTeamAdmin } from '../middleware/teamScope.js';
-import { isAdminAuthorized } from '../middleware/apiScope.js';
+import { currentTeamId } from '../middleware/teamScope.js';
 import { sendError } from '../middleware/errorHandler.js';
-
-/** 装 skill 是改「Agent 能加载什么」，属于 Admin 面：token 或 Team role 任一通过。 */
-function canAdmin(req: Parameters<typeof isAdminAuthorized>[0]): boolean {
-  if (isAdminAuthorized(req)) return true;
-  return isTeamAdmin(req, 'owner', 'admin');
-}
+import { canAdmin } from '../middleware/adminAccess.js';
 
 /**
  * raw zip body。用 raw 而不是 multipart：只需要一个文件，引入 multipart parser
@@ -48,7 +42,7 @@ export function skillsRouter(skills: SkillService) {
 
   router.post('/global', rawZip, (req, res) => {
     if (!canAdmin(req)) {
-      res.status(403).json({ error: '需要 Team owner/admin（或有效的 ADMIN_API_TOKEN）' });
+      res.status(403).json({ error: '需要 Team owner 或 admin 权限' });
       return;
     }
     if (!Buffer.isBuffer(req.body)) {
@@ -65,7 +59,7 @@ export function skillsRouter(skills: SkillService) {
 
   router.delete('/global/:name', (req, res) => {
     if (!canAdmin(req)) {
-      res.status(403).json({ error: '需要 Team owner/admin（或有效的 ADMIN_API_TOKEN）' });
+      res.status(403).json({ error: '需要 Team owner 或 admin 权限' });
       return;
     }
     try {
@@ -89,7 +83,7 @@ export function skillsRouter(skills: SkillService) {
 
   router.post('/team', rawZip, (req, res) => {
     if (!canAdmin(req)) {
-      res.status(403).json({ error: '需要 Team owner/admin（或有效的 ADMIN_API_TOKEN）' });
+      res.status(403).json({ error: '需要 Team owner 或 admin 权限' });
       return;
     }
     if (!Buffer.isBuffer(req.body)) {
@@ -110,7 +104,7 @@ export function skillsRouter(skills: SkillService) {
 
   router.delete('/team/:name', (req, res) => {
     if (!canAdmin(req)) {
-      res.status(403).json({ error: '需要 Team owner/admin（或有效的 ADMIN_API_TOKEN）' });
+      res.status(403).json({ error: '需要 Team owner 或 admin 权限' });
       return;
     }
     try {
@@ -134,7 +128,7 @@ export function skillsRouter(skills: SkillService) {
 
   router.post('/members/:memberId', rawZip, (req, res) => {
     if (!canAdmin(req)) {
-      res.status(403).json({ error: '需要 Team owner/admin（或有效的 ADMIN_API_TOKEN）' });
+      res.status(403).json({ error: '需要 Team owner 或 admin 权限' });
       return;
     }
     if (!Buffer.isBuffer(req.body)) {
@@ -153,7 +147,7 @@ export function skillsRouter(skills: SkillService) {
 
   router.delete('/members/:memberId/:name', (req, res) => {
     if (!canAdmin(req)) {
-      res.status(403).json({ error: '需要 Team owner/admin（或有效的 ADMIN_API_TOKEN）' });
+      res.status(403).json({ error: '需要 Team owner 或 admin 权限' });
       return;
     }
     try {

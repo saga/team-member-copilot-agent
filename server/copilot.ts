@@ -69,6 +69,18 @@ export interface RunMemberTurnInput {
   teamId: string;
   /** 这一轮生效的能力。冻结在这里而不是在 hook 里现查 Member，见下。 */
   capabilities: RuntimeCapabilities;
+  /**
+   * 触发这一轮的消息带上的文件。
+   *
+   * 交给 SDK 作为 attachment（引擎自己知道怎么读 PDF / 图片），而不是把内容
+   * 抄进 prompt —— 那既浪费 token，也会让「到底是文件里写的还是模型记的」
+   * 变得说不清。默认空数组：绝大多数 turn 没有附件。
+   */
+  attachments?: Array<{
+    path: string;
+    displayName: string;
+    contentType?: string;
+  }>;
 }
 
 export interface CancelTurnResult {
@@ -314,6 +326,20 @@ export class CopilotService {
           {
             prompt: input.prompt,
             ...(input.sourceMemberId ? { source: `agent-${input.sourceMemberId}` } : {}),
+            // path 必须指向真实存在的文件：SDK 会自己去读它，读不到时它会静默
+            // 少一个附件，而模型只会说「我没看到那个文件」。所以空的 path 直接
+            // 不过滤掉 —— 宁可少传一个附件，也不要传一个注定读不到的路径。
+            ...(input.attachments?.length
+              ? {
+                  attachments: input.attachments
+                    .filter((file) => file.path)
+                    .map((file) => ({
+                      type: 'file' as const,
+                      path: file.path,
+                      displayName: file.displayName,
+                    })),
+                }
+              : {}),
           },
           config.executionTimeoutMs,
         );

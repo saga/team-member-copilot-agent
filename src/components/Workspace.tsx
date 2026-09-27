@@ -4,6 +4,8 @@ import type { Member } from '../lib/api';
 import { useRoute } from '../lib/router';
 import { ConversationHeader } from './team/ConversationHeader';
 import { ConversationMessages } from './team/ConversationMessages';
+import { ConversationFilesDrawer } from './team/ConversationFilesDrawer';
+import { ConversationFilePicker } from './team/ConversationFilePicker';
 import { MessageComposer } from './team/MessageComposer';
 import { MemberProfile } from './team/MemberProfile';
 import { TeamManagement } from './team/TeamManagement';
@@ -53,6 +55,16 @@ export function Workspace() {
    * 「顺手开了一个新会话」。编辑是瞬态模态，不进 URL。
    */
   const [editingMemberId, setEditingMemberId] = useState<string | null>(null);
+  /**
+   * 下一条消息要带的文件（composer 上的 chip）。
+   *
+   * 存 id 而不是文件对象：文件列表会随着 SSE 更新（处理中就绪、被删掉），
+   * 存对象的话 chip 上显示的是那一刻的快照。发送后清空 —— chip 是「这条消息
+   * 的上下文」，不是「这个会话的上下文」。
+   */
+  const [selectedFileIds, setSelectedFileIds] = useState<string[]>([]);
+  const [filesDrawerOpen, setFilesDrawerOpen] = useState(false);
+  const [filePickerOpen, setFilePickerOpen] = useState(false);
   /** 首载默认落点只决定一次，标记防止后续路由变化重新触发。 */
   const bootstrappedRef = useRef(false);
 
@@ -64,6 +76,8 @@ export function Workspace() {
     setBusy,
     setError,
     navigate,
+    selectedFileIds,
+    setSelectedFileIds,
     setEditingMemberId,
     setNewDiscussionOpen,
     setNewWorkOpen,
@@ -79,6 +93,7 @@ export function Workspace() {
     streaming,
     delegations,
     conversationStates,
+    conversationFiles,
     recipientMemberId,
     setRecipientMemberId,
     notice,
@@ -93,9 +108,28 @@ export function Workspace() {
     applyConversationChanged,
     applyMemberSaved,
   } = data;
-  const { createDirect, createGroup, createWork, createMember, archiveMember, send } = actions;
+  const { createDirect, createGroup, createWork, createMember, archiveMember, send, uploadFile, deleteFile } =
+    actions;
 
   const editingMember = editingMemberId ? (memberById.get(editingMemberId) ?? null) : null;
+
+  /**
+   * composer 上真正显示的文件。
+   *
+   * 从 id 反查当前列表，而不是直接拿上传那一刻的对象：文件可能在两次渲染之间
+   * 变成 processing → ready，也可能被删掉（那就该从 chip 上消失，而不是留一个
+   * 发不出去的附件让用户猜为什么失败）。
+   */
+  const selectedFiles = selectedFileIds
+    .map((id) => conversationFiles.find((file) => file.id === id))
+    .filter((file): file is NonNullable<typeof file> => Boolean(file));
+
+  /** 切换会话时清空选中：chip 属于上一个房间的消息。 */
+  useEffect(() => {
+    setSelectedFileIds([]);
+    setFilesDrawerOpen(false);
+    setFilePickerOpen(false);
+  }, [conversationId]);
 
   // URL → data：跟随路由切会话。等会话列表到位后再动作 —— 深链直进时路由
   // 先到、roster 后到，提前打开没有意义。路由指明的会话不存在（过期链接）就
@@ -216,6 +250,8 @@ export function Workspace() {
               allMembers={members}
               states={conversationStates}
               memberStatus={memberStatus}
+              fileCount={conversationFiles.length}
+              onOpenFiles={() => setFilesDrawerOpen(true)}
               onConversationChanged={applyConversationChanged}
               // 子组件只处理单个 state；状态「消失」只有 SSE 会带来，
               // 统一在边界上包成同一种变化对象。
@@ -266,6 +302,12 @@ export function Workspace() {
               disabled={!conversationId}
               recipientMemberId={recipientMemberId}
               onRecipientChange={setRecipientMemberId}
+              selectedFiles={selectedFiles}
+              onRemoveFile={(fileId) =>
+                setSelectedFileIds((current) => current.filter((id) => id !== fileId))
+              }
+              onUploadFile={(file) => void uploadFile(file)}
+              onOpenFilePicker={() => setFilePickerOpen(true)}
             />
           </Content>
         )}
@@ -292,6 +334,41 @@ export function Workspace() {
         onCreate={createWork}
         onCancel={() => setNewWorkOpen(false)}
       />
+
+      {selectedConversation && (
+        <ConversationFilesDrawer
+          open={filesDrawerOpen}
+          conversationId={selectedConversation.id}
+          files={conversationFiles}
+          busy={busy}
+          onUseInChat={(file) => {
+            if (!selectedFileIds.includes(file.id)) {
+              setSelectedFileIds((current) => [...current, file.id]);
+            }
+            // 引用之后把抽屉收起来：下一步是打字，抽屉挡着消息列表反而碍事。
+            setFilesDrawerOpen(false);
+          }}
+          onUpload={(file) => void uploadFile(file)}
+          onDelete={(file) => void deleteFile(file)}
+          onClose={() => setFilesDrawerOpen(false)}
+        />
+      )}
+
+      {selectedConversation && (
+        <ConversationFilePicker
+          open={filePickerOpen}
+          files={conversationFiles}
+          selectedIds={selectedFileIds}
+          busy={busy}
+          onSelect={(file) => {
+            if (!selectedFileIds.includes(file.id)) {
+              setSelectedFileIds((current) => [...current, file.id]);
+            }
+          }}
+          onUpload={(file) => void uploadFile(file)}
+          onClose={() => setFilePickerOpen(false)}
+        />
+      )}
     </Layout>
   );
 }
