@@ -10,7 +10,7 @@ export default function App() {
       <Layout className="app-shell">
         <Header className="app-header">
           <Space>
-            <span className="app-header-title">Team Member Copilot Agent</span>
+            <span className="app-header-title">Team Collaboration Agent</span>
           </Space>
           <Space>
             <HealthBadge />

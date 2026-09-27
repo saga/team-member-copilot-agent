@@ -583,8 +583,8 @@ MUTATIONS = [
         "steps": [
             (
                 "server/team-service.ts",
-                "        this.tasks.markCompleted(taskAfterTurn.id, content || undefined);",
-                "        void content;",
+                "        this.tasks.markFailed(taskAfterTurn.id, 'Agent turn 结束时没有调用 update_task 报告任务完成或阻塞');\n        this.orchestrator.onTaskChanged(taskAfterTurn.id);\n",
+                "",
             )
         ],
     },
@@ -594,7 +594,7 @@ MUTATIONS = [
         "steps": [
             (
                 "server/task-orchestrator.ts",
-                "    if (this.scheduler.isBusy(conversationId, leadMemberId)) return false;\n",
+                "    if (this.scheduler.isBusy(conversationId, leadMemberId) && reason !== 'lead_recovery') {\n      return false;\n    }\n",
                 "",
             )
         ],
@@ -722,6 +722,39 @@ MUTATIONS = [
                 "server/team-service.ts",
                 "      if (content && input.turnMode === 'lead') {",
                 "      if (content) {",
+            )
+        ],
+    },
+    {
+        "name": "recovery 唤醒也被 Lead 忙挡掉（失败通知丢失）",
+        "test": "server/test/task-service.test.ts",
+        "steps": [
+            (
+                "server/task-orchestrator.ts",
+                "    if (this.scheduler.isBusy(conversationId, leadMemberId) && reason !== 'lead_recovery') {\n      return false;\n    }",
+                "    if (this.scheduler.isBusy(conversationId, leadMemberId)) {\n      return false;\n    }",
+            )
+        ],
+    },
+    {
+        "name": "running 的 Task 可直接 cancel（与执行中 Execution 分裂）",
+        "test": "server/test/task-service.test.ts",
+        "steps": [
+            (
+                "server/task-service.ts",
+                "    if (task.status === 'running' && this.taskExecutionActive(task)) {\n      throw conflict('任务正在执行，请先取消对应的 Execution');\n    }\n",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "没调 update_task 的 turn 自动 completed（做一半算做完）",
+        "test": "server/test/task-service.test.ts",
+        "steps": [
+            (
+                "server/team-service.ts",
+                "        this.tasks.markFailed(taskAfterTurn.id, 'Agent turn 结束时没有调用 update_task 报告任务完成或阻塞');",
+                "        this.tasks.markCompleted(taskAfterTurn.id, content || undefined);",
             )
         ],
     },

@@ -333,6 +333,16 @@ export class StubCopilot {
    */
   wakeReasonOf: ((executionId: string) => string | null) | null = null;
 
+  /**
+   * turn 开始时的钩子：模拟「Agent 在 turn 内调了 tool」。
+   *
+   * 真实 Agent 靠 update_task 报告完成/阻塞，stub 默认不调任何 tool ——
+   * 那等于永远扮演「不守规矩的 Agent」。用 reportTaskTurns 接上后，
+   * 它才是一个会正常完工的执行人；P0-3 的静默测试显式置空它。
+   * reset 不动它（和 wakeReasonOf 一样是装配期接线）。
+   */
+  onTurnStart: ((input: RunMemberTurnInput) => void) | null = null;
+
   async runMemberTurn(input: RunMemberTurnInput): Promise<string> {
     this.turns.push({
       executionId: input.executionId,
@@ -347,6 +357,7 @@ export class StubCopilot {
     if (this.failMemberIds.has(input.member.id)) {
       throw new Error(`stub engine failure (${input.member.name})`);
     }
+    this.onTurnStart?.(input);
 
     const reason = this.wakeReasonOf?.(input.executionId) ?? null;
     const skip =
@@ -389,4 +400,35 @@ export class StubCopilot {
   get asCopilot(): CopilotService {
     return this as unknown as CopilotService;
   }
+}
+
+/**
+ * 让 stub 扮演守规矩的 Agent：Task turn 内调 update_task(completed)。
+ *
+ * 只对还处在 running 的任务报告 —— 测试里显式 updateTask(blocked/failed) 之后，
+ * turn 才结束是正常情况（Agent 正在干活时任务被外部置终态），重复上报不该覆盖。
+ * 和测试的显式调用撞车（对方先置终态）时吞掉：重复报告完成是无害的。
+ */
+export function reportTaskTurns(team: TeamService, stub: StubCopilot): void {
+  stub.onTurnStart = (input) => {
+    let taskId: string | null;
+    try {
+      taskId = team.getExecution(input.executionId).taskId;
+    } catch {
+      return;
+    }
+    if (!taskId) return;
+    if (team.getTask(taskId).status !== 'running') return;
+    try {
+      team.updateTask({
+        conversationId: team.getExecution(input.executionId).conversationId,
+        memberId: input.member.id,
+        taskId,
+        status: 'completed',
+        summary: `done by ${input.member.name}`,
+      });
+    } catch {
+      // 和测试里的显式 updateTask 撞车：任务已被置成终态，重复报告无害
+    }
+  };
 }

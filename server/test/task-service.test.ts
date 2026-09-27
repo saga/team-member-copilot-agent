@@ -13,7 +13,7 @@ const { db } = await import('../db.js');
 const { RecoveryService } = await import('../recovery-service.js');
 const { ConversationMemberService } = await import('../conversation-member-service.js');
 const { MemberService } = await import('../member-service.js');
-const { StubCopilot, createTestStack, singleExecutionId } = await import('./support.js');
+const { StubCopilot, createTestStack, reportTaskTurns, singleExecutionId } = await import('./support.js');
 import type { CopilotService } from '../copilot.js';
 
 void config;
@@ -21,6 +21,10 @@ void config;
 const stub = new StubCopilot();
 const memberService = new MemberService(db);
 const { team } = createTestStack(db, memberService, stub.asCopilot as unknown as CopilotService);
+// stub 默认扮演守规矩的 Agent：Task turn 内调 update_task(completed)。
+// turn 结束自动 completed 的旧语义已删除，不调 tool 的 turn 会判 failed ——
+// 那个行为由“静默 Agent”单测单独覆盖，这里全部按正常完工走。
+reportTaskTurns(team, stub);
 
 const alice = team.createMember({ name: 'Task Alice', role: 'Lead' });
 const bob = team.createMember({ name: 'Task Bob', role: 'Engineer' });
@@ -484,6 +488,9 @@ describe('Task 生命周期补严', () => {
         leadMemberId: alice.id,
       });
       if (upstream === 'failed') stub.failMemberIds.add(bob.id);
+      // cancelled 分支：执行人静音让 A 停在 ready。running 的任务不能直接取消
+      // （必须先取消 execution），ready 的可以直接取消。
+      if (upstream === 'cancelled') team.setMemberMuted(room.id, bob.id, true);
       try {
         await team.planTasks({
           conversationId: room.id,
@@ -643,6 +650,9 @@ describe('Task 生命周期补严', () => {
       memberIds: [alice.id, bob.id],
       leadMemberId: alice.id,
     });
+    // 执行人静音：任务停在 ready。running 的任务必须先取消 execution，
+    // 不能直接取消（见“正在执行的 Task 不能直接 cancel”）。
+    team.setMemberMuted(cancelledRoom.id, bob.id, true);
     await team.planTasks({
       conversationId: cancelledRoom.id,
       memberId: alice.id,
@@ -779,6 +789,189 @@ describe('Task 生命周期补严', () => {
     } finally {
       stub.failMemberIds.clear();
       stub.reset();
+    }
+  });
+
+  it('Lead 正忙时 Task 失败，recovery 照样排队等 Lead 跑完', async () => {
+    stub.reset();
+    stub.failMemberIds.add(bob.id);
+    let release!: () => void;
+    stub.hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    stub.holdMemberIds = new Set([alice.id]);
+    try {
+      const room = team.createConversation({
+        kind: 'task',
+        title: 'BusyLeadRecovery',
+        memberIds: [alice.id, bob.id],
+        leadMemberId: alice.id,
+      });
+      await team.sendMessage({ conversationId: room.id, content: '开工' });
+      // 等 Lead turn 真正跑起来再让 worker 失败，否则测不到“正忙”
+      for (let attempt = 0; attempt < 400; attempt += 1) {
+        const running = db
+          .prepare(
+            `SELECT 1 AS ok FROM execution WHERE conversation_id = ? AND member_id = ? AND status = 'running'`,
+          )
+          .get(room.id, alice.id) as unknown as { ok: number } | undefined;
+        if (running) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      await team.planTasks({
+        conversationId: room.id,
+        memberId: alice.id,
+        objective: '忙中出错',
+        requirements: { facts: [], assumptions: [], constraints: [], successCriteria: [] },
+        tasks: [{ key: 'a', title: 'A', assigneeMemberId: bob.id }],
+      });
+      // worker 失败落定（此时 Lead 还被按住）：recovery 必须已经排上，不能丢
+      for (let attempt = 0; attempt < 400; attempt += 1) {
+        if (team.listTasks(room.id)[0]?.status === 'failed') break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.equal(team.listTasks(room.id)[0].status, 'failed');
+      release();
+      stub.hold = null;
+      stub.holdMemberIds = null;
+      await waitForConversationIdle(room.id);
+
+      const leadRuns = db
+        .prepare(
+          `SELECT wake_reason AS reason FROM execution WHERE conversation_id = ? AND member_id = ? ORDER BY created_at`,
+        )
+        .all(room.id, alice.id) as unknown as Array<{ reason: string }>;
+      assert.ok(leadRuns.length >= 2, 'Lead 当前 turn 完成后必须接着跑 recovery');
+      assert.ok(
+        leadRuns.some((run) => run.reason === 'lead_recovery'),
+        'recovery 唤醒不能在 Lead 正忙时丢掉',
+      );
+      assert.equal(team.getConversation(room.id).status, 'blocked');
+    } finally {
+      release();
+      stub.hold = null;
+      stub.holdMemberIds = null;
+      stub.failMemberIds.clear();
+      stub.reset();
+    }
+  });
+
+  it('正在执行的 Task 不能直接 cancel，execution 收尾后可以', async () => {
+    stub.reset();
+    const room = team.createConversation({
+      kind: 'task',
+      title: 'CancelRunning',
+      memberIds: [alice.id, bob.id],
+      leadMemberId: alice.id,
+    });
+    let release!: () => void;
+    stub.hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    stub.holdMemberIds = new Set([bob.id]);
+    try {
+      await team.planTasks({
+        conversationId: room.id,
+        memberId: alice.id,
+        objective: '取消执行中',
+        requirements: { facts: [], assumptions: [], constraints: [], successCriteria: [] },
+        tasks: [{ key: 'a', title: 'A', assigneeMemberId: bob.id }],
+      });
+      for (let attempt = 0; attempt < 400; attempt += 1) {
+        if (team.listTasks(room.id)[0]?.status === 'running') break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const task = team.listTasks(room.id)[0];
+      assert.equal(task.status, 'running');
+      assert.throws(() => team.cancelTask(task.id), /先取消对应的 Execution/);
+      // execution 收尾（这里直接落终态，效果等同用户在 UI 上取消了它）后放行
+      db.prepare(`UPDATE execution SET status = 'cancelled' WHERE id = ?`).run(task.currentExecutionId);
+      const cancelled = team.cancelTask(task.id);
+      assert.equal(cancelled.status, 'cancelled');
+    } finally {
+      release();
+      stub.hold = null;
+      stub.holdMemberIds = null;
+      stub.reset();
+    }
+    await waitForConversationIdle(room.id);
+  });
+
+  it('cancel ready 的 Task，下游变 blocked 并广播', async () => {
+    stub.reset();
+    const room = team.createConversation({
+      kind: 'task',
+      title: 'CancelChain',
+      memberIds: [alice.id, bob.id],
+      leadMemberId: alice.id,
+    });
+    team.setMemberMuted(room.id, bob.id, true);
+    await team.planTasks({
+      conversationId: room.id,
+      memberId: alice.id,
+      objective: '取消链',
+      requirements: { facts: [], assumptions: [], constraints: [], successCriteria: [] },
+      tasks: [
+        { key: 'a', title: 'A', assigneeMemberId: bob.id },
+        { key: 'b', title: 'B', assigneeMemberId: bob.id, dependencies: ['a'] },
+      ],
+    });
+    const seen: Array<{ id: string; status: string }> = [];
+    const off = team.subscribe(room.id, (event) => {
+      if (event.type === 'task.updated') {
+        const task = event.data as { id: string; status: string };
+        seen.push({ id: task.id, status: task.status });
+      }
+    });
+    try {
+      const taskA = team.listTasks(room.id).find((task) => task.title === 'A')!;
+      team.cancelTask(taskA.id);
+      await waitForConversationIdle(room.id);
+    } finally {
+      off();
+    }
+    const tasks = team.listTasks(room.id);
+    assert.equal(tasks.find((task) => task.title === 'A')?.status, 'cancelled');
+    const taskB = tasks.find((task) => task.title === 'B')!;
+    assert.equal(taskB.status, 'blocked', '上游取消后下游必须 blocked');
+    assert.ok(
+      seen.some((item) => item.id === taskB.id && item.status === 'blocked'),
+      '下游变 blocked 必须广播 task.updated',
+    );
+    assert.equal(team.getConversation(room.id).status, 'blocked');
+  });
+
+  it('Task turn 内没调 update_task，任务判 failed 并唤醒 Lead', async () => {
+    stub.reset();
+    // 扮演不守规矩的 Agent：turn 内不报告完成也不报告阻塞
+    stub.onTurnStart = null;
+    try {
+      const room = team.createConversation({
+        kind: 'task',
+        title: 'SilentAgent',
+        memberIds: [alice.id, bob.id],
+        leadMemberId: alice.id,
+      });
+      await team.planTasks({
+        conversationId: room.id,
+        memberId: alice.id,
+        objective: '静默',
+        requirements: { facts: [], assumptions: [], constraints: [], successCriteria: [] },
+        tasks: [{ key: 'a', title: 'A', assigneeMemberId: bob.id }],
+      });
+      await waitForConversationIdle(room.id);
+      const task = team.listTasks(room.id)[0];
+      assert.equal(task.status, 'failed', '没报告的 turn 不能按完成处理');
+      assert.match(task.blocker ?? '', /update_task/);
+      const leadRuns = db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM execution WHERE conversation_id = ? AND member_id = ? AND wake_reason = 'lead_recovery'`,
+        )
+        .get(room.id, alice.id) as unknown as { n: number };
+      assert.ok(leadRuns.n >= 1, '静默失败必须唤醒 Lead 来收拾');
+      assert.equal(team.getConversation(room.id).status, 'blocked');
+    } finally {
+      reportTaskTurns(team, stub);
     }
   });
 

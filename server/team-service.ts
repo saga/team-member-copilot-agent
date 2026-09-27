@@ -1221,10 +1221,10 @@ export class TeamService {
 
   cancelTask(taskId: string): ConversationTask {
     const task = this.tasks.cancel(taskId);
-    this.emit(task.conversationId, { type: 'task.updated', data: task });
-    this.tasks.recomputeConversationStatus(task.conversationId);
-    this.emit(task.conversationId, { type: 'conversation.updated', data: this.getConversation(task.conversationId) });
-    return task;
+    // cancelled 也要走统一入口：下游依赖它的任务在这里翻成 blocked 并广播，
+    // 只重算工作区状态会漏掉这一整条链。
+    this.orchestrator.onTaskChanged(task.id);
+    return this.tasks.get(task.id);
   }
 
   private safeGetTask(taskId: string): ConversationTask | null {
@@ -2642,9 +2642,11 @@ export class TeamService {
       this.touchAgentPresence(input.member.id);
 
       if (taskAfterTurn && taskAfterTurn.status === 'running') {
-        // Agent 这一轮里没有显式改任务状态：turn 结束即任务完成，
-        // turn 的回复就是任务结果。显式置 blocked / failed 的不受影响。
-        this.tasks.markCompleted(taskAfterTurn.id, content || undefined);
+        // turn 结束时 Task 还在 running：Agent 没有调 update_task 报告完成或阻塞。
+        // 不能按「输出了文字 = 做完了」自动 completed —— 做一半就输出一段文字的
+        // Agent 会把没做完的任务标记成完成。按失败处理，Lead recovery 来决定
+        // retry / 补充信息 / 继续处理。
+        this.tasks.markFailed(taskAfterTurn.id, 'Agent turn 结束时没有调用 update_task 报告任务完成或阻塞');
         this.orchestrator.onTaskChanged(taskAfterTurn.id);
       } else if (taskAfterTurn && ['completed', 'failed', 'blocked', 'cancelled'].includes(taskAfterTurn.status)) {
         // Agent 已在 turn 内调 update_task 改了终态：按最新状态推进一次。

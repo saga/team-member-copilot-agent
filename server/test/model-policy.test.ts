@@ -19,12 +19,14 @@ const {
 } = await import('../model-policy.js');
 const { db } = await import('../db.js');
 const { MemberService } = await import('../member-service.js');
-const { StubCopilot, createTestStack, singleExecutionId } = await import('./support.js');
+const { StubCopilot, createTestStack, reportTaskTurns, singleExecutionId } = await import('./support.js');
 import type { CopilotService } from '../copilot.js';
 
 const stub = new StubCopilot();
 const memberService = new MemberService(db);
 const { team } = createTestStack(db, memberService, stub.asCopilot as unknown as CopilotService);
+// 同 task-service.test.ts：stub 扮演守规矩的 Agent，Task turn 内正常完工。
+reportTaskTurns(team, stub);
 
 const requirements = { facts: [], assumptions: [], constraints: [], successCriteria: [] };
 

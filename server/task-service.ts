@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { now } from './db.js';
-import { badRequest, notFound } from './http-error.js';
+import { badRequest, conflict, notFound } from './http-error.js';
 import type {
   ConversationStatus,
   ConversationTask,
@@ -311,6 +311,12 @@ export class TaskService {
 
   cancel(taskId: string): ConversationTask {
     const task = this.get(taskId);
+    // 还在引擎里跑的任务不能直接取消：Task 先变 cancelled，会留下
+    // 「Task 已取消、Execution 却 completed」的分裂。先取消 execution，
+    // 等它落到终态再取消任务 —— 那时挂着的不再是活的执行。
+    if (task.status === 'running' && this.taskExecutionActive(task)) {
+      throw conflict('任务正在执行，请先取消对应的 Execution');
+    }
     if (TERMINAL_TASK.has(task.status)) throw badRequest(`这个任务已经结束（${task.status}）`);
     this.db
       .prepare(`UPDATE conversation_task SET status = 'cancelled', updated_at = ? WHERE id = ?`)
@@ -410,6 +416,21 @@ export class TaskService {
       )
       .all(task.conversationId, ...task.dependencies) as unknown as Array<{ status: string }>;
     return rows.map((row) => row.status);
+  }
+
+  /**
+   * Task 当前挂的那条 execution 是不是还没收尾。
+   *
+   * cancel 的判据是它，不是 task.status：execution 已经 cancelled / interrupted
+   * 时任务虽然还标着 running，但引擎里已经没东西在跑了，这时必须放行 ——
+   * 否则「先取消 Execution 再取消任务」这条路走不通。
+   */
+  private taskExecutionActive(task: ConversationTask): boolean {
+    if (!task.currentExecutionId) return false;
+    const row = this.db.prepare(`SELECT status FROM execution WHERE id = ?`).get(task.currentExecutionId) as unknown as
+      | { status: string }
+      | undefined;
+    return !!row && (row.status === 'queued' || row.status === 'running' || row.status === 'waiting_for_member');
   }
 
   private dependenciesCompleted(task: ConversationTask): boolean {
