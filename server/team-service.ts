@@ -597,7 +597,14 @@ export class TeamService {
     return this.hydrateConversation(row);
   }
 
-  createConversation(input: CreateConversationInput): Conversation {
+  /**
+   * 建工作区。Task 工作区默认让 Lead 主动先开口（`autoStartLead`）：
+   * 用户建完不用先想第一句话，Lead 会先看 Jira 和上下文，缺信息就直接问。
+   *
+   * 关掉它只为了测试装配：开了会导致每个新建房间都多一轮 Lead turn，
+   * 数 execution / 消息条数的断言会全崩。线上 HTTP 建工作区一律开着。
+   */
+  createConversation(input: CreateConversationInput, opts?: { autoStartLead?: boolean }): Conversation {
     const memberIds = [...new Set(input.memberIds)];
     if (memberIds.length === 0) throw badRequest('至少需要一个 Member');
 
@@ -700,6 +707,33 @@ export class TeamService {
       insertMember.run(id, memberId, createdAt);
       // 新房间没有历史，房间读游标从 0 开始
       this.states.ensure(id, memberId, 0);
+    }
+
+    // Lead 主动先开口：落一条 system 开场（触发消息），再唤醒 Lead。
+    // 用户看到的第一条就是 Lead 的回应，而不是一个等他先说话的空房间。
+    if (kind === 'task' && leadMemberId && opts?.autoStartLead) {
+      const opener: ConversationMessage = {
+        id: randomUUID(),
+        conversationId: id,
+        messageSequence: this.nextMessageSequence(id),
+        senderType: 'system',
+        senderId: 'system',
+        replyToMessageId: null,
+        taskId: null,
+        clientRequestId: null,
+        content:
+          `新工作区已创建：${title}。` +
+          `参与：${members.map((member) => member.name).join('、')}。` +
+          (externalWorkRef ? `挂钩业务：${externalWorkRef.key}。` : '') +
+          '请主动推进：先看清目标，缺信息就直接问用户。',
+        executionId: null,
+        files: [],
+        createdAt: now(),
+      };
+      this.insertMessage(opener);
+      this.touchConversation(id);
+      this.emit(id, { type: 'message.created', data: opener });
+      this.orchestrator.ensureLeadWake(id, leadMemberId, opener.messageSequence);
     }
 
     return this.getConversation(id);

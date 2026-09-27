@@ -126,7 +126,8 @@ export function conversationsRouter(
       return;
     }
     try {
-      res.status(201).json({ conversation: team.createConversation(parsed.data) });
+      // 线上建工作区 Lead 主动先开口：用户不用先想第一句话。
+      res.status(201).json({ conversation: team.createConversation(parsed.data, { autoStartLead: true }) });
     } catch (error) {
       sendError(res, error);
     }

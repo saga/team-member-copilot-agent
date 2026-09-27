@@ -57,7 +57,7 @@ export function useWorkspaceActions(deps: WorkspaceActionDeps) {
     data.openConversation(created.id);
     deps.setNewTaskOpen(false);
     deps.navigate({ view: 'tasks', conversationId: created.id });
-    data.setNotice('工作区建好了，在下面说清楚要达成什么，Lead 会先确认目标再规划任务。');
+    data.setNotice('工作区建好了，Lead 正在看需求，他会先开口：缺信息就直接问，够了就直接列任务开干。');
   }
 
   async function createMember(input: { name: string; role: string }): Promise<void> {

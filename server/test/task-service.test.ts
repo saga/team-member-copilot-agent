@@ -696,8 +696,7 @@ describe('Task 生命周期补严', () => {
     assert.equal(team.getConversation(room2.id).leadMemberId, bob.id);
   });
 
-  it('blocked 的任务会自动唤醒 Lead', async () => {
-    const room = team.createConversation({
+  it('blocked 的任务会自动唤醒 Lead', async () => {    const room = team.createConversation({
       kind: 'task',
       title: 'WakeLead',
       memberIds: [alice.id, bob.id],
@@ -726,5 +725,34 @@ describe('Task 生命周期补严', () => {
       )
       .get(room.id, alice.id) as unknown as { n: number };
     assert.ok(leadRuns.n >= 1, 'Lead 应该在任务阻塞后被唤醒');
+  });
+
+  it('建工作区时 Lead 主动先开口，不用等用户说话', async () => {
+    const room = team.createConversation(
+      {
+        kind: 'task',
+        title: 'Proactive',
+        memberIds: [alice.id, bob.id],
+        leadMemberId: alice.id,
+      },
+      { autoStartLead: true },
+    );
+    // 开场 system 消息先落库（Lead 这一轮的触发消息）
+    const opener = team.listMessages(room.id, 10)[0];
+    assert.equal(opener.senderType, 'system');
+
+    await waitForConversationIdle(room.id);
+    // Lead 被唤醒并说了话
+    const leadRuns = db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM execution WHERE conversation_id = ? AND member_id = ? AND wake_reason = 'lead_message'`,
+      )
+      .get(room.id, alice.id) as unknown as { n: number };
+    assert.ok(leadRuns.n >= 1, 'Lead 建完就该被唤醒');
+    const messages = team.listMessages(room.id, 10);
+    assert.ok(
+      messages.some((message) => message.senderType === 'member' && message.senderId === alice.id),
+      'Lead 应该主动说第一句话',
+    );
   });
 });

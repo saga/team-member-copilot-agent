@@ -30,7 +30,7 @@ interface TaskCreatorProps {
 /**
  * 新建 Task 工作区（Modal，挂在页面根部）。
  *
- * 建完之后用户在输入框里说清楚目标，Lead 会澄清并规划任务、自动开始执行。
+ * 建完 Lead 会主动先开口（看 Jira 和上下文，缺信息就问），用户不用先想第一句话。
  * 不需要「开始执行」按钮：进入这个工作区本身就表示要完成这件事情。
  */
 export function TaskCreator({ open, members, onCreate, onCancel }: TaskCreatorProps) {
