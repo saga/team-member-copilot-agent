@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Button, Input, Space } from 'antd';
-import { PlusOutlined, ProjectOutlined, SearchOutlined } from '@ant-design/icons';
+import { PlusOutlined, SearchOutlined } from '@ant-design/icons';
 import type { Conversation } from '../../lib/api';
 import { ConversationList } from '../team/ConversationList';
 
@@ -8,24 +8,20 @@ interface ConversationSidebarProps {
   conversations: Conversation[];
   selectedConversationId: string | null;
   onSelectConversation: (conversationId: string) => void;
-  onNewDiscussion: () => void;
-  onNewWork: () => void;
+  onNewTask: () => void;
 }
 
 /**
- * 聊天工作面的第二列：只装会话。
+ * 工作区第二列：只装工作区。
  *
- * 这里只允许出现 Search、会话分组（Discussions / Work / Direct）、
- * New discussion、New work。创建表单不在这里 —— 两个按钮只负责打开
- * 挂在页面根部的 Modal。成员管理、Current Work、Automation
- * 都在 Team 管理面，不在这里。
+ * 这里只允许出现 Search、Tasks 分组、New task。创建表单不在这里 ——
+ * 按钮只负责打开挂在页面根部的 Modal。
  */
 export function ConversationSidebar({
   conversations,
   selectedConversationId,
   onSelectConversation,
-  onNewDiscussion,
-  onNewWork,
+  onNewTask,
 }: ConversationSidebarProps) {
   const [search, setSearch] = useState('');
 
@@ -51,11 +47,8 @@ export function ConversationSidebar({
         />
       </div>
       <Space direction="vertical" style={{ width: '100%', marginTop: 8 }}>
-        <Button type="primary" block icon={<PlusOutlined />} onClick={onNewDiscussion}>
-          New discussion
-        </Button>
-        <Button block icon={<ProjectOutlined />} onClick={onNewWork}>
-          New work
+        <Button type="primary" block icon={<PlusOutlined />} onClick={onNewTask}>
+          New task
         </Button>
       </Space>
     </div>

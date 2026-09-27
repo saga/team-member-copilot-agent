@@ -26,9 +26,9 @@ const rawFile = express.raw({ type: () => true, limit: config.maxConversationFil
 
 const createConversationSchema = z.object({
   title: z.string().trim().max(200).optional(),
-  kind: z.enum(['direct', 'group', 'work']).optional(),
+  kind: z.enum(['task', 'direct']).optional(),
   memberIds: z.array(z.string().min(1)).min(1).max(20),
-  defaultMemberId: z.string().optional(),
+  leadMemberId: z.string().optional(),
   /**
    * 这间会话围绕哪条外部工作。
    *
@@ -59,7 +59,6 @@ const createConversationSchema = z.object({
 
 const sendMessageSchema = z.object({
   content: z.string().trim().min(1).max(20000),
-  targetMemberId: z.string().min(1).optional(),
   replyToMessageId: z.string().min(1).optional(),
   /**
    * 幂等键。同一个键第二次到达时不会再落一条消息，也不会再派一次唤醒，
@@ -146,6 +145,15 @@ export function conversationsRouter(
     const limit = Number.isFinite(requested) ? Math.min(Math.max(requested, 1), 500) : 100;
     try {
       res.json({ messages: team.listMessages(req.params.id, limit) });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  /** 这个工作区的任务列表。 */
+  router.get('/:id/tasks', (req, res) => {
+    try {
+      res.json({ tasks: team.listTasks(req.params.id) });
     } catch (error) {
       sendError(res, error);
     }

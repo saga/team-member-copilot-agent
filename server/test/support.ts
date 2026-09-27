@@ -3,7 +3,7 @@ import path from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { config } from '../config.js';
 import type { CopilotService, RunMemberTurnInput } from '../copilot.js';
-import type { WakePlan } from '../group-dispatcher.js';
+import type { WakePlan } from '../team-service.js';
 import { TeamService } from '../team-service.js';
 import type { CapabilityContext } from '../capabilities/types.js';
 import { CapabilityRegistry } from '../capabilities/registry.js';
@@ -21,7 +21,6 @@ import { ConversationFileProcessor } from '../conversation-file-processor.js';
 import { KnowledgeToolProvider } from '../capabilities/providers/knowledge-tools.js';
 import { HostCodingToolProvider } from '../capabilities/providers/host-tools.js';
 import type { MemberService } from '../member-service.js';
-import { NO_REPLY_SENTINEL } from '../member-decision.js';
 import { TeamStructureService } from '../team-structure-service.js';
 import type { WorkManagementRegistry } from '../work-management/types.js';
 
@@ -94,6 +93,9 @@ export function createCapabilityStack(
       delegateMember: (input) => resolveTeam().delegateMember(input),
       rememberMember: (input) => resolveTeam().rememberMember(input),
       messageMember: (input) => resolveTeam().messageMember(input),
+      requestClarification: (input) => resolveTeam().requestClarification(input),
+      planTasks: (input) => resolveTeam().planTasks(input),
+      updateTask: (input) => resolveTeam().updateTask(input),
     }),
   );
   registry.registerToolProvider(new KnowledgeToolProvider());
@@ -196,6 +198,22 @@ export function executionIdForWake(
   conversationId: string,
   wake: WakePlan,
 ): string {
+  if (wake.triggerSequence === null || wake.triggerSequence === undefined) {
+    const taskRow = db
+      .prepare(
+        `
+        SELECT id
+        FROM execution
+        WHERE conversation_id = ?
+          AND member_id = ?
+        ORDER BY created_at DESC, rowid DESC
+        LIMIT 1
+        `,
+      )
+      .get(conversationId, wake.memberId) as unknown as { id: string } | undefined;
+    assert.ok(taskRow, `找不到 wake(${wake.memberId}) 对应的 execution`);
+    return taskRow.id;
+  }
   const row = db
     .prepare(
       `
@@ -237,9 +255,7 @@ export function singleExecutionId(
  * 机制类用例要的是确定性（一次发送 = 可数的 execution），广播进来只会
  * 让断言之间的时序变得不可预测。
  *
- * 注意 mute 会挡掉一切唤醒，包括显式 `targetMemberId` 与 @mention。
- * 用 targetMemberId 驱动单轮的用例不需要 mute：点名只唤醒一个人，
- * 而 Member 的回复不会再自动唤醒别人，没有连锁可压。
+ * 注意 mute 会挡掉一切唤醒。用户消息只唤醒 Lead，不再有点名单轮。
  */
 export function muteAllMembers(team: TeamService, conversationId: string): void {
   for (const member of team.getConversation(conversationId).members) {
@@ -290,9 +306,8 @@ export class StubCopilot {
    */
   streamDeltas = false;
   /**
-   * 这些 Member 一律返回 `<NO_REPLY>`，其他 Member 按 `mode` 走。
-   *
-   * 用来构造「房间里只有某一个人会说话」。
+   * 保留字段：Task 模式下每轮都必须有结果，不再有沉默语义。
+   * 留着它是为了不改各用例的装配，只是不再产生效果。
    */
   readonly skipMemberIds = new Set<string>();
   /**
@@ -327,7 +342,8 @@ export class StubCopilot {
       this.skipMemberIds.has(input.member.id) ||
       (this.speakOnlyOnReasons !== null && !this.speakOnlyOnReasons.has(reason ?? ''));
 
-    const reply = skip ? NO_REPLY_SENTINEL : `reply from ${input.member.name}`;
+    const reply = `reply from ${input.member.name}`;
+    void skip;
     if (this.streamDeltas) {
       for (const char of reply) input.onDelta?.(char);
     }

@@ -296,7 +296,7 @@ describe('execution 开始时的取证：控制面直连 Provider', () => {
     const stack = createTestStack(db, memberService, stub.asCopilot, registry);
     const agent = stack.team.createMember({ name: 'SnapshotProbe', role: 'E' });
     const room = stack.team.createConversation({
-      kind: 'work',
+      kind: 'task',
       title: 'ABC-2001',
       externalWorkRef: { provider: 'jira', key: 'ABC-2001' },
       memberIds: [agent.id],
@@ -366,7 +366,7 @@ describe('Jira webhook：最小投影 + 共享密钥门禁', () => {
   const stack = createTestStack(db, memberService, new StubCopilot().asCopilot);
   const agent = stack.team.createMember({ name: 'WebhookAgent', role: 'E' });
   const room = stack.team.createConversation({
-    kind: 'work',
+    kind: 'task',
     title: 'ABC-777',
     externalWorkRef: { provider: 'jira', key: 'ABC-777' },
     memberIds: [agent.id],

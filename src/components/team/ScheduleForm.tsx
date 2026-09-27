@@ -26,8 +26,8 @@ export function ScheduleForm({
   const [intervalSeconds, setIntervalSeconds] = useState<number>(3600);
   const [busy, setBusy] = useState(false);
 
-  // Schedule 只绑 work 房间：别的 kind 建了也跑不了（后端同样拒绝）。
-  const workRooms = conversations.filter((c) => c.kind === 'work');
+  // Schedule 只绑 Task 工作区：别的 kind 建了也跑不了（后端同样拒绝）。
+  const workRooms = conversations.filter((c) => c.kind === 'task');
 
   async function submit() {
     if (!memberId || !conversationId || !prompt.trim() || !runAt) return;

@@ -226,6 +226,7 @@ describe('schema 就位（PRAGMA user_version）', () => {
         'conversation_member',
         'conversation_member_state',
         'conversation_message',
+        'conversation_task',
         'conversation_event',
         'member_runtime',
         'execution',
@@ -237,6 +238,7 @@ describe('schema 就位（PRAGMA user_version）', () => {
         'conversation_file',
         'conversation_message_file',
         'conversation_file_fts',
+        'conversation_task',
       ];
       assert.deepEqual(
         Object.fromEntries(tables.map((table) => [table, tableColumns(handle, table)])),
@@ -308,10 +310,30 @@ describe('schema 就位（PRAGMA user_version）', () => {
             'external_work_ref',
             'title',
             'kind',
-            'default_member_id',
+            'objective',
+            'lead_member_id',
+            'status',
+            'requirements_json',
+            'open_questions_json',
             'created_by',
             'event_sequence',
             'message_sequence',
+            'created_at',
+            'updated_at',
+          ],
+          conversation_task: [
+            'id',
+            'conversation_id',
+            'title',
+            'description',
+            'assignee_member_id',
+            'status',
+            'dependencies_json',
+            'acceptance_criteria_json',
+            'result',
+            'blocker',
+            'current_execution_id',
+            'sort_order',
             'created_at',
             'updated_at',
           ],
@@ -325,6 +347,7 @@ describe('schema 就位（PRAGMA user_version）', () => {
             'pending_wake',
             'pending_wake_trigger_sequence',
             'pending_wake_reason',
+            'pending_wake_task_id',
             'muted',
             'updated_at',
           ],
@@ -334,8 +357,8 @@ describe('schema 就位（PRAGMA user_version）', () => {
             'message_sequence',
             'sender_type',
             'sender_id',
-            'target_member_id',
             'reply_to_message_id',
+            'task_id',
             'content',
             'execution_id',
             'client_request_id',
@@ -376,6 +399,7 @@ describe('schema 就位（PRAGMA user_version）', () => {
             'error',
             'waiting_for_runtime_id',
             'retry_of_execution_id',
+            'task_id',
             'decision',
             'trigger_message_sequence',
             'wake_reason',
@@ -451,17 +475,22 @@ describe('schema 就位（PRAGMA user_version）', () => {
         'idx_conversation_file_hash',
         'idx_conversation_file_status',
         'idx_conversation_member_state_wake',
+        'idx_conversation_task_assignee',
+        'idx_conversation_task_conversation',
+        'idx_conversation_task_status',
         'idx_conversation_team',
         'idx_execution_conversation_created',
         'idx_execution_external_work_key',
         'idx_execution_parent',
         'idx_execution_status',
+        'idx_execution_task',
         'idx_knowledge_document_kb',
         'idx_member_seed_key',
         'idx_message_client_request',
         'idx_message_conversation_created',
         'idx_message_conversation_sequence',
         'idx_message_file_file',
+        'idx_message_task',
         'idx_scheduled_wake_due',
         'idx_scheduled_wake_member',
         'idx_scheduled_wake_run_execution',
@@ -550,7 +579,6 @@ const sendRaw = team.sendMessage.bind(team);
 async function sendMessage(input: {
   conversationId: string;
   content: string;
-  targetMemberId?: string;
   replyToMessageId?: string;
 }) {
   const result = await sendRaw(input);
@@ -563,70 +591,35 @@ describe('message_sequence 是会话内严格全序', () => {
 describe('ContextAssembler：增量上下文而不是整段重放', () => {
   it('只注入「上次成功 turn 之后新增」的消息，并排除自己与触发消息', async () => {
     const conv = team.createConversation({
-      kind: 'group',
+      kind: 'task',
       title: 'Incremental',
       memberIds: [alice.id, bob.id],
+      leadMemberId: alice.id,
     });
-    // 四轮都由显式 targetMemberId 驱动（点名只唤醒一个人，
-    // Member 的回复也不会自动唤醒别人），「谁在什么时候读到了什么」可断言。
+    // Task 工作区里用户消息只唤醒 Lead：两轮都是 Alice 处理，
+    // 「谁在什么时候读到了什么」可断言。
 
-    // 1) Alice 先说话
-    const first = await sendMessage({
-      conversationId: conv.id,
-      content: 'ALICE-FIRST',
-      targetMemberId: alice.id,
-    });
+    const first = await sendMessage({ conversationId: conv.id, content: 'LEAD-FIRST' });
     await waitForStatus(first.executionId, 'completed');
 
-    // 2) Bob 第一次发言：应该看到 Alice 的回复
-    const bobFirst = await sendMessage({
-      conversationId: conv.id,
-      content: 'BOB-FIRST',
-      targetMemberId: bob.id,
-    });
-    await waitForStatus(bobFirst.executionId, 'completed');
+    const turn1 = stub.turnsFor(alice.id).at(-1);
+    assert.ok(turn1);
+    assert.match(turn1.prompt, /Recent relevant updates|LEAD-FIRST/);
 
-    const bobTurn1 = stub.turnsFor(bob.id).at(-1);
-    assert.ok(bobTurn1);
-    assert.match(bobTurn1.prompt, /stub reply from/, 'Bob 应该看到 Alice 的回复');
-    // group 房间走 discussion 模式：房间活动以 transcript 形式给出，
-    // 触发消息本身也在 transcript 里（不像 direct 那样单独拎成 Current message）
-    assert.match(bobTurn1.prompt, /Room activity since you last read it/);
-    assert.match(bobTurn1.prompt, /ALICE-FIRST/, '也应该看到触发 Alice 的那条用户消息');
-    assert.match(bobTurn1.prompt, /BOB-FIRST/);
-
-    // 3) Alice 再说一句
-    const second = await sendMessage({
-      conversationId: conv.id,
-      content: 'ALICE-SECOND',
-      targetMemberId: alice.id,
-    });
+    const second = await sendMessage({ conversationId: conv.id, content: 'LEAD-SECOND' });
     await waitForStatus(second.executionId, 'completed');
 
-    // 4) Bob 第二次发言：只应该看到 Alice 的第二句
-    const bobSecond = await sendMessage({
-      conversationId: conv.id,
-      content: 'BOB-SECOND',
-      targetMemberId: bob.id,
-    });
-    await waitForStatus(bobSecond.executionId, 'completed');
-
-    const bobTurn2 = stub.turnsFor(bob.id).at(-1);
-    assert.ok(bobTurn2);
-    assert.match(bobTurn2.prompt, /ALICE-SECOND/, '新消息必须注入');
+    const turn2 = stub.turnsFor(alice.id).at(-1);
+    assert.ok(turn2);
+    assert.match(turn2.prompt, /LEAD-SECOND/, '新消息必须注入');
     assert.doesNotMatch(
-      bobTurn2.prompt,
-      /ALICE-FIRST/,
-      '老消息不能重复注入 —— 它在 Bob 的 Copilot session history 里已经有了',
-    );
-    assert.doesNotMatch(
-      bobTurn2.prompt,
-      /BOB-FIRST/,
-      'Bob 自己产出的历史消息不能回灌给自己',
+      turn2.prompt,
+      /LEAD-FIRST/,
+      '老消息不能重复注入 —— 它在 Lead 的 Copilot session history 里已经有了',
     );
 
     // checkpoint 覆盖了被过滤掉的消息（否则下一轮还会重复读到它们）
-    const runtime = runtimeRow(conv.id, bob.id);
+    const runtime = runtimeRow(conv.id, alice.id);
     assert.ok(runtime);
     assert.ok(runtime.last_context_message_sequence > 0);
   });
@@ -636,10 +629,10 @@ describe('ContextAssembler：增量上下文而不是整段重放', () => {
 describe('checkpoint 只在 turn 成功后推进', () => {
   it('turn 失败时 last_context_message_sequence 保持不变', async () => {
     const conv = team.createConversation({
-      kind: 'direct',
+      kind: 'task',
       title: 'Failure',
       memberIds: [bob.id],
-      defaultMemberId: bob.id,
+      leadMemberId: bob.id,
     });
 
     const ok = await sendMessage({ conversationId: conv.id, content: 'OK-1' });
@@ -672,23 +665,41 @@ describe('checkpoint 只在 turn 成功后推进', () => {
 describe('wait-for 环检测（跨 delegation 树的死锁保护）', () => {
   it('目标 runtime 正在等自己时，delegation 被拒绝', async () => {
     const conv = team.createConversation({
-      kind: 'group',
+      kind: 'task',
       title: 'WaitFor',
       memberIds: [alice.id, bob.id],
     });
 
-    const aliceRun = await sendMessage({
-      conversationId: conv.id,
-      content: 'A',
-      targetMemberId: alice.id,
-    });
+    const aliceRun = await sendMessage({ conversationId: conv.id, content: 'A' });
     await waitForStatus(aliceRun.executionId, 'completed');
 
-    const bobRun = await sendMessage({
+    // Bob 的 execution 走 Task 建出来：用户消息只唤醒 Lead，
+    // 这里需要的是「Bob 有一条独立 root execution + runtime」
+    //（delegation 建出来的 child 自带 path，前置的 path 环检测会先拦住，
+    // 考不到 wait-for 这条分支）。
+    await team.planTasks({
       conversationId: conv.id,
-      content: 'B',
-      targetMemberId: bob.id,
+      memberId: alice.id,
+      objective: 'wait-for setup',
+      requirements: { facts: [], assumptions: [], constraints: [], successCriteria: [] },
+      tasks: [{ key: 't1', title: 'T', assigneeMemberId: bob.id }],
     });
+    let bobRunId = '';
+    for (let attempt = 0; attempt < 400; attempt += 1) {
+      const row = db
+        .prepare(
+          `SELECT id FROM execution WHERE conversation_id = ? AND member_id = ? AND kind = 'member_work'
+           ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+        )
+        .get(conv.id, bob.id) as unknown as { id: string } | undefined;
+      if (row) {
+        bobRunId = row.id;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(bobRunId, '前置条件：Bob 应该有一条 task execution');
+    const bobRun = { executionId: bobRunId };
     await waitForStatus(bobRun.executionId, 'completed');
 
     const aliceRuntime = runtimeRow(conv.id, alice.id);
@@ -734,10 +745,10 @@ describe('wait-for 环检测（跨 delegation 树的死锁保护）', () => {
 describe('durable conversation_event 与 SSE 回放', () => {
   it('durable 事件带递增 sequence，message.delta 不落库', async () => {
     const conv = team.createConversation({
-      kind: 'direct',
+      kind: 'task',
       title: 'Events',
       memberIds: [bob.id],
-      defaultMemberId: bob.id,
+      leadMemberId: bob.id,
     });
 
     // 建房间本身也会产生事件（成员状态行是一行真实的状态），所以比较的是
@@ -797,10 +808,10 @@ describe('durable conversation_event 与 SSE 回放', () => {
 
   it('replayAndSubscribe 先补历史再推实时，且不重复投递', async () => {
     const conv = team.createConversation({
-      kind: 'direct',
+      kind: 'task',
       title: 'ReplaySubscribe',
       memberIds: [bob.id],
-      defaultMemberId: bob.id,
+      leadMemberId: bob.id,
     });
 
     const first = await sendMessage({ conversationId: conv.id, content: 'history' });
@@ -925,21 +936,21 @@ describe('RecoveryService', () => {
       INSERT INTO team (id, name, created_by, created_at, updated_at)
       VALUES ('t1', 'T', 'u', 't', 't');
 
-      INSERT INTO conversation (id, team_id, title, kind, created_by, message_sequence, created_at, updated_at)
-      VALUES ('c', 't1', 'Room', 'group', 'u', 23, 't', 't');
+      INSERT INTO conversation (id, team_id, title, kind, lead_member_id, status, created_by, message_sequence, created_at, updated_at)
+      VALUES ('c', 't1', 'Room', 'task', 'm1', 'running', 'u', 23, 't', 't');
 
       INSERT INTO conversation_member (conversation_id, member_id, joined_at)
       VALUES ('c', 'm1', 't'), ('c', 'm2', 't');
     `);
 
-    // Alice：排队中被进程带走 —— 触发消息是 17，原因是 mention。
-    // 房间现在已经走到 23；旧实现会拿 23 + open_discussion 重放，等于换了一轮。
+    // Alice：排队中被进程带走 —— 触发消息是 17，原因是 lead_message。
+    // 房间现在已经走到 23；拿当前水位重放等于换了一轮。
     //
     // pending_wake 与 wake_status 是两次写（调度器分开调，因为「正在跑」时不该
     // 把状态压回 queued），这里手动复现「刚入队就被进程带走」那一刻。
     const states = new ConversationMemberService(handle);
     states.ensure('c', 'm1', 0);
-    states.setPendingWake('c', 'm1', true, { triggerSequence: 17, reason: 'mention' });
+    states.setPendingWake('c', 'm1', true, { triggerSequence: 17, reason: 'lead_message' });
     states.setWakeStatus('c', 'm1', 'queued');
 
     // Bob：已经进过引擎（wake_status = running），不能被重派
@@ -958,7 +969,7 @@ describe('RecoveryService', () => {
 
     assert.deepEqual(
       report.lostWakes.map((wake) => ({ ...wake })),
-      [{ conversationId: 'c', memberId: 'm1', reason: 'mention', triggerSequence: 17 }],
+      [{ conversationId: 'c', memberId: 'm1', taskId: null, reason: 'lead_message', triggerSequence: 17 }],
       '只有「排队中」的那条可重派，且必须带上原来的 trigger + reason',
     );
 
@@ -1005,51 +1016,43 @@ describe('RecoveryService', () => {
 describe('redispatchWake：恢复出来的是同一轮', () => {
   it('用落库的 trigger + reason 重放，而不是拿房间当前水位猜一个', async () => {
     const room = team.createConversation({
-      kind: 'group',
+      kind: 'task',
       title: 'Crash Room',
       memberIds: [alice.id, bob.id],
     });
 
-    // 只点名 Bob。Alice 从头到尾没被唤醒，读游标停在 0。
-    const first = await sendMessage({
-      conversationId: room.id,
-      content: 'Bob 先看这个',
-      targetMemberId: bob.id,
-    });
+    // 用户消息只唤醒 Lead（Alice）。Bob 从头到尾没被唤醒，读游标停在 0。
+    const first = await sendMessage({ conversationId: room.id, content: '先看这个' });
     await waitForStatus(first.executionId, 'completed');
     await waitForConversationIdle(room.id);
 
     // 再堆一条，把房间水位推高 —— 这样「原样重放」和「猜一个」会明显不同
-    const second = await sendMessage({
-      conversationId: room.id,
-      content: 'Bob 再补一条',
-      targetMemberId: bob.id,
-    });
+    const second = await sendMessage({ conversationId: room.id, content: '再补一条' });
     await waitForStatus(second.executionId, 'completed');
     await waitForConversationIdle(room.id);
 
     const watermark = team.getConversation(room.id).messageSequence;
     assert.ok(watermark > 1, '前置条件：房间水位应该已经超过第 1 条');
 
-    // 模拟「Alice 的唤醒在排队时进程被 kill」。
+    // 模拟「Bob 的唤醒在排队时进程被 kill」。
     //
     // 这个状态没法通过公开 API 造出来（正常路径下一入队就立刻开跑），所以直接
     // 把 durable 那几个字段写成崩溃那一刻的样子 —— 这正是 RecoveryService
     // 重启后看到的东西。
     const states = new ConversationMemberService(db);
-    states.setPendingWake(room.id, alice.id, true, { triggerSequence: 1, reason: 'mention' });
-    states.setWakeStatus(room.id, alice.id, 'queued');
+    states.setPendingWake(room.id, bob.id, true, { triggerSequence: 1, reason: 'lead_message' });
+    states.setWakeStatus(room.id, bob.id, 'queued');
 
     const lost = states.findLostWakes();
     assert.deepEqual(
-      lost.filter((wake) => wake.memberId === alice.id).map((wake) => ({ ...wake })),
-      [{ conversationId: room.id, memberId: alice.id, reason: 'mention', triggerSequence: 1 }],
+      lost.filter((wake) => wake.memberId === bob.id).map((wake) => ({ ...wake })),
+      [{ conversationId: room.id, memberId: bob.id, taskId: null, reason: 'lead_message', triggerSequence: 1 }],
     );
 
     for (const wake of lost) team.redispatchWake(wake);
     await waitForConversationIdle(room.id);
 
-    const aliceRuns = (
+    const bobRuns = (
       db
         .prepare(
           `
@@ -1059,17 +1062,15 @@ describe('redispatchWake：恢复出来的是同一轮', () => {
           ORDER BY rowid
           `,
         )
-        .all(room.id, alice.id) as unknown as Array<{
+        .all(room.id, bob.id) as unknown as Array<{
         trigger_message_sequence: number | null;
         wake_reason: string | null;
       }>
     ).map((row) => ({ ...row }));
 
     assert.deepEqual(
-      aliceRuns,
-      [{ trigger_message_sequence: 1, wake_reason: 'mention' }],
-      // 旧实现会产出 { trigger_message_sequence: watermark, wake_reason: 'open_discussion' }：
-      // 对着另一条消息、以另一个理由重新判断要不要发言。
+      bobRuns,
+      [{ trigger_message_sequence: 1, wake_reason: 'lead_message' }],
       '重放出来的必须是当时那一轮',
     );
   });
@@ -1078,10 +1079,10 @@ describe('redispatchWake：恢复出来的是同一轮', () => {
 describe('retryExecution', () => {
   it('生成新 execution 并指回原记录，审计链不断', async () => {
     const conv = team.createConversation({
-      kind: 'direct',
+      kind: 'task',
       title: 'Retry',
       memberIds: [bob.id],
-      defaultMemberId: bob.id,
+      leadMemberId: bob.id,
     });
 
     stub.failWith = 'transient';

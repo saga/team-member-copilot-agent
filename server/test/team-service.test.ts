@@ -76,14 +76,12 @@ const { team } = createTestStack(db, memberService, stub as unknown as CopilotSe
 const sendRaw = team.sendMessage.bind(team);
 
 /**
- * `POST /messages` 返回的是 `wakes[]`（group 房间一条消息可以唤醒多个 Member），
- * 不再有单个 executionId。这个文件里的用例都是「一个收件人」的场景，
- * 包一层把那条 execution 找回来，断言本身不用改。
+ * `POST /messages` 返回的是 `wakes[]`（Task 模式下最多唤醒 Lead 一个），
+ * 不再有单个 executionId。包一层把那条 execution 找回来，断言本身不用改。
  */
 async function sendMessage(input: {
   conversationId: string;
   content: string;
-  targetMemberId?: string;
   replyToMessageId?: string;
 }) {
   const result = await sendRaw(input);
@@ -151,13 +149,12 @@ before(() => {
   archivist = team.createMember({ name: 'Archivist', role: 'Knowledge Manager' });
 
   const conversation = team.createConversation({
-    kind: 'group',
+    kind: 'task',
     title: 'Investment Review Team',
     memberIds: [researcher.id, coder.id, reviewer.id, analyst.id, archivist.id],
   });
   // 这个 group 是给 delegation / 审计链用例当「同一个房间里的多个 Member」用的。
-  // 每一轮都显式点名（targetMemberId 只唤醒一个人），Member 的回复也不会
-  // 自动唤醒别人，所以不需要静音来压制广播。共享讨论本身由 team-chat.test.ts 覆盖。
+  // 用户消息只唤醒 Lead（researcher），delegation 走显式协作。
   teamConversationId = conversation.id;
 });
 
@@ -234,16 +231,16 @@ describe('Member 是跨 conversation 的长期身份', () => {
 describe('Conversation / Runtime 边界', () => {
   it('同一个 Member 在不同 Conversation 拥有不同 Runtime', async () => {
     const other = team.createConversation({
-      kind: 'direct',
+      kind: 'task',
       memberIds: [researcher.id],
-      defaultMemberId: researcher.id,
+      leadMemberId: researcher.id,
     });
 
     // Runtime 是懒创建的：先各跑一轮，runtime 才落库
+    // （团队工作区的 Lead 恰好是 researcher，所以这一轮由他处理）
     const inTeam = await sendMessage({
       conversationId: teamConversationId,
       content: '团队会话里的一轮',
-      targetMemberId: researcher.id,
     });
     const inSolo = await sendMessage({
       conversationId: other.id,
@@ -269,85 +266,77 @@ describe('Conversation / Runtime 边界', () => {
     );
   });
 
-  it('只有 group 允许增减成员，direct / work 的成员固定', () => {
-    const solo = team.createConversation({
+  it('只有 Task 工作区允许增减成员，direct 私聊的成员固定', () => {
+    const dm = team.createConversation({
       kind: 'direct',
-      memberIds: [coder.id],
-      defaultMemberId: coder.id,
+      memberIds: [coder.id, reviewer.id],
     });
-    assert.throws(() => team.removeMember(solo.id, coder.id), /只有 group 允许增减成员/);
-    assert.throws(() => team.addMember(solo.id, reviewer.id), /只有 group 允许增减成员/);
+    assert.throws(() => team.removeMember(dm.id, coder.id), /只有 Task 工作区允许增减成员/);
+    assert.throws(() => team.addMember(dm.id, analyst.id), /只有 Task 工作区允许增减成员/);
 
     const work = team.createConversation({
-      kind: 'work',
+      kind: 'task',
       memberIds: [coder.id],
-      defaultMemberId: coder.id,
+      leadMemberId: coder.id,
     });
-    assert.throws(() => team.addMember(work.id, reviewer.id), /只有 group 允许增减成员/);
+    const grown = team.addMember(work.id, reviewer.id);
+    assert.equal(grown.members.length, 2);
+    const shrunk = team.removeMember(work.id, reviewer.id);
+    assert.equal(shrunk.members.length, 1);
   });
 
   it('kind 的形状约束在 Service 层强制（API 是公开的）', () => {
-    // direct 允许 1~2 个 Member：1 个 = 用户 ↔ Member，2 个 = Member ↔ Member 私聊。
-    // 3 个就不是 direct 了。
+    // direct = Member 私聊，必须恰好两个人。
+    assert.throws(
+      () => team.createConversation({ kind: 'direct', memberIds: [coder.id] }),
+      /必须恰好两个成员/,
+    );
     assert.throws(
       () =>
         team.createConversation({
           kind: 'direct',
           memberIds: [coder.id, reviewer.id, analyst.id],
         }),
-      /单聊需要一个成员/,
+      /必须恰好两个成员/,
     );
     assert.equal(
       team.createConversation({ kind: 'direct', memberIds: [coder.id, reviewer.id] }).members.length,
       2,
       '两个 Member 的 direct = Member 私聊，必须允许',
     );
-    assert.throws(
-      () => team.createConversation({ kind: 'group', memberIds: [coder.id] }),
-      /群聊至少需要两个成员/,
-    );
-    assert.throws(
-      () => team.createConversation({ kind: 'work', memberIds: [coder.id, reviewer.id] }),
-      /work 会话只能有一个成员/,
+    // task 需要 1~20 个成员。
+    assert.throws(() => team.createConversation({ kind: 'task', memberIds: [] }), /至少需要一个/);
+    assert.equal(
+      team.createConversation({ kind: 'task', memberIds: [coder.id] }).members.length,
+      1,
+      '单个成员的 Task 工作区必须允许',
     );
   });
 
-  it('defaultMemberId 只对 1:1 房间成立：越界报 400，group 直接拒绝', () => {
-    // 1:1 房间：必须是 roster 里的人
+  it('leadMemberId 必须是工作区里的人，不传默认第一个成员', () => {
     assert.throws(
       () =>
         team.createConversation({
-          kind: 'direct',
+          kind: 'task',
           memberIds: [coder.id, reviewer.id],
-          defaultMemberId: 'not-in-conversation',
+          leadMemberId: 'not-in-conversation',
         }),
-      /指定的默认收件人必须在这个会话里/,
+      /指定的 Lead 必须在这个工作区里/,
     );
 
-    // group：这个字段在这里没有语义，显式传了要报错而不是被默默忽略 ——
-    // 静默忽略会让调用方以为自己设置成功了，然后把它当成默认收件人。
-    assert.throws(
-      () =>
-        team.createConversation({
-          kind: 'group',
-          memberIds: [coder.id, reviewer.id],
-          defaultMemberId: coder.id,
-        }),
-      /群聊不需要也不能指定默认收件人/,
-    );
-
-    const group = team.createConversation({
-      kind: 'group',
+    const work = team.createConversation({
+      kind: 'task',
       memberIds: [coder.id, reviewer.id],
     });
-    assert.equal(group.defaultMemberId, null);
+    assert.equal(work.leadMemberId, coder.id);
+    assert.equal(work.status, 'intake');
   });
 
   it('listMessages 返回最近 N 条且按时间正序', async () => {
     const conversation = team.createConversation({
-      kind: 'direct',
+      kind: 'task',
       memberIds: [reviewer.id],
-      defaultMemberId: reviewer.id,
+      leadMemberId: reviewer.id,
     });
 
     let lastExecutionId = '';
@@ -395,7 +384,11 @@ describe('Member 生命周期边界', () => {
   }
 
   it('还有 execution 在跑时不能归档，跑完就可以', async () => {
-    const conversation = team.createConversation({ kind: 'direct', memberIds: [archivist.id] });
+    const conversation = team.createConversation({
+      kind: 'task',
+      memberIds: [archivist.id],
+      leadMemberId: archivist.id,
+    });
 
     await whileBusy(async () => {
       const { executionId } = await sendMessage({
@@ -419,9 +412,9 @@ describe('Member 生命周期边界', () => {
     team.updateMember(archivist.id, { status: 'active' });
   });
 
-  it('排队中的唤醒同样算「有活」，不能归档也不能移出', async () => {
+  it('Lead 忙时新消息不重复入队，忙时不能归档也不能移出', async () => {
     const group = team.createConversation({
-      kind: 'group',
+      kind: 'task',
       memberIds: [archivist.id, reviewer.id],
     });
 
@@ -429,22 +422,15 @@ describe('Member 生命周期边界', () => {
       const first = await sendMessage({
         conversationId: group.id,
         content: '第一轮',
-        targetMemberId: archivist.id,
       });
       await waitForStatus(first.executionId, 'running');
 
-      // 第二轮落进 pending，还没开跑 —— 用 sendRaw：这一轮此刻还没有 execution，
-      // 这正是要断言的状态。
-      await sendRaw({
+      // Lead 忙时新的用户消息只落库、不重复入队 —— 消息靠 checkpoint 被下一轮看到。
+      const second = await sendRaw({
         conversationId: group.id,
         content: '第二轮',
-        targetMemberId: archivist.id,
       });
-
-      const state = team
-        .listConversationState(group.id)
-        .find((item) => item.memberId === archivist.id);
-      assert.equal(state?.pendingWake, true, '前置条件：应该有一条排队的唤醒');
+      assert.equal(second.wakes.length, 0, 'Lead 忙时不该重复入队');
 
       assert.throws(() => team.updateMember(archivist.id, { status: 'archived' }), /不能归档/);
       assert.throws(() => team.removeMember(group.id, archivist.id), /不能移出/);
@@ -455,16 +441,13 @@ describe('Member 生命周期边界', () => {
 
   it('移出再重新加入拿到全新的 Copilot session，不从旧上下文续写', async () => {
     const group = team.createConversation({
-      kind: 'group',
-      memberIds: [coder.id, reviewer.id, analyst.id],
+      kind: 'task',
+      memberIds: [analyst.id, coder.id, reviewer.id],
+      leadMemberId: analyst.id,
     });
 
-    // 先让 analyst 在房间里跑一轮，把 runtime 用起来
-    const first = await sendMessage({
-      conversationId: group.id,
-      content: '记录一下',
-      targetMemberId: analyst.id,
-    });
+    // 先让 analyst（Lead）在房间里跑一轮，把 runtime 用起来
+    const first = await sendMessage({ conversationId: group.id, content: '记录一下' });
     await waitForStatus(first.executionId, 'completed');
     await waitForConversationIdle(group.id);
 
@@ -505,7 +488,6 @@ describe('delegation 业务控制', () => {
     const { executionId } = await sendMessage({
       conversationId: teamConversationId,
       content: '先研究这个问题',
-      targetMemberId: researcher.id,
     });
     await waitForStatus(executionId, 'completed');
 
@@ -535,7 +517,6 @@ describe('delegation 业务控制', () => {
     const { executionId } = await sendMessage({
       conversationId: teamConversationId,
       content: '多层 cycle 测试起点',
-      targetMemberId: researcher.id,
     });
     await waitForStatus(executionId, 'completed');
 
@@ -588,7 +569,6 @@ describe('delegation 业务控制', () => {
     const { executionId } = await sendMessage({
       conversationId: teamConversationId,
       content: 'depth 测试起点',
-      targetMemberId: researcher.id,
     });
     await waitForStatus(executionId, 'completed');
 
@@ -635,7 +615,6 @@ describe('delegation 业务控制', () => {
     const { executionId } = await sendMessage({
       conversationId: teamConversationId,
       content: 'parent 归属测试',
-      targetMemberId: researcher.id,
     });
     await waitForStatus(executionId, 'completed');
 

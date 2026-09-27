@@ -83,7 +83,7 @@ MUTATIONS = [
         "steps": [
             (
                 "server/capabilities/providers/filesystem-knowledge.ts",
-                "    if (kb.scope === 'personal' && kb.memberId !== memberId) {\n      throw forbidden('该 Member 没有访问这个 Knowledge Base 的权限');\n    }\n",
+                "    if (kb.scope === 'personal' && kb.memberId !== memberId) {\n      throw forbidden('这是别人的个人资料库，没有权限查看');\n    }\n",
                 "",
             )
         ],
@@ -212,7 +212,7 @@ MUTATIONS = [
         "steps": [
             (
                 "server/team-structure-service.ts",
-                "    if (!memberInConversation) {\n      throw badRequest('Schedule 的 Member 必须属于绑定的 work conversation');\n    }",
+                "    if (!memberInConversation) {\n      throw badRequest('定时任务的执行成员必须在这个 Task 工作区里');\n    }",
                 "",
             )
         ],
@@ -223,7 +223,7 @@ MUTATIONS = [
         "steps": [
             (
                 "server/team-structure-service.ts",
-                "    if (current.status === 'completed' && status === 'active') {\n      throw conflict('已完成的 once schedule 不能 resume');\n    }",
+                "    if (current.status === 'completed' && status === 'active') {\n      throw conflict('一次性定时任务已经跑完，不能重新开启');\n    }",
                 "",
             )
         ],
@@ -256,7 +256,7 @@ MUTATIONS = [
         "steps": [
             (
                 "server/team-structure-service.ts",
-                "      if (row.n === 0) {\n        throw conflict('Team 至少必须保留一个 active owner');\n      }",
+                "      if (row.n === 0) {\n        throw conflict('团队至少要保留一个未归档的 owner');\n      }",
                 "",
             )
         ],
@@ -338,52 +338,7 @@ MUTATIONS = [
             )
         ],
     },
-    {
-        "name": "Member 发言自动唤醒别人（自动接龙回来）",
-        "test": "server/test/group-dispatcher.test.ts",
-        "steps": [
-            (
-                "server/group-dispatcher.ts",
-                "    if (message.senderType === 'member') {",
-                "    if (false) {",
-            )
-        ],
-    },
-    {
-        "name": "everyone 拿不到「可以沉默」的指令（出口没关）",
-        "test": "server/test/team-chat.test.ts",
-        "steps": [
-            ("server/context-assembler.ts", "  if (reason === 'everyone') {", "  if (reason === null) {")
-        ],
-    },
-    {
-        "name": "认不出的唤醒原因变成必须回答（宁可误报也不沉默）",
-        "test": "server/test/team-chat.test.ts",
-        "steps": [
-            (
-                "server/conversation-member-service.ts",
-                "  return 'everyone';",
-                "  return 'direct';",
-            )
-        ],
-    },
-    {
-        "name": "mention 合并时输给更弱的唤醒（点名被降级成顺带看看）",
-        "test": "server/test/team-chat.test.ts",
-        "steps": [("server/member-turn-scheduler.ts", "  mention: 2,", "  mention: 0,")],
-    },
     # ── 唤醒原因的持久化读回 ──────────────────────────────────────────────
-    {
-        "name": "mention 没进读回白名单（崩溃恢复时点名被降级成顺带看看）",
-        "test": "server/test/team-chat.test.ts",
-        "steps": [
-            (
-                "server/conversation-member-service.ts",
-                "  mention: true,\n  direct: true,",
-                "  direct: true,",
-            )
-        ],
-    },
     # ── Member 记忆隔离：Team 上下文不出 Team ─────────────────────────────
     {
         "name": "remember_member 写全局（Team 上下文漏进所有 Team）",
@@ -396,53 +351,7 @@ MUTATIONS = [
             )
         ],
     },
-    {
-        "name": "prompt 里不注入 Team 上下文（换 Team 也看不到）",
-        "test": "server/test/team-chat.test.ts",
-        "steps": [
-            (
-                "server/team-service.ts",
-                "    const teamMemory = this.members.readTeamMemory(member.id, conversation.teamId);",
-                "    const teamMemory = '';",
-            )
-        ],
-    },
     # ── 哨兵不能泄漏到客户端 ──────────────────────────────────────────────
-    {
-        "name": "流式路径不过滤哨兵（用户会先看到 <NO_REPLY> 再看着它消失）",
-        "test": "server/test/team-chat.test.ts",
-        "steps": [
-            ("server/team-service.ts", "          const visible = streamGate.push(delta);", "          const visible = delta;")
-        ],
-    },
-    {
-        "name": "收尾时不看判定结果（skip 的尾巴 = 哨兵本身，直接放出去）",
-        "test": "server/test/team-chat.test.ts",
-        "steps": [
-            (
-                "server/team-service.ts",
-                "      const tail = streamGate.flush(outcome.decision);",
-                "      const tail = streamGate.flush('reply');",
-            )
-        ],
-    },
-    {
-        # 同一条变异，但钉在**客户端真正看到的字节流**上。
-        #
-        # 这一条单独存在是因为 SSE 断言有个非常容易踩的空绿：`message.delta` 是
-        # 逐字符的，每个字符各占一帧，所以 `<NO_REPLY>` 在原始 body 里从来不会连续
-        # 出现 —— 直接对 body 做字符串匹配**永远**为 false，包括哨兵真的漏出去时。
-        # 必须解析帧、把 delta 拼起来再断言。这条变异保证那个解析真的做了。
-        "name": "SSE 把 delta 原样转发（客户端会看到哨兵长出来再消失）",
-        "test": "server/test/conversations-api.test.ts",
-        "steps": [
-            (
-                "server/team-service.ts",
-                "          const visible = streamGate.push(delta);",
-                "          const visible = delta;",
-            )
-        ],
-    },
     # ── Capability 三层（global + team + member）────────────────────────────
     {
         "name": "三层合并顺序反了（member 被 global 盖住）",
@@ -620,6 +529,84 @@ MUTATIONS = [
                 "server/db-migrations.ts",
                 "CREATE INDEX idx_message_file_file\n  ON conversation_message_file(file_id);\n\n",
                 "",
+            )
+        ],
+    },
+    # ── Task 状态层 ─────────────────────────────────────────────────────
+    {
+        "name": "plan 不翻译依赖 key（依赖永远对不上，B 一直 pending）",
+        "test": "server/test/task-service.test.ts",
+        "steps": [
+            (
+                "server/task-service.ts",
+                "          dependencies_json: JSON.stringify((task.dependencies ?? []).map((dep) => idByKey.get(dep) ?? dep)),",
+                "          dependencies_json: JSON.stringify(task.dependencies ?? []),",
+            )
+        ],
+    },
+    {
+        "name": "plan 不检查循环依赖（A→B→A 直接落库）",
+        "test": "server/test/task-service.test.ts",
+        "steps": [
+            (
+                "server/task-service.ts",
+                "    validateNoCycle(keys, input.tasks.map((task) => task.dependencies ?? []));\n",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "update_task 不校验执行人（谁都能改别人的任务）",
+        "test": "server/test/task-service.test.ts",
+        "steps": [
+            (
+                "server/task-service.ts",
+                "    if (task.assigneeMemberId !== input.memberId) {\n      throw badRequest('只能更新分给自己的任务');\n    }\n",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "非 Lead 也能规划任务（越权）",
+        "test": "server/test/task-service.test.ts",
+        "steps": [
+            (
+                "server/task-service.ts",
+                "    if (input.leadMemberId && input.memberId !== input.leadMemberId) {\n      throw badRequest('只有负责这个工作的 Lead 才能制定任务计划');\n    }\n",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "Task turn 结束不自动收尾（任务永远停在 running）",
+        "test": "server/test/task-service.test.ts",
+        "steps": [
+            (
+                "server/team-service.ts",
+                "        this.tasks.markCompleted(taskAfterTurn.id, content || undefined);",
+                "        void content;",
+            )
+        ],
+    },
+    {
+        "name": "Lead 忙时重复入队（同一轮被跑两遍）",
+        "test": "server/test/team-service.test.ts",
+        "steps": [
+            (
+                "server/task-orchestrator.ts",
+                "    if (this.scheduler.isBusy(conversationId, leadMemberId)) return false;\n",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "恢复时 running 的 Task 不置 blocked（重启后 UI 还显示在跑）",
+        "test": "server/test/task-service.test.ts",
+        "steps": [
+            (
+                "server/recovery-service.ts",
+                "          WHERE status = 'running'\n          `,\n        )\n        .run('服务重启导致执行中断，检查后可重试', timestamp);",
+                "          WHERE status = 'never-running'\n          `,\n        )\n        .run('服务重启导致执行中断，检查后可重试', timestamp);",
             )
         ],
     },

@@ -1,19 +1,19 @@
 import { useEffect, useRef, useState } from 'react';
-import { Alert, Empty, Layout, Space, Tag } from 'antd';
+import { Alert, Empty, Layout, Space, Tag, Typography } from 'antd';
 import type { Member } from '../lib/api';
 import { useRoute } from '../lib/router';
 import { ConversationHeader } from './team/ConversationHeader';
 import { ConversationMessages } from './team/ConversationMessages';
+import { TaskPanel } from './team/TaskPanel';
 import { ConversationFilesDrawer } from './team/ConversationFilesDrawer';
 import { ConversationFilePicker } from './team/ConversationFilePicker';
 import { MessageComposer } from './team/MessageComposer';
 import { MemberProfile } from './team/MemberProfile';
 import { TeamManagement } from './team/TeamManagement';
 import { CapabilitySettings } from './team/CapabilitySettings';
-import { GroupCreator } from './team/GroupCreator';
 import { ConversationSidebar } from './chat/ConversationSidebar';
 import { WorkspaceNav } from './workspace/WorkspaceNav';
-import { WorkCreator } from './team/WorkCreator';
+import { TaskCreator } from './team/TaskCreator';
 import { ResizableSider } from './ResizableSider';
 import { STATUS_LABEL, useWorkspaceData } from './workspace/useWorkspaceData';
 import { useWorkspaceActions } from './workspace/useWorkspaceActions';
@@ -43,9 +43,8 @@ export function Workspace() {
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  /** 三个创建窗口互不干扰：各管各的开关。 */
-  const [newDiscussionOpen, setNewDiscussionOpen] = useState(false);
-  const [newWorkOpen, setNewWorkOpen] = useState(false);
+  /** 创建窗口的开关。 */
+  const [newTaskOpen, setNewTaskOpen] = useState(false);
   const [newMemberOpen, setNewMemberOpen] = useState(false);
   /**
    * 正在编辑档案的 Member。
@@ -79,8 +78,7 @@ export function Workspace() {
     selectedFileIds,
     setSelectedFileIds,
     setEditingMemberId,
-    setNewDiscussionOpen,
-    setNewWorkOpen,
+    setNewTaskOpen,
     setNewMemberOpen,
   });
 
@@ -94,8 +92,8 @@ export function Workspace() {
     delegations,
     conversationStates,
     conversationFiles,
-    recipientMemberId,
-    setRecipientMemberId,
+    tasks,
+    applyTaskChanged,
     notice,
     setNotice,
     memberById,
@@ -108,7 +106,8 @@ export function Workspace() {
     applyConversationChanged,
     applyMemberSaved,
   } = data;
-  const { createDirect, createGroup, createWork, createMember, archiveMember, send, uploadFile, deleteFile } =
+  void applyTaskChanged;
+  const { createTask, createMember, archiveMember, send, uploadFile, deleteFile, retryTask, cancelTask } =
     actions;
 
   const editingMember = editingMemberId ? (memberById.get(editingMemberId) ?? null) : null;
@@ -189,8 +188,7 @@ export function Workspace() {
             conversations={conversations}
             selectedConversationId={conversationId}
             onSelectConversation={selectConversation}
-            onNewDiscussion={() => setNewDiscussionOpen(true)}
-            onNewWork={() => setNewWorkOpen(true)}
+            onNewTask={() => setNewTaskOpen(true)}
           />
         </ResizableSider>
       )}
@@ -215,7 +213,14 @@ export function Workspace() {
             onToggleNewMember={() => setNewMemberOpen((value) => !value)}
             onCreateMember={createMember}
             onCancelNewMember={() => setNewMemberOpen(false)}
-            onChatMember={(member) => void createDirect(member)}
+            onNewTaskWithMember={(member) =>
+              void createTask({
+                title: `${member.name} 的工作区`,
+                memberIds: [member.id],
+                leadMemberId: member.id,
+                jiraKey: '',
+              })
+            }
             onViewMember={(member) => setEditingMemberId(member.id)}
             onManageMemberCapabilities={manageMemberCapabilities}
             onArchiveMember={(member) => void archiveMember(member)}
@@ -250,6 +255,7 @@ export function Workspace() {
               allMembers={members}
               states={conversationStates}
               memberStatus={memberStatus}
+              memberLabel={memberLabel}
               fileCount={conversationFiles.length}
               onOpenFiles={() => setFilesDrawerOpen(true)}
               onConversationChanged={applyConversationChanged}
@@ -273,14 +279,37 @@ export function Workspace() {
               </Space>
             )}
 
-            <ConversationMessages
-              conversation={selectedConversation}
-              messages={messages}
-              streaming={streaming}
-              delegations={delegations}
-              memberLabel={memberLabel}
-              scrollRef={scrollRef}
-            />
+            <div style={{ display: 'flex', gap: 12, padding: '8px 18px 0', minHeight: 0, flex: 1 }}>
+              {selectedConversation.kind === 'task' && (
+                <div style={{ width: 300, flexShrink: 0, overflowY: 'auto' }}>
+                  <TaskPanel
+                    conversation={selectedConversation}
+                    tasks={tasks.filter((task) => task.conversationId === selectedConversation.id)}
+                    memberLabel={memberLabel}
+                    onRetryTask={(taskId) => void retryTask(taskId)}
+                    onCancelTask={(taskId) => void cancelTask(taskId)}
+                  />
+                </div>
+              )}
+              <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                  动态
+                </Typography.Text>
+                <ConversationMessages
+                  conversation={selectedConversation}
+                  messages={messages}
+                  streaming={streaming}
+                  delegations={delegations}
+                  memberLabel={memberLabel}
+                  taskLabel={(taskId) =>
+                    taskId
+                      ? (tasks.find((task) => task.id === taskId)?.title ?? null)
+                      : null
+                  }
+                  scrollRef={scrollRef}
+                />
+              </div>
+            </div>
 
             {notice && (
               <Alert
@@ -300,8 +329,6 @@ export function Workspace() {
               onSend={() => void send()}
               busy={busy}
               disabled={!conversationId}
-              recipientMemberId={recipientMemberId}
-              onRecipientChange={setRecipientMemberId}
               selectedFiles={selectedFiles}
               onRemoveFile={(fileId) =>
                 setSelectedFileIds((current) => current.filter((id) => id !== fileId))
@@ -321,18 +348,11 @@ export function Workspace() {
         />
       )}
 
-      <GroupCreator
-        open={newDiscussionOpen}
+      <TaskCreator
+        open={newTaskOpen}
         members={members}
-        onCreate={createGroup}
-        onCancel={() => setNewDiscussionOpen(false)}
-      />
-
-      <WorkCreator
-        open={newWorkOpen}
-        members={members}
-        onCreate={createWork}
-        onCancel={() => setNewWorkOpen(false)}
+        onCreate={createTask}
+        onCancel={() => setNewTaskOpen(false)}
       />
 
       {selectedConversation && (

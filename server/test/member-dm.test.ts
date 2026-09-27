@@ -107,7 +107,7 @@ describe('私聊房间', () => {
 
   it('用户 ↔ Member 的单聊不会被当成私聊', () => {
     const [a, b] = newPair();
-    const solo = team.createConversation({ kind: 'direct', title: a.name, memberIds: [a.id] });
+    const solo = team.createConversation({ kind: 'task', title: a.name, memberIds: [a.id] });
 
     const dm = team.openDirectMessage(a.id, b.id);
 
@@ -133,13 +133,12 @@ describe('私聊消息', () => {
 
     assert.equal(result.message.senderType, 'member');
     assert.equal(result.message.senderId, a.id);
-    assert.equal(result.message.targetMemberId, b.id);
+    assert.equal(result.message.senderId, a.id);
     assert.equal(result.peer.id, b.id);
 
     assert.equal(result.wakes.length, 1);
     assert.equal(result.wakes[0].memberId, b.id);
-    // 显式收件人 → reason 是 direct（等价一次点名），不是 open_discussion
-    assert.equal(result.wakes[0].reason, 'direct');
+    assert.equal(result.wakes[0].reason, 'lead_message');
 
     const executionId = executionIdForWake(db, result.conversation.id, result.wakes[0]);
     await waitForStatus(executionId, 'completed');

@@ -36,6 +36,7 @@ import { knowledgeRouter } from './routes/knowledge.js';
 import { internalRouter } from './routes/internal.js';
 import { conversationsRouter } from './routes/conversations.js';
 import { executionsRouter } from './routes/executions.js';
+import { tasksRouter } from './routes/tasks.js';
 import { teamRouter } from './routes/team.js';
 import { workManagementRouter, describeWebhookBoundary } from './routes/work-management.js';
 import { errorHandler } from './middleware/errorHandler.js';
@@ -99,6 +100,9 @@ registry.registerToolProvider(
     delegateMember: (input) => teamService.delegateMember(input),
     rememberMember: (input) => teamService.rememberMember(input),
     messageMember: (input) => teamService.messageMember(input),
+    requestClarification: (input) => teamService.requestClarification(input),
+    planTasks: (input) => teamService.planTasks(input),
+    updateTask: (input) => teamService.updateTask(input),
   }),
 );
 registry.registerToolProvider(new KnowledgeToolProvider());
@@ -220,6 +224,7 @@ app.use('/api/team', teamRouter(structureService, teamEvents));
 app.use('/api/work-management', workManagementRouter(teamService, workManagement));
 app.use('/api/conversations', conversationsRouter(teamService, conversationFiles, conversationFileProcessor, localKnowledgeProvider));
 app.use('/api/executions', executionsRouter(teamService));
+app.use('/api/tasks', tasksRouter(teamService));
 // 以某个 Member 的身份说话 —— 独立的命名空间 + token 门禁，见 middleware/apiScope.ts
 app.use('/api/internal', internalRouter(teamService));
 

@@ -10,7 +10,7 @@ interface MemberListProps {
   onToggleNewMember: () => void;
   onCreateMember: (input: { name: string; role: string }) => Promise<void>;
   onCancelNewMember: () => void;
-  onChat: (member: Member) => void;
+  onNewTask: (member: Member) => void;
   onViewProfile: (member: Member) => void;
   onManageCapabilities: (member: Member) => void;
   onArchive: (member: Member) => void;
@@ -27,9 +27,8 @@ const AVAILABILITY_DOT: Record<string, 'success' | 'warning' | 'default' | 'erro
 /**
  * Team 管理面的 Members 页。
  *
- * 每一行只有一个主动作 —— Open chat（使用这个 Member）。
- * 管理类动作（看档案、配能力、归档）收进 `...` 菜单：使用与管理是两个层次，
- * 并排成 Chat / Edit 会让人以为是两个平行产品。
+ * 每一行只有一个主动作 —— New task（以这个 Member 为 Lead 开一个工作区）。
+ * 管理类动作（看档案、配能力、归档）收进 `...` 菜单：使用与管理是两个层次。
  *
  * 布局不用 antd List：它的 actions 与 Meta 在窄侧栏里互相挤压，
  * 长名字/长 role 会被折成一行一个词。这里用显式 flex + minWidth:0 + ellipsis，
@@ -41,7 +40,7 @@ export function MemberList({
   onToggleNewMember,
   onCreateMember,
   onCancelNewMember,
-  onChat,
+  onNewTask,
   onViewProfile,
   onManageCapabilities,
   onArchive,
@@ -123,9 +122,9 @@ export function MemberList({
                     type="link"
                     size="small"
                     icon={<MessageOutlined />}
-                    onClick={() => onChat(member)}
+                    onClick={() => onNewTask(member)}
                   >
-                    Open chat
+                    New task
                   </Button>
                   <Dropdown
                     menu={{

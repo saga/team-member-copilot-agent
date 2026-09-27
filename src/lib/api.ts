@@ -213,14 +213,44 @@ export interface ScheduledWake {
   updatedAt: string;
 }
 
+export type ConversationStatus =
+  | 'intake'
+  | 'waiting_user'
+  | 'running'
+  | 'blocked'
+  | 'completed'
+  | 'cancelled';
+
+export interface TaskRequirementFact {
+  key: string;
+  value: string;
+  source: 'user' | 'jira' | 'knowledge' | 'conversation' | 'agent';
+  confirmed: boolean;
+}
+
+export interface TaskRequirements {
+  facts: TaskRequirementFact[];
+  assumptions: string[];
+  constraints: string[];
+  successCriteria: string[];
+}
+
 export interface Conversation {
   id: string;
   teamId: string;
   /** 这间会话围绕哪条外部工作（Jira 工单）。业务状态在 Jira，这里只是引用。 */
   externalWorkRef: ExternalWorkRef | null;
   title: string;
-  kind: 'direct' | 'group' | 'work';
-  defaultMemberId: string | null;
+  kind: 'task' | 'direct';
+  /** 这次工作的总体目标。 */
+  objective: string;
+  /** 当前负责澄清需求、维护任务整体状态的 Member。 */
+  leadMemberId: string | null;
+  status: ConversationStatus;
+  /** 已确认的业务 context。 */
+  requirements: TaskRequirements;
+  /** 当前还缺哪些必须由用户回答的信息。 */
+  openQuestions: string[];
   createdBy: string;
   /** 会话内单调递增的 event 游标，等于 SSE 的 Last-Event-ID。 */
   eventSequence: number;
@@ -229,6 +259,32 @@ export interface Conversation {
   createdAt: string;
   updatedAt: string;
   members: Member[];
+}
+
+export type ConversationTaskStatus =
+  | 'pending'
+  | 'ready'
+  | 'running'
+  | 'blocked'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
+
+export interface ConversationTask {
+  id: string;
+  conversationId: string;
+  title: string;
+  description: string;
+  assigneeMemberId: string;
+  status: ConversationTaskStatus;
+  dependencies: string[];
+  acceptanceCriteria: string[];
+  result: string | null;
+  blocker: string | null;
+  currentExecutionId: string | null;
+  sortOrder: number;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export type ConversationFileStatus = 'processing' | 'ready' | 'failed' | 'deleted';
@@ -262,8 +318,9 @@ export interface ConversationMessage {
   messageSequence: number;
   senderType: 'user' | 'member' | 'system';
   senderId: string;
-  targetMemberId: string | null;
   replyToMessageId: string | null;
+  /** 这条消息属于哪个 Task 的进展，null = 整个工作的通用消息。 */
+  taskId: string | null;
   /** 发送时带的幂等键；null = 这条消息不参与去重。 */
   clientRequestId: string | null;
   content: string;
@@ -323,6 +380,8 @@ export interface ExecutionRecord {
   id: string;
   conversationId: string;
   memberId: string;
+  /** 这次运行属于哪个 Task，null = Lead 处理用户输入。 */
+  taskId: string | null;
   /** 开始时快照的引用（取自 conversation），历史事实不随后续改动漂移。 */
   externalWorkRef: ExternalWorkRef | null;
   /** 开跑那一刻向 Jira 取证的结果。null = 没挂业务 / 取证失败 / 未配置。 */
@@ -351,34 +410,30 @@ export interface ExecutionRecord {
 }
 
 /**
- * 为什么唤醒这个 Member。确定性规则的产物（见 server/group-dispatcher.ts），
- * 不是 LLM routing：
- *   direct          1:1 房间，或请求里显式指定了 targetMemberId
- *   mention         消息里 @ 了它
- *   open_discussion 用户没 @ 任何人，让房间成员自行判断要不要发言
- *   follow_up       另一个 Member 发言后顺带被唤醒（受 autoWakeRounds 限制）
+ * 为什么唤醒这个 Member。确定性规则的产物，不是 LLM routing：
+ *   lead_message 用户给 Task 工作区发消息，唤醒 Lead
+ *   task_ready   Task 依赖满足，唤醒执行人
+ *   schedule     定时唤醒
  */
-export type WakeReason = 'direct' | 'mention' | 'open_discussion' | 'follow_up' | 'schedule';
+export type WakeReason = 'lead_message' | 'task_ready' | 'schedule';
 
 /** 一条消息唤醒了哪个 Member、为什么。 */
 export interface WakePlan {
   memberId: string;
   reason: WakeReason;
-  triggerSequence: number;
+  taskId: string | null;
+  triggerSequence: number | null;
 }
 
 /**
  * POST /messages 的结果。
  *
- * 刻意**没有**单个 executionId：group 房间的一条消息可以唤醒多个 Member，
- * 各自产生一条 execution，一个字段表达不了。谁被唤醒了看 `wakes`，
+ * Task 工作区里一条用户消息只唤醒 Lead，`wakes` 最多一项。
  * 每条 execution 的进展通过 SSE 的 `execution.updated` 到达。
  */
 export interface SendMessageResult {
   message: ConversationMessage;
   wakes: WakePlan[];
-  /** 消息里 @ 了但不属于这个房间的名字；非空时服务端刻意**不**广播给全员。 */
-  unresolvedMentions: string[];
   /**
    * 命中了幂等键：返回的是**已经存在的**那条消息，`wakes` 因此必为空
    * （当时的唤醒早就发生过了）。
@@ -761,9 +816,9 @@ export const api = {
 
   createConversation(input: {
     title?: string;
-    kind?: 'direct' | 'group' | 'work';
+    kind?: 'task' | 'direct';
     memberIds: string[];
-    defaultMemberId?: string;
+    leadMemberId?: string;
     /** 围绕哪条外部工作。只传引用，工单内容在 Jira。 */
     externalWorkRef?: { provider?: 'jira'; key: string; externalId?: string | null } | null;
   }): Promise<{ conversation: Conversation }> {
@@ -915,17 +970,14 @@ export const api = {
   },
 
   /**
-   * 发一条消息。202：消息已落库、唤醒已入队，结果通过 SSE 推。
+   * 发一条消息。202：消息已落库、Lead 已唤醒，结果通过 SSE 推。
    *
-   * `targetMemberId` 只在 UI 明确点名时传（direct 房间自动就是那一个成员）。
-   * group 房间的「Everyone」必须传 undefined —— 由服务端 GroupDispatcher
-   * 决定唤醒谁。前端替服务端挑一个成员会把共享讨论降级成单人聊天。
+   * 用户不需要知道「发给谁」：Task 工作区里用户消息只唤醒 Lead。
    */
   sendMessage(
     conversationId: string,
     input: {
       content: string;
-      targetMemberId?: string;
       replyToMessageId?: string;
       /** 幂等键：同一次发送重试（响应丢了、双击）不会变成两条消息。 */
       clientRequestId?: string;
@@ -969,8 +1021,35 @@ export const api = {
     ).then(json<{ conversation: Conversation }>);
   },
 
+  /** 这个工作区的任务列表。 */
+  listTasks(conversationId: string): Promise<{ tasks: ConversationTask[] }> {
+    return fetch(
+      `${API_BASE}/api/conversations/${encodeURIComponent(conversationId)}/tasks`,
+    ).then(json<{ tasks: ConversationTask[] }>);
+  },
+
+  getTask(taskId: string): Promise<{ task: ConversationTask }> {
+    return fetch(`${API_BASE}/api/tasks/${encodeURIComponent(taskId)}`).then(
+      json<{ task: ConversationTask }>,
+    );
+  },
+
+  /** 重试：failed / blocked / cancelled → ready。 */
+  retryTask(taskId: string): Promise<{ task: ConversationTask }> {
+    return fetch(`${API_BASE}/api/tasks/${encodeURIComponent(taskId)}/retry`, {
+      method: 'POST',
+    }).then(json<{ task: ConversationTask }>);
+  },
+
+  cancelTask(taskId: string): Promise<{ task: ConversationTask }> {
+    return fetch(`${API_BASE}/api/tasks/${encodeURIComponent(taskId)}/cancel`, {
+      method: 'POST',
+    }).then(json<{ task: ConversationTask }>);
+  },
+
   /**
-   * 会话级 SSE：message.created / message.delta / execution.updated / delegation.*
+   * 会话级 SSE：message.created / message.delta / execution.updated /
+   * task.updated / conversation.updated / delegation.*
    *
    * 服务端会给 durable 事件带 `id: <sequence>`，浏览器断线重连时自动回传
    * Last-Event-ID，服务端据此补发断线期间的事件 —— 前端不需要自己记录水位。

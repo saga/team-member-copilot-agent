@@ -616,7 +616,6 @@ const sendRaw = team.sendMessage.bind(team);
 async function sendMessage(input: {
   conversationId: string;
   content: string;
-  targetMemberId?: string;
   replyToMessageId?: string;
 }) {
   const result = await sendRaw(input);
@@ -625,9 +624,9 @@ async function sendMessage(input: {
 
 function newConversation() {
   return team.createConversation({
-    kind: 'direct',
+    kind: 'task',
     memberIds: [alice.id],
-    defaultMemberId: alice.id,
+    leadMemberId: alice.id,
   });
 }
 
@@ -695,7 +694,7 @@ describe('Execution cancel 状态机', () => {
     // 真正会稳定停在 queued 的是 delegation —— 它不走 scheduler，直接堵在
     // 目标 Member 的 runtime 锁后面。
     const conv = team.createConversation({
-      kind: 'group',
+      kind: 'task',
       memberIds: [alice.id, bob.id],
     });
 
@@ -705,20 +704,34 @@ describe('Execution cancel 状态机', () => {
     });
 
     try {
-      // Alice 占住自己的 runtime
-      const aliceHeld = await sendMessage({
-        conversationId: conv.id,
-        content: 'blocker',
-        targetMemberId: alice.id,
-      });
+      // Alice 占住自己的 runtime（用户消息只唤醒 Lead）
+      const aliceHeld = await sendMessage({ conversationId: conv.id, content: 'blocker' });
       await waitForStatus(aliceHeld.executionId, 'running');
 
-      // Bob 也需要一条 parent execution 才能发起委派
-      const bobHeld = await sendMessage({
+      // Bob 的 parent execution 走 Task 建出来（Lead 是 Alice，直接调 service）
+      await team.planTasks({
         conversationId: conv.id,
-        content: 'parent',
-        targetMemberId: bob.id,
+        memberId: alice.id,
+        objective: 'queued setup',
+        requirements: { facts: [], assumptions: [], constraints: [], successCriteria: [] },
+        tasks: [{ key: 'b1', title: 'B', assigneeMemberId: bob.id }],
       });
+      let bobHeldId = '';
+      for (let attempt = 0; attempt < 400; attempt += 1) {
+        const row = db
+          .prepare(
+            `SELECT id, status FROM execution WHERE conversation_id = ? AND member_id = ?
+             ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+          )
+          .get(conv.id, bob.id) as unknown as { id: string; status: string } | undefined;
+        if (row) {
+          bobHeldId = row.id;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.ok(bobHeldId, '前置条件：Bob 应该有一条 task execution');
+      const bobHeld = { executionId: bobHeldId };
       await waitForStatus(bobHeld.executionId, 'running');
 
       // 不 await：delegateMember 在第一个 await 之前就把 child execution 落库了，
@@ -785,16 +798,33 @@ describe('Execution cancel 状态机', () => {
 describe('归档 Member 的 conversation 语义', () => {
   it('归档后保留在 roster 里（历史事实），但不能作为新的执行目标', async () => {
     const conv = team.createConversation({
-      kind: 'group',
+      kind: 'task',
       memberIds: [alice.id, bob.id],
+      leadMemberId: alice.id,
     });
-    // 这个用例只关心「bob 被点名那一轮」
-    const sent = await sendMessage({
+    // Bob 的执行记录走 Task 建出来
+    await team.planTasks({
       conversationId: conv.id,
-      content: 'first',
-      targetMemberId: bob.id,
+      memberId: alice.id,
+      objective: 'archive setup',
+      requirements: { facts: [], assumptions: [], constraints: [], successCriteria: [] },
+      tasks: [{ key: 'b1', title: 'B', assigneeMemberId: bob.id }],
     });
-    await waitForStatus(sent.executionId, 'completed');
+    let sentId = '';
+    for (let attempt = 0; attempt < 400; attempt += 1) {
+      const row = db
+        .prepare(
+          `SELECT id, status FROM execution WHERE conversation_id = ? AND member_id = ?
+           ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+        )
+        .get(conv.id, bob.id) as unknown as { id: string; status: string } | undefined;
+      if (row && row.status === 'completed') {
+        sentId = row.id;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(sentId, '前置条件：Bob 应该有一条已完成的 execution');
 
     try {
       team.updateMember(bob.id, { status: 'archived' });
@@ -807,26 +837,32 @@ describe('归档 Member 的 conversation 语义', () => {
       assert.equal(after.members.length, 2);
 
       // 2) 历史 execution 仍然可查、指向它
-      assert.equal(team.getExecution(sent.executionId).memberId, bob.id);
-      assert.equal(team.listMessages(conv.id).some((m) => m.senderId === bob.id), true);
+      assert.equal(team.getExecution(sentId).memberId, bob.id);
 
       // 3) 但不能派新活
       await assert.rejects(
-        () => sendMessage({ conversationId: conv.id, content: 'again', targetMemberId: bob.id }),
+        () =>
+          team.planTasks({
+            conversationId: conv.id,
+            memberId: alice.id,
+            objective: 'x',
+            requirements: { facts: [], assumptions: [], constraints: [], successCriteria: [] },
+            tasks: [{ key: 'b2', title: 'B2', assigneeMemberId: bob.id }],
+          }),
         /已归档/,
       );
       assert.throws(
-        () => team.retryExecution(sent.executionId),
+        () => team.retryExecution(sentId),
         /已归档/,
         'retry 也是一次新活',
       );
 
       // 4) 归档的 Member 不能被加进新 conversation
       assert.throws(
-        () => team.createConversation({ kind: 'direct', memberIds: [bob.id] }),
+        () => team.createConversation({ kind: 'task', memberIds: [bob.id] }),
         /已归档/,
       );
-      // 5) 也不能被加进已有 group
+      // 5) 也不能被加进已有工作区
       assert.throws(() => team.addMember(conv.id, bob.id), /已归档/);
     } finally {
       team.updateMember(bob.id, { status: 'active' });
@@ -839,15 +875,11 @@ describe('listExecutions', () => {
     // delegation 要求 target 在同一个 conversation 的 roster 里，
     // 所以这里必须是 group（alice + bob），不能用 newConversation()。
     const conv = team.createConversation({
-      kind: 'group',
+      kind: 'task',
       memberIds: [alice.id, bob.id],
     });
-    // 断言的是「恰好 2 条 execution」，所以每一轮都点名
-    const parent = await sendMessage({
-      conversationId: conv.id,
-      content: 'parent',
-      targetMemberId: alice.id,
-    });
+    // 用户消息只唤醒 Lead（Alice），delegation 再建一条 Bob 的 child
+    const parent = await sendMessage({ conversationId: conv.id, content: 'parent' });
     await waitForStatus(parent.executionId, 'completed');
 
     await team.delegateMember({

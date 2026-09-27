@@ -88,7 +88,7 @@ function patchState(conversationId: string, memberId: string, body: unknown) {
 }
 
 async function makeGroup(title: string): Promise<string> {
-  const response = await post({ kind: 'group', title, memberIds: [alice.id, bob.id] });
+  const response = await post({ kind: 'task', title, memberIds: [alice.id, bob.id] });
   assert.equal(response.status, 201);
   const body = (await response.json()) as { conversation: { id: string } };
   return body.conversation.id;
@@ -97,7 +97,7 @@ async function makeGroup(title: string): Promise<string> {
 describe('POST /conversations：externalWorkRef 必须穿过边界', () => {
   it('带引用的会话拿得到引用（schema 漏声明会让它静默变成 null）', async () => {
     const response = await post({
-      kind: 'work',
+      kind: 'task',
       title: 'ABC-900',
       memberIds: [alice.id],
       externalWorkRef: { provider: 'jira', key: ' ABC-900 ', externalId: '100900' },
@@ -115,7 +115,7 @@ describe('POST /conversations：externalWorkRef 必须穿过边界', () => {
 
   it('空 key 的引用 = 没有引用（不炸，也不造一条指向空工单的记录）', async () => {
     const response = await post({
-      kind: 'work',
+      kind: 'task',
       title: 'ABC-901',
       memberIds: [alice.id],
       externalWorkRef: { provider: 'jira', key: '   ' },
@@ -127,7 +127,7 @@ describe('POST /conversations：externalWorkRef 必须穿过边界', () => {
 
   it('不支持的外部系统回 400，而不是 500', async () => {
     const response = await post({
-      kind: 'work',
+      kind: 'task',
       title: 'ABC-902',
       memberIds: [alice.id],
       externalWorkRef: { provider: 'github', key: 'X-1' },
@@ -167,7 +167,7 @@ describe('PATCH /members/:memberId/state：muted', () => {
   });
 });
 
-describe('GET /events：客户端看到的东西里没有哨兵', () => {
+describe('GET /events：流式增量原样到达客户端', () => {
   interface SseFrame {
     event: string;
     data: Record<string, unknown>;
@@ -177,10 +177,8 @@ describe('GET /events：客户端看到的东西里没有哨兵', () => {
    * 把 SSE 字节流还原成客户端收到的事件序列。
    *
    * **必须解析，不能在原始 body 上找字符串。** `message.delta` 是逐字符的，
-   * 每个字符各自包在一帧 `data: {...}` 里，所以 `<NO_REPLY>` 这十个字符在原始
-   * 字节流里**从来不会连续出现** —— `body.includes('NO_REPLY')` 永远为 false，
-   * **包括哨兵真的漏出去的时候** —— 在原始 body 上找字符串是一条空绿断言，
-   * 变异验证逮到过它。
+   * 每个字符各自包在一帧 `data: {...}` 里，在原始 body 上找字符串是一条
+   * 空绿断言。
    */
   function parseSse(body: string): SseFrame[] {
     const frames: SseFrame[] = [];
@@ -226,8 +224,8 @@ describe('GET /events：客户端看到的东西里没有哨兵', () => {
     assert.fail(`没等到第 ${expected} 条终态事件，这条流是死的`);
   }
 
-  it('哨兵整条被扣住（客户端一个字都收不到），而正常回复仍然逐字到达', async () => {
-    const created = await post({ kind: 'direct', title: 'SSE Room', memberIds: [alice.id] });
+  it('回复逐字到达客户端，终态事件排在所有增量之后', async () => {
+    const created = await post({ kind: 'task', title: 'SSE Room', memberIds: [alice.id], leadMemberId: alice.id });
     assert.equal(created.status, 201);
     const { conversation } = (await created.json()) as { conversation: { id: string } };
 
@@ -259,28 +257,22 @@ describe('GET /events：客户端看到的东西里没有哨兵', () => {
         body: JSON.stringify({ content }),
       });
 
-    // 真实引擎逐字吐；不打开这个开关，过滤路径根本没被走到
+    // 真实引擎逐字吐
     stub.streamDeltas = true;
 
     try {
-      // 第一轮：这个 Member 判断自己没什么可补的
-      stub.mode = 'skip';
       assert.equal((await send('你还有补充吗')).status, 202);
       await waitForCompleted(() => body, 1);
-      assert.equal(
-        streamedText(body),
-        '',
-        `哨兵漏到客户端了 —— 用户会先看到它再看着它消失：${JSON.stringify(streamedText(body))}`,
-      );
+      assert.equal(streamedText(body), 'reply from ConvApiA', '回复必须逐字到达客户端');
 
-      // 第二轮：同一个 Member 这次开口。它证明这条流是活的 ——
-      // 上面那个空字符串是「被扣住了」，不是「流断了」。
-      stub.mode = 'reply';
       assert.equal((await send('那你现在说点什么')).status, 202);
       await waitForCompleted(() => body, 2);
-      assert.equal(streamedText(body), 'reply from ConvApiA', '正常回复必须逐字到达客户端');
+      assert.equal(
+        streamedText(body),
+        'reply from ConvApiAreply from ConvApiA',
+        '两轮增量都应该到达',
+      );
     } finally {
-      stub.mode = 'reply';
       stub.streamDeltas = false;
       controller.abort();
       await pump;

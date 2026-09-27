@@ -51,11 +51,12 @@ export class MemberTurnScheduler {
 
     this.pending.set(key, merged);
 
-    // durable 视图：连同触发消息与原因一起落库。进程在排队期间挂掉时，
-    // RecoveryService 靠这三样把同一轮原样重放出来（而不是猜一个）。
+    // durable 视图：连同触发消息、原因、Task 一起落库。进程在排队期间挂掉时，
+    // RecoveryService 靠这几样把同一轮原样重放出来（而不是猜一个）。
     this.states.setPendingWake(wake.conversationId, wake.memberId, true, {
       triggerSequence: merged.triggerSequence,
       reason: merged.reason,
+      taskId: merged.taskId,
     });
     if (!this.inFlight.has(key)) {
       this.states.setWakeStatus(wake.conversationId, wake.memberId, 'queued');
@@ -138,44 +139,34 @@ function keyOf(conversationId: string, memberId: string): string {
 }
 
 /**
- * reason 的「具体程度」。
- *
- * 合并时保留更具体的那一个：被 @ 到比「顺带唤醒」更值得回答，
- * 反过来降级会让一次明确的点名被吞掉。
+ * reason 的「具体程度」。Task 执行优先于 Lead 处理用户输入：
+ * 同一个 Member 身上，Task wake 不能被一条 Lead wake 顶掉。
  */
 const REASON_PRIORITY: Record<Exclude<WakeReason, 'schedule'>, number> = {
-  mention: 2,
-  direct: 1,
-  everyone: 0,
+  task_ready: 2,
+  lead_message: 1,
 };
 
 /**
  * 合并两条落在同一个 (conversation, member) 上的唤醒。
  *
- * **整条保留，不做字段级拼装。** 早先的实现是「reason 取更明确的、triggerSequence
- * 取更大的」分别计算，于是可能拼出一条并不存在的事件：
- *
- *   #10 "@bob 看一下"   → mention @10
- *   #11 "大家再看一下"   → everyone @11
- *   合并结果           → mention @11      ← #11 并没有点名 Bob
- *
- * ContextAssembler 会照 reason 给出「你被明确点名，必须回答」，但它指的是一条
- * 谁都没点名的消息。所以规则是：
- *
- *   更明确的 wake → 保留原来那一条（连同它的 trigger）
- *   同级 wake     → 用更新的那一条
- *   更弱的 wake   → 不覆盖已有的明确 wake
- *
- * 被丢掉的那条消息并没有消失：ContextAssembler 注入的是「自 checkpoint 以来的
- * 全部消息」，不是「触发消息」一条，所以两条消息都会进 prompt。
+ * **整条保留，不做字段级拼装。** 不同 Task 的 wake 不合并：它们是两件不同的事，
+ * 拼起来会让执行人对着错误的 Task 跑。
  */
 function mergeWake(current: PendingWake, incoming: PendingWake): PendingWake {
-  const currentPriority = REASON_PRIORITY[current.reason];
-  const incomingPriority = REASON_PRIORITY[incoming.reason];
-
+  if ((current.taskId ?? null) !== (incoming.taskId ?? null)) {
+    const currentPriority = REASON_PRIORITY[current.reason] ?? 0;
+    const incomingPriority = REASON_PRIORITY[incoming.reason] ?? 0;
+    if (incomingPriority > currentPriority) return incoming;
+    return current;
+  }
+  const currentPriority = REASON_PRIORITY[current.reason] ?? 0;
+  const incomingPriority = REASON_PRIORITY[incoming.reason] ?? 0;
   if (incomingPriority > currentPriority) return incoming;
   if (incomingPriority === currentPriority) {
-    return incoming.triggerSequence > current.triggerSequence ? incoming : current;
+    const currentSeq = current.triggerSequence ?? 0;
+    const incomingSeq = incoming.triggerSequence ?? 0;
+    return incomingSeq > currentSeq ? incoming : current;
   }
   return current;
 }

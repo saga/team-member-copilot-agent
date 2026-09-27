@@ -1,9 +1,9 @@
 import { useState } from 'react';
-import { Button, Dropdown, Select, Space } from 'antd';
+import { Button, Dropdown, Space } from 'antd';
 import { PaperClipOutlined } from '@ant-design/icons';
 import { Sender } from '@ant-design/x';
 import type { Conversation, ConversationFile } from '../../lib/api';
-import { EVERYONE, isMemberDm } from './constants';
+import { isMemberDm } from './constants';
 import { FileChip } from './FileAttachmentCard';
 
 interface MessageComposerProps {
@@ -13,9 +13,6 @@ interface MessageComposerProps {
   onSend: () => void;
   busy: boolean;
   disabled: boolean;
-  /** group：这条消息发给谁（Everyone 空串 / 某个成员 id）。Header 不管这个。 */
-  recipientMemberId: string;
-  onRecipientChange: (memberId: string) => void;
   /** 这条消息要带的文件（从 Shared Files 引用或刚上传的）。 */
   selectedFiles: ConversationFile[];
   onRemoveFile: (fileId: string) => void;
@@ -28,18 +25,10 @@ interface MessageComposerProps {
  *
  * Enter 发送 / Shift+Enter 换行由 Sender 处理。
  *
- * 占位文案按房间类型分开 —— group 里「发给谁」和 direct 里完全不同，
- * 用同一句会让用户以为自己在跟一个人说话。Work 也要单独一句：它虽然也是
- * 一对一，但「给这个人发消息」和「围绕一张工单给这个人下指令」不是一回事，
- * 后者才是这个房间存在的理由。
+ * 用户不需要知道「发给谁」：Task 工作区里消息只唤醒 Lead。
  *
- * Member 之间的私聊是只读的：那句话里两个 Member 是主角，用户插进去会掉进
- * dispatcher 的「非 group」分支去取 active[0]，唤醒谁取决于 roster 顺序。
- * 服务端会 400，这里直接把输入框锁掉，别让人先打一段字再被拒。
- *
- * 文件（📎）与收件人选择器一样放在 prefix 里：它们都回答「这条消息怎么发」，
- * 而输入框回答「说什么」。选中的文件显示在输入框上方 —— 那是发送前最后一次
- * 让人看见「这条消息会带上什么」的位置。
+ * Member 之间的私聊是只读的。服务端会 400，这里直接把输入框锁掉，
+ * 别让人先打一段字再被拒。
  */
 export function MessageComposer({
   conversation,
@@ -48,8 +37,6 @@ export function MessageComposer({
   onSend,
   busy,
   disabled,
-  recipientMemberId,
-  onRecipientChange,
   selectedFiles,
   onRemoveFile,
   onUploadFile,
@@ -57,15 +44,10 @@ export function MessageComposer({
 }: MessageComposerProps) {
   const readOnly = isMemberDm(conversation);
   const [dragging, setDragging] = useState(false);
-  const memberName = conversation.members[0]?.name ?? '成员';
-  const workLabel = conversation.externalWorkRef?.key ?? conversation.title;
+  void conversation.externalWorkRef;
   const placeholder = readOnly
     ? '这是 Member 之间的私聊，你可以旁观，但不能替他们发言。'
-    : conversation.kind === 'group'
-      ? '对讨论说点什么… 使用 @handle 指定成员'
-      : conversation.kind === 'work'
-        ? `围绕 ${workLabel} 给 ${memberName} 下指令…`
-        : `给 ${memberName} 发消息…`;
+    : '补充需求、回答澄清问题或调整当前任务…';
 
   return (
     <div
@@ -101,33 +83,6 @@ export function MessageComposer({
         submitType="enter"
         prefix={
           <Space size={2} align="center">
-            {conversation.kind === 'group' && (
-              <Select
-                size="small"
-                variant="borderless"
-                value={recipientMemberId}
-                onChange={onRecipientChange}
-                // 下拉宽度不能跟随触发器：prefix 里 borderless Select 很窄，
-                // 跟随宽度会把 @handle 全部截成省略号。
-                popupMatchSelectWidth={false}
-                // 输入区在屏幕底部，弹出层固定向上、左缘与触发器对齐，
-                // 避免自动翻转时左右跳动。
-                placement="topLeft"
-                options={[
-                  {
-                    value: EVERYONE,
-                    label: 'Everyone',
-                  },
-                  ...conversation.members
-                    .filter((member) => member.status === 'active')
-                    .map((member) => ({
-                      value: member.id,
-                      label: `@${member.handle}`,
-                    })),
-                ]}
-              />
-            )}
-
             {!readOnly && (
               <Dropdown
                 trigger={['click']}

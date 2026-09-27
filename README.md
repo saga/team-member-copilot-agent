@@ -7,13 +7,11 @@ A server-side AI Team platform built on GitHub Copilot SDK.
 ```
 User
 │
-├── Direct Conversation ────────────────┐
-│                                       │
-└── Group Conversation                  │
-                                        │
-        ├── Researcher Member ── Runtime ── Copilot Session
-        ├── Coder Member ─────── Runtime ── Copilot Session
-        └── Reviewer Member ──── Runtime ── Copilot Session
+└── Task Conversation (Task Workspace)
+        │
+        ├── Task A ──> Alice ── Execution ── Runtime ── Copilot Session
+        ├── Task B ──> Bob   ── Execution ── Runtime ── Copilot Session
+        └── Task C ──> Carol ── Execution ── Runtime ── Copilot Session
                                         │
                     ┌───────────────────┴───────────────────┐
                     │              Capabilities             │
@@ -76,29 +74,30 @@ Provider ID 是稳定契约，实现可以替换：把 `local.filesystem-knowled
 
 - **Team** — stable organizational and authorization boundary.
 - **Member** — long-lived AI participant with stable identity and memory.
-- **Discussion** — temporary multi-member conversation.
-- **Work** — a focused business work context, optionally linked to Jira.
-- **Direct** — one-to-one conversation.
-- **Execution** — one concrete runtime turn.
+- **Task Conversation** — 一次持续的工作（Task Workspace），只此一种用户会话。
+- **Task** — 为了完成这次工作要完成的具体事情，分配给 Team Member，有依赖。
+- **Execution** — 某个 Member 实际执行某个 Task 的一次运行。
+- **Direct** — Member ↔ Member 内部私聊，只作为内部机制。
 
-A Discussion is not a Team entity.
-A Member is not recreated for each Discussion.
-Members do not automatically wake each other after every reply.
-Agent-to-agent collaboration is explicit through `ask_member` and `message_member`.
+用户消息只唤醒 Lead（`conversation.leadMemberId`），Task 就绪只唤醒执行人。
+没有 Chat 模式，没有 Everyone，Member 的协作是 `ask_member`（阻塞拿结果）与
+`message_member`（投递不等待），任务分派来自 Lead 的 `plan_tasks`。
+Lead 只负责澄清与规划，执行由各 Task 的执行人推进，依赖由 TaskOrchestrator 自动推进。
 
 | 概念 | 含义 |
 |------|------|
 | **Member** | 业务上的长期 AI 同事。持久身份 + role + style + system prompt + model + 能力组成 + 全局长期记忆 + Team 上下文。身份跨 Team 稳定（同一个人），记忆按 Team 隔离。 |
 | **Capability** | 三层能力引用：`global` / `team` / `member`，存在同一张 `capability_binding` 表里（`scope_type` + `scope_id`）。**`effective = global + team + member` 才是「能用什么」的唯一答案**，任何单层都不是。 |
-| **Conversation** | 聊天/协作空间。`direct`（和一个 Member 的单聊）/ `group`（Discussion：临时多人协作房间，不是 Team 实体）/ `work`（一个 Member 围绕一条外部工作的业务上下文，可挂 Jira）。 |
+| **Conversation** | Task 工作区。`task`（用户真正使用的工作会话，有 `objective` / `leadMemberId` / `status` / `requirements` / `openQuestions`，可挂 Jira）/ `direct`（Member ↔ Member 内部私聊）。状态机：`intake → waiting_user → running → completed`，异常 `blocked`，终止 `cancelled`。完成条件由 Task 状态决定，不由 LLM 宣布。 |
+| **Task** | `conversation_task` 表。`pending → ready → running → completed`（异常 `blocked` / `failed`，终止 `cancelled`）；依赖用 `dependencies_json` 表达（第一版只要列表，不要树）；上限 20 个；循环依赖拒绝落库；只能由执行人自己 `update_task`；同一个 Member 同时只跑一个 Task。 |
 | **MemberRuntime** | 某 Member 在某 Conversation 中的运行实例。一个 runtime 拥有一个稳定的 Copilot Session 和一个独立 workspace。 |
 | **CopilotSession** | Runtime 的执行引擎状态。**内部实现细节，不是业务对象。** |
 | **Execution** | Agent 实际跑了一轮。记录 `parent_execution_id` / `delegation_path` / `external_work_ref`（开始时从 conversation 快照）/ `external_work_snapshot`（开始时向外部系统取证），构成完整审计链。状态：`queued` / `running` / `waiting_for_member` / `completed` / `failed` / `cancelled` / `interrupted`。 |
 | **Team** | 顶层协作边界（单 Team 部署，`team_id` 为以后多 Team 留结构）。 |
 | **TeamMembership** | 谁属于 Team：`human`（`principalId=user id`，单机为 `LOCAL_ACTOR_ID`）/ `agent`（`principalId=member.id`），`role=owner/admin/member`。`Member.role` 是职业角色，两者绝不合并。 |
-| **Jira（外部事实源）** | 业务工作（工单、状态、负责人、工作流）以 Jira 为准，**本地不复制**。本地只有两个值对象：`ExternalWorkRef`（provider/externalId/key/url，挂在 Conversation 与 Execution 上）和 `ExternalWorkSnapshot`（execution 开始时向 Jira 取证的最小字段）。没有 Project / WorkItem / JiraIssue 这些本地业务对象。`Current Work` = active execution → 外部引用。**注意 `Current Work` 不是「工作列表」，它是「现在正在跑的 execution」**：只建一个 work conversation 不会让它出现任何东西，必须那个 Member 真的被唤醒（`queued → running`）才算在干活 —— 所以前端入口在左栏 Conversations 分区的 `New Work`（`WorkCreator.tsx`），建房间时可以直接带上第一条指令；不带指令时会明确提示 Current Work 会是空的。Agent 通过 `atlassian.jira-tools` 读写工单；控制面（取证、webhook 定位房间）走 `WorkManagementProvider` 直连，**不经过 LLM**。 |
+| **Jira（外部事实源）** | 业务工作（工单、状态、负责人、工作流）以 Jira 为准，**本地不复制**。本地只有两个值对象：`ExternalWorkRef`（provider/externalId/key/url，挂在 Conversation 与 Execution 上）和 `ExternalWorkSnapshot`（execution 开始时向 Jira 取证的最小字段）。没有 Project / WorkItem / JiraIssue 这些本地业务对象。`Current Work` = active execution → 外部引用。Agent 通过 `atlassian.jira-tools` 读写工单；控制面（取证、webhook 定位房间）走 `WorkManagementProvider` 直连，**不经过 LLM**。 |
 | **Presence** | Team 层可接工作状态：落库只有 `available/away/paused`，`busy/offline` 由 active execution / lastSeen 计算。`paused` 只拦自动唤醒，不拦 @ 点名。 |
-| **ScheduledWake** | `once` / `interval` 定时唤醒，必须绑定 `work` conversation，且被调度的 Member 必须在该 conversation 里；`UNIQUE(schedule_id, scheduled_for)` 幂等，周期不补历史。执行链固定为 `ScheduledWake → ScheduledWakeRun → Execution → executeMemberTurn`，**不经过 MemberTurnScheduler**（聊天 wake 与 schedule wake 不是同一种 wake，不能 coalesce）；run 的终态随 execution 收口（completed/failed），不停在 running 上没有下文。 |
+| **ScheduledWake** | `once` / `interval` 定时唤醒，必须绑定 `task` 工作区，且被调度的 Member 必须在该工作区里；`UNIQUE(schedule_id, scheduled_for)` 幂等，周期不补历史。执行链固定为 `ScheduledWake → ScheduledWakeRun → Execution → executeMemberTurn`，**不经过 MemberTurnScheduler**（聊天 wake 与 schedule wake 不是同一种 wake，不能 coalesce）；run 的终态随 execution 收口（completed/failed），不停在 running 上没有下文。 |
 
 两个游标保证顺序与可靠性：
 
@@ -111,9 +110,8 @@ Conversation 的形状是**不变量，由 Service 层强制**（不是靠 React
 
 | kind | 成员数 | 能否增减 |
 |------|--------|----------|
-| `direct` | 恰好 1 | 不能 |
-| `group` | ≥ 2 | 能（`addMember` / `removeMember`，移出后仍须满足 ≥ 2） |
-| `work` | 恰好 1 | 不能 |
+| `task` | 1~20 | 能（`addMember` / `removeMember`，移出后仍须满足形状） |
+| `direct` | 恰好 2（Member 私聊） | 不能 |
 
 API 是公开的，所以 `assertConversationKindShape()` 必须挡在 `createConversation` / `addMember` / `removeMember` 里，
 而不是指望前端只发合法的请求。
@@ -371,52 +369,36 @@ scheduler 的入队单位**就是**落库的重放单位：
 interface PendingWake {
   conversationId: string;
   memberId: string;
-  reason: WakeReason;      // mention | direct | everyone
-  triggerSequence: number; // 是哪条消息唤起的
+  taskId: string | null;        // null = Lead 处理用户输入，非 null = 执行这个 Task
+  reason: WakeReason;           // lead_message | task_ready
+  triggerSequence: number | null; // Lead wake 才有，Task wake 为 null
 }
 ```
 
 两者共用同一个形状，是为了让「恢复出来的那一轮」和「当时那一轮」在结构上不可能不一致。
-只存一个 `pending_wake` 布尔位时，恢复只能拿当前水位 + 一个猜的原因去重建 —— 结果是
-`@bob 看一下风险`（mention @17）被重放成对着第 23 条消息的顺带唤醒。
+只存一个 `pending_wake` 布尔位时，恢复只能拿当前水位 + 一个猜的原因去重建。
 
 三处细节：
 
 - **「排队 → 在跑」是一个原子翻转。** `beginWake()`（清 pending）和 `insertExecution()`
   必须在同一个事务里。反过来先清 pending 再建 execution 有一个窗口：进程死在中间，
   唤醒和 execution 会同时消失。
-- **合并要整条保留，不能字段级拼装。** `mergeWake()` 若分别取「更明确的 reason」和
-  「更大的 triggerSequence」，会拼出一个从未发生的事件（`mention` + 第 11 条消息，
-  而第 11 条并没有点名）。正确做法是更明确的 reason 胜出**连同它自己的 trigger**，
-  同级取更新的。被丢掉的那条消息不会消失：`ContextAssembler` 注入的是 checkpoint
-  以来的全部消息。
+- **合并要整条保留，不能字段级拼装，不同 Task 的 wake 不合并。** 同一个 Member 身上
+  Task wake 优先于 Lead wake。被丢掉的那条消息不会消失：`ContextAssembler` 注入的是
+  checkpoint 以来的全部消息。
 - **区分「跑失败了」与「连跑都没跑起来」。** 后者要清掉 durable 标记，否则每次重启
   都会重派一条注定失败的唤醒。scheduler 通过 `run(wake, markStarted)` 回调拿到这个区分。
 
-**Discussion 里没有默认的接话人。** 用户发一条无 mention 的消息，全体以
-`everyone` 被唤醒，每个人都拿到「没东西补就 `<NO_REPLY>`」的出口 ——
-想推进靠显式协作（`@mention` / `ask_member` / `message_member`），
-不靠平台指定应答者。Member 自己的发言**不**自动唤醒任何人：
-A 回复 → 唤醒 B → B 回复 → 唤醒 A 是没有终点的自动接龙。
+**Task 工作区里用户消息只唤醒 Lead。** Lead 忙时新消息只落库、不重复入队，
+靠 checkpoint 被下一轮看到。Task 就绪只唤醒执行人，且同一个 Member 同时只跑一个
+Task。Member 自己的发言**不**自动唤醒任何人。
 
-所以 reason 只有三档，**指令也跟着分档**，两件事缺一不可：
+所以 reason 只有两档（+ schedule）：
 
 ```
-mention           用户 @ 了它，必须回答
-direct            1:1 房间 / 显式 targetMemberId，必须回答
-everyone          用户对 discussion 说话、没 @ 任何人，可以沉默
+lead_message      用户给 Task 工作区发消息，唤醒 Lead
+task_ready        Task 依赖满足，唤醒执行人
 ```
-
-- **@ 了不存在的人不广播。** 用户明确想找某个人，把消息广播给全员是更糟的
-  误解 —— 服务端不唤醒任何人，只把没认领的 @ 原样回给调用方。
-- **合并时更明确的理由必须赢**：`mention(2) > direct(1) > everyone(0)`。
-  一次 @ 和一条顺带唤醒撞在同一个人身上时，点名输了就被悄悄降级成「顺带看看」。
-- 只改路由是无效的：reason 标对了、指令里却仍写着别的，模型会挑更省力的那个。
-
-`<NO_REPLY>` 是控制信号，不是内容，**绝不能到达客户端**。流式路径上由 `NoReplyStreamGate`
-扣住前缀与哨兵一致的部分，一旦分叉就原样放行（正常回复零额外延迟）；收尾时
-`flush(decision)` **必须**带上判定结果 —— skip 时被扣住的那条尾巴就是哨兵本身，放出去
-正是要修的现象（先出现再消失，看起来像 UI 故障）。
 
 归档 / 移出 Member 前有三道闸门（未结束的 execution、`pending_wake`/`wake_status`、
 scheduler 内存队列），任一条命中就 `409 Conflict` —— 不做「边跑边踢」。移出时
@@ -518,7 +500,7 @@ KB、一次用企业搜索 —— 那是两种不同的能力实现，而快照�
 { type: 'conversation_member_state.updated', data: { memberId, state: ConversationMemberState | null } }
 ```
 
-否则前端只能靠「消息数变了」猜要不要刷新 —— 而 NO_REPLY、queued、mute 这三种
+否则前端只能靠「消息数变了」猜要不要刷新 —— 而 queued、mute 这些
 状态变化**都不伴随新消息**，猜不出来。
 
 三处形状上的选择：
@@ -772,18 +754,22 @@ npm run dev            # 同时启动 client(:5173) + server(:3001)
 | PATCH | `/api/team/members/:kind/:id` | 改 Team role/status（owner/admin） |
 | GET | `/api/team/activity` | Current Work：active execution → member / Jira key / conversation（须 Team 成员） |
 | GET · PATCH | `/api/team/presence` | Presence 列表（须 Team 成员）/ 改 availability（本人改本人，Admin 改别人） |
-| GET · POST | `/api/team/schedules` | Schedule 列表 / 新建（owner/admin，只能绑 work 房间） |
+| GET · POST | `/api/team/schedules` | Schedule 列表 / 新建（owner/admin，只能绑 Task 工作区） |
 | PATCH · POST | `/api/team/schedules/:id` | 改状态 / pause/resume/cancel（owner/admin） |
-| POST | `/api/conversations` | 创建 Direct / Group / Work（可选 `externalWorkRef: { provider?, key, externalId? }`，业务状态在 Jira） |
+| POST | `/api/conversations` | 创建 Task 工作区 / Direct 私聊（`leadMemberId` 必须是工作区里的人，可选 `externalWorkRef: { provider?, key, externalId? }`，业务状态在 Jira） |
 | GET | `/api/conversations/:id` | 单个 Conversation |
 | GET | `/api/conversations/:id/messages?limit=` | 最近 N 条消息（按 `messageSequence` 正序） |
-| POST | `/api/conversations/:id/messages` | 发送消息 → `202 { message, wakes, unresolvedMentions, deduplicated }`。可选 `clientRequestId`（幂等键）、`replyToMessageId`（必须属于本房间） |
-| POST | `/api/conversations/:id/members` | 加入 Member（仅 `group`） |
-| DELETE | `/api/conversations/:id/members/:memberId` | 移出 Member（仅 `group`） |
+| POST | `/api/conversations/:id/messages` | 发送消息 → `202 { message, wakes, deduplicated }`（只唤醒 Lead）。可选 `clientRequestId`（幂等键）、`replyToMessageId`（必须属于本房间） |
+| GET | `/api/conversations/:id/tasks` | 这个工作区的任务列表 |
+| GET | `/api/tasks/:id` | 单个 Task |
+| POST | `/api/tasks/:id/retry` | 重试 Task（failed / blocked / cancelled → ready） |
+| POST | `/api/tasks/:id/cancel` | 取消 Task |
+| POST | `/api/conversations/:id/members` | 加入 Member（仅 Task 工作区） |
+| DELETE | `/api/conversations/:id/members/:memberId` | 移出 Member（仅 Task 工作区） |
 | GET | `/api/conversations/:id/events?since=` | 会话级 SSE（支持 `Last-Event-ID` 回放） |
 | GET | `/api/conversations/:id/executions?limit=` | 该会话的 execution，按 `createdAt` 正序（默认 200，夹在 1..1000） |
 | GET | `/api/conversations/:id/state` | 房间里每个 Member 的读游标 / 唤醒状态 / 静音 |
-| PATCH | `/api/conversations/:id/members/:memberId/state` | `{ muted: boolean }` —— 静音后 dispatcher 不再唤醒它（@ 也唤不醒） |
+| PATCH | `/api/conversations/:id/members/:memberId/state` | `{ muted: boolean }` —— 静音后不再唤醒它 |
 | GET | `/api/conversations/:id/files` | 这个会话共享的文件（不含已删除的） |
 | POST | `/api/conversations/:id/files?filename=` | 上传一个文件（raw body）→ `202 { file }`，`status=processing`。扩展名闸门在服务端 |
 | GET | `/api/conversations/:id/files/:fileId/content?download=1` | 取正文。默认 inline 只给 PDF / 图片，其余 attachment + `nosniff` + CSP sandbox |
@@ -934,42 +920,28 @@ PUT /api/capabilities/catalog
 }
 ```
 
-Direct Chat：
-
-```json
-{ "kind": "direct", "memberIds": ["researcher-id"] }
-```
-
-Group Chat：
+Task 工作区：
 
 ```json
 {
-  "kind": "group",
-  "title": "Investment Review Team",
-  "memberIds": ["researcher-id", "coder-id", "reviewer-id"]
+  "kind": "task",
+  "title": "解决 ABC-123 登录失败问题",
+  "memberIds": ["alice-id", "bob-id", "carol-id"],
+  "leadMemberId": "alice-id",
+  "externalWorkRef": { "provider": "jira", "key": "ABC-123" }
 }
 ```
 
-`group` **不接受** `defaultMemberId`（传了直接 `400`）：收件人由 `GroupDispatcher`
-按 @mention 决定，留一个「默认谁接」的值只会让人以为它可以依赖。
+`leadMemberId` 必须是工作区里的人，不传默认第一个成员。
+用户发消息不需要指定收件人：只唤醒 Lead。
 
-发消息时用 `targetMemberId` 决定谁回应（不做 LLM router，保持确定性）：
-
-```json
-{ "content": "请 @coder 根据这个结论写一个验证脚本", "targetMemberId": "coder-id" }
-```
-
-`@mention` 的解析只做**精确匹配**，且 handle 优先于 name：
+Lead 的推进工具（Core Tools）：
 
 ```
-@<token>  →  byHandle.get(token) ?? byName.get(token)
-             两者都没有 → unresolved（不广播给全员）
+request_clarification   信息不足时问用户（最多 3 个问题）→ waiting_user
+plan_tasks              信息足够时制定目标 + 任务列表 → 自动开始执行
+update_task             执行人上报自己任务的进展（只能动自己的）
 ```
-
-不做前缀匹配（`@ann` 命中 `anna`）也不做「最长名字胜出」：token 里带空格时后者
-会让解析结果取决于谁的名字更长。`@Alice Chen` 会被截成 `Alice`，取不出来就进
-`unresolved` —— 这是一个取舍，不是缺陷：允许空格会让 `@Alice and Bob please look`
-变成一句有歧义的句子，而且没有正确答案。
 
 ## Storage
 
@@ -1068,19 +1040,19 @@ src/                          # Vite + React + Ant Design 前端
     workspace/
       WorkspaceNav.tsx        # 窄导航 Rail：Chat / Team / Settings
     chat/
-      ConversationSidebar.tsx # 聊天工作面第二列：Search + 会话分组 + New Team / New Work
+      ConversationSidebar.tsx # 工作区第二列：Search + Tasks 分组 + New task
     team/                     # 各面共用的业务组件
       TeamManagement.tsx      # Team 管理面：Members / Current Work / Automation 三页签
       CapabilitySettings.tsx  # 能力配置：Modal（旧入口）与 Settings 页内嵌两种形态；三页签（Company defaults / Team defaults / This member），Skill / Knowledge / Action 的名字与开关
       ScopedSkillLibrary.tsx  # skill 文件库（global / team / member 共用同一个组件；能力窗口里上传即启用）
       TeamSections.tsx        # CurrentWorkSection（active execution → Jira key）
-      ConversationList.tsx    # 会话分组列表（Team discussions / Work / Direct + Search 过滤）+ New Team / New Work 入口
-      WorkCreator.tsx         # 新建 Work：title + Member + Jira key + 第一条指令（建完可直接开跑）
-      GroupCreator.tsx        # 新建 Team（≥2 个成员；Work 是 1 个成员，所以是另一个入口）
-      ConversationMessages.tsx  # @ant-design/x Bubble.List + Timeline（delegation）
-      MessageComposer.tsx     # @ant-design/x Sender
-      ConversationHeader.tsx  # 会话标题 + 成员状态 + 收件人选择（管理按钮不在这里）
-      GroupMemberManager.tsx  # antd Table：加人 / 移人 / 静音（有未完成工作时禁止 Remove）
+      ConversationList.tsx    # Tasks 分组列表（按状态排序）+ Search 过滤
+      TaskCreator.tsx         # 新建 Task 工作区：title + 成员 + Lead + Jira key
+      TaskPanel.tsx           # 工作区左侧：目标 + 任务列表 + 进展 + 重试/取消
+      ConversationMessages.tsx  # @ant-design/x Bubble.List + Timeline（delegation），显示为动态
+      MessageComposer.tsx     # @ant-design/x Sender（无收件人选择）
+      ConversationHeader.tsx  # 标题 + 状态 + Lead + Jira + 成员
+      MemberManager.tsx       # antd Table：加人 / 移人 / 静音（有未完成工作时禁止 Remove）
       MemberEditor.tsx        # antd Form + Popconfirm Archive（能力已移到 Capabilities）
       MemberMemory.tsx        # 记忆编辑器（global / team 复用同一套全文 + 版本 + 409）
       MemberActivity.tsx      # Member 视角的动态（参与过的 conversation / 所属 Team）
@@ -1150,10 +1122,9 @@ server/                       # Express + Copilot SDK 后端
     member-skills.test.ts          # 三个 scope 的 skill 安装 / 卸载 / zip 安全闸（穿越、symlink、体积、同名覆盖）
     runtime-reliability.test.ts    # schema 形状 / 序号 / 增量上下文 / durable event / 恢复 / 死锁
     runtime-correctness.test.ts    # resume 分类 / 超时 abort / 工具授权接线 / cancel 状态机 / retry
-    team-chat.test.ts              # 产品行为：direct / group / @mention / NO_REPLY / 应答者 / 唤醒合并与原因读回 / persona 与记忆隔离
-    member-decision.test.ts        # 哨兵判定（normalize 容忍度）与流式过滤：两个模块对「什么算 <NO_REPLY>」不能有分歧
-    conversations-api.test.ts      # 真实 HTTP：externalWorkRef 过边界 / 静音 state patch / SSE 字节流上没有哨兵
-    data-integrity.test.ts         # replyTo 校验 / 消息幂等 / 记忆乐观并发 / 上下文上限 / 配置快照 / state 事件 / mention 精确匹配
+    task-service.test.ts             # Task 规划 / 依赖 / 并行串行 / 执行人归属 / Lead 单点 / 澄清 / 阻塞重试 / 重启恢复
+    conversations-api.test.ts      # 真实 HTTP：externalWorkRef 过边界 / 静音 state patch / SSE 流式增量
+    data-integrity.test.ts         # replyTo 校验 / 消息幂等 / 记忆乐观并发 / 上下文上限 / 配置快照 / state 事件
     member-template-seeder.test.ts # provisioning 幂等 / 不覆盖已改 Member / 归档不复活 / 穿越与重复 key / 能力绑定
     knowledge-provider.test.ts     # 检索范围限定在授权的 KB / personal 隔离 / 路径注入 / 索引幂等 / 磁盘同步
     conversation-files.test.ts     # 上传与提取时序 / 附件与引用 / 跨会话 403 / 软删除保留历史 / promote / 响应头

@@ -98,7 +98,55 @@ export interface Member {
   updatedAt: string;
 }
 
-export type ConversationKind = 'direct' | 'group' | 'work';
+export type ConversationKind = 'task' | 'direct';
+
+export type ConversationStatus =
+  | 'intake'
+  | 'waiting_user'
+  | 'running'
+  | 'blocked'
+  | 'completed'
+  | 'cancelled';
+
+export interface TaskRequirementFact {
+  key: string;
+  value: string;
+  source: 'user' | 'jira' | 'knowledge' | 'conversation' | 'agent';
+  confirmed: boolean;
+}
+
+export interface TaskRequirements {
+  facts: TaskRequirementFact[];
+  assumptions: string[];
+  constraints: string[];
+  successCriteria: string[];
+}
+
+export type ConversationTaskStatus =
+  | 'pending'
+  | 'ready'
+  | 'running'
+  | 'blocked'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
+
+export interface ConversationTask {
+  id: string;
+  conversationId: string;
+  title: string;
+  description: string;
+  assigneeMemberId: string;
+  status: ConversationTaskStatus;
+  dependencies: string[];
+  acceptanceCriteria: string[];
+  result: string | null;
+  blocker: string | null;
+  currentExecutionId: string | null;
+  sortOrder: number;
+  createdAt: string;
+  updatedAt: string;
+}
 
 export interface Team {
   id: string;
@@ -211,7 +259,15 @@ export interface Conversation {
   externalWorkRef: ExternalWorkRef | null;
   title: string;
   kind: ConversationKind;
-  defaultMemberId: string | null;
+  /** 这次工作的总体目标。 */
+  objective: string;
+  /** 当前负责澄清需求、维护任务整体状态的 Member。 */
+  leadMemberId: string | null;
+  status: ConversationStatus;
+  /** 已确认的业务 context，直接 JSON，不做几十个字段。 */
+  requirements: TaskRequirements;
+  /** 当前还缺哪些必须由用户回答的信息。 */
+  openQuestions: string[];
   createdBy: string;
   /** 会话内单调递增的 event 游标，用于 SSE replay。 */
   eventSequence: number;
@@ -231,8 +287,9 @@ export interface ConversationMessage {
   messageSequence: number;
   senderType: MessageSenderType;
   senderId: string;
-  targetMemberId: string | null;
   replyToMessageId: string | null;
+  /** 这条消息属于哪个 Task 的进展，null = 整个工作的通用消息。 */
+  taskId: string | null;
   /**
    * 调用方为这次「发送」提供的幂等键（可以带前缀，比如 `web-<uuid>`）。
    *
@@ -299,35 +356,26 @@ export type ExecutionKind = 'interactive' | 'member_delegate' | 'member_work';
 /**
  * 一轮 turn 的性质，决定 prompt 里给 Member 的指令。
  *
- *   direct     —— 1:1 房间，用户在跟你说话，必须回答
- *   discussion —— group 房间的共享讨论，可以判断「我不该发言」
+ *   lead       —— 用户在推动整个工作，Lead 处理需求/变化/阻塞
+ *   task       —— 当前 Member 正在执行指定 Task
  *   delegation —— ask_member 派来的明确子任务，必须交付结果
  */
-export type TurnMode = 'direct' | 'discussion' | 'delegation';
+export type TurnMode = 'lead' | 'task' | 'delegation';
 
 /**
  * 为什么唤醒这个 Member。确定性规则产出，不经过 LLM 路由。
  *
- *   direct   1:1 房间、请求里显式指定 targetMemberId
- *   mention  消息里 @ 了它
- *   everyone 用户对 discussion 说话、没 @ 任何人
- *   schedule 定时唤醒
- *
- * direct / mention 必须回答；everyone 允许 <NO_REPLY>。
+ *   lead_message 用户给 Task 工作区发消息，唤醒 Lead
+ *   task_ready   Task 依赖满足，唤醒执行人
+ *   schedule     定时唤醒
  */
 export type WakeReason =
-  | 'direct'
-  | 'mention'
-  | 'everyone'
+  | 'lead_message'
+  | 'task_ready'
   | 'schedule';
 
-/**
- * Member 的一次 turn 的产出。
- *
- * `skip` 不是错误 —— Team Member 和普通 chatbot 最大的区别之一就是它可以说
- * 「我没有新信息，不重复别人的结论」。所以「不发言」是**成功**的一种结果。
- */
-export type ExecutionDecision = 'reply' | 'skip';
+/** Member 的一次 turn 的产出：Task 模式下每轮都必须有结果，不再沉默。 */
+export type ExecutionDecision = 'reply';
 
 export type ExecutionStatus =
   | 'queued'
@@ -376,6 +424,8 @@ export interface ExecutionRecord {
   id: string;
   conversationId: string;
   memberId: string;
+  /** 这次运行属于哪个 Task，null = Lead 处理用户输入。 */
+  taskId: string | null;
   /**
    * 开始时快照的**引用**（取自 conversation），历史事实不随后续改动漂移。
    * conversation 后来换了挂钩的工单，这条 execution 仍然知道当时在干哪条。
@@ -456,11 +506,12 @@ export interface ConversationMemberState {
    * 排队中那次唤醒是被哪条消息、以什么原因触发的。没有排队时为 null。
    *
    * 和 `pendingWake` 一起落库是**必须的**：只记住「有人被唤醒过」，恢复时就只能
-   * 拿房间当前水位 + 最宽松的 reason 去猜，重放出来的是另一轮 —— 一次显式
-   * @mention 会被降级成「顺带看看」，而且对着的是另一条消息。
+   * 拿房间当前水位去猜，重放出来的是另一轮。
    */
   pendingWakeTriggerSequence: number | null;
   pendingWakeReason: WakeReason | null;
+  /** 排队中的唤醒属于哪个 Task，null = Lead 处理用户输入。 */
+  pendingWakeTaskId: string | null;
   /** 静音：dispatcher 不会唤醒它（@ 也唤不醒）。 */
   muted: boolean;
   updatedAt: string;
@@ -472,12 +523,18 @@ export interface ConversationMemberState {
  * 它只服务 conversation wake，不承载 schedule。Scheduled work 走
  * ScheduledWakeRun → Execution → runScheduledExecution，不经过
  * MemberTurnScheduler，两者不能被错误 coalesce。
+ *
+ * taskId 为 null = Lead 处理用户输入；非 null = 执行这个 Task。
+ * Task wake 没有触发消息，triggerSequence 为 null。
  */
 export interface PendingWake {
   conversationId: string;
   memberId: string;
+  /** null = Lead 处理用户输入，非 null = 执行这个 Task。 */
+  taskId: string | null;
   reason: Exclude<WakeReason, 'schedule'>;
-  triggerSequence: number;
+  /** Lead wake 才需要，Task wake 为 null。 */
+  triggerSequence: number | null;
 }
 
 /**
@@ -519,11 +576,13 @@ export type ConversationEventType =
   | 'message.created'
   | 'message.delta'
   | 'execution.updated'
+  | 'task.updated'
+  | 'conversation.updated'
   /**
    * 某个 Member 在房间里的状态变了（读游标 / 唤醒状态 / 静音）。
    *
    * durable 事件，和别的状态一样先落库再广播：前端靠它把 ●idle / ●working /
-   * 🔇muted 实时化，而不是轮询。只依赖 message.created 是不够的 —— NO_REPLY /
+   * 🔇muted 实时化，而不是轮询。只依赖 message.created 是不够的 ——
    * pending / mute 这些变化都不伴随新消息。
    */
   | 'conversation_member_state.updated'

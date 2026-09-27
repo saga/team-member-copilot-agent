@@ -148,6 +148,23 @@ export class RecoveryService {
       report.lostWakes = this.states.findLostWakes();
       report.wakesReset = this.states.resetWakeStatuses();
 
+      // 5. running 的 Task 不要自动重跑：把它们置成 blocked，前端显示原因并提供重试。
+      this.db
+        .prepare(
+          `
+          UPDATE conversation_task
+          SET status = 'blocked', blocker = ?, updated_at = ?
+          WHERE status = 'running'
+          `,
+        )
+        .run('服务重启导致执行中断，检查后可重试', timestamp);
+      this.db
+        .prepare(
+          `UPDATE conversation SET status = 'blocked', updated_at = ?
+           WHERE status = 'running' AND id IN (SELECT conversation_id FROM conversation_task WHERE status = 'blocked')`,
+        )
+        .run(timestamp);
+
       this.db.exec('COMMIT');
     } catch (error) {
       this.db.exec('ROLLBACK');

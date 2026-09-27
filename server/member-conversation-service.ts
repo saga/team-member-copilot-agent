@@ -6,31 +6,11 @@ import { badRequest } from './http-error.js';
 /**
  * Member ↔ Member 的私聊（DM）。
  *
- * ── 为什么复用 `direct` 而不新增一个 kind ───────────────────────────────
- *
- * 一个 direct 房间有两种含义，靠 roster 大小区分：
- *
- *   1 个 Member  —— 用户 ↔ 该 Member
- *   2 个 Member  —— Member ↔ Member，没有用户参与
- *
- * 这样不需要动 `conversation.kind` 的 CHECK 约束（SQLite 改不了，只能重建表，
- * 而这张表被 6 张表 FK 引用），也不需要改 GroupDispatcher：DM 的每条消息都带
- * `targetMemberId`，dispatch 时会命中「显式收件人」分支（该分支在 kind 判断
- * **之前**），拿到 `reason = 'direct'`，且天然绕过静音过滤。
- *
- * `turnMode` 也就自然是对的值 —— runWake 里 `kind === 'group' ? 'discussion' : 'direct'`，
- * DM 拿到的是「你在跟一个人说话，必须回答」，而不是 group 的「你可以选择不发言」。
- *
- * ── 为什么 DM 里的回复不自动唤醒对方 ───────────────────────────────────
+ * direct 只剩一种含义：两个 Member 的私聊，没有用户参与。
+ * 用户的工作统一走 Task 工作区，不再有用户 ↔ 单个 Member 的单聊房间。
  *
  * 唤醒的唯一触发点是「**显式发一条 DM**」（本服务的 send / team.sendMemberMessage）。
- * Member 在自己的 turn 里发言后的自动派发，对 DM 房间是关闭的（见 team-service
- * 的 executeMemberTurn）。
- *
- * 否则 A 问 → B 答 → 唤醒 A → A 答 → 唤醒 B → ... 是一个没有终点的循环：
- * 没有人在旁边看着，两个 Member 会一直对话到把 token 烧完。断掉自动闭环之后，
- * DM 就是真正的异步消息 —— 对方回没回，由 inbox 的未读状态回答（lastSeenMessageSequence），
- * 想继续就再显式发一条。
+ * 否则 A 问 → B 答 → 唤醒 A → A 答 → 唤醒 B → ... 是一个没有终点的循环。
  */
 
 /** 两个 Member 的 direct 房间 = Member 私聊（没有用户参与）。 */
@@ -61,7 +41,7 @@ export class MemberConversationService {
   /**
    * 找 (a, b) 之间已有的 DM 房间。顺序无关：a↔b 和 b↔a 是同一个房间。
    *
-   * 必须校验房间里**恰好**两个人：用户 ↔ Member 的单聊也是 `kind = 'direct'`，
+   * 必须校验房间里**恰好**两个人：direct 只允许两个成员，
    * 但 roster 只有一个人，不能把它当成 DM。
    */
   find(a: string, b: string): Conversation | null {
@@ -108,7 +88,7 @@ export class MemberConversationService {
     const existing = this.find(a, b);
     if (existing) return existing;
 
-    // title 显式写成双方，避免落到 createConversation 的默认值（非 group 时取
+    // title 显式写成双方，避免落到 createConversation 的默认值（取
     // members[0].name）—— 那会让人分不清这是「和 Alice 单聊」还是「Alice 和 Bob 在聊」。
     return this.team.createConversation({
       kind: 'direct',

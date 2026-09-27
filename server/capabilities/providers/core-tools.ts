@@ -43,6 +43,43 @@ export interface CoreToolHost {
     targetMemberId: string;
     content: string;
   }): Promise<{ conversationId: string; messageId: string }>;
+
+  requestClarification(input: {
+    conversationId: string;
+    memberId: string;
+    questions: string[];
+    assumptions?: string[];
+    summary?: string;
+  }): Promise<string>;
+
+  planTasks(input: {
+    conversationId: string;
+    memberId: string;
+    objective: string;
+    requirements: {
+      facts: Array<{ key: string; value: string; source: 'user' | 'jira' | 'knowledge' | 'conversation' | 'agent'; confirmed: boolean }>;
+      assumptions: string[];
+      constraints: string[];
+      successCriteria: string[];
+    };
+    tasks: Array<{
+      key: string;
+      title: string;
+      description?: string;
+      assigneeMemberId?: string;
+      dependencies?: string[];
+      acceptanceCriteria?: string[];
+    }>;
+  }): Promise<string>;
+
+  updateTask(input: {
+    conversationId: string;
+    memberId: string;
+    taskId: string;
+    status: 'running' | 'completed' | 'blocked';
+    summary: string;
+    blocker?: string;
+  }): Promise<string>;
 }
 
 export class CoreTeamToolProvider implements ToolProvider {
@@ -128,7 +165,111 @@ export class CoreTeamToolProvider implements ToolProvider {
             teamId: context.teamId,
             content: String(args.content),
           }),
-      }
+      },
+      {
+        providerId: this.id,
+        implementation: 'app' as const,
+        kind: 'custom',
+        name: 'request_clarification',
+        description:
+          'Lead only. Ask the user for missing information that blocks progress. ' +
+          'At most 3 questions at a time. The workspace moves to waiting_user.',
+        risk: 'coordination',
+        parameters: z.object({
+          questions: z.array(z.string().min(1).max(1000)).min(1).max(3),
+          assumptions: z.array(z.string().min(1).max(1000)).max(10).optional(),
+          summary: z.string().max(4000).optional(),
+        }),
+        execute: (context, args) =>
+          this.host.requestClarification({
+            conversationId: context.conversationId,
+            memberId: context.memberId,
+            questions: (args.questions as string[]).map(String),
+            ...((args as { assumptions?: string[] }).assumptions === undefined
+              ? {}
+              : { assumptions: ((args as { assumptions?: string[] }).assumptions ?? []).map(String) }),
+            ...((args as { summary?: string }).summary === undefined
+              ? {}
+              : { summary: String((args as { summary?: string }).summary) }),
+          }),
+      },
+      {
+        providerId: this.id,
+        implementation: 'app' as const,
+        kind: 'custom',
+        name: 'plan_tasks',
+        description:
+          'Lead only. Define the objective and the concrete task list for this workspace. ' +
+          'Tasks start automatically once dependencies are met.',
+        risk: 'coordination',
+        parameters: z.object({
+          objective: z.string().min(1).max(4000),
+          requirements: z.object({
+            facts: z
+              .array(
+                z.object({
+                  key: z.string().min(1).max(200),
+                  value: z.string().min(1).max(4000),
+                  source: z.enum(['user', 'jira', 'knowledge', 'conversation', 'agent']),
+                  confirmed: z.boolean(),
+                }),
+              )
+              .max(50)
+              .default([]),
+            assumptions: z.array(z.string().max(1000)).max(20).default([]),
+            constraints: z.array(z.string().max(1000)).max(20).default([]),
+            successCriteria: z.array(z.string().max(1000)).max(20).default([]),
+          }),
+          tasks: z
+            .array(
+              z.object({
+                key: z.string().regex(/^[a-zA-Z0-9_-]+$/),
+                title: z.string().min(1).max(300),
+                description: z.string().max(8000).default(''),
+                assigneeMemberId: z.string().min(1),
+                dependencies: z.array(z.string()).max(20).default([]),
+                acceptanceCriteria: z.array(z.string().min(1).max(1000)).max(20).default([]),
+              }),
+            )
+            .min(1)
+            .max(20),
+        }),
+        execute: (context, args) =>
+          this.host.planTasks({
+            conversationId: context.conversationId,
+            memberId: context.memberId,
+            objective: String((args as { objective: string }).objective),
+            requirements: (args as { requirements: never }).requirements,
+            tasks: (args as { tasks: never }).tasks as never as Parameters<CoreToolHost['planTasks']>[0]['tasks'],
+          }),
+      },
+      {
+        providerId: this.id,
+        implementation: 'app' as const,
+        kind: 'custom',
+        name: 'update_task',
+        description:
+          'Report progress on your assigned task. Only the assignee can update it. ' +
+          'Call with completed when done, blocked when you cannot proceed.',
+        risk: 'coordination',
+        parameters: z.object({
+          taskId: z.string().min(1),
+          status: z.enum(['running', 'completed', 'blocked']),
+          summary: z.string().min(1).max(10000),
+          blocker: z.string().max(4000).optional(),
+        }),
+        execute: (context, args) =>
+          this.host.updateTask({
+            conversationId: context.conversationId,
+            memberId: context.memberId,
+            taskId: String((args as { taskId: string }).taskId),
+            status: (args as { status: 'running' | 'completed' | 'blocked' }).status,
+            summary: String((args as { summary: string }).summary),
+            ...((args as { blocker?: string }).blocker === undefined
+              ? {}
+              : { blocker: String((args as { blocker?: string }).blocker) }),
+          }),
+      },
     ];
   }
 }

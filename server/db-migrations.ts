@@ -20,7 +20,7 @@ import type { DatabaseSync } from 'node:sqlite';
  *
  * 程序不认识任何别的编号 —— 没有升级代码，认出来也无从下手。
  */
-export const SCHEMA_VERSION = 18;
+export const SCHEMA_VERSION = 19;
 
 /**
  * 当前 schema 的完整定义，按最终形状写。
@@ -307,9 +307,26 @@ CREATE TABLE conversation (
   external_work_ref TEXT,
   title TEXT NOT NULL,
   kind TEXT NOT NULL
-    CHECK (kind IN ('direct', 'group', 'work')),
-  -- group 房间一律为 NULL：收件人由 GroupDispatcher 按 @mention 决定。
-  default_member_id TEXT,
+    CHECK (kind IN ('task', 'direct')),
+  -- 这次工作的总体目标，由 Lead 通过 plan_tasks 确认。
+  objective TEXT NOT NULL DEFAULT '',
+  -- 当前负责澄清需求、维护任务整体状态的 Member。
+  lead_member_id TEXT,
+  status TEXT NOT NULL DEFAULT 'intake'
+    CHECK (
+      status IN (
+        'intake',
+        'waiting_user',
+        'running',
+        'blocked',
+        'completed',
+        'cancelled'
+      )
+    ),
+  -- 已确认的业务 context（JSON TaskRequirements），不做几十个字段。
+  requirements_json TEXT NOT NULL DEFAULT '{"facts":[],"assumptions":[],"constraints":[],"successCriteria":[]}',
+  -- 还缺哪些必须由用户回答的信息（JSON string[]）。
+  open_questions_json TEXT NOT NULL DEFAULT '[]',
   created_by TEXT NOT NULL,
   -- 会话内单调递增的两个游标：event 用于 SSE replay，message 用于 context checkpoint
   event_sequence INTEGER NOT NULL DEFAULT 0,
@@ -319,7 +336,7 @@ CREATE TABLE conversation (
   FOREIGN KEY (team_id)
     REFERENCES team(id)
     ON DELETE CASCADE,
-  FOREIGN KEY (default_member_id)
+  FOREIGN KEY (lead_member_id)
     REFERENCES member(id)
     ON DELETE SET NULL
 );
@@ -368,6 +385,8 @@ CREATE TABLE conversation_member_state (
   -- WakeReason 的取值由 domain.ts 定义。刻意不加 CHECK：SQLite 加 CHECK 只能
   -- 重建表，而取值集合在 TypeScript 侧已经是封闭联合，写入口只有 scheduler 一处。
   pending_wake_reason TEXT,
+  -- 排队中的唤醒属于哪个 Task，NULL = Lead 处理用户输入。
+  pending_wake_task_id TEXT,
   muted INTEGER NOT NULL DEFAULT 0,
   updated_at TEXT NOT NULL,
   PRIMARY KEY (conversation_id, member_id),
@@ -390,8 +409,9 @@ CREATE TABLE conversation_message (
   sender_type TEXT NOT NULL
     CHECK (sender_type IN ('user', 'member', 'system')),
   sender_id TEXT NOT NULL,
-  target_member_id TEXT,
   reply_to_message_id TEXT,
+  -- 这条消息属于哪个 Task 的进展，NULL = 整个工作的通用消息。
+  task_id TEXT,
   content TEXT NOT NULL,
   execution_id TEXT,
   -- 调用方为这条消息发的幂等键。同一次「发送」被重试（响应丢了、用户狂点）
@@ -404,13 +424,60 @@ CREATE TABLE conversation_message (
   FOREIGN KEY (conversation_id)
     REFERENCES conversation(id)
     ON DELETE CASCADE,
-  FOREIGN KEY (target_member_id)
-    REFERENCES member(id)
+  FOREIGN KEY (task_id)
+    REFERENCES conversation_task(id)
     ON DELETE SET NULL
 );
 
 CREATE INDEX idx_message_conversation_created
   ON conversation_message(conversation_id, created_at);
+
+CREATE INDEX idx_message_task
+  ON conversation_message(task_id);
+
+CREATE TABLE conversation_task (
+  id TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  assignee_member_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (
+      status IN (
+        'pending',
+        'ready',
+        'running',
+        'blocked',
+        'completed',
+        'failed',
+        'cancelled'
+      )
+    ),
+  dependencies_json TEXT NOT NULL DEFAULT '[]',
+  acceptance_criteria_json TEXT NOT NULL DEFAULT '[]',
+  result TEXT,
+  blocker TEXT,
+  current_execution_id TEXT,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (conversation_id)
+    REFERENCES conversation(id)
+    ON DELETE CASCADE,
+  FOREIGN KEY (assignee_member_id)
+    REFERENCES member(id),
+  FOREIGN KEY (current_execution_id)
+    REFERENCES execution(id)
+);
+
+CREATE INDEX idx_conversation_task_conversation
+  ON conversation_task(conversation_id, sort_order);
+
+CREATE INDEX idx_conversation_task_status
+  ON conversation_task(conversation_id, status);
+
+CREATE INDEX idx_conversation_task_assignee
+  ON conversation_task(assignee_member_id, status);
 
 CREATE UNIQUE INDEX idx_message_conversation_sequence
   ON conversation_message(conversation_id, message_sequence);
@@ -497,10 +564,12 @@ CREATE TABLE execution (
   waiting_for_runtime_id TEXT,
   -- retry 会生成新 execution 并指回被 retry 的那条，审计链不断
   retry_of_execution_id TEXT,
-  -- 这一轮最终判断了什么（发言 / 沉默）以及唤醒它的那条消息
+  -- 这次运行属于哪个 Task，NULL = Lead 处理用户输入。
+  task_id TEXT,
+  -- 这一轮最终判断了什么以及唤醒它的那条消息
   decision TEXT,
   trigger_message_sequence INTEGER,
-  -- 为什么唤醒这个 Member（direct / mention / everyone / schedule）。
+  -- 为什么唤醒这个 Member（lead_message / task_ready / schedule）。
   -- 落库是为了重启恢复时能忠实重放同一轮，而不是猜一个。
   wake_reason TEXT,
   -- 这一轮跑的时候，这个 Member 的配置长什么样。
@@ -522,7 +591,9 @@ CREATE TABLE execution (
   FOREIGN KEY (parent_execution_id)
     REFERENCES execution(id),
   FOREIGN KEY (retry_of_execution_id)
-    REFERENCES execution(id)
+    REFERENCES execution(id),
+  FOREIGN KEY (task_id)
+    REFERENCES conversation_task(id)
 );
 
 CREATE INDEX idx_execution_conversation_created
@@ -533,6 +604,9 @@ CREATE INDEX idx_execution_parent
 
 CREATE INDEX idx_execution_status
   ON execution(status);
+
+CREATE INDEX idx_execution_task
+  ON execution(task_id);
 
 CREATE INDEX idx_execution_external_work_key
   ON execution(json_extract(external_work_ref, '$.key'));

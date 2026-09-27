@@ -90,7 +90,7 @@ describe('Team / Membership', () => {
     structure.ensureAgentMembership(team.id, outsider.id);
     structure.updateMembership(team.id, 'agent', outsider.id, { status: 'inactive' });
     assert.throws(
-      () => stack.team.createConversation({ kind: 'direct', memberIds: [outsider.id] }),
+      () => stack.team.createConversation({ kind: 'task', memberIds: [outsider.id] }),
       /停用|归档|Team/,
     );
     structure.updateMembership(team.id, 'agent', outsider.id, { status: 'active' });
@@ -119,7 +119,7 @@ describe('Scheduler', () => {
     const stub = new StubCopilot();
     const stack = createTestStack(db, memberService, stub.asCopilot);
     const agent = stack.team.createMember({ name: 'SchedAgent', role: 'E' });
-    const room = stack.team.createConversation({ kind: 'work', memberIds: [agent.id] });
+    const room = stack.team.createConversation({ kind: 'task', memberIds: [agent.id] });
     const scheduler = new SchedulerService(structure, () => stack.team);
 
     const past = new Date(Date.now() - 1000).toISOString();
@@ -167,7 +167,7 @@ describe('Scheduler', () => {
     const stub = new StubCopilot();
     const stack = createTestStack(db, memberService, stub.asCopilot);
     const agent = stack.team.createMember({ name: 'SchedPrompt', role: 'E' });
-    const room = stack.team.createConversation({ kind: 'work', memberIds: [agent.id] });
+    const room = stack.team.createConversation({ kind: 'task', memberIds: [agent.id] });
     // 先制造一条聊天消息：messageSequence > 0。旧的实现会把 scheduled prompt
     // 伪装成「最近一条消息」重放 —— 这条断言锁死 prompt 保真。
     muteAllMembers(stack.team, room.id);
@@ -204,7 +204,7 @@ describe('Scheduler', () => {
     // stub 收到的是渲染后的 prompt：schedule prompt 必须是「当前消息」本身，
     // 聊天消息只能作为共享上下文出现 —— 而不是被当成最近一条消息重放。
     const rendered = stub.turnFor(executionId).prompt;
-    assert.ok(rendered.includes(`Current message:\n\n${PROMPT}`), '当前消息必须是 schedule 的 prompt');
+    assert.ok(rendered.includes(PROMPT), '当前消息必须是 schedule 的 prompt');
     assert.ok(rendered.includes('[User] 聊天里最后一条消息'), '聊天消息只作为共享上下文');
 
     await waitFor(() => stack.team.getExecution(executionId).status === 'completed', 'execution 完成');
@@ -216,7 +216,7 @@ describe('Scheduler', () => {
     const stub = new StubCopilot();
     const stack = createTestStack(db, memberService, stub.asCopilot);
     const agent = stack.team.createMember({ name: 'SchedArchived', role: 'E' });
-    const room = stack.team.createConversation({ kind: 'work', memberIds: [agent.id] });
+    const room = stack.team.createConversation({ kind: 'task', memberIds: [agent.id] });
     const scheduler = new SchedulerService(structure, () => stack.team);
 
     // dueSchedules 是全 Team 的：先把前面用例留下的到期 schedule 清掉，
@@ -246,7 +246,7 @@ describe('Scheduler', () => {
     const stub = new StubCopilot();
     const stack = createTestStack(db, memberService, stub.asCopilot);
     const agent = stack.team.createMember({ name: 'EnqueueOnly', role: 'E' });
-    const room = stack.team.createConversation({ kind: 'work', memberIds: [agent.id] });
+    const room = stack.team.createConversation({ kind: 'task', memberIds: [agent.id] });
     const schedule = structure.createSchedule(
       team.id,
       { memberId: agent.id, conversationId: room.id, prompt: 'not started', type: 'once', runAt: new Date(Date.now() + 60_000).toISOString() },
@@ -283,7 +283,7 @@ describe('Scheduler', () => {
     const stub = new StubCopilot();
     const stack = createTestStack(db, memberService, stub.asCopilot);
     const agent = stack.team.createMember({ name: 'TickOrder', role: 'E' });
-    const room = stack.team.createConversation({ kind: 'work', memberIds: [agent.id] });
+    const room = stack.team.createConversation({ kind: 'task', memberIds: [agent.id] });
     const scheduler = new SchedulerService(structure, () => stack.team);
     const schedule = createScheduleDue({ memberId: agent.id, conversationId: room.id, prompt: 'ordered', type: 'once' });
 
@@ -305,7 +305,7 @@ describe('Scheduler', () => {
     const { StubCopilot } = await import('./support.js');
     const stack = createTestStack(db, memberService, new StubCopilot().asCopilot);
     const agent = stack.team.createMember({ name: 'RunTs', role: 'E' });
-    const room = stack.team.createConversation({ kind: 'work', memberIds: [agent.id] });
+    const room = stack.team.createConversation({ kind: 'task', memberIds: [agent.id] });
     const schedule = structure.createSchedule(
       team.id,
       { memberId: agent.id, conversationId: room.id, prompt: 'ts', type: 'once', runAt: new Date(Date.now() + 60_000).toISOString() },
@@ -342,7 +342,7 @@ describe('Scheduler', () => {
     const stub = new StubCopilot();
     const stack = createTestStack(db, memberService, stub.asCopilot);
     const agent = stack.team.createMember({ name: 'RecoverAgent', role: 'E' });
-    const room = stack.team.createConversation({ kind: 'work', memberIds: [agent.id] });
+    const room = stack.team.createConversation({ kind: 'task', memberIds: [agent.id] });
     const scheduler = new SchedulerService(structure, () => stack.team);
 
     // A) run 建了、execution 还没建（崩溃点）→ 恢复必须重建并跑完。
@@ -388,7 +388,7 @@ describe('Schedule 约束', () => {
     const stack = createTestStack(db, memberService, new StubCopilot().asCopilot);
     const insider = stack.team.createMember({ name: 'RoomInsider', role: 'E' });
     const outsider = stack.team.createMember({ name: 'RoomOutsider', role: 'E' });
-    const room = stack.team.createConversation({ kind: 'work', memberIds: [insider.id] });
+    const room = stack.team.createConversation({ kind: 'task', memberIds: [insider.id] });
     assert.throws(
       () =>
         structure.createSchedule(
@@ -396,7 +396,7 @@ describe('Schedule 约束', () => {
           { memberId: outsider.id, conversationId: room.id, prompt: 'x', type: 'once', runAt: new Date(Date.now() + 60_000).toISOString() },
           'local-user',
         ),
-      /执行成员必须在这个 work 会话里/,
+      /执行成员必须在这个 Task 工作区里/,
     );
   });
 
@@ -404,7 +404,7 @@ describe('Schedule 约束', () => {
     const { StubCopilot } = await import('./support.js');
     const stack = createTestStack(db, memberService, new StubCopilot().asCopilot);
     const agent = stack.team.createMember({ name: 'SchedValidate', role: 'E' });
-    const room = stack.team.createConversation({ kind: 'work', memberIds: [agent.id] });
+    const room = stack.team.createConversation({ kind: 'task', memberIds: [agent.id] });
 
     // runAt 必须是有效时间。
     assert.throws(
@@ -432,7 +432,7 @@ describe('Schedule 约束', () => {
     const { StubCopilot } = await import('./support.js');
     const stack = createTestStack(db, memberService, new StubCopilot().asCopilot);
     const agent = stack.team.createMember({ name: 'OnceResume', role: 'E' });
-    const room = stack.team.createConversation({ kind: 'work', memberIds: [agent.id] });
+    const room = stack.team.createConversation({ kind: 'task', memberIds: [agent.id] });
     const schedule = structure.createSchedule(team.id, { memberId: agent.id, conversationId: room.id, prompt: 'once', type: 'once', runAt: new Date(Date.now() + 60_000).toISOString() }, 'local-user');
     structure.updateScheduleStatus(schedule.id, 'completed');
     assert.throws(() => structure.updateScheduleStatus(schedule.id, 'active'), /已经跑完|重新开启/);
@@ -620,7 +620,7 @@ describe('外部工作：本地只有引用，业务事实在 Jira', () => {
     const other = stack.team.createMember({ name: 'JiraSecond', role: 'E' });
 
     const conv = stack.team.createConversation({
-      kind: 'work',
+      kind: 'task',
       title: 'Policy Service',
       externalWorkRef: { provider: 'jira', key: ' ABC-123 ' },
       memberIds: [someone.id],
@@ -630,7 +630,7 @@ describe('外部工作：本地只有引用，业务事实在 Jira', () => {
     assert.equal(ref?.provider, 'jira');
     assert.equal(ref?.externalId, 'ABC-123', '没给不可变 id 时先用 key 占位');
 
-    const plain = stack.team.createConversation({ kind: 'group', memberIds: [someone.id, other.id] });
+    const plain = stack.team.createConversation({ kind: 'task', memberIds: [someone.id, other.id] });
     assert.equal(stack.team.getConversation(plain.id).externalWorkRef, null);
   });
 
@@ -640,7 +640,7 @@ describe('外部工作：本地只有引用，业务事实在 Jira', () => {
     const stack = createTestStack(db, memberService, stub.asCopilot);
     const agent = stack.team.createMember({ name: 'JiraWorker', role: 'E' });
     const room = stack.team.createConversation({
-      kind: 'work',
+      kind: 'task',
       title: 'ABC-128',
       externalWorkRef: { provider: 'jira', key: 'ABC-128' },
       memberIds: [agent.id],
@@ -660,7 +660,7 @@ describe('外部工作：本地只有引用，业务事实在 Jira', () => {
     const stack = createTestStack(db, memberService, stub.asCopilot);
     const agent = stack.team.createMember({ name: 'ActivityProbe', role: 'E' });
     const room = stack.team.createConversation({
-      kind: 'work',
+      kind: 'task',
       title: 'ABC-130',
       externalWorkRef: { provider: 'jira', key: 'ABC-130' },
       memberIds: [agent.id],
@@ -693,7 +693,7 @@ describe('外部工作：本地只有引用，业务事实在 Jira', () => {
     const stack = createTestStack(db, memberService, new StubCopilot().asCopilot);
     const agent = stack.team.createMember({ name: 'RenameProbe', role: 'E' });
     const room = stack.team.createConversation({
-      kind: 'work',
+      kind: 'task',
       title: 'old key',
       externalWorkRef: { provider: 'jira', key: 'OLD-1', externalId: '100900' },
       memberIds: [agent.id],

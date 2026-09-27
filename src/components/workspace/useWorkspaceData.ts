@@ -6,6 +6,7 @@ import {
   type ConversationMemberState,
   type ConversationMemberStateChange,
   type ConversationMessage,
+  type ConversationTask,
   type DelegationEvent,
   type DeltaEvent,
   type ExecutionRecord,
@@ -13,7 +14,7 @@ import {
   type Member,
 } from '../../lib/api';
 import type { DelegationLog, StreamState } from '../team/ConversationMessages';
-import { EVERYONE, type MemberStatus, type MemberStatusLookup } from '../team/constants';
+import type { MemberStatus, MemberStatusLookup } from '../team/constants';
 
 /** 还在推进中的 execution 状态；到了其它状态就说明这条 execution 已经收尾。 */
 export const ACTIVE_STATUSES: ExecutionStatus[] = ['queued', 'running', 'waiting_for_member'];
@@ -87,8 +88,9 @@ export interface WorkspaceData {
    */
   noteUploadedFile: (file: ConversationFile) => void;
   removeConversationFile: (fileId: string) => void;
-  recipientMemberId: string;
-  setRecipientMemberId: (memberId: string) => void;
+  /** 当前工作区的任务（TaskPanel 用）。 */
+  tasks: ConversationTask[];
+  applyTaskChanged: (task: ConversationTask) => void;
   notice: string | null;
   setNotice: (notice: string | null) => void;
   memberById: Map<string, Member>;
@@ -123,14 +125,7 @@ export function useWorkspaceData({ onError }: { onError: (message: string | null
   const [delegations, setDelegations] = useState<DelegationLog[]>([]);
   /** executionId → 最近一次 execution.updated，用来渲染 runtime 实时状态。 */
   const [executions, setExecutions] = useState<Record<string, ExecutionRecord>>({});
-  /**
-   * 收件人。**不是** conversation.defaultMemberId —— 那是「这个房间默认归谁」，
-   * 用它当 group 的默认收件人会把多人共享讨论强制降级成单人聊天。
-   *
-   *   direct → 房间里唯一那个 Member
-   *   group  → ''（Everyone），由服务端 GroupDispatcher 决定唤醒谁
-   */
-  const [recipientMemberId, setRecipientMemberId] = useState<string>(EVERYONE);
+  const [tasks, setTasks] = useState<ConversationTask[]>([]);
   const [conversationStates, setConversationStates] = useState<
     Record<string, ConversationMemberState>
   >({});
@@ -240,7 +235,6 @@ export function useWorkspaceData({ onError }: { onError: (message: string | null
       return;
     }
 
-    const conversation = conversationsRef.current.find((item) => item.id === conversationId);
     const activeId = conversationId;
 
     setMessages([]);
@@ -249,6 +243,7 @@ export function useWorkspaceData({ onError }: { onError: (message: string | null
     setExecutions({});
     setConversationStates({});
     setConversationFiles([]);
+    setTasks([]);
     onError(null);
 
     void api
@@ -259,11 +254,14 @@ export function useWorkspaceData({ onError }: { onError: (message: string | null
       })
       .catch((e: unknown) => onError(e instanceof Error ? e.message : String(e)));
 
-    if (conversation?.kind === 'group') {
-      setRecipientMemberId(EVERYONE);
-    } else {
-      setRecipientMemberId(conversation?.members[0]?.id ?? EVERYONE);
-    }
+    void api
+      .listTasks(activeId)
+      .then((result) => {
+        if (!cancelled) setTasks(result.tasks);
+      })
+      .catch(() => {
+        // 任务列表只是增强，拿不到不该打断工作区
+      });
 
     void api
       .listMessages(activeId)
@@ -342,6 +340,24 @@ export function useWorkspaceData({ onError }: { onError: (message: string | null
       }
     });
 
+    source.addEventListener('task.updated', (event) => {
+      const task = parseEvent<ConversationTask>(event as MessageEvent);
+      if (!task) return;
+      setTasks((current) => {
+        const exists = current.some((item) => item.id === task.id);
+        if (!exists) return [...current, task].sort((a, b) => a.sortOrder - b.sortOrder);
+        return current.map((item) => (item.id === task.id ? task : item));
+      });
+    });
+
+    source.addEventListener('conversation.updated', (event) => {
+      const next = parseEvent<Conversation>(event as MessageEvent);
+      if (!next) return;
+      setConversations((current) =>
+        current.map((conversation) => (conversation.id === next.id ? next : conversation)),
+      );
+    });
+
     source.addEventListener('conversation_member_state.updated', (event) => {
       const change = parseEvent<ConversationMemberStateChange>(event as MessageEvent);
       if (!change) return;
@@ -410,7 +426,7 @@ export function useWorkspaceData({ onError }: { onError: (message: string | null
    *
    * 只依赖 conversationId：之后的每一次变化都由
    * `conversation_member_state.updated` 事件推过来，不需要再靠「消息数变了」
-   * 这种间接信号去猜 —— NO_REPLY / 排队 / 静音都不伴随新消息，
+   * 这种间接信号去猜 —— 排队 / 静音都不伴随新消息，
    * 靠消息数刷新会漏掉它们，而且会随每个 turn 都戳一次接口。
    */
   useEffect(() => {
@@ -517,6 +533,10 @@ export function useWorkspaceData({ onError }: { onError: (message: string | null
     );
   }
 
+  function applyTaskChanged(task: ConversationTask) {
+    setTasks((current) => current.map((item) => (item.id === task.id ? task : item)));
+  }
+
   function applyConversationChanged(next: Conversation) {
     setConversations((current) =>
       current.map((conversation) => (conversation.id === next.id ? next : conversation)),
@@ -526,7 +546,7 @@ export function useWorkspaceData({ onError }: { onError: (message: string | null
   /**
    * Member 身份改完之后，两个地方都持有它的副本，必须一起更新：
    *   members                —— 侧栏、mention 解析、选择器
-   *   conversation.members   —— header 的成员 chip、recipient 下拉
+   *   conversation.members   —— header 的成员 chip
    * 漏掉后者会出现「名字改了但群里的 chip 还是旧的」。
    *
    * 归档的 Member 直接从侧栏移除（listMembers 只返回 active），但保留在
@@ -589,8 +609,8 @@ export function useWorkspaceData({ onError }: { onError: (message: string | null
     noteUploadedFile,
     removeConversationFile: (fileId: string) =>
       setConversationFiles((current) => current.filter((item) => item.id !== fileId)),
-    recipientMemberId,
-    setRecipientMemberId,
+    tasks,
+    applyTaskChanged,
     notice,
     setNotice,
     memberById,

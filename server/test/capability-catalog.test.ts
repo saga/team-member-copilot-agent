@@ -80,7 +80,14 @@ describe('Resolver：Tool selector 只给点名的工具', () => {
       capabilityContext(member.id, defaultTeam.id),
       stack.capabilities.getEffective(defaultTeam.id, member.id),
     );
-    assert.deepEqual(toolNamesOf(all.tools), ['ask_member', 'message_member', 'remember_member']);
+    assert.deepEqual(toolNamesOf(all.tools), [
+      'ask_member',
+      'message_member',
+      'plan_tasks',
+      'remember_member',
+      'request_clarification',
+      'update_task',
+    ]);
 
     stack.capabilities.replaceMember(member.id, {
       skills: [],

@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { Avatar, Badge, Button, Space, Tag, Tooltip, Typography } from 'antd';
 import { PaperClipOutlined, TeamOutlined } from '@ant-design/icons';
 import type { Conversation, ConversationMemberState, Member } from '../../lib/api';
-import { GroupMemberManager } from './GroupMemberManager';
+import { MemberManager } from './MemberManager';
 import { isMemberDm, type MemberStatusLookup } from './constants';
 
 interface ConversationHeaderProps {
@@ -19,16 +19,9 @@ interface ConversationHeaderProps {
 }
 
 /**
- * 会话头：只负责「识别房间」与「这个房间有哪些共享物」。
+ * 工作区头：标题 / 状态 / Lead / Jira / 成员。
  *
- *   Title / kind / Jira / avatars / Shared / Participants
- *
- * 「这条消息发给谁」是 MessageComposer 的事（输入框前缀的选择器），
- * 静音/移人/加人是 Participants 抽屉的事。Avatar 只显示人 + 状态，
- * 点击不再静音 —— 误触一次就把 Agent  ban 掉是最差的交互。
- *
- * Shared 放在这里而不是塞进第二列：文件的归属是**这个会话**，它的入口就该和
- * 会话标题在同一行；放进侧栏会让人以为是全局资料，而它只对房间里的人可见。
+ * 不再显示「对话类型」：用户界面里只有 Task 工作区。
  */
 export function ConversationHeader({
   conversation,
@@ -39,10 +32,11 @@ export function ConversationHeader({
   onConversationChanged,
   onStateChanged,
   onOpenFiles,
-}: ConversationHeaderProps) {
-  const isGroup = conversation.kind === 'group';
+  memberLabel,
+}: ConversationHeaderProps & { memberLabel: (id: string) => string }) {
   const isDm = isMemberDm(conversation);
   const [participantsOpen, setParticipantsOpen] = useState(false);
+  const leadName = conversation.leadMemberId ? memberLabel(conversation.leadMemberId) : null;
 
   return (
     <>
@@ -53,8 +47,7 @@ export function ConversationHeader({
               {conversation.title}
             </Typography.Title>
 
-            {conversation.kind === 'work' && <Tag color="gold">Work</Tag>}
-            {conversation.kind === 'group' && <Tag color="blue">discussion</Tag>}
+            {!isDm && <Tag color={conversation.status === 'completed' ? 'success' : 'processing'}>{conversation.status}</Tag>}
 
             {conversation.externalWorkRef?.key && (
               <Tag color="cyan">{conversation.externalWorkRef.key}</Tag>
@@ -64,9 +57,12 @@ export function ConversationHeader({
           <Typography.Text type="secondary">
             {isDm
               ? conversation.members.map((member) => member.name).join(' ↔ ')
-              : isGroup
-                ? `${conversation.members.length} participants`
-                : (conversation.members[0]?.name ?? '')}
+              : [
+                  leadName ? `Lead ${leadName}` : null,
+                  `${conversation.members.length} members`,
+                ]
+                  .filter(Boolean)
+                  .join(' · ')}
           </Typography.Text>
         </div>
 
@@ -96,7 +92,7 @@ export function ConversationHeader({
             Shared{fileCount > 0 ? ` ${fileCount}` : ''}
           </Button>
 
-          {isGroup && (
+          {!isDm && (
             <Button icon={<TeamOutlined />} onClick={() => setParticipantsOpen(true)}>
               Participants
             </Button>
@@ -104,8 +100,8 @@ export function ConversationHeader({
         </Space>
       </div>
 
-      {isGroup && (
-        <GroupMemberManager
+      {!isDm && (
+        <MemberManager
           open={participantsOpen}
           conversation={conversation}
           allMembers={allMembers}

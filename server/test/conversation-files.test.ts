@@ -65,7 +65,7 @@ before(async () => {
 
   room = stack.team.createConversation({
     title: 'Files room',
-    kind: 'group',
+    kind: 'task',
     memberIds: [alice.id, bob.id],
   }).id;
   sideRoom = stack.team.createConversation({ title: 'Side room', memberIds: [alice.id] }).id;

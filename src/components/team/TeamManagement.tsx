@@ -17,7 +17,7 @@ export function TeamManagement({
   onToggleNewMember,
   onCreateMember,
   onCancelNewMember,
-  onChatMember,
+  onNewTaskWithMember,
   onViewMember,
   onManageMemberCapabilities,
   onArchiveMember,
@@ -28,7 +28,7 @@ export function TeamManagement({
   onToggleNewMember: () => void;
   onCreateMember: (input: { name: string; role: string }) => Promise<void>;
   onCancelNewMember: () => void;
-  onChatMember: (member: Member) => void;
+  onNewTaskWithMember: (member: Member) => void;
   onViewMember: (member: Member) => void;
   onManageMemberCapabilities: (member: Member) => void;
   onArchiveMember: (member: Member) => void;
@@ -49,7 +49,7 @@ export function TeamManagement({
                 onToggleNewMember={onToggleNewMember}
                 onCreateMember={onCreateMember}
                 onCancelNewMember={onCancelNewMember}
-                onChat={onChatMember}
+                onNewTask={onNewTaskWithMember}
                 onViewProfile={onViewMember}
                 onManageCapabilities={onManageMemberCapabilities}
                 onArchive={onArchiveMember}

@@ -325,8 +325,8 @@ export class TeamStructureService {
       .get(input.conversationId) as unknown as { id: string; kind: string; team_id: string } | undefined;
     if (!conversation) throw notFound(`Conversation 不存在：${input.conversationId}`);
     if (conversation.team_id !== teamId) throw badRequest('这个会话不属于当前团队');
-    if (conversation.kind !== 'work') throw badRequest('定时任务只能挂在 work 会话上');
-    // 被调度的 Member 必须属于绑定的 work conversation，否则运行时才炸。
+    if (conversation.kind !== 'task') throw badRequest('定时任务只能挂在 Task 工作区上');
+    // 被调度的 Member 必须属于绑定的 Task 工作区，否则运行时才炸。
     const memberInConversation = this.db
       .prepare(
         `
@@ -338,7 +338,7 @@ export class TeamStructureService {
       )
       .get(input.conversationId, input.memberId);
     if (!memberInConversation) {
-      throw badRequest('定时任务的执行成员必须在这个 work 会话里');
+      throw badRequest('定时任务的执行成员必须在这个 Task 工作区里');
     }
     const prompt = input.prompt.trim();
     if (!prompt) throw badRequest('定时任务的指令内容不能为空');

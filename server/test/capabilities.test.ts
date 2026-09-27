@@ -926,7 +926,7 @@ describe('TeamService 的能力读写入口', () => {
 
   it('快照里的 capabilityManifestHash 就是解析出来的那一份；改能力之后跟着变', async () => {
     const member = stack.team.createMember({ name: 'Rotating', role: 'T' });
-    const room = stack.team.createConversation({ kind: 'direct', memberIds: [member.id] });
+    const room = stack.team.createConversation({ kind: 'task', memberIds: [member.id], leadMemberId: member.id });
 
     const first = await stack.team.sendMessage({ conversationId: room.id, content: 'one' });
     const before = await snapshotOf(singleExecutionId(db, room.id, first.wakes));

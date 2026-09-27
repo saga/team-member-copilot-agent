@@ -30,7 +30,6 @@ process.env.COPILOT_WARMUP = 'false';
 const { config } = await import('../config.js');
 const { db } = await import('../db.js');
 const { MemberService } = await import('../member-service.js');
-const { resolveMentions } = await import('../group-dispatcher.js');
 const { singleExecutionId, muteAllMembers, createTestStack } = await import('./support.js');
 
 after(() => {
@@ -132,8 +131,8 @@ describe('replyToMessageId 必须指得着，而且是同一个房间里的', ()
     const alice = makeMember('Reply Alice', 'reply-alice');
     const bob = makeMember('Reply Bob', 'reply-bob');
 
-    const room = team.createConversation({ kind: 'direct', memberIds: [alice.id] });
-    const other = team.createConversation({ kind: 'direct', memberIds: [bob.id] });
+    const room = team.createConversation({ kind: 'task', memberIds: [alice.id], leadMemberId: alice.id });
+    const other = team.createConversation({ kind: 'task', memberIds: [bob.id], leadMemberId: bob.id });
 
     const elsewhere = await team.sendMessage({ conversationId: other.id, content: '别的房间' });
 
@@ -171,7 +170,7 @@ describe('replyToMessageId 必须指得着，而且是同一个房间里的', ()
 describe('POST /messages 的幂等键', () => {
   it('同一个 key 第二次到达：不落新消息、不再唤醒、把第一条原样返回', async () => {
     const alice = makeMember('Idem Alice', 'idem-alice');
-    const room = team.createConversation({ kind: 'direct', memberIds: [alice.id] });
+    const room = team.createConversation({ kind: 'task', memberIds: [alice.id], leadMemberId: alice.id });
 
     const key = 'req-0001';
 
@@ -204,7 +203,7 @@ describe('POST /messages 的幂等键', () => {
 
   it('幂等命中不消费 message_sequence，也不留空号', async () => {
     const alice = makeMember('Idem2 Alice', 'idem2-alice');
-    const room = team.createConversation({ kind: 'direct', memberIds: [alice.id] });
+    const room = team.createConversation({ kind: 'task', memberIds: [alice.id], leadMemberId: alice.id });
 
     await team.sendMessage({ conversationId: room.id, content: 'a', clientRequestId: 'k1' });
     await waitForConversationIdle(room.id);
@@ -278,7 +277,7 @@ describe('ContextAssembler 的单轮上限', () => {
     // group 房间：bob 被静音，alice 不发言，这样房间里能攒下一批消息而
     // 没有人被唤醒，制造出「沉默很久」的现场。
     const room = team.createConversation({
-      kind: 'group',
+      kind: 'task',
       title: 'Context',
       memberIds: [alice.id, bob.id],
     });
@@ -313,28 +312,29 @@ describe('ContextAssembler 的单轮上限', () => {
         runtime,
         conversation: team.getConversation(room.id),
         member: team.getMember(alice.id),
-        turnMode: 'discussion',
+        turnMode: 'lead',
         triggerMessageSequence: total,
-        wakeReason: 'mention',
+        wakeReason: 'lead_message',
         currentPrompt: 'hello',
       });
 
       assert.equal(context.sharedMessages.length, 3);
-      // 留的是**最新**的三条，不是最旧的三条 —— 唤醒它的是刚刚发生的事
+      // 触发消息本身单独拎成 Current message，不进 transcript；
+      // 留的是剩下里**最新**的三条
       assert.deepEqual(
         context.sharedMessages.map((message) => message.content),
-        ['消息 10', '消息 11', '消息 12'],
+        ['消息 9', '消息 10', '消息 11'],
       );
-      assert.equal(context.elidedMessageCount, total - 3);
+      assert.equal(context.elidedMessageCount, total - 4);
       assert.equal(context.elidedFromSequence, 1);
 
       // checkpoint 仍然推到读到的最后一条（否则同一批消息每轮重放），
       // 但 prompt 里必须写明被略过的那一段 —— 不写的话模型会把 transcript
       // 当成房间的全部，据此下「没人提过这个」的错误结论。
       assert.equal(context.consumedThroughSequence, total);
-      assert.match(context.prompt, /9 earlier messages .* were omitted/);
-      assert.match(context.prompt, /消息 12/);
-      assert.doesNotMatch(context.prompt, /消息 9/);
+      assert.match(context.prompt, /8 earlier messages .* were omitted/);
+      assert.match(context.prompt, /消息 11/);
+      assert.doesNotMatch(context.prompt, /消息 8/);
     } finally {
       config.maxContextMessages = originalLimit;
     }
@@ -347,7 +347,7 @@ describe('ContextAssembler 的单轮上限', () => {
     // group 房间 + 全员静音：这样攒下来的都是**用户**消息，不会混进 Member 的
     // 回复（那些会被当成「自己说过的话」过滤掉，让这个用例测不到字符预算）。
     const room = team.createConversation({
-      kind: 'group',
+      kind: 'task',
       title: 'Chars',
       memberIds: [alice.id, bob.id],
     });
@@ -378,18 +378,18 @@ describe('ContextAssembler 的单轮上限', () => {
         },
         conversation: team.getConversation(room.id),
         member: team.getMember(alice.id),
-        turnMode: 'discussion',
+        turnMode: 'lead',
         triggerMessageSequence: 2,
-        wakeReason: 'everyone',
+        wakeReason: 'lead_message',
         currentPrompt: '',
       });
 
-      // 超预算也至少留一条，且留的是最新的那条
+      // 触发消息（第 2 条）单独拎成 Current message，不进 transcript；
+      // 超预算也至少留一条（第 1 条）
       assert.equal(context.sharedMessages.length, 1);
-      assert.equal(context.sharedMessages[0].content, 'y'.repeat(4000));
-      assert.equal(context.elidedMessageCount, 1);
+      assert.equal(context.sharedMessages[0].content, 'x'.repeat(4000));
+      assert.equal(context.elidedMessageCount, 0);
       assert.equal(context.consumedThroughSequence, 2);
-      assert.match(context.prompt, /1 earlier message in this room/);
     } finally {
       config.maxContextChars = originalChars;
     }
@@ -401,7 +401,7 @@ describe('ContextAssembler 的单轮上限', () => {
 describe('execution 记录当时用的配置', () => {
   it('跑完一轮后有快照；改了 Member 身份之后 retry 的快照跟着变', async () => {
     const alice = makeMember('Snapshot Alice', 'snapshot-alice');
-    const room = team.createConversation({ kind: 'direct', memberIds: [alice.id] });
+    const room = team.createConversation({ kind: 'task', memberIds: [alice.id], leadMemberId: alice.id });
 
     const sent = await team.sendMessage({ conversationId: room.id, content: '第一轮' });
     const executionId = singleExecutionId(db, room.id, sent.wakes);
@@ -442,7 +442,7 @@ describe('execution 记录当时用的配置', () => {
 
   it('历史 execution 没有快照时读出来是 null，不是坏掉的 JSON', () => {
     const alice = makeMember('Snapshot2 Alice', 'snapshot2-alice');
-    const room = team.createConversation({ kind: 'direct', memberIds: [alice.id] });
+    const room = team.createConversation({ kind: 'task', memberIds: [alice.id], leadMemberId: alice.id });
 
     db.prepare(
       `
@@ -460,7 +460,7 @@ describe('execution 记录当时用的配置', () => {
 describe('conversation_member_state.updated', () => {
   it('状态变化会落库并广播，且广播时 DB 里已经是新状态', async () => {
     const alice = makeMember('State Alice', 'state-alice');
-    const room = team.createConversation({ kind: 'direct', memberIds: [alice.id] });
+    const room = team.createConversation({ kind: 'task', memberIds: [alice.id], leadMemberId: alice.id });
 
     const received: Array<{
       memberId: string;
@@ -517,7 +517,7 @@ describe('conversation_member_state.updated', () => {
     const bob = makeMember('State2 Bob', 'state2-bob');
 
     const room = team.createConversation({
-      kind: 'group',
+      kind: 'task',
       title: 'State',
       memberIds: [alice.id, bob.id],
     });
@@ -565,7 +565,7 @@ describe('conversation_member_state.updated', () => {
     const carol = makeMember('State3 Carol', 'state3-carol');
 
     const room = team.createConversation({
-      kind: 'group',
+      kind: 'task',
       title: 'Removal',
       memberIds: [alice.id, bob.id, carol.id],
     });
@@ -589,65 +589,4 @@ describe('conversation_member_state.updated', () => {
       '移出后不该再出现在状态列表里',
     );
   });
-});
-
-// -------------------------------------------------------- 7. @mention 解析
-describe('@mention 只做精确匹配', () => {
-  const members = [
-    { id: 'm1', handle: 'alice', name: 'Alice' },
-    { id: 'm2', handle: 'anna', name: 'Anna' },
-    { id: 'm3', handle: 'chen', name: 'Alice Chen' },
-  ] as unknown as Member[];
-
-  it('@ann 不再匹配到 @anna（前缀猜测是最容易搞错收件人的那种）', () => {
-    const result = resolveMentions('@ann 看一下', members);
-    assert.deepEqual(result.matched, []);
-    assert.deepEqual(result.unresolved, ['ann']);
-  });
-
-  it('token 比 handle 长时不再被前缀吃掉（@alicexyz ≠ @alice）', () => {
-    // 这是前缀兜底真正会猜错的那个方向：旧实现是 `token.startsWith(key)`，
-    // 所以任何以某个 handle / name 开头的字符串都会被算成命中 ——
-    // `@Bobby`（在喊一个不在房间里的人）会被解析成 `@Bob`，
-    // `@annax` 会被解析成 `@anna`。消息发给错误的人，而且没有任何提示。
-    for (const text of ['@alicexyz 看一下', '@annax 看一下', '@AliceChenExtra 看一下']) {
-      const result = resolveMentions(text, members);
-      assert.deepEqual(result.matched, [], `${text} 不该命中任何人`);
-      assert.equal(result.unresolved.length, 1, `${text} 应当报「没匹配到」`);
-    }
-
-    // 精确写法照常命中
-    assert.deepEqual(
-      resolveMentions('@anna', members).matched.map((member) => member.id),
-      ['m2'],
-    );
-  });
-
-  it('带空格的 name 被空格截断后，只认精确命中，不再靠前缀猜到别人头上', () => {
-    // `@Alice Chen` 取出来的 token 是 `Alice`。以前这里会走前缀匹配，
-    // 命中的是**谁**取决于索引顺序和谁的名字更长 —— 也就是「猜」。
-    //
-    // 现在只有两个确定性结果：精确命中某个 handle / name，或者报没匹配到。
-    const withHandle = resolveMentions('@Alice Chen 看下', members);
-    // members 里有一个 handle 恰好是 `alice`，所以这条是**精确命中**，
-    // 不是猜错：用户写出来的 token 就是它。
-    assert.deepEqual(
-      withHandle.matched.map((member) => member.id),
-      ['m1'],
-    );
-
-    // 换成没有 handle 冲突的 roster，同样的写法就只能报「没匹配到」
-    const noConflict = members.filter((member) => member.handle !== 'alice');
-    const rejected = resolveMentions('@Alice Chen 看下', noConflict);
-    assert.deepEqual(rejected.matched, []);
-    assert.deepEqual(rejected.unresolved, ['Alice']);
-
-    // 去掉空格写就能命中 name（这是 name 索引里真实存在的 key）
-    const compact = resolveMentions('@AliceChen 看下', noConflict);
-    assert.deepEqual(
-      compact.matched.map((member) => member.id),
-      ['m3'],
-    );
-  });
-
 });

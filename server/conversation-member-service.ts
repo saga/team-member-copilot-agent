@@ -17,6 +17,7 @@ interface StateRow {
   pending_wake: number;
   pending_wake_trigger_sequence: number | null;
   pending_wake_reason: string | null;
+  pending_wake_task_id: string | null;
   muted: number;
   updated_at: string;
 }
@@ -190,7 +191,7 @@ export class ConversationMemberService {
     conversationId: string,
     memberId: string,
     pending: boolean,
-    wake?: { triggerSequence: number; reason: WakeReason },
+    wake?: { triggerSequence: number | null; reason: WakeReason; taskId?: string | null },
   ): void {
     if (pending && !wake) {
       // 这是调用方的编程错误，不是用户输入问题：能落库的 pending 必须可重放。
@@ -205,6 +206,7 @@ export class ConversationMemberService {
           pending_wake = ?,
           pending_wake_trigger_sequence = ?,
           pending_wake_reason = ?,
+          pending_wake_task_id = ?,
           updated_at = ?
         WHERE conversation_id = ?
           AND member_id = ?
@@ -214,6 +216,7 @@ export class ConversationMemberService {
         pending ? 1 : 0,
         pending && wake ? wake.triggerSequence : null,
         pending && wake ? wake.reason : null,
+        pending && wake ? (wake.taskId ?? null) : null,
         now(),
         conversationId,
         memberId,
@@ -239,6 +242,7 @@ export class ConversationMemberService {
           pending_wake = 0,
           pending_wake_trigger_sequence = NULL,
           pending_wake_reason = NULL,
+          pending_wake_task_id = NULL,
           wake_status = 'running',
           updated_at = ?
         WHERE conversation_id = ?
@@ -265,12 +269,14 @@ export class ConversationMemberService {
           pending_wake = 0,
           pending_wake_trigger_sequence = NULL,
           pending_wake_reason = NULL,
+          pending_wake_task_id = NULL,
           updated_at = ?
         WHERE conversation_id = ?
           AND member_id = ?
           AND pending_wake = 1
           AND pending_wake_trigger_sequence IS ?
           AND pending_wake_reason IS ?
+          AND pending_wake_task_id IS ?
         `,
       )
       .run(
@@ -279,6 +285,7 @@ export class ConversationMemberService {
         memberId,
         expected.triggerSequence,
         expected.reason,
+        expected.taskId,
       );
     this.emitState(conversationId, memberId);
   }
@@ -366,7 +373,8 @@ export class ConversationMemberService {
           conversation_id,
           member_id,
           pending_wake_trigger_sequence,
-          pending_wake_reason
+          pending_wake_reason,
+          pending_wake_task_id
         FROM conversation_member_state
         WHERE pending_wake = 1
           AND wake_status = 'queued'
@@ -377,12 +385,14 @@ export class ConversationMemberService {
       member_id: string;
       pending_wake_trigger_sequence: number | null;
       pending_wake_reason: string | null;
+      pending_wake_task_id: string | null;
     }>;
 
     return rows.map((row) => ({
       conversationId: row.conversation_id,
       memberId: row.member_id,
-      triggerSequence: row.pending_wake_trigger_sequence ?? 0,
+      taskId: row.pending_wake_task_id,
+      triggerSequence: row.pending_wake_trigger_sequence,
       reason: asWakeReason(row.pending_wake_reason),
     }));
   }
@@ -398,6 +408,7 @@ export class ConversationMemberService {
           pending_wake = 0,
           pending_wake_trigger_sequence = NULL,
           pending_wake_reason = NULL,
+          pending_wake_task_id = NULL,
           updated_at = ?
         WHERE wake_status <> 'idle'
            OR pending_wake = 1
@@ -415,9 +426,8 @@ export class ConversationMemberService {
  * 就编译不过。字符串比较不会报错，Record 会。
  */
 const KNOWN_WAKE_REASONS: Record<Exclude<WakeReason, 'schedule'>, true> = {
-  mention: true,
-  direct: true,
-  everyone: true,
+  lead_message: true,
+  task_ready: true,
 };
 
 /**
@@ -432,9 +442,9 @@ export function asWakeReason(value: string | null): Exclude<WakeReason, 'schedul
   if (value !== null && Object.prototype.hasOwnProperty.call(KNOWN_WAKE_REASONS, value)) {
     return value as Exclude<WakeReason, 'schedule'>;
   }
-  // 认不出来的一律按**最宽松**的处理：宁可让一个成员可以沉默，也不要让一个
-  // 乱码值变成「必须回答」。
-  return 'everyone';
+  // 认不出来的一律按 Lead 处理：Task wake 必须带 taskId 才能重放，
+  // 认不出的原因不能伪装成一次 Task 执行。
+  return 'lead_message';
 }
 
 function mapState(row: StateRow): ConversationMemberState {
@@ -447,6 +457,7 @@ function mapState(row: StateRow): ConversationMemberState {
     pendingWake: row.pending_wake === 1,
     pendingWakeTriggerSequence: row.pending_wake_trigger_sequence,
     pendingWakeReason: row.pending_wake_reason ? asWakeReason(row.pending_wake_reason) : null,
+    pendingWakeTaskId: row.pending_wake_task_id,
     muted: row.muted === 1,
     updatedAt: row.updated_at,
   };

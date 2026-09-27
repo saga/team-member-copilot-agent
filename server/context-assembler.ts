@@ -3,12 +3,12 @@ import { config } from './config.js';
 import type {
   Conversation,
   ConversationMessage,
+  ConversationTask,
   Member,
   MemberRuntime,
   TurnMode,
   WakeReason,
 } from './domain.js';
-import { NO_REPLY_SENTINEL } from './member-decision.js';
 
 /**
  * Conversation context 与 Copilot Session history 的职责划分：
@@ -62,8 +62,8 @@ interface MessageRow {
   message_sequence: number;
   sender_type: 'user' | 'member' | 'system';
   sender_id: string;
-  target_member_id: string | null;
   reply_to_message_id: string | null;
+  task_id: string | null;
   client_request_id: string | null;
   content: string;
   execution_id: string | null;
@@ -82,8 +82,11 @@ export class ContextAssembler {
     triggerMessageSequence: number | null;
     /** 为什么被唤醒；delegation 传 null。 */
     wakeReason: WakeReason | null;
-    /** 本次要处理的内容（direct = 用户那条消息；discussion 只是提示；delegation = 任务）。 */
+    /** 本次要处理的内容（lead = 用户那条消息；task = 任务描述；delegation = 任务）。 */
     currentPrompt: string;
+    currentTask?: ConversationTask | null;
+    tasks?: ConversationTask[];
+    memberNames?: Map<string, string>;
     /**
      * 这间房间挂了外部工作（Jira 工单）时才带的引用。
      *
@@ -130,9 +133,6 @@ export class ContextAssembler {
       if (message.senderType === 'member' && message.senderId === input.runtime.memberId) {
         return false;
       }
-      // 讨论模式下触发消息**不**排除：它就是房间活动的最后一条，会被排进
-      // transcript。direct / delegation 才把它单独拎出来当「当前消息 / 任务」。
-      if (input.turnMode === 'discussion') return true;
       return message.messageSequence !== input.triggerMessageSequence;
     });
 
@@ -160,6 +160,8 @@ export class ContextAssembler {
       turnMode: TurnMode;
       wakeReason: WakeReason | null;
       currentPrompt: string;
+      currentTask?: ConversationTask | null;
+      tasks?: ConversationTask[];
       work?: { provider: string; key: string; url: string | null } | null;
       referencedFiles?: Array<{ originalName: string }>;
     },
@@ -181,9 +183,7 @@ export class ContextAssembler {
       );
     }
 
-    if (input.turnMode === 'discussion') {
-      sections.push(this.roomHeader(input.conversation, input.member));
-    }
+    sections.push(this.workspaceHeader(input.conversation, input.member, input.tasks ?? [], input.currentTask ?? null));
 
     const referenced = input.referencedFiles ?? [];
     if (referenced.length > 0) {
@@ -199,10 +199,7 @@ export class ContextAssembler {
     }
 
     if (sharedMessages.length > 0) {
-      const header =
-        input.turnMode === 'discussion'
-          ? 'Room activity since you last read it:'
-          : 'Shared conversation context (new since your last turn):';
+      const header = 'Recent relevant updates (new since your last turn):';
 
       // 略过的部分必须说出来。不说的话，模型会把 transcript 当成房间的全部，
       // 然后给出「没有人提过 X」这种被截断本身制造出来的结论。
@@ -222,32 +219,57 @@ export class ContextAssembler {
       return sections.join('\n\n');
     }
 
-    if (input.turnMode === 'direct') {
-      sections.push('Current message:', input.currentPrompt, DIRECT_INSTRUCTION);
+    if (input.turnMode === 'task') {
+      sections.push('User message:', input.currentPrompt, TASK_INSTRUCTION);
       return sections.join('\n\n');
     }
 
-    // discussion：触发消息已经在 transcript 里了，这里只说「轮到你判断」。
-    sections.push(discussionInstruction(input.wakeReason));
-
+    sections.push('User message:', input.currentPrompt, LEAD_INSTRUCTION);
     return sections.join('\n\n');
   }
 
-  private roomHeader(conversation: Conversation, member: Member): string {
-    const participants = conversation.members
-      .map((item) => {
-        const marker = item.id === member.id ? ' (you)' : '';
-        const archived = item.status === 'active' ? '' : ' [archived]';
-        return `- ${item.name} (@${item.handle})${marker}${archived}`;
-      })
-      .join('\n');
-
-    return [
-      `Room: ${conversation.title}`,
-      `You are one participant in this group conversation, not the assistant of the whole room.`,
-      'Participants:',
-      participants,
-    ].join('\n');
+  private workspaceHeader(
+    conversation: Conversation,
+    member: Member,
+    tasks: ConversationTask[],
+    currentTask: ConversationTask | null,
+  ): string {
+    const lines: string[] = [
+      `Current task workspace: ${conversation.title}`,
+      `Objective: ${conversation.objective || '(not yet defined)'}`,
+      `Status: ${conversation.status}`,
+    ];
+    if (conversation.requirements.successCriteria.length > 0) {
+      lines.push(`Success criteria: ${conversation.requirements.successCriteria.join('; ')}`);
+    }
+    if (conversation.requirements.constraints.length > 0) {
+      lines.push(`Constraints: ${conversation.requirements.constraints.join('; ')}`);
+    }
+    if (conversation.openQuestions.length > 0) {
+      lines.push(`Open questions: ${conversation.openQuestions.join('; ')}`);
+    }
+    if (tasks.length > 0) {
+      const names = this.memberNames();
+      lines.push(
+        'Current tasks:',
+        ...tasks.map((task) => {
+          const marker = task.id === currentTask?.id ? '>> ' : '';
+          const name = names.get(task.assigneeMemberId) ?? task.assigneeMemberId;
+          return `${marker}[${task.status}] ${task.title} — ${name}`;
+        }),
+      );
+    }
+    if (currentTask) {
+      lines.push(
+        `Your assigned task: ${currentTask.title}`,
+        `Description: ${currentTask.description || '(none)'}`,
+        currentTask.acceptanceCriteria.length > 0
+          ? `Acceptance criteria: ${currentTask.acceptanceCriteria.join('; ')}`
+          : '',
+      );
+    }
+    void member;
+    return lines.filter(Boolean).join('\n');
   }
 
   private transcript(messages: ConversationMessage[]): string {
@@ -277,9 +299,21 @@ export class ContextAssembler {
   }
 }
 
-const DIRECT_INSTRUCTION = [
-  'You are the designated responder in this conversation.',
-  'Answer the message directly and concisely.',
+const LEAD_INSTRUCTION = [
+  'You are the Lead of this task workspace.',
+  'Your job is to advance the work toward completion.',
+  'Do not chat socially. Do not repeat known information. Do not ask unnecessary questions.',
+  'Use request_clarification when information is missing (at most 3 questions).',
+  'When enough information is available, call plan_tasks immediately.',
+  'The goal is task completion, not conversation continuation.',
+].join('\n');
+
+const TASK_INSTRUCTION = [
+  'You are responsible for completing your assigned task.',
+  'Do the work. Use available tools and knowledge.',
+  "When your assigned work is complete, call update_task with status completed.",
+  "If you cannot proceed, call update_task with status blocked and explain the blocker.",
+  'Do not return generic conversational commentary.',
 ].join('\n');
 
 /**
@@ -288,15 +322,10 @@ const DIRECT_INSTRUCTION = [
  * 规则只有一条：**从最新往前取**，取到条数或字符数上限为止。
  *
  * 为什么不从最旧往前取（也就是丢掉最新的那些）：那等于把「刚刚发生的讨论」
- * 换成「很久以前的讨论」，而被唤醒的原因恰恰是刚刚发生的事。丢掉最新的一条
- * 更荒谬 —— 触发消息在 discussion 模式下就在里面。
+ * 换成「很久以前的讨论」，而被唤醒的原因恰恰是刚刚发生的事。
  *
  * 也不做「保留头 + 保留尾、中间省略」那种截法：模型看到的两段之间没有因果
  * 关系，比少看到一点更容易产生错误结论。
- *
- * 至少注入一条：一条都没有时，discussion 模式会对着空房间判断「要不要发言」，
- * 而它明明是被这条消息唤醒的。单条消息超长时也照注入 —— 上限是用来防事故的，
- * 不是用来把一轮变成空的。
  */
 function selectWindow(
   messages: ConversationMessage[],
@@ -326,40 +355,6 @@ function selectWindow(
   return { included, elided: messages.slice(0, messages.length - included.length) };
 }
 
-/**
- * group 房间里「要不要发言」的指令。
- *
- * 三档：direct / mention 必须回答；everyone 可以 NO_REPLY。
- */
-function discussionInstruction(reason: WakeReason | null): string {
-  if (reason === 'mention') {
-    return [
-      'You were addressed by name, so you must respond.',
-      'Do not repeat what other participants already said.',
-      'Add only information that is useful and distinct.',
-      'Reply directly and concisely.',
-    ].join('\n');
-  }
-
-  if (reason === 'everyone') {
-    return [
-      'You are one of the participants included in this discussion.',
-      '',
-      'Decide whether you have something useful to contribute.',
-      `If you do not have anything useful or non-duplicative to add, reply with exactly: ${NO_REPLY_SENTINEL}`,
-      '',
-      'Do not summarize the entire discussion.',
-      'Do not agree merely for the sake of participating.',
-      'Add information, reasoning, risks, or a concrete next step only when useful.',
-    ].join('\n');
-  }
-
-  return [
-    'Reply directly to the user.',
-    'Be concise and useful.',
-  ].join('\n');
-}
-
 function mapMessage(row: MessageRow): ConversationMessage {
   return {
     id: row.id,
@@ -367,8 +362,8 @@ function mapMessage(row: MessageRow): ConversationMessage {
     messageSequence: row.message_sequence,
     senderType: row.sender_type,
     senderId: row.sender_id,
-    targetMemberId: row.target_member_id,
     replyToMessageId: row.reply_to_message_id,
+    taskId: row.task_id,
     clientRequestId: row.client_request_id,
     content: row.content,
     executionId: row.execution_id,

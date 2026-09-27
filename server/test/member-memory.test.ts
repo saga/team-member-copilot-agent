@@ -60,7 +60,7 @@ describe('Member memory 隔离', () => {
 
   it('remember_member 只写当前 Team，从不碰全局记忆', async () => {
     const member = team.createMember({ name: 'Agent Amy', role: 'Reviewer' });
-    const conversation = team.createConversation({ kind: 'direct', memberIds: [member.id] });
+    const conversation = team.createConversation({ kind: 'task', memberIds: [member.id], leadMemberId: member.id });
     const teamId = team.getConversation(conversation.id).teamId;
 
     const result = await team.rememberMember({
@@ -89,7 +89,7 @@ describe('Member memory 隔离', () => {
 
   it('全局记忆与 Team 上下文版本相互独立', () => {
     const member = team.createMember({ name: 'Version Vera', role: 'Analyst' });
-    const conversation = team.createConversation({ kind: 'direct', memberIds: [member.id] });
+    const conversation = team.createConversation({ kind: 'task', memberIds: [member.id], leadMemberId: member.id });
     const teamId = team.getConversation(conversation.id).teamId;
 
     const globalBefore = team.getMemberMemory(member.id).version;

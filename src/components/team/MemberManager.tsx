@@ -7,7 +7,7 @@ import {
   type Member,
 } from '../../lib/api';
 
-interface GroupMemberManagerProps {
+interface MemberManagerProps {
   open: boolean;
   conversation: Conversation;
   /** 全部可用成员，用来挑「还没进房间的人」。 */
@@ -22,11 +22,11 @@ interface GroupMemberManagerProps {
  * Discussion 的 Participants 抽屉：加人 / 移人 / 静音。
  *
  * 约束在 UI 上也表达出来，而不是只在点下去之后等后端报错：
- * discussion 至少要两个成员。后端 `assertConversationKindShape()` 会拦，但把
+ * Task 工作区 至少要两个成员。后端 `assertConversationKindShape()` 会拦，但把
  * 「移出」按钮留在那里让人点、再弹一个 400，是最差的交互。
  * 归档的 Member 保留在 roster 里（历史事实），但不能被重新加进来。
  */
-export function GroupMemberManager({
+export function MemberManager({
   open,
   conversation,
   allMembers,
@@ -34,7 +34,7 @@ export function GroupMemberManager({
   onConversationChanged,
   onStateChanged,
   onClose,
-}: GroupMemberManagerProps) {
+}: MemberManagerProps) {
   const [busyMemberId, setBusyMemberId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -43,8 +43,8 @@ export function GroupMemberManager({
     (member) => member.status === 'active' && !rosterIds.has(member.id),
   );
 
-  // 移出后 roster 必须仍是合法 discussion（≥ 2）
-  const removeDisabled = conversation.members.length <= 2;
+  // 移出后 roster 必须仍是合法 Task 工作区（≥ 1）
+  const removeDisabled = conversation.members.length <= 1;
 
   async function run(memberId: string, action: () => Promise<void>) {
     setBusyMemberId(memberId);

@@ -26,6 +26,8 @@ interface ConversationMessagesProps {
   delegations: DelegationLog[];
   /** 把 memberId 显示成名字。 */
   memberLabel: (memberId: string) => string;
+  /** 把 taskId 显示成任务标题（Task 进展消息用）。 */
+  taskLabel: (taskId: string | null) => string | null;
   scrollRef: RefObject<HTMLDivElement | null>;
 }
 
@@ -45,20 +47,14 @@ export function ConversationMessages({
   streaming,
   delegations,
   memberLabel,
+  taskLabel,
   scrollRef,
 }: ConversationMessagesProps) {
-  const isGroup = conversation.kind === 'group';
-
+  void conversation;
   if (messages.length === 0 && Object.keys(streaming).length === 0) {
     return (
       <div className="chat-scroll" ref={scrollRef}>
-        <Empty
-          description={
-            isGroup
-              ? '收件人保持 Everyone 时，消息会发给房间里所有成员，由他们自己决定要不要回话；想指定某个人，就在这里选，或在正文里 @他。'
-              : `${conversation.members[0]?.name ?? '该成员'} 会带着自己的记忆和工作区来回答，需要时也可以把子任务交给其他成员帮忙。`
-          }
-        />
+        <Empty description="说清楚要达成什么，Lead 会先确认目标再规划任务。整个工作过程都会记录在这里。" />
       </div>
     );
   }
@@ -68,19 +64,23 @@ export function ConversationMessages({
       key: message.id,
       role: message.senderType === 'user' ? ('user' as const) : message.senderType === 'member' ? ('ai' as const) : ('system' as const),
       placement: (message.senderType === 'user' ? 'end' : 'start') as 'end' | 'start',
-      content:
-        message.files.length === 0 ? (
-          message.content
-        ) : (
-          <>
-            {message.content}
+      content: (
+        <>
+          {taskLabel(message.taskId) && (
+            <div style={{ fontSize: 12, color: '#999', marginBottom: 2 }}>
+              Task：{taskLabel(message.taskId)}
+            </div>
+          )}
+          {message.content}
+          {message.files.length > 0 && (
             <div className="message-files">
               {message.files.map((file) => (
                 <FileAttachmentCard key={file.id} file={file} compact />
               ))}
             </div>
-          </>
-        ),
+          )}
+        </>
+      ),
       header:
         message.senderType === 'member'
           ? memberLabel(message.senderId)
@@ -101,7 +101,7 @@ export function ConversationMessages({
       role: 'ai' as const,
       placement: 'start' as const,
       content: stream.content || '▍',
-      typing: { step: 2, interval: 50 },
+      typing: { effect: 'typing' as const, step: 2, interval: 50 },
       header: memberLabel(stream.memberId),
       avatar: <Avatar size="small">{memberLabel(stream.memberId).slice(0, 1).toUpperCase()}</Avatar>,
     })),
