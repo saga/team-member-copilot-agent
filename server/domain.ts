@@ -367,14 +367,35 @@ export type TurnMode = 'lead' | 'task' | 'delegation';
 /**
  * 为什么唤醒这个 Member。确定性规则产出，不经过 LLM 路由。
  *
- *   lead_message 用户给 Task 工作区发消息，唤醒 Lead
- *   task_ready   Task 依赖满足，唤醒执行人
- *   schedule     定时唤醒
+ *   lead_message      用户给 Task 工作区发普通消息，唤醒 Lead
+ *   lead_clarification 用户回答了 Lead 的澄清问题，唤醒 Lead 继续推进
+ *   lead_recovery     Task 失败/阻塞，唤醒 Lead 做整体判断
+ *   task_ready        Task 依赖满足，唤醒执行人
+ *   schedule          定时唤醒
  */
 export type WakeReason =
   | 'lead_message'
+  | 'lead_clarification'
+  | 'lead_recovery'
   | 'task_ready'
   | 'schedule';
+
+/**
+ * Lead 这一轮为什么需要某个档位的模型。不通过 LLM 判断，
+ * 由控制面按唤醒原因 / 任务状态 / 用户意图确定性路由。
+ */
+export type LeadModelPurpose =
+  | 'planning'
+  | 'clarification'
+  | 'recovery'
+  | 'synthesis'
+  | 'routine';
+
+/** 某一轮用了哪个档位的模型、为什么：审计与成本分析只看它。 */
+export type ModelPurpose =
+  | `lead:${LeadModelPurpose}`
+  | 'member:task'
+  | 'member:delegation';
 
 /** Member 的一次 turn 的产出：Task 模式下每轮都必须有结果，不再沉默。 */
 export type ExecutionDecision = 'reply';
@@ -411,7 +432,10 @@ export type ExecutionStatus =
  */
 export interface ExecutionConfigSnapshot {
   memberRevision: string;
+  /** 这一轮实际使用的模型。 */
   model: string;
+  /** 为什么选这个模型，用于审计与成本分析。老数据没有它，读出来是 undefined。 */
+  modelPurpose?: ModelPurpose;
   /** system prompt 全文的 sha256（不存全文：它可以从 member + memory 重算）。 */
   systemPromptHash: string;
   /** 长期记忆内容的 sha256。Agent 在 turn 里写记忆会让它变化。 */

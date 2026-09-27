@@ -10,11 +10,12 @@ process.env.COPILOT_WARMUP = 'false';
 
 const { modelPolicy } = await import('../config.js');
 const {
-  assertModelPolicy,
   buildModelPolicy,
   parseModelList,
   parseModelStrengths,
   resolveMemberModel,
+  classifyLeadTurn,
+  chooseLeadModel,
 } = await import('../model-policy.js');
 const { db } = await import('../db.js');
 const { MemberService } = await import('../member-service.js');
@@ -46,106 +47,228 @@ after(() => {
 });
 
 describe('模型策略配置', () => {
-  it('Lead 强度高于所有 Member 模型，默认取第一个', () => {
+  it('Strong Lead > Standard Lead >= Member', () => {
     const policy = buildModelPolicy({
-      leadModel: 'gpt-5',
+      strongLeadModel: 'gpt-5',
+      standardLeadModel: 'gpt-5-mini',
       memberModels: ['gpt-5-mini', 'gpt-4.1-mini'],
       strengths: parseModelStrengths('{"gpt-5":100,"gpt-5-mini":60,"gpt-4.1-mini":40}'),
     });
-    assert.equal(policy.lead.id, 'gpt-5');
+    assert.equal(policy.lead.strong.id, 'gpt-5');
+    assert.equal(policy.lead.standard.id, 'gpt-5-mini');
+    assert.equal(policy.members[0].tier, 'standard');
+    assert.equal(policy.members[1].tier, 'cheap');
     assert.equal(policy.defaultMemberModel, 'gpt-5-mini');
+    assert.ok(policy.lead.strong.strength > policy.lead.standard.strength);
     for (const member of policy.members) {
-      assert.ok(policy.lead.strength > member.strength);
+      assert.ok(policy.lead.standard.strength >= member.strength);
     }
   });
 
-  it('同 strength 的 Member 模型启动失败', () => {
+  it('Strong Lead 不强于 Standard Lead 时启动失败', () => {
     assert.throws(
       () =>
         buildModelPolicy({
-          leadModel: 'gpt-5',
-          memberModels: ['gpt-5-mini'],
-          strengths: parseModelStrengths('{"gpt-5":100,"gpt-5-mini":100}'),
+          strongLeadModel: 'gpt-5',
+          standardLeadModel: 'gpt-5-mini',
+          memberModels: ['gpt-4.1-mini'],
+          strengths: parseModelStrengths('{"gpt-5":60,"gpt-5-mini":100,"gpt-4.1-mini":40}'),
         }),
-      /strength/,
+      /必须强于/,
     );
   });
 
-  it('比 Lead 更强的 Member 模型启动失败', () => {
-    assert.throws(
-      () =>
-        assertModelPolicy({
-          lead: { id: 'gpt-5', strength: 100 },
-          members: [{ id: 'gpt-6', strength: 120 }],
-          defaultMemberModel: 'gpt-6',
-        }),
-      /gpt-6/,
-    );
-  });
-
-  it('强度表里缺模型直接抛，不静默补默认值', () => {
+  it('Member 不得超过 Standard Lead', () => {
     assert.throws(
       () =>
         buildModelPolicy({
-          leadModel: 'gpt-5',
-          memberModels: ['gpt-5-mini'],
-          strengths: parseModelStrengths('{"gpt-5":100}'),
+          strongLeadModel: 'gpt-5',
+          standardLeadModel: 'gpt-5-mini',
+          memberModels: ['gpt-6'],
+          strengths: parseModelStrengths('{"gpt-5":100,"gpt-5-mini":60,"gpt-6":80}'),
         }),
-      /gpt-5-mini/,
+      /高于 Standard Lead/,
     );
+  });
+
+  it('Member strength 等于 Standard Lead 时为 Standard', () => {
+    const policy = buildModelPolicy({
+      strongLeadModel: 'gpt-5',
+      standardLeadModel: 'gpt-5-mini',
+      memberModels: ['gpt-5-mini'],
+      strengths: parseModelStrengths('{"gpt-5":100,"gpt-5-mini":60}'),
+    });
+    assert.equal(policy.members[0].tier, 'standard');
+  });
+
+  it('低于 Standard Lead 的 Member 是 Cheap', () => {
+    const policy = buildModelPolicy({
+      strongLeadModel: 'gpt-5',
+      standardLeadModel: 'gpt-5-mini',
+      memberModels: ['gpt-4.1-mini'],
+      strengths: parseModelStrengths('{"gpt-5":100,"gpt-5-mini":60,"gpt-4.1-mini":40}'),
+    });
+    assert.equal(policy.members[0].tier, 'cheap');
+  });
+
+  it('Strong Lead 不能作为普通 Task 模型', () => {
+    const policy = buildModelPolicy({
+      strongLeadModel: 'gpt-5',
+      standardLeadModel: 'gpt-5-mini',
+      memberModels: ['gpt-5-mini', 'gpt-4.1-mini'],
+      strengths: parseModelStrengths('{"gpt-5":100,"gpt-5-mini":60,"gpt-4.1-mini":40}'),
+    });
+    assert.throws(() => resolveMemberModel(policy, 'gpt-5'), /Strong Lead/);
+  });
+
+  it('不存在的 Member 模型被拒绝，空回落默认', () => {
+    assert.throws(() => resolveMemberModel(modelPolicy, 'gpt-不存在'), /未知模型/);
+    assert.equal(resolveMemberModel(modelPolicy, null), modelPolicy.defaultMemberModel);
+  });
+
+  it('建 Member / 改 Member 时 Strong 与拼错都被拒绝', () => {
+    const member = team.createMember({ name: 'Model Pam', role: 'Engineer' });
+    assert.throws(() => team.updateMember(member.id, { model: modelPolicy.lead.strong.id }), /Strong Lead/);
+    assert.throws(() => team.updateMember(member.id, { model: 'gpt-拼错了' }), /未知模型/);
+    assert.throws(
+      () => team.createMember({ name: 'Model Evil', role: 'X', model: modelPolicy.lead.strong.id }),
+      /Strong Lead/,
+    );
+    const updated = team.updateMember(member.id, { model: modelPolicy.members[0].id });
+    assert.equal(updated.model, modelPolicy.members[0].id);
+    assert.equal(team.updateMember(member.id, { model: null }).model, null);
   });
 
   it('parseModelList 按逗号切分并去空', () => {
     assert.deepEqual(parseModelList('a, b,,c '), ['a', 'b', 'c']);
   });
+});
 
-  it('不存在的 Member 模型被拒绝', () => {
-    assert.throws(() => resolveMemberModel(modelPolicy, 'gpt-不存在'), /未知模型/);
+describe('Lead model routing', () => {
+  const policy = buildModelPolicy({
+    strongLeadModel: 'gpt-5',
+    standardLeadModel: 'gpt-5-mini',
+    memberModels: ['gpt-5-mini', 'gpt-4.1-mini'],
+    strengths: parseModelStrengths('{"gpt-5":100,"gpt-5-mini":60,"gpt-4.1-mini":40}'),
   });
 
-  it('Lead 模型不能当普通任务模型', () => {
-    assert.throws(() => resolveMemberModel(modelPolicy, modelPolicy.lead.id), /Lead 模型/);
-  });
-
-  it('空模型回落默认 Member 模型', () => {
-    assert.equal(resolveMemberModel(modelPolicy, null), modelPolicy.defaultMemberModel);
-    assert.equal(resolveMemberModel(modelPolicy, '  '), modelPolicy.defaultMemberModel);
-  });
-
-  it('建 Member / 改 Member 时越级与拼错都被拒绝', () => {
-    const member = team.createMember({ name: 'Model Pam', role: 'Engineer' });
-    assert.throws(() => team.updateMember(member.id, { model: modelPolicy.lead.id }), /Lead 模型/);
-    assert.throws(() => team.updateMember(member.id, { model: 'gpt-拼错了' }), /未知模型/);
-    assert.throws(
-      () => team.createMember({ name: 'Model Evil', role: 'X', model: modelPolicy.lead.id }),
-      /Lead 模型/,
+  it('没有 Task 时 Strong', () => {
+    assert.deepEqual(
+      chooseLeadModel(policy, classifyLeadTurn({ wakeReason: 'lead_message', taskCount: 0, prompt: '开始' })),
+      { model: 'gpt-5', purpose: 'lead:planning' },
     );
-    // 合法的低档模型能写进去，清空能回落
-    const updated = team.updateMember(member.id, { model: modelPolicy.members[0].id });
-    assert.equal(updated.model, modelPolicy.members[0].id);
-    assert.equal(team.updateMember(member.id, { model: null }).model, null);
+  });
+
+  it('普通 Lead 输入使用 Standard', () => {
+    assert.deepEqual(
+      chooseLeadModel(
+        policy,
+        classifyLeadTurn({ wakeReason: 'lead_message', taskCount: 3, prompt: '现在进展怎么样？' }),
+      ),
+      { model: 'gpt-5-mini', purpose: 'lead:routine' },
+    );
+  });
+
+  it('用户回答 clarification 使用 Strong', () => {
+    assert.deepEqual(
+      chooseLeadModel(
+        policy,
+        classifyLeadTurn({ wakeReason: 'lead_clarification', taskCount: 2, prompt: '生产环境是 us-east-1。' }),
+      ),
+      { model: 'gpt-5', purpose: 'lead:clarification' },
+    );
+  });
+
+  it('Task recovery 使用 Strong', () => {
+    assert.deepEqual(
+      chooseLeadModel(policy, classifyLeadTurn({ wakeReason: 'lead_recovery', taskCount: 4, prompt: '请继续处理' })),
+      { model: 'gpt-5', purpose: 'lead:recovery' },
+    );
+  });
+
+  it('明确要求重新规划时使用 Strong', () => {
+    assert.deepEqual(
+      chooseLeadModel(
+        policy,
+        classifyLeadTurn({ wakeReason: 'lead_message', taskCount: 4, prompt: '重新规划当前任务并调整成员分工' }),
+      ),
+      { model: 'gpt-5', purpose: 'lead:synthesis' },
+    );
+  });
+
+  it('普通的进度追问不升级 Strong', () => {
+    assert.equal(
+      classifyLeadTurn({ wakeReason: 'lead_message', taskCount: 4, prompt: '现在怎么样了' }),
+      'routine',
+    );
   });
 });
 
 describe('执行时模型选择', () => {
-  it('Lead turn 即使 Member 配了便宜模型，也用 leadModel', async () => {
+  it('首次 Lead turn 使用 Strong', async () => {
     stub.reset();
-    const cheap = modelPolicy.members[0].id;
-    const lead = team.createMember({ name: 'Model Lead', role: 'Lead', model: cheap });
+    const lead = team.createMember({ name: 'Dynamic Lead', role: 'Lead', model: modelPolicy.members[0].id });
     const room = team.createConversation({
       kind: 'task',
-      title: 'LeadModel',
+      title: 'DynamicLead',
       memberIds: [lead.id],
       leadMemberId: lead.id,
     });
-    const sent = await team.sendMessage({ conversationId: room.id, content: '开始吧' });
-    const executionId = singleExecutionId(db, room.id, sent.wakes);
+    const result = await team.sendMessage({ conversationId: room.id, content: '帮我开始这个工作' });
+    const executionId = singleExecutionId(db, room.id, result.wakes);
     await waitForConversationIdle(room.id);
 
-    assert.equal(stub.turnFor(executionId).model, modelPolicy.lead.id);
-    const snapshot = team.getExecution(executionId).configSnapshot;
-    assert.ok(snapshot, 'Lead turn 必须留下配置快照');
-    assert.equal(snapshot.model, modelPolicy.lead.id, '快照记录的必须是真实运行模型');
+    assert.equal(stub.turnFor(executionId).model, modelPolicy.lead.strong.id);
+    assert.equal(team.getExecution(executionId).configSnapshot?.modelPurpose, 'lead:planning');
+  });
+
+  it('已有 Task 时普通 Lead 输入使用 Standard', async () => {
+    stub.reset();
+    const lead = team.createMember({ name: 'Routine Lead', role: 'Lead' });
+    const worker = team.createMember({ name: 'Routine Worker', role: 'Engineer' });
+    const room = team.createConversation({
+      kind: 'task',
+      title: 'RoutineLead',
+      memberIds: [lead.id, worker.id],
+      leadMemberId: lead.id,
+    });
+    // 执行人静音：任务保持 ready 不开跑，Lead 这一轮的 taskCount 才稳定
+    team.setMemberMuted(room.id, worker.id, true);
+    await team.planTasks({
+      conversationId: room.id,
+      memberId: lead.id,
+      objective: '普通 Lead 测试',
+      requirements,
+      tasks: [{ key: 'a', title: 'A', assigneeMemberId: worker.id }],
+    });
+    const result = await team.sendMessage({ conversationId: room.id, content: '现在进展怎么样？' });
+    const executionId = singleExecutionId(db, room.id, result.wakes);
+    await waitForConversationIdle(room.id);
+
+    assert.equal(stub.turnFor(executionId).model, modelPolicy.lead.standard.id);
+    assert.equal(team.getExecution(executionId).configSnapshot?.modelPurpose, 'lead:routine');
+  });
+
+  it('用户回答 clarification 时 Lead 使用 Strong', async () => {
+    stub.reset();
+    const lead = team.createMember({ name: 'Clarification Lead', role: 'Lead' });
+    const room = team.createConversation({
+      kind: 'task',
+      title: 'ClarificationLead',
+      memberIds: [lead.id],
+      leadMemberId: lead.id,
+    });
+    await team.requestClarification({
+      conversationId: room.id,
+      memberId: lead.id,
+      questions: ['生产环境是什么？'],
+    });
+    const result = await team.sendMessage({ conversationId: room.id, content: '生产环境是 us-east-1。' });
+    const executionId = singleExecutionId(db, room.id, result.wakes);
+    await waitForConversationIdle(room.id);
+
+    assert.equal(stub.turnFor(executionId).model, modelPolicy.lead.strong.id);
+    assert.equal(team.getExecution(executionId).configSnapshot?.modelPurpose, 'lead:clarification');
   });
 
   it('Task turn 用执行人配的模型，未配用默认 Member 模型', async () => {
@@ -182,15 +305,11 @@ describe('执行时模型选择', () => {
       const execution = db
         .prepare(`SELECT id FROM execution WHERE task_id = ? ORDER BY created_at LIMIT 1`)
         .get(task.id) as unknown as { id: string };
-      const turn = stub.turnFor(execution.id);
-      const expected =
-        task.assigneeMemberId === cheap.id ? cheap.model! : modelPolicy.defaultMemberModel;
-      assert.equal(turn.model, expected, `任务 ${task.title} 用的模型不对`);
-      assert.equal(
-        team.getExecution(execution.id).configSnapshot?.model,
-        expected,
-        '快照记录的必须是真实运行模型',
-      );
+      const expected = task.assigneeMemberId === cheap.id ? cheap.model! : modelPolicy.defaultMemberModel;
+      assert.equal(stub.turnFor(execution.id).model, expected, `任务 ${task.title} 用的模型不对`);
+      const snapshot = team.getExecution(execution.id).configSnapshot;
+      assert.equal(snapshot?.model, expected, '快照记录的必须是真实运行模型');
+      assert.equal(snapshot?.modelPurpose, 'member:task');
     }
     // Task 完成不唤醒 Lead：Lead 全程没有 execution
     const leadRuns = db

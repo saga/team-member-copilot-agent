@@ -3,7 +3,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { config, modelPolicy } from './config.js';
-import { resolveMemberModel } from './model-policy.js';
+import { classifyLeadTurn, chooseLeadModel, resolveMemberModel } from './model-policy.js';
 import { hashText } from './content-hash.js';
 import { runInTransaction } from './db-tx.js';
 import { now } from './db.js';
@@ -968,21 +968,48 @@ export class TeamService {
     const created = { ...message, files };
     this.emit(conversation.id, { type: 'message.created', data: created });
 
+    // Lead 唤醒原因决定模型档位，落库前就要定：回答澄清用 clarification，
+    // 在阻塞里追问用 recovery，其余是普通消息。判据是发送前的工作区状态，
+    // 下面的 waiting_user → running 翻转之后就看不出来了。
+    const leadWakeReason =
+      conversation.status === 'waiting_user'
+        ? 'lead_clarification'
+        : conversation.status === 'blocked'
+          ? 'lead_recovery'
+          : 'lead_message';
+
     if (conversation.status === 'waiting_user') {
       this.db
-        .prepare(`UPDATE conversation SET status = 'running', open_questions_json = '[]', updated_at = ? WHERE id = ?`)
+        .prepare(
+          `
+          UPDATE conversation
+          SET
+            status = 'running',
+            open_questions_json = '[]',
+            updated_at = ?
+          WHERE id = ?
+          `,
+        )
         .run(now(), conversation.id);
-      this.emit(conversation.id, { type: 'conversation.updated', data: this.getConversation(conversation.id) });
+      this.emit(conversation.id, {
+        type: 'conversation.updated',
+        data: this.getConversation(conversation.id),
+      });
     }
 
     const wakes: WakePlan[] = [];
     const fresh = this.getConversation(conversation.id);
     if (fresh.leadMemberId) {
-      const enqueued = this.orchestrator.ensureLeadWake(conversation.id, fresh.leadMemberId, created.messageSequence);
+      const enqueued = this.orchestrator.ensureLeadWake(
+        conversation.id,
+        fresh.leadMemberId,
+        created.messageSequence,
+        leadWakeReason,
+      );
       if (enqueued) {
         wakes.push({
           memberId: fresh.leadMemberId,
-          reason: 'lead_message',
+          reason: leadWakeReason,
           taskId: null,
           triggerSequence: created.messageSequence,
         });
@@ -2365,17 +2392,33 @@ export class TeamService {
   }
 
   /**
-   * 这一轮真正用的模型。判据只有 turnMode，不看 Member 身上的其它字段：
+   * 这一轮真正用的模型 + 选择原因。判据只有确定性输入，不经过 LLM：
    *
-   *   Lead        → 全场最强的 leadModel（配置定，见 model-policy.ts）
    *   Task/delegation → 这个人配的 Task 模型，未配则回落默认 Member 模型
+   *   Lead            → 默认 Standard；规划 / 澄清 / 恢复 / 综合时升级 Strong
    *
-   * Member 配了 Lead 模型或未知名字会在这里抛 —— 宁可这一轮失败，
-   * 也不能让它带着一个越级的模型跑起来。
+   * prompt 用的是触发这一轮的原始输入，不是 assemble 后的完整 context ——
+   * context 里本身就带着“规划 / 综合 / Task”这些词，用它判断意图会误升级。
    */
-  private executionModel(member: Member, turnMode: TurnMode): string {
-    if (turnMode === 'lead') return modelPolicy.lead.id;
-    return resolveMemberModel(modelPolicy, member.model);
+  private executionModel(input: {
+    member: Member;
+    turnMode: TurnMode;
+    tasks: ConversationTask[];
+    wakeReason: WakeReason | null;
+    prompt: string;
+  }): { model: string; purpose: ExecutionConfigSnapshot['modelPurpose'] } {
+    if (input.turnMode !== 'lead') {
+      return {
+        model: resolveMemberModel(modelPolicy, input.member.model),
+        purpose: input.turnMode === 'task' ? 'member:task' : 'member:delegation',
+      };
+    }
+    const leadPurpose = classifyLeadTurn({
+      wakeReason: input.wakeReason ?? 'lead_message',
+      taskCount: input.tasks.length,
+      prompt: input.prompt,
+    });
+    return chooseLeadModel(modelPolicy, leadPurpose);
   }
 
   private async runTurn(input: {
@@ -2490,13 +2533,27 @@ export class TeamService {
       // 模型在这里定、传给引擎、同时记进快照：三处是同一个值。
       // 快照写在这里而不是建 execution 时：system prompt 与能力组成都是到这里
       // 才定下来的，而它们的指纹就是快照的核心。
-      const model = this.executionModel(input.member, input.turnMode);
-      this.recordConfigSnapshot(executionId, input.member, input.conversation.teamId, systemPrompt, runtimeCapabilities.manifestHash, model);
+      const modelSelection = this.executionModel({
+        member: input.member,
+        turnMode: input.turnMode,
+        tasks: allTasks,
+        wakeReason: input.wakeReason,
+        prompt: input.prompt,
+      });
+      this.recordConfigSnapshot(
+        executionId,
+        input.member,
+        input.conversation.teamId,
+        systemPrompt,
+        runtimeCapabilities.manifestHash,
+        modelSelection.model,
+        modelSelection.purpose,
+      );
 
       const result = await this.copilot.runMemberTurn({
         runtime,
         member: input.member,
-        model,
+        model: modelSelection.model,
         systemPrompt,
         prompt: context.prompt,
         sourceMemberId: input.sourceMemberId,
@@ -2807,10 +2864,12 @@ export class TeamService {
     systemPrompt: string,
     capabilityManifestHash: string,
     model: string,
+    modelPurpose: ExecutionConfigSnapshot['modelPurpose'],
   ): ExecutionConfigSnapshot {
     return {
       memberRevision: member.updatedAt,
       model,
+      modelPurpose,
       systemPromptHash: hashText(systemPrompt),
       memoryHash: hashText(
         `${this.members.getMemory(member.id).content}\0${this.members.getTeamMemory(member.id, teamId).content}`,
@@ -2834,10 +2893,18 @@ export class TeamService {
     systemPrompt: string,
     capabilityManifestHash: string,
     model: string,
+    modelPurpose: ExecutionConfigSnapshot['modelPurpose'],
   ): void {
     try {
       this.updateExecution(executionId, {
-        configSnapshot: this.buildConfigSnapshot(member, teamId, systemPrompt, capabilityManifestHash, model),
+        configSnapshot: this.buildConfigSnapshot(
+          member,
+          teamId,
+          systemPrompt,
+          capabilityManifestHash,
+          model,
+          modelPurpose,
+        ),
       });
     } catch (error) {
       // eslint-disable-next-line no-console

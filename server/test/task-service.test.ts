@@ -465,10 +465,10 @@ describe('Task 生命周期补严', () => {
       // Lead 被自动唤醒一次（之前 Lead 从没跑过，这一轮只能来自失败推进）
       const leadRuns = db
         .prepare(
-          `SELECT COUNT(*) AS n FROM execution WHERE conversation_id = ? AND member_id = ? AND wake_reason = 'lead_message'`,
+          `SELECT COUNT(*) AS n FROM execution WHERE conversation_id = ? AND member_id = ? AND wake_reason = 'lead_recovery'`,
         )
         .get(room.id, alice.id) as unknown as { n: number };
-      assert.ok(leadRuns.n >= 1, 'Lead 应该在任务失败后被唤醒');
+      assert.ok(leadRuns.n >= 1, 'Lead 应该在任务失败后以 recovery 原因被唤醒');
     } finally {
       stub.failMemberIds.delete(bob.id);
     }
@@ -721,10 +721,10 @@ describe('Task 生命周期补严', () => {
     await waitForConversationIdle(room.id);
     const leadRuns = db
       .prepare(
-        `SELECT COUNT(*) AS n FROM execution WHERE conversation_id = ? AND member_id = ? AND wake_reason = 'lead_message'`,
+        `SELECT COUNT(*) AS n FROM execution WHERE conversation_id = ? AND member_id = ? AND wake_reason = 'lead_recovery'`,
       )
       .get(room.id, alice.id) as unknown as { n: number };
-    assert.ok(leadRuns.n >= 1, 'Lead 应该在任务阻塞后被唤醒');
+    assert.ok(leadRuns.n >= 1, 'Lead 应该在任务阻塞后以 recovery 原因被唤醒');
   });
 
   it('Task 失败唤醒 Lead，下游 blocked 的变化广播到前端', async () => {
@@ -771,10 +771,10 @@ describe('Task 生命周期补严', () => {
       );
       const leadRuns = db
         .prepare(
-          `SELECT COUNT(*) AS n FROM execution WHERE conversation_id = ? AND member_id = ? AND wake_reason = 'lead_message'`,
+          `SELECT COUNT(*) AS n FROM execution WHERE conversation_id = ? AND member_id = ? AND wake_reason = 'lead_recovery'`,
         )
         .get(room.id, alice.id) as unknown as { n: number };
-      assert.ok(leadRuns.n >= 1, 'Task 失败后 Lead 必须被唤醒');
+      assert.ok(leadRuns.n >= 1, 'Task 失败后 Lead 必须以 recovery 原因被唤醒');
       assert.equal(team.getConversation(room.id).status, 'blocked');
     } finally {
       stub.failMemberIds.clear();

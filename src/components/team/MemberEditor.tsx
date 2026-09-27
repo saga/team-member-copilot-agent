@@ -19,7 +19,7 @@ interface MemberEditorProps {
  *
  * 这些字段最后会拼进 system prompt（见 TeamService.buildMemberSystemPrompt），
  * 所以它们是**人格定义**，不是元数据装饰。`model` 只能选策略里的 Member 模型
- * （Lead 模型不在下拉里），留空 = 显式回落默认 Member 模型，
+ * （Standard / Cheap，Strong 不在下拉里），留空 = 显式回落默认 Member 模型，
  * 所以提交时要用 null 而不是空串。
  *
  * 「能用什么」**不在这里**：能力现在是三层继承的（global + team + member），
@@ -120,16 +120,20 @@ export function MemberEditor({ member, modelPolicy, onSaved, onCancel }: MemberE
       <Form.Item
         name="model"
         label="Task Model"
-        extra={`普通任务使用的模型；这个成员担任 Lead 时自动使用 Lead 模型${
-          modelPolicy ? `（${modelPolicy.lead.id}）` : ''
-        }。`}
+        extra={
+          modelPolicy
+            ? `普通任务可使用 Standard / Cheap 模型；留空使用 ${modelPolicy.defaultMemberModel}。` +
+              `担任 Lead 时不使用这里的模型，而是由系统按工作复杂度在 ` +
+              `${modelPolicy.lead.standard.id} / ${modelPolicy.lead.strong.id} 之间自动选择。`
+            : '模型策略加载中…'
+        }
       >
         <Select
           allowClear
-          placeholder={modelPolicy ? '使用团队默认 Member 模型' : '模型列表加载中…'}
+          placeholder={modelPolicy ? `默认 ${modelPolicy.defaultMemberModel}` : '模型列表加载中…'}
           options={(modelPolicy?.members ?? []).map((model) => ({
             value: model.id,
-            label: model.id,
+            label: model.tier === 'standard' ? `${model.id} · Standard` : `${model.id} · Cheap`,
           }))}
         />
       </Form.Item>

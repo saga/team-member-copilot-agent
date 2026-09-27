@@ -141,10 +141,13 @@ function keyOf(conversationId: string, memberId: string): string {
 /**
  * reason 的「具体程度」。Task 执行优先于 Lead 处理用户输入：
  * 同一个 Member 身上，Task wake 不能被一条 Lead wake 顶掉。
+ * 三种 Lead 原因同级：都是「Lead 要说话」，谁的新消息序号大听谁的。
  */
 const REASON_PRIORITY: Record<Exclude<WakeReason, 'schedule'>, number> = {
   task_ready: 2,
   lead_message: 1,
+  lead_clarification: 1,
+  lead_recovery: 1,
 };
 
 /**

@@ -411,8 +411,9 @@ describe('execution 记录当时用的配置', () => {
     const firstSnapshot = first.configSnapshot;
     assert.ok(firstSnapshot, '跑完一轮必须留下配置快照');
     assert.equal(firstSnapshot.memberRevision, team.getMember(alice.id).updatedAt);
-    // 这一轮是 Lead turn：快照记的必须是真实运行的 leadModel，不是 Member 身上的回落值
-    assert.equal(firstSnapshot.model, modelPolicy.lead.id);
+    // 这一轮是无 Task 的 Lead 首轮（planning）：快照记的必须是 Strong，不是回落值
+    assert.equal(firstSnapshot.model, modelPolicy.lead.strong.id);
+    assert.equal(firstSnapshot.modelPurpose, 'lead:planning');
     assert.equal(firstSnapshot.hostToolsEnabled, config.allowHostCodingTools);
     assert.match(firstSnapshot.systemPromptHash, /^[\da-f]{64}$/);
     assert.match(firstSnapshot.memoryHash, /^[\da-f]{64}$/);

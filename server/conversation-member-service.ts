@@ -427,6 +427,8 @@ export class ConversationMemberService {
  */
 const KNOWN_WAKE_REASONS: Record<Exclude<WakeReason, 'schedule'>, true> = {
   lead_message: true,
+  lead_clarification: true,
+  lead_recovery: true,
   task_ready: true,
 };
 

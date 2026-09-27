@@ -682,13 +682,24 @@ MUTATIONS = [
         ],
     },
     {
-        "name": "Lead 绕过模型策略（用 Member 模型跑）",
+        "name": "Lead 规划降档用 Standard（Strong 被绕过）",
         "test": "server/test/model-policy.test.ts",
         "steps": [
             (
-                "server/team-service.ts",
-                "    if (turnMode === 'lead') return modelPolicy.lead.id;",
-                "    if (turnMode === 'lead') return resolveMemberModel(modelPolicy, member.model);",
+                "server/model-policy.ts",
+                "    case 'planning':\n      return { model: policy.lead.strong.id, purpose: 'lead:planning' };",
+                "    case 'planning':\n      return { model: policy.lead.standard.id, purpose: 'lead:planning' };",
+            )
+        ],
+    },
+    {
+        "name": "唤醒原因被任务计数盖掉（clarification 误判成 planning）",
+        "test": "server/test/model-policy.test.ts",
+        "steps": [
+            (
+                "server/model-policy.ts",
+                "  // 显式原因优先于任务计数：用户刚回答澄清 / 任务刚失败阻塞，\n  // 这一轮的性质由触发原因决定，而不是由“有没有 Task”猜。\n  if (input.wakeReason === 'lead_clarification') {\n    return 'clarification';\n  }\n  if (input.wakeReason === 'lead_recovery') {\n    return 'recovery';\n  }\n  // 没有 Task 时，Lead 的职责就是理解目标 / 澄清 / 初始规划。\n  if (input.taskCount === 0) {\n    return 'planning';\n  }",
+                "  if (input.taskCount === 0) {\n    return 'planning';\n  }\n  if (input.wakeReason === 'lead_clarification') {\n    return 'clarification';\n  }\n  if (input.wakeReason === 'lead_recovery') {\n    return 'recovery';\n  }",
             )
         ],
     },

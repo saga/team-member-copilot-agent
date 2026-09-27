@@ -11,24 +11,32 @@ function intEnv(name: string, fallback: number): number {
   return Number.isInteger(value) && value > 0 ? value : fallback;
 }
 
+const configuredMemberModels = parseModelList(env('COPILOT_MEMBER_MODELS', 'gpt-5-mini,gpt-4.1-mini'));
+const legacyDefaultModel = env('COPILOT_MODEL', 'gpt-5');
+// COPILOT_LEAD_MODEL 是旧配置名，仍兼容；新配置优先用 COPILOT_LEAD_STRONG_MODEL。
+const strongLeadModel = env('COPILOT_LEAD_STRONG_MODEL', env('COPILOT_LEAD_MODEL', legacyDefaultModel));
+const standardLeadModel = env('COPILOT_LEAD_STANDARD_MODEL', configuredMemberModels[0] ?? 'gpt-5-mini');
+
 const dataDir = path.resolve(env('DATA_DIR', '.data'));
 
 export const config = {
   port: Number(env('PORT', '3001')),
   corsOrigin: env('CORS_ORIGIN', 'http://localhost:5173'),
   githubToken: env('GITHUB_TOKEN', '') || undefined,
-  defaultModel: env('COPILOT_MODEL', 'gpt-5'),
+  defaultModel: legacyDefaultModel,
   /**
-   * Lead 模型：永远是全场最强的那个。
+   * Lead 模型不是固定一个：
    *
-   * 默认跟 COPILOT_MODEL 同一个值 —— 单模型部署下 Lead 和 Task 用同一个，
-   * 策略校验只看「Member 列表里没有达到 Lead 强度的」，不拦这种。
-   * 多模型部署用 COPILOT_LEAD_MODEL / COPILOT_MEMBER_MODELS / COPILOT_MODEL_STRENGTHS 显式分开。
+   *   standard = 普通 Lead 工作（默认）
+   *   strong   = 规划 / 澄清 / 恢复 / 综合（按规则升级）
+   *
+   * 具体哪一轮用哪个由 TeamService.executionModel 按模型策略决定，见 model-policy.ts。
    */
-  leadModel: env('COPILOT_LEAD_MODEL', env('COPILOT_MODEL', 'gpt-5')),
-  /** 普通 Task / delegation 可选的模型：只能是低一档的，见 model-policy.ts。 */
-  memberModels: parseModelList(env('COPILOT_MEMBER_MODELS', 'gpt-5-mini,gpt-4.1-mini')),
-  /** 模型强度表：`{"gpt-5":100,"gpt-5-mini":60}`，Lead 必须是最高的。 */
+  leadStrongModel: strongLeadModel,
+  leadStandardModel: standardLeadModel,
+  /** 普通 Member Task 可以使用的模型：只能是 Standard / Cheap 档。 */
+  memberModels: configuredMemberModels,
+  /** 模型强度表：数字越大越强，`{"gpt-5":100,"gpt-5-mini":60}`。 */
   modelStrengths: parseModelStrengths(
     env('COPILOT_MODEL_STRENGTHS', '{"gpt-5":100,"gpt-5-mini":60,"gpt-4.1-mini":40}'),
   ),
@@ -197,10 +205,11 @@ export const config = {
 
 /**
  * 全局唯一的模型策略。配置错了这里直接抛，服务拒绝启动 ——
- * 不能让 Lead 带着和 Task 同档的模型跑起来，跑起来之后的任何检查都晚了。
+ * 强约束（Strong > Standard >= Member）在第一轮跑起来之前就必须成立。
  */
 export const modelPolicy: ModelPolicy = buildModelPolicy({
-  leadModel: config.leadModel,
+  strongLeadModel: config.leadStrongModel,
+  standardLeadModel: config.leadStandardModel,
   memberModels: config.memberModels,
   strengths: config.modelStrengths,
 });

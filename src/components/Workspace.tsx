@@ -346,7 +346,9 @@ export function Workspace() {
       <TaskCreator
         open={newTaskOpen}
         members={members}
-        leadModelId={modelPolicy?.lead.id ?? null}
+        leadModels={
+          modelPolicy ? { standard: modelPolicy.lead.standard.id, strong: modelPolicy.lead.strong.id } : null
+        }
         onCreate={createTask}
         onCancel={() => setNewTaskOpen(false)}
       />

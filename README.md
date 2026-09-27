@@ -905,8 +905,9 @@ Content-Type: application/json
 ```
 
 `model` 只能填 `COPILOT_MEMBER_MODELS` 里的（或省略回落默认）：它是这个人做普通
-Task 时用的模型，担任 Lead 时服务端自动换成 `COPILOT_LEAD_MODEL`。填 Lead 模型
-或拼错的名字会被拒绝（`400`）。
+Task 时用的模型。担任 Lead 时不用这个字段 —— 服务端按规则在 Standard /
+Strong 两档之间自动选择（普通工作 Standard，规划 / 澄清 / 恢复 / 综合才升级
+Strong）。填 Strong 模型或拼错的名字会被拒绝（`400`）。
 
 新建的 Member 自动获得默认能力组成（团队 skill、个人 skill、个人资料库、协作与检索
 工具）。要调整它（比如给它开宿主工具），走能力目录接口（用户语言的 ID，
@@ -1127,6 +1128,7 @@ server/                       # Express + Copilot SDK 后端
     runtime-reliability.test.ts    # schema 形状 / 序号 / 增量上下文 / durable event / 恢复 / 死锁
     runtime-correctness.test.ts    # resume 分类 / 超时 abort / 工具授权接线 / cancel 状态机 / retry
     task-service.test.ts             # Task 规划 / 依赖 / 并行串行 / 执行人归属 / Lead 单点 / 澄清 / 阻塞重试 / 重启恢复
+    model-policy.test.ts             # Strong > Standard >= Member / Lead 按原因与意图分档 / 快照记真实模型与 purpose
     conversations-api.test.ts      # 真实 HTTP：externalWorkRef 过边界 / 静音 state patch / SSE 流式增量
     data-integrity.test.ts         # replyTo 校验 / 消息幂等 / 记忆乐观并发 / 上下文上限 / 配置快照 / state 事件
     member-template-seeder.test.ts # provisioning 幂等 / 不覆盖已改 Member / 归档不复活 / 穿越与重复 key / 能力绑定
@@ -1145,10 +1147,12 @@ scripts/
 | `PORT` | `3001` | HTTP 端口 |
 | `DATA_DIR` | `.data` | 数据根目录 |
 | `GITHUB_TOKEN` | 空 | 留空则用本机 `copilot` CLI 已登录用户 |
-| `COPILOT_MODEL` | `gpt-5` | 默认模型（Lead 未单独配置时也用它） |
-| `COPILOT_LEAD_MODEL` | 跟 `COPILOT_MODEL` 同值 | Lead 模型：全场最强，担任 Lead 时自动使用，不能配给普通 Task |
-| `COPILOT_MEMBER_MODELS` | `gpt-5-mini,gpt-4.1-mini` | 普通 Task / delegation 可选模型（只能低一档），第一个是默认 |
-| `COPILOT_MODEL_STRENGTHS` | `{"gpt-5":100,…}` | 模型强度表；Member 强度达到 Lead 即拒绝启动 |
+| `COPILOT_MODEL` | `gpt-5` | 默认模型（Strong Lead 未单独配置时的回落值） |
+| `COPILOT_LEAD_MODEL` | 跟 `COPILOT_MODEL` 同值 | 旧配置名，仍兼容；等价于 `COPILOT_LEAD_STRONG_MODEL` |
+| `COPILOT_LEAD_STRONG_MODEL` | 跟 `COPILOT_MODEL` 同值 | Strong Lead：规划 / 澄清 / 恢复 / 综合时用，绝不能配给普通 Task |
+| `COPILOT_LEAD_STANDARD_MODEL` | `COPILOT_MEMBER_MODELS` 的第一个 | Standard Lead：普通 Lead 工作用，可同时出现在 Member 列表里 |
+| `COPILOT_MEMBER_MODELS` | `gpt-5-mini,gpt-4.1-mini` | 普通 Task / delegation 可选模型（Standard / Cheap），第一个是默认 |
+| `COPILOT_MODEL_STRENGTHS` | `{"gpt-5":100,…}` | 模型强度表；硬约束 Strong > Standard >= Member，违反即拒绝启动 |
 | `COPILOT_WARMUP` | `true` | 启动时预热 Copilot client |
 | `MAX_DELEGATION_DEPTH` | `4` | `delegation_path` 最大长度 |
 | `EXECUTION_TIMEOUT_MS` | `600000` | 单次 turn 上限（SDK 默认 60s 对带工具的真实任务太短） |

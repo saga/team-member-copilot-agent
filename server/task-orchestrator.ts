@@ -1,6 +1,6 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { now } from './db.js';
-import type { ConversationTask } from './domain.js';
+import type { ConversationTask, WakeReason } from './domain.js';
 import { TaskService } from './task-service.js';
 import type { ConversationMemberService } from './conversation-member-service.js';
 import type { MemberTurnScheduler } from './member-turn-scheduler.js';
@@ -16,6 +16,7 @@ export interface TaskEvents {
  *   用户消息 → Lead 唤醒
  *   plan 后 → 找 ready → 按执行人入队
  *   Task 完成 → 刷新依赖 → 找下一批 ready → 重算工作区状态
+ *   Task 阻塞/失败 → 唤醒 Lead 做整体判断
  *
  * 同一个 Member 同时只跑一个 Task：入队前看 scheduler.isBusy。
  */
@@ -28,7 +29,12 @@ export class TaskOrchestrator {
     private readonly events: TaskEvents,
   ) {}
 
-  ensureLeadWake(conversationId: string, leadMemberId: string | null, triggerSequence: number): boolean {
+  ensureLeadWake(
+    conversationId: string,
+    leadMemberId: string | null,
+    triggerSequence: number,
+    reason: Extract<WakeReason, 'lead_message' | 'lead_clarification' | 'lead_recovery'> = 'lead_message',
+  ): boolean {
     if (!leadMemberId) return false;
     if (this.scheduler.isBusy(conversationId, leadMemberId)) return false;
     const state = this.states.get(conversationId, leadMemberId);
@@ -37,7 +43,7 @@ export class TaskOrchestrator {
       conversationId,
       memberId: leadMemberId,
       taskId: null,
-      reason: 'lead_message',
+      reason,
       triggerSequence,
     });
     return true;
@@ -68,15 +74,11 @@ export class TaskOrchestrator {
   }
 
   /**
-   * Task 状态变化的统一入口：按 DB 里读到的最新 status 分发。
+   * Task 状态变化：
    *
-   *   completed / cancelled → 推进下游，不唤醒 Lead
-   *   blocked / failed     → 推进下游，并唤醒 Lead（只有这里需要人看一眼）
-   *   其它                 → 只广播，不推进
-   *
-   * 完成是正常进展：每个 Task 完成后都把 Lead 叫起来回顾一次，
-   * 既浪费最强模型，也会产生无意义的进度消息。全部完成即 completed，
-   * 同样不再叫 Lead。Lead 只在三处被唤醒：用户消息、初始规划、失败/阻塞。
+   * completed / cancelled → 自动推进下游，不唤醒 Lead
+   * blocked / failed     → 刷新依赖，唤醒 Lead 做整体判断（recovery 原因）
+   * 其它                 → 只广播
    */
   onTaskChanged(taskId: string): void {
     const task = this.tasks.get(taskId);
@@ -90,7 +92,7 @@ export class TaskOrchestrator {
       this.startReadyTasks(task.conversationId);
       const conversation = this.readConversation(task.conversationId);
       if (conversation?.leadMemberId) {
-        this.ensureLeadWake(task.conversationId, conversation.leadMemberId, conversation.messageSequence);
+        this.ensureLeadWake(task.conversationId, conversation.leadMemberId, conversation.messageSequence, 'lead_recovery');
       }
       this.recomputeAndEmit(task.conversationId);
       this.events.onTask(this.tasks.get(taskId));
@@ -106,9 +108,7 @@ export class TaskOrchestrator {
 
   onTaskInterrupted(taskId: string, reason: string): void {
     this.tasks.markBlocked(taskId, reason);
-    this.tasks.recomputeConversationStatus(this.tasks.get(taskId).conversationId);
-    this.events.onTask(this.tasks.get(taskId));
-    this.events.onConversation(this.tasks.get(taskId).conversationId);
+    this.onTaskChanged(taskId);
   }
 
   private hasActiveExecution(conversationId: string, memberId: string): boolean {

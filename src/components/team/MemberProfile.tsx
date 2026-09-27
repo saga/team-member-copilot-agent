@@ -64,7 +64,9 @@ export function MemberProfile({ member, modelPolicy, onSaved, onClose }: MemberP
         <>
           <Typography.Paragraph type="secondary" style={{ fontSize: 12, marginBottom: 12 }}>
             默认 Task 模型：{taskModel}
-            {modelPolicy && `；担任 Lead 时自动使用 Lead 模型 ${modelPolicy.lead.id}。`}
+            {modelPolicy &&
+              `；担任 Lead 时，普通工作使用 ${modelPolicy.lead.standard.id}，` +
+              `需要规划、综合或恢复时自动升级到 ${modelPolicy.lead.strong.id}。`}
           </Typography.Paragraph>
           <MemberEditor member={member} modelPolicy={modelPolicy} onSaved={onSaved} onCancel={onClose} />
         </>

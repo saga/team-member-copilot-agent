@@ -368,9 +368,17 @@ export type ExecutionStatus =
  *
  * 只存指纹不存全文：system prompt 和 memory 都能从 member + 磁盘重算。
  */
+/** 某一轮为什么用这个模型：`lead:planning` 之类，或 `member:task`。 */
+export type ModelPurpose =
+  | `lead:${'planning' | 'clarification' | 'recovery' | 'synthesis' | 'routine'}`
+  | 'member:task'
+  | 'member:delegation';
+
 export interface ExecutionConfigSnapshot {
   memberRevision: string;
   model: string;
+  /** 为什么选这个模型（老数据没有）。 */
+  modelPurpose?: ModelPurpose;
   systemPromptHash: string;
   memoryHash: string;
   /** 这一轮实际生效的能力组成（Provider ID + 版本 + 工具集）的 sha256。 */
@@ -413,11 +421,18 @@ export interface ExecutionRecord {
 
 /**
  * 为什么唤醒这个 Member。确定性规则的产物，不是 LLM routing：
- *   lead_message 用户给 Task 工作区发消息，唤醒 Lead
- *   task_ready   Task 依赖满足，唤醒执行人
- *   schedule     定时唤醒
+ *   lead_message       用户发普通消息，唤醒 Lead
+ *   lead_clarification 用户回答了澄清问题，唤醒 Lead 继续推进
+ *   lead_recovery      Task 失败/阻塞，唤醒 Lead 做整体判断
+ *   task_ready         Task 依赖满足，唤醒执行人
+ *   schedule           定时唤醒
  */
-export type WakeReason = 'lead_message' | 'task_ready' | 'schedule';
+export type WakeReason =
+  | 'lead_message'
+  | 'lead_clarification'
+  | 'lead_recovery'
+  | 'task_ready'
+  | 'schedule';
 
 /** 一条消息唤醒了哪个 Member、为什么。 */
 export interface WakePlan {
@@ -506,20 +521,28 @@ export interface Health {
   copilotError?: string;
 }
 
-/** 一个可用模型及其强度：数字越大越强，Lead 永远是最高的那个。 */
+/** 模型档位：strong 只给 Lead，standard / cheap 给普通 Task。 */
+export type ModelTier = 'strong' | 'standard' | 'cheap';
+
+/** 一个可用模型及其强度：数字越大越强。 */
 export interface ModelDefinition {
   id: string;
   strength: number;
+  tier: ModelTier;
 }
 
 /**
  * 模型策略（服务端是唯一真相源）。
  *
- * Lead 担任推进者时自动用 `lead`；普通 Task 只能从 `members` 里选，
- * 未选则用 `defaultMemberModel`。`members` 里永远没有 Lead 模型。
+ * Lead 默认用 `lead.standard`，规划 / 澄清 / 恢复 / 综合时升级到
+ * `lead.strong`；普通 Task 只能从 `members` 里选，未选则用
+ * `defaultMemberModel`。`members` 里永远没有 Strong 模型。
  */
 export interface ModelPolicy {
-  lead: ModelDefinition;
+  lead: {
+    strong: ModelDefinition;
+    standard: ModelDefinition;
+  };
   members: ModelDefinition[];
   defaultMemberModel: string;
 }
