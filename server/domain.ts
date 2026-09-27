@@ -452,6 +452,13 @@ export interface ExecutionConfigSnapshot {
   capabilityManifestHash: string;
   /** 部署层是否放行宿主工具。它决定 availableTools 的真实形状。 */
   hostToolsEnabled: boolean;
+  /**
+   * 这一轮授权判定的 Policy 版本。老数据没有它，读出来是 undefined。
+   *
+   * 执行时冻结：事后才能回答「当时是按哪版政策放的行」。现在只有内置实现，
+   * 换成真正的 Policy Service 时这里记它的版本。
+   */
+  policyRevision?: string;
 }
 
 export interface ExecutionRecord {

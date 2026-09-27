@@ -113,16 +113,26 @@ export class CapabilityResolver {
     const dedupedSkills = dedupe(skillEntries, (entry) => entry.artifact.name, 'Skill');
     const dedupedTools = dedupe(tools, (tool) => tool.name, 'Tool');
 
+    // Turn 可见性：Lead-only 工具不对 Member turn 暴露。只是「少给」——
+    // 授权仍在 TeamService（planTasks / addTask / …里的 Lead 检查），
+    // manifest 记的是过滤后的可见集合，即这一轮真的能用的。
+    //
+    // 调用方没说 turnMode（老测试路径）时不过滤：默认可见，不静默收走。
+    const visibleTools = dedupedTools.filter((tool) => {
+      if (!tool.availableTo || !context.turnMode) return true;
+      return tool.availableTo.includes(context.turnMode);
+    });
+
     return {
       skills: dedupedSkills.map((entry) => entry.artifact),
       knowledge,
-      tools: dedupedTools,
-      toolIndex: new Map(dedupedTools.map((tool) => [tool.name, tool])),
+      tools: visibleTools,
+      toolIndex: new Map(visibleTools.map((tool) => [tool.name, tool])),
       manifestHash: manifestHashOf(
         capabilities,
         dedupedSkills,
         knowledge,
-        dedupedTools,
+        visibleTools,
         toolProviderVersions,
       ),
     };

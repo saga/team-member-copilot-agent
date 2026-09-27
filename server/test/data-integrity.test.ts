@@ -382,6 +382,7 @@ describe('execution 记录当时用的配置', () => {
     // 这一轮是无 Task 的 Lead 首轮（planning）：快照记的必须是 Strong，不是回落值
     assert.equal(firstSnapshot.model, modelPolicy.lead.strong.id);
     assert.equal(firstSnapshot.modelPurpose, 'lead:planning');
+    assert.equal(firstSnapshot.policyRevision, 'builtin-deny-high-risk-v1');
     assert.equal(firstSnapshot.hostToolsEnabled, config.allowHostCodingTools);
     assert.match(firstSnapshot.systemPromptHash, /^[\da-f]{64}$/);
     assert.match(firstSnapshot.memoryHash, /^[\da-f]{64}$/);

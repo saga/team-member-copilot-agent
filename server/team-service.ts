@@ -1132,10 +1132,11 @@ export class TeamService {
     this.touchConversation(conversation.id);
     this.emit(conversation.id, { type: 'message.created', data: message });
 
-    // 私聊直接唤醒对端，不经过任何 dispatcher。
+    // 私聊直接唤醒对端，不经过任何 dispatcher。忙也不丢：scheduler 自己负责
+    // idle → 立即执行、busy → pending、pending → coalesce。
     const state = this.states.get(conversation.id, target.id);
     const wakes: WakePlan[] = [];
-    if (!state.muted && !this.scheduler.isBusy(conversation.id, target.id)) {
+    if (!state.muted) {
       const wake: PendingWake = {
         conversationId: conversation.id,
         memberId: target.id,
@@ -2646,6 +2647,7 @@ export class TeamService {
         executionId,
         input.conversation.id,
         input.conversation.teamId,
+        input.turnMode,
       );
       const systemPrompt = this.buildMemberSystemPrompt(
         input.conversation,
@@ -2780,8 +2782,13 @@ export class TeamService {
         // Lead 一轮结束：如果期间产生了任务，推进就绪的；否则有新用户消息就再唤醒。
         this.orchestrator.startReadyTasks(input.conversation.id);
         const latest = this.getConversation(input.conversation.id);
-        const leadState = this.states.get(input.conversation.id, input.member.id);
-        if (latest.leadMemberId === input.member.id && leadState.lastSeenMessageSequence < latest.messageSequence) {
+        // 本轮刚发的回复不算「没看到的新消息」：messageSequence 被自己的回复
+        // 推高了一位，直接拿 lastSeen 比会永远小于 latest，每轮结束都再叫
+        // 自己一轮，无限自言自语。只有比自己回复更新的消息才值得再跑一轮。
+        const seenThrough = message
+          ? message.messageSequence
+          : this.states.get(input.conversation.id, input.member.id).lastSeenMessageSequence;
+        if (latest.leadMemberId === input.member.id && seenThrough < latest.messageSequence) {
           this.orchestrator.ensureLeadWake(input.conversation.id, latest.leadMemberId, latest.messageSequence);
         }
       }
@@ -2960,12 +2967,14 @@ export class TeamService {
     executionId: string,
     conversationId: string,
     teamId: string,
+    turnMode: TurnMode,
   ): Promise<RuntimeCapabilities> {
     return this.capabilityResolver.resolve(
       {
         teamId,
         memberId: member.id,
         conversationId,
+        turnMode,
         executionId,
         userId: config.localUserId,
       },
@@ -2995,6 +3004,9 @@ export class TeamService {
       memberRevision: member.updatedAt,
       model,
       modelPurpose,
+      // 内置 Policy（DenyHighRisk）没有上报版本号的地方，先记死这个名字：
+      // 快照要的是「当时按哪版政策执行」，不是「代码里有没有版本常量」。
+      policyRevision: 'builtin-deny-high-risk-v1',
       systemPromptHash: hashText(systemPrompt),
       memoryHash: hashText(
         `${this.members.getMemory(member.id).content}\0${this.members.getTeamMemory(member.id, teamId).content}`,

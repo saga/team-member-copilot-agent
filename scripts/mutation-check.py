@@ -589,13 +589,13 @@ MUTATIONS = [
         ],
     },
     {
-        "name": "Lead 忙时重复入队（同一轮被跑两遍）",
+        "name": "Lead 轮末自激（自己的回复也算新消息，无限自言自语）",
         "test": "server/test/team-service.test.ts",
         "steps": [
             (
-                "server/task-orchestrator.ts",
-                "    if (this.scheduler.isBusy(conversationId, leadMemberId) && reason !== 'lead_recovery') {\n      return false;\n    }\n",
-                "",
+                "server/team-service.ts",
+                "        const seenThrough = message\n          ? message.messageSequence\n          : this.states.get(input.conversation.id, input.member.id).lastSeenMessageSequence;\n",
+                "        const seenThrough = this.states.get(input.conversation.id, input.member.id).lastSeenMessageSequence;\n",
             )
         ],
     },
@@ -726,13 +726,35 @@ MUTATIONS = [
         ],
     },
     {
-        "name": "recovery 唤醒也被 Lead 忙挡掉（失败通知丢失）",
+        "name": "忙时丢 wake（加回 isBusy 丢弃，失败通知丢失）",
         "test": "server/test/task-service.test.ts",
         "steps": [
             (
                 "server/task-orchestrator.ts",
-                "    if (this.scheduler.isBusy(conversationId, leadMemberId) && reason !== 'lead_recovery') {\n      return false;\n    }",
-                "    if (this.scheduler.isBusy(conversationId, leadMemberId)) {\n      return false;\n    }",
+                "    if (!leadMemberId) return false;\n",
+                "    if (!leadMemberId) return false;\n    if (this.scheduler.isBusy(conversationId, leadMemberId)) return false;\n",
+            )
+        ],
+    },
+    {
+        "name": "resolver 不过滤 Lead-only（Member turn 看到 plan_tasks）",
+        "test": "server/test/capabilities.test.ts",
+        "steps": [
+            (
+                "server/capabilities/resolver.ts",
+                "    const visibleTools = dedupedTools.filter((tool) => {\n      if (!tool.availableTo || !context.turnMode) return true;\n      return tool.availableTo.includes(context.turnMode);\n    });\n",
+                "    const visibleTools = dedupedTools;\n",
+            )
+        ],
+    },
+    {
+        "name": "快照不记 policy 版本（事后说不清按哪版政策放的行）",
+        "test": "server/test/data-integrity.test.ts",
+        "steps": [
+            (
+                "server/team-service.ts",
+                "      policyRevision: 'builtin-deny-high-risk-v1',\n",
+                "",
             )
         ],
     },

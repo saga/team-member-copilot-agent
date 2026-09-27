@@ -37,15 +37,9 @@ export class TaskOrchestrator {
     reason: Extract<WakeReason, 'lead_message' | 'lead_clarification' | 'lead_recovery'> = 'lead_message',
   ): boolean {
     if (!leadMemberId) return false;
-    // 用户消息 / clarification：Lead 正忙时不重复入队，消息本身会通过
-    // message checkpoint 被下一轮看到。
-    //
-    // recovery 例外：Task 失败不产生新消息，错过这一次就永远没人处理 blocked。
-    // scheduler 本来就支持 inFlight + pending，忙时入队只是排着，当前 turn
-    // 完成后接着跑，不需要新状态。
-    if (this.scheduler.isBusy(conversationId, leadMemberId) && reason !== 'lead_recovery') {
-      return false;
-    }
+    // 忙也不丢：scheduler 按 (conversation, member) 串行，忙时入队只是排进
+    // pending（同 key 合并，不会跑重），当前 turn 跑完接着跑。之前在这里按
+    // isBusy 丢弃，Task 失败这类不产生新消息的唤醒一旦错过就永远没人处理。
     const state = this.states.get(conversationId, leadMemberId);
     if (state.muted) return false;
     this.scheduler.enqueue({

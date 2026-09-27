@@ -1,5 +1,5 @@
 import type { defineTool } from '@github/copilot-sdk';
-import type { CapabilityBinding, MemberCapabilities } from '../domain.js';
+import type { CapabilityBinding, MemberCapabilities, TurnMode } from '../domain.js';
 
 /**
  * 能力层（Skill / Knowledge / Tool）的契约。
@@ -41,6 +41,11 @@ export interface CapabilityContext {
   conversationId: string;
   executionId: string;
   userId: string;
+  /**
+   * 这一轮的性质。可选：不传时不过滤（老调用方与测试照旧）。
+   * 生产路径（TeamService.resolveCapabilities）永远传。
+   */
+  turnMode?: TurnMode;
 }
 
 // ------------------------------------------------------------------- Skill
@@ -197,6 +202,14 @@ export interface RuntimeTool {
    * 显式放行（HOST_CODING_TOOLS）。它是部署前提，不是 Member 能自己声明的东西。
    */
   requiresHostAccess?: boolean;
+  /**
+   * 这个工具只在哪些 turn 里可见。不填 = 所有 turn 可见。
+   *
+   * 这只是「少给」：隐藏不等于授权，真正的 Lead 检查仍在 TeamService
+   * （planTasks / addTask / reassignTask / requestClarification）里，
+   * 绕过可见性直接调 host 也会被拦下。可以减少能力，不能提升权限。
+   */
+  availableTo?: TurnMode[];
   /** custom tool 必填。 */
   parameters?: ToolParameters;
   /** custom tool 必填。builtin 由引擎自己执行。 */

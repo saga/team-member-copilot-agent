@@ -211,6 +211,7 @@ export class CoreTeamToolProvider implements ToolProvider {
           'Lead only. Ask the user for missing information that blocks progress. ' +
           'At most 3 questions at a time. The workspace moves to waiting_user.',
         risk: 'coordination',
+        availableTo: ['lead'],
         parameters: z.object({
           questions: z.array(z.string().min(1).max(1000)).min(1).max(3),
           assumptions: z.array(z.string().min(1).max(1000)).max(10).optional(),
@@ -243,6 +244,7 @@ export class CoreTeamToolProvider implements ToolProvider {
           'omit it to follow the assignee default. ' +
           'Tasks start automatically once dependencies are met.',
         risk: 'coordination',
+        availableTo: ['lead'],
         parameters: z.object({
           objective: z.string().min(1).max(4000),
           requirements: z.object({
@@ -298,6 +300,7 @@ export class CoreTeamToolProvider implements ToolProvider {
           'Set modelTier to strong for an unusually complex task; omit it to follow the assignee default. ' +
           'The task starts automatically when its dependencies are satisfied.',
         risk: 'coordination',
+        availableTo: ['lead'],
         parameters: z.object({
           title: z.string().min(1).max(300),
           description: z.string().max(8000).optional(),
@@ -329,6 +332,7 @@ export class CoreTeamToolProvider implements ToolProvider {
           'Lead only. Reassign a not-yet-running task to another active Member in this workspace. ' +
           'Do not reassign a task that is already ready, running, completed or cancelled.',
         risk: 'coordination',
+        availableTo: ['lead'],
         parameters: z.object({
           taskId: z.string().min(1),
           assigneeMemberId: z.string().min(1),

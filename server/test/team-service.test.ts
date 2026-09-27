@@ -380,7 +380,7 @@ describe('Member 生命周期边界', () => {
     team.updateMember(archivist.id, { status: 'active' });
   });
 
-  it('Lead 忙时新消息不重复入队，忙时不能归档也不能移出', async () => {
+  it('Lead 忙时新消息排队合并，只多跑一轮，忙时不能归档也不能移出', async () => {
     const group = team.createConversation({
       kind: 'task',
       memberIds: [archivist.id, reviewer.id],
@@ -393,18 +393,23 @@ describe('Member 生命周期边界', () => {
       });
       await waitForStatus(first.executionId, 'running');
 
-      // Lead 忙时新的用户消息只落库、不重复入队 —— 消息靠 checkpoint 被下一轮看到。
+      // 忙也不丢：第二条入队排着，由 scheduler 合并，而不是丢掉。
       const second = await sendRaw({
         conversationId: group.id,
         content: '第二轮',
       });
-      assert.equal(second.wakes.length, 0, 'Lead 忙时不该重复入队');
+      assert.equal(second.wakes.length, 1, '忙时消息照样排队');
 
       assert.throws(() => team.updateMember(archivist.id, { status: 'archived' }), /不能归档/);
       assert.throws(() => team.removeMember(group.id, archivist.id), /不能移出/);
     });
 
     await waitForConversationIdle(group.id);
+    // 两轮消息收敛成两轮执行：第一轮 + 合并后的一轮，不会跑出第三轮。
+    const leadRuns = db
+      .prepare(`SELECT COUNT(*) AS n FROM execution WHERE conversation_id = ? AND member_id = ?`)
+      .get(group.id, archivist.id) as unknown as { n: number };
+    assert.equal(leadRuns.n, 2, '排队合并不能变成重复执行');
   });
 
   it('移出再重新加入拿到全新的 Copilot session，不从旧上下文续写', async () => {

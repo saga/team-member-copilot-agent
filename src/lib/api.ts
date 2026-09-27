@@ -383,6 +383,8 @@ export interface ExecutionConfigSnapshot {
   model: string;
   /** 为什么选这个模型（老数据没有）。 */
   modelPurpose?: ModelPurpose;
+  /** 当时授权判定的 Policy 版本（老数据没有）。 */
+  policyRevision?: string;
   systemPromptHash: string;
   memoryHash: string;
   /** 这一轮实际生效的能力组成（Provider ID + 版本 + 工具集）的 sha256。 */

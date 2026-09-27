@@ -745,7 +745,42 @@ describe('Tool guard', () => {
   });
 });
 
-// ═══════════════════════════════════════════════ 7. 工具契约
+// ═══════════════════════════════════════════════ 7. Turn 可见性
+
+describe('Turn 可见性：Lead-only 工具不对 Member 暴露', () => {
+  const LEAD_ONLY = ['request_clarification', 'plan_tasks', 'add_task', 'reassign_task'];
+  const binding = { skills: [], knowledge: [], tools: [{ providerId: 'team.core-tools' }] };
+
+  it('Lead turn 全可见；Member turn 看不到四个 Lead-only', async () => {
+    const base = capabilityContext('visibility-member', defaultTeam.id);
+    const lead = await stack.resolver.resolve({ ...base, turnMode: 'lead' }, binding);
+    const member = await stack.resolver.resolve({ ...base, turnMode: 'task' }, binding);
+
+    const leadNames = lead.tools.map((tool) => tool.name);
+    const memberNames = member.tools.map((tool) => tool.name);
+    for (const name of LEAD_ONLY) {
+      assert.ok(leadNames.includes(name), `Lead turn 必须看到 ${name}`);
+      assert.ok(!memberNames.includes(name), `Member turn 不能看到 ${name}（只隐藏，不授权）`);
+    }
+    // 执行人上报和协作工具不受影响
+    for (const name of ['update_task', 'ask_member', 'message_member', 'remember_member']) {
+      assert.ok(memberNames.includes(name), `Member turn 必须看到 ${name}`);
+    }
+  });
+
+  it('不传 turnMode 时不过滤（老调用方行为不变）', async () => {
+    const runtime = await stack.resolver.resolve(
+      capabilityContext('visibility-legacy', defaultTeam.id),
+      binding,
+    );
+    const names = runtime.tools.map((tool) => tool.name);
+    for (const name of LEAD_ONLY) {
+      assert.ok(names.includes(name), `没说 turnMode 时不能静默收走 ${name}`);
+    }
+  });
+});
+
+// ═══════════════════════════════════════════════ 8. 工具契约
 
 describe('KnowledgeToolProvider：检索范围只由 binding 决定', () => {
   function toolOf(runtime: RuntimeCapabilities, name: string): RuntimeTool {
@@ -883,7 +918,7 @@ describe('KnowledgeToolProvider：检索范围只由 binding 决定', () => {
   });
 });
 
-// ═══════════════════════════════════════════════ 8. TeamService 入口
+// ═══════════════════════════════════════════════ 9. TeamService 入口
 
 describe('TeamService 的能力读写入口', () => {
   it('新建 Member 的 Member 层是空的 —— 它继承 global/team，而不是复制一份基线', () => {
