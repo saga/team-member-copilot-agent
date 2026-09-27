@@ -43,9 +43,6 @@ export class TaskOrchestrator {
     // recovery 例外：Task 失败不产生新消息，错过这一次就永远没人处理 blocked。
     // scheduler 本来就支持 inFlight + pending，忙时入队只是排着，当前 turn
     // 完成后接着跑，不需要新状态。
-    if (this.scheduler.isBusy(conversationId, leadMemberId) && reason !== 'lead_recovery') {
-      return false;
-    }
     const state = this.states.get(conversationId, leadMemberId);
     if (state.muted) return false;
     this.scheduler.enqueue({
