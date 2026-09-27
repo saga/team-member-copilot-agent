@@ -46,7 +46,7 @@ export function MemberManager({
 
   // 移出后 roster 必须仍是合法 Task 工作区（≥ 1）
   const removeDisabled = conversation.members.length <= 1;
-  // 任务开始后 roster 冻结：只有准备中 / 等待补充时能增删成员。
+  // 任务开始后 roster 冻结：只有准备中 / 等你回答时能增删成员。
   const rosterFrozen =
     conversation.status !== 'intake' && conversation.status !== 'waiting_user';
 

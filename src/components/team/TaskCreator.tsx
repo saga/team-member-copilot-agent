@@ -67,56 +67,82 @@ export function TaskCreator({ open, members, onCreate, onCancel }: TaskCreatorPr
   return (
     <Modal
       open={open}
-      title="New task"
-      okText="Create"
-      cancelText="Cancel"
+      title="新建工作区"
+      okText="创建"
+      cancelText="取消"
+      width={600}
       onCancel={onCancel}
       onOk={() => void submit()}
       confirmLoading={busy}
       okButtonProps={{ disabled: !canCreate }}
     >
-      <Space direction="vertical" style={{ width: '100%' }} size={8}>
-        <Input
-          value={title}
-          onChange={(e) => setTitle(e.target.value)}
-          placeholder="这次工作要达成什么，例如 解决 ABC-123 登录失败问题"
-          autoFocus
-        />
+      <Space direction="vertical" style={{ width: '100%' }} size={12}>
+        <div>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            标题
+          </Typography.Text>
+          <Input
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+            placeholder="这次工作要达成什么，例如 解决 ABC-123 登录失败问题"
+            autoFocus
+            style={{ marginTop: 4 }}
+          />
+        </div>
 
-        <Select
-          mode="multiple"
-          value={memberIds}
-          onChange={(values) => {
-            setMemberIds(values);
-            if (leadMemberId && !values.includes(leadMemberId)) setLeadMemberId(null);
-          }}
-          placeholder="参与的成员"
-          style={{ width: '100%' }}
-          options={activeMembers.map((member) => ({
-            value: member.id,
-            label: `${member.name} · ${member.role}`,
-          }))}
-        />
-
-        <Select
-          value={effectiveLead}
-          onChange={setLeadMemberId}
-          placeholder="谁负责推进（Lead）"
-          style={{ width: '100%' }}
-          options={activeMembers
-            .filter((member) => memberIds.includes(member.id))
-            .map((member) => ({
+        <div>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            参与的成员
+          </Typography.Text>
+          <Select
+            mode="multiple"
+            value={memberIds}
+            onChange={(values) => {
+              setMemberIds(values);
+              if (leadMemberId && !values.includes(leadMemberId)) setLeadMemberId(null);
+            }}
+            placeholder="选 1~20 个成员"
+            style={{ width: '100%', marginTop: 4 }}
+            maxTagCount="responsive"
+            allowClear
+            options={activeMembers.map((member) => ({
               value: member.id,
               label: `${member.name} · ${member.role}`,
             }))}
-        />
+          />
+        </div>
 
-        <Input
-          value={jiraKey}
-          onChange={(e) => setJiraKey(e.target.value)}
-          placeholder="Jira issue key（可选，例如 ABC-123）"
-          maxLength={60}
-        />
+        <div>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            谁负责推进（Lead）
+          </Typography.Text>
+          <Select
+            value={effectiveLead}
+            onChange={setLeadMemberId}
+            placeholder="先选成员，再定 Lead"
+            style={{ width: '100%', marginTop: 4 }}
+            allowClear
+            options={activeMembers
+              .filter((member) => memberIds.includes(member.id))
+              .map((member) => ({
+                value: member.id,
+                label: `${member.name} · ${member.role}`,
+              }))}
+          />
+        </div>
+
+        <div>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            Jira 工单（可选）
+          </Typography.Text>
+          <Input
+            value={jiraKey}
+            onChange={(e) => setJiraKey(e.target.value)}
+            placeholder="例如 ABC-123，不填就是不挂业务"
+            maxLength={60}
+            style={{ marginTop: 4 }}
+          />
+        </div>
 
         {trimmedKey && !title.trim() && (
           <Typography.Link onClick={() => setTitle(trimmedKey)}>

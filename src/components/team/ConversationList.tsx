@@ -1,5 +1,5 @@
 import type { Conversation } from '../../lib/api';
-import { CONVERSATION_STATUS_TEXT } from './constants';
+import { CONVERSATION_STATUS_TEXT, describeConversationStatus } from './constants';
 
 interface ConversationListProps {
   conversations: Conversation[];
@@ -11,8 +11,14 @@ interface ConversationListProps {
 
 /**
  * 副标题：进度 + 成员 + Jira。
+ *
+ * 等你回答时直接把问题贴出来 —— 光写个状态名，用户还得点进去才知道要答什么。
  */
 function rowMeta(conversation: Conversation) {
+  if (conversation.status === 'waiting_user' && conversation.openQuestions[0]) {
+    const more = conversation.openQuestions.length > 1 ? `（等 ${conversation.openQuestions.length} 个）` : '';
+    return `等你回答：${conversation.openQuestions[0]}${more}`;
+  }
   const names = conversation.members.map((m) => m.name).join(' · ');
   const key = conversation.externalWorkRef?.key;
   const progress =
@@ -71,11 +77,13 @@ export function ConversationList({ conversations, selectedId, onSelect, search }
             >
               <div className="conversation-item-title">
                 <span className="conversation-item-name">{conversation.title}</span>
-                <span className="conversation-item-badge">
+                <span className="conversation-item-badge" title={describeConversationStatus(conversation)}>
                   {CONVERSATION_STATUS_TEXT[conversation.status] ?? conversation.status}
                 </span>
               </div>
-              <div className="conversation-item-meta">{rowMeta(conversation)}</div>
+              <div className="conversation-item-meta" title={describeConversationStatus(conversation)}>
+                {rowMeta(conversation)}
+              </div>
             </div>
           ))}
         </div>
