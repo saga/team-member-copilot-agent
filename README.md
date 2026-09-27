@@ -97,6 +97,7 @@ Lead 只负责澄清与规划，执行由各 Task 的执行人推进，依赖由
 | **TeamMembership** | 谁属于 Team：`human`（`principalId=user id`，单机为 `LOCAL_ACTOR_ID`）/ `agent`（`principalId=member.id`），`role=owner/admin/member`。`Member.role` 是职业角色，两者绝不合并。 |
 | **Jira（外部事实源）** | 业务工作（工单、状态、负责人、工作流）以 Jira 为准，**本地不复制**。本地只有两个值对象：`ExternalWorkRef`（provider/externalId/key/url，挂在 Conversation 与 Execution 上）和 `ExternalWorkSnapshot`（execution 开始时向 Jira 取证的最小字段）。没有 Project / WorkItem / JiraIssue 这些本地业务对象。`Current Work` = active execution → 外部引用。Agent 通过 `atlassian.jira-tools` 读写工单；控制面（取证、webhook 定位房间）走 `WorkManagementProvider` 直连，**不经过 LLM**。 |
 | **Presence** | Team 层可接工作状态：落库只有 `available/away/paused`，`busy/offline` 由 active execution / lastSeen 计算。`paused` 只拦自动唤醒，不拦 @ 点名。 |
+| **Experience** | 可检索的工作经验（`trigger → lesson`），落在 `.data/experiences/<teamId>/experiences.jsonl`，不进数据库。MEMORY.md 是长期事实/习惯（全文 append），Experience 是面向任务复用的经验（按需检索）。Agent 用 `learn_experience` 存（用户纠正/成功复盘/策略发现），控制面每轮按原始输入自动检索、经 ContextAssembler 注入 prompt —— Agent 不需要记得检索。授权/政策/模型规则禁止当经验存，经验只是建议，当前需求与权威知识优先。 |
 | **ScheduledWake** | `once` / `interval` 定时唤醒，必须绑定 `task` 工作区，且被调度的 Member 必须在该工作区里；`UNIQUE(schedule_id, scheduled_for)` 幂等，周期不补历史。执行链固定为 `ScheduledWake → ScheduledWakeRun → Execution → executeMemberTurn`，**不经过 MemberTurnScheduler**（聊天 wake 与 schedule wake 不是同一种 wake，不能 coalesce）；run 的终态随 execution 收口（completed/failed），不停在 running 上没有下文。 |
 
 两个游标保证顺序与可靠性：
@@ -1129,6 +1130,7 @@ server/                       # Express + Copilot SDK 后端
     runtime-correctness.test.ts    # resume 分类 / 超时 abort / 工具授权接线 / cancel 状态机 / retry
     task-service.test.ts             # Task 规划 / 依赖 / 并行串行 / 执行人归属 / Lead 单点 / 澄清 / 阻塞重试 / 重启恢复
     model-policy.test.ts             # Strong > Standard >= Member / Lead 按原因与意图分档 / 快照记真实模型与 purpose
+    experience-store.test.ts         # 经验存取 / Team 与 member 隔离 / 去重 / 存→下一轮 prompt 的完整回路
     conversations-api.test.ts      # 真实 HTTP：externalWorkRef 过边界 / 静音 state patch / SSE 流式增量
     data-integrity.test.ts         # replyTo 校验 / 消息幂等 / 记忆乐观并发 / 上下文上限 / 配置快照 / state 事件
     member-template-seeder.test.ts # provisioning 幂等 / 不覆盖已改 Member / 归档不复活 / 穿越与重复 key / 能力绑定

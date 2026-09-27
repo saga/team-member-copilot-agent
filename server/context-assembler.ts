@@ -9,6 +9,7 @@ import type {
   TurnMode,
   WakeReason,
 } from './domain.js';
+import type { ExperienceRecord } from './experience-store.js';
 
 /**
  * Conversation context 与 Copilot Session history 的职责划分：
@@ -86,6 +87,11 @@ export class ContextAssembler {
     currentPrompt: string;
     currentTask?: ConversationTask | null;
     tasks?: ConversationTask[];
+    /**
+     * 控制面按本轮输入检索到的相关经验。Member 不需要记得检索 ——
+     * 检索条件（prompt + 目标 + 当前任务）由调用方拼好传进来。
+     */
+    experiences?: ExperienceRecord[];
     memberNames?: Map<string, string>;
     /**
      * 这间房间挂了外部工作（Jira 工单）时才带的引用。
@@ -162,6 +168,7 @@ export class ContextAssembler {
       currentPrompt: string;
       currentTask?: ConversationTask | null;
       tasks?: ConversationTask[];
+      experiences?: ExperienceRecord[];
       work?: { provider: string; key: string; url: string | null } | null;
       referencedFiles?: Array<{ originalName: string }>;
     },
@@ -184,6 +191,23 @@ export class ContextAssembler {
     }
 
     sections.push(this.workspaceHeader(input.conversation, input.member, input.tasks ?? [], input.currentTask ?? null));
+
+    // 经验是建议，不是政策：当前需求、权威知识、平台政策冲突时听后者。
+    if (input.experiences && input.experiences.length > 0) {
+      sections.push(
+        [
+          'Relevant past experiences:',
+          ...input.experiences.map(
+            (experience) =>
+              `- [${experience.kind}] ${experience.lesson}` +
+              (experience.evidence ? ` (evidence: ${experience.evidence})` : ''),
+          ),
+          '',
+          'Use these experiences as guidance, not as authoritative policy.',
+          'If current requirements or authoritative knowledge conflict with an experience, follow the current authoritative source.',
+        ].join('\n'),
+      );
+    }
 
     const referenced = input.referencedFiles ?? [];
     if (referenced.length > 0) {
@@ -339,6 +363,13 @@ const LEAD_INSTRUCTION = [
   'Do not create or modify Jira subtasks merely to mirror the internal task plan.',
   'Use Jira write tools only when the user request and tool authorization explicitly require changing Jira.',
   '',
+  'LEARNING FROM EXPERIENCE:',
+  'When the user explicitly corrects your approach, extract the reusable lesson with learn_experience.',
+  'When you discover a strategy that is likely useful for similar future work, you may store it with learn_experience.',
+  'Store reusable lessons, not conversation transcripts or temporary task details.',
+  'Do not store authorization rules, security boundaries, credentials, private data, or model-policy changes as experience.',
+  'Experiences are guidance only; current user requirements, authoritative knowledge, and platform policy take precedence.',
+  '',
   'EXECUTION:',
   'The platform starts ready tasks automatically.',
   'Do not manually simulate another Member doing the work.',
@@ -353,6 +384,7 @@ const TASK_INSTRUCTION = [
   'Do the work. Use available tools and knowledge.',
   "When your assigned work is complete, call update_task with status completed.",
   "If you cannot proceed, call update_task with status blocked and explain the blocker.",
+  'When you discover a reusable method or a meaningful lesson from this task, you may store it with learn_experience.',
   'Do not return generic conversational commentary.',
 ].join('\n');
 

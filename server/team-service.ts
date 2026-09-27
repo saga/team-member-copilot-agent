@@ -8,6 +8,7 @@ import { hashText } from './content-hash.js';
 import { runInTransaction } from './db-tx.js';
 import { now } from './db.js';
 import { ContextAssembler } from './context-assembler.js';
+import { ExperienceStore, type ExperienceKind } from './experience-store.js';
 import { ConversationMemberService } from './conversation-member-service.js';
 import { MemberTurnScheduler } from './member-turn-scheduler.js';
 import { TaskOrchestrator } from './task-orchestrator.js';
@@ -335,6 +336,11 @@ export class TeamService {
   private readonly scheduler: MemberTurnScheduler;
   /** Task 状态的唯一业务入口。 */
   private readonly tasks: TaskService;
+  /**
+   * 可检索的工作经验库。MEMORY.md 是长期事实/习惯，这个是 trigger → lesson、
+   * 按需检索注入 prompt —— 两类记忆的读写与消费路径都分开。
+   */
+  private readonly experiences: ExperienceStore;
   /** Task 就绪 → 入队、完成 → 推进下一批。 */
   private readonly orchestrator: TaskOrchestrator;
   /** Member ↔ Member 私聊的房间拓扑（find-or-create / 列表 / 发送）。 */
@@ -384,6 +390,7 @@ export class TeamService {
     private readonly conversationFiles?: ConversationFileService,
   ) {
     this.contextAssembler = new ContextAssembler(db);
+    this.experiences = new ExperienceStore();
     this.states = new ConversationMemberService(db, (conversationId, change) => {
       // 房间状态变化（读游标 / 唤醒状态 / 静音）也走同一条 durable 事件通道。
       this.emit(conversationId, { type: 'conversation_member_state.updated', data: change });
@@ -1892,6 +1899,38 @@ export class TeamService {
   }
 
   /**
+   * Member 的学习入口（learn_experience tool）。
+   *
+   * 只收 trigger → lesson 的可复用经验，不收事件流水账；授权类内容
+   * （capability / policy / model）由 Control Plane 管，不经过这里 ——
+   * prompt 里有明确禁令，见 context-assembler 的 LEARNING 段。
+   */
+  async learnExperience(input: {
+    conversationId: string;
+    memberId: string;
+    kind: ExperienceKind;
+    trigger: string;
+    lesson: string;
+    evidence?: string;
+    scope?: 'member' | 'team';
+    confidence?: number;
+  }): Promise<string> {
+    const conversation = this.getConversation(input.conversationId);
+    this.requireActiveMember(conversation, input.memberId);
+    const experience = this.experiences.add({
+      memberId: input.memberId,
+      teamId: conversation.teamId,
+      kind: input.kind,
+      trigger: input.trigger,
+      lesson: input.lesson,
+      evidence: input.evidence,
+      scope: input.scope ?? 'team',
+      confidence: input.confidence ?? 0.8,
+    });
+    return `已保存可复用经验：${experience.lesson}`;
+  }
+
+  /**
    * Member 长期记忆的读写。
    *
    * 落在 `.data/members/<id>/memory/MEMORY.md`，不进数据库：记忆是自然语言
@@ -2557,6 +2596,20 @@ export class TeamService {
 
     const currentTask = input.taskId ? this.safeGetTask(input.taskId) : null;
     const allTasks = this.safeListTasks(input.conversation.id);
+    // 经验检索由控制面做，不经过 LLM：Agent 不需要记得检索，检索条件是
+    // 这一轮的原始输入（prompt + 目标 + 当前任务），不是 assemble 后的全文。
+    const experiences = this.experiences.search({
+      memberId: input.member.id,
+      teamId: input.conversation.teamId,
+      query: [
+        input.prompt,
+        input.conversation.objective,
+        currentTask?.title ?? '',
+        currentTask?.description ?? '',
+        currentTask?.acceptanceCriteria.join(' ') ?? '',
+      ].join('\n'),
+      limit: 5,
+    });
     const context = this.contextAssembler.assemble({
       runtime,
       conversation: input.conversation,
@@ -2567,6 +2620,7 @@ export class TeamService {
       currentPrompt: input.prompt,
       currentTask,
       tasks: allTasks,
+      experiences,
       // 优先用取证返回的规范引用：工单被改过 key 时，告诉 Agent 的是**现在**的
       // key，而不是建会话那天记下的那个。
       work: this.workContextFor(workSnapshot?.ref ?? input.execution.externalWorkRef),

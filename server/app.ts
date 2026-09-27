@@ -105,6 +105,7 @@ registry.registerToolProvider(
     planTasks: (input) => teamService.planTasks(input),
     addTask: (input) => teamService.addTask(input),
     reassignTask: (input) => teamService.reassignTask(input),
+    learnExperience: (input) => teamService.learnExperience(input),
     updateTask: (input) => teamService.updateTask(input),
   }),
 );

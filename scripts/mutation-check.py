@@ -781,6 +781,17 @@ MUTATIONS = [
         ],
     },
     {
+        "name": "检索到的经验不注入 prompt（存了也白存）",
+        "test": "server/test/experience-store.test.ts",
+        "steps": [
+            (
+                "server/team-service.ts",
+                "      tasks: allTasks,\n      experiences,\n",
+                "      tasks: allTasks,\n",
+            )
+        ],
+    },
+    {
         "name": "running 的任务也能换执行人（飞着的活被转手）",
         "test": "server/test/task-service.test.ts",
         "steps": [
