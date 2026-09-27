@@ -308,6 +308,7 @@ function turnInput(
     },
     systemPrompt: 'You are Alice.',
     prompt: 'hello',
+    model: 'gpt-5',
     executionId: 'exec-1',
     conversationId: 'conv-1',
     teamId: defaultTeam.id,

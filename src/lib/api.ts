@@ -506,6 +506,24 @@ export interface Health {
   copilotError?: string;
 }
 
+/** 一个可用模型及其强度：数字越大越强，Lead 永远是最高的那个。 */
+export interface ModelDefinition {
+  id: string;
+  strength: number;
+}
+
+/**
+ * 模型策略（服务端是唯一真相源）。
+ *
+ * Lead 担任推进者时自动用 `lead`；普通 Task 只能从 `members` 里选，
+ * 未选则用 `defaultMemberModel`。`members` 里永远没有 Lead 模型。
+ */
+export interface ModelPolicy {
+  lead: ModelDefinition;
+  members: ModelDefinition[];
+  defaultMemberModel: string;
+}
+
 export interface DelegationEvent {
   executionId: string;
   parentExecutionId?: string;
@@ -538,6 +556,11 @@ function scopedSkillPath(scope: SkillScope, memberId?: string): string {
 export const api = {
   health(): Promise<Health> {
     return fetch(`${API_BASE}/api/health`).then(json<Health>);
+  },
+
+  /** 模型策略：Member 编辑器与 Task 创建窗口的下拉选项从这里来。 */
+  getModelPolicy(): Promise<{ policy: ModelPolicy }> {
+    return fetch(`${API_BASE}/api/models`).then(json<{ policy: ModelPolicy }>);
   },
 
   listMembers(): Promise<{ members: Member[] }> {

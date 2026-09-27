@@ -44,6 +44,11 @@ export class TaskOrchestrator {
   }
 
   startReadyTasks(conversationId: string): ConversationTask[] {
+    // 依赖链的状态变化（ready / blocked）在这里统一广播：只发触发任务自己的
+    // 变化，下游从 pending 翻成的 blocked 会静默丢掉，前端就永远是旧状态。
+    const changed = this.tasks.refreshReady(this.db, conversationId);
+    for (const task of changed.ready) this.events.onTask(task);
+    for (const task of changed.blocked) this.events.onTask(task);
     const started: ConversationTask[] = [];
     for (const task of this.tasks.findReady(conversationId)) {
       if (this.scheduler.isBusy(conversationId, task.assigneeMemberId)) continue;
@@ -62,54 +67,41 @@ export class TaskOrchestrator {
     return started;
   }
 
-  onTaskCompleted(taskId: string): void {
-    const task = this.tasks.get(taskId);
-    this.tasks.refreshReady(this.db, task.conversationId);
-    this.startReadyTasks(task.conversationId);
-    const conversation = this.readConversation(task.conversationId);
-    if (conversation?.leadMemberId) {
-      this.ensureLeadWake(task.conversationId, conversation.leadMemberId, conversation.messageSequence);
-    }
-    const status = this.tasks.recomputeConversationStatus(task.conversationId);
-    if (status) this.events.onConversation(task.conversationId);
-    this.events.onTask(this.tasks.get(taskId));
-  }
-
   /**
-   * Task 状态变化的统一入口：按最新 status 分发，一个 Task 只推进一次。
-   * 调用方不要再按「完成/失败」各调一遍 —— 终态以 DB 里读到的为准。
+   * Task 状态变化的统一入口：按 DB 里读到的最新 status 分发。
+   *
+   *   completed / cancelled → 推进下游，不唤醒 Lead
+   *   blocked / failed     → 推进下游，并唤醒 Lead（只有这里需要人看一眼）
+   *   其它                 → 只广播，不推进
+   *
+   * 完成是正常进展：每个 Task 完成后都把 Lead 叫起来回顾一次，
+   * 既浪费最强模型，也会产生无意义的进度消息。全部完成即 completed，
+   * 同样不再叫 Lead。Lead 只在三处被唤醒：用户消息、初始规划、失败/阻塞。
    */
   onTaskChanged(taskId: string): void {
     const task = this.tasks.get(taskId);
     if (task.status === 'completed' || task.status === 'cancelled') {
-      this.onTaskCompleted(taskId);
-    } else if (task.status === 'blocked' || task.status === 'failed') {
-      this.onTaskBlocked(taskId);
-    } else {
-      this.events.onTask(task);
+      this.startReadyTasks(task.conversationId);
+      this.recomputeAndEmit(task.conversationId);
+      this.events.onTask(this.tasks.get(taskId));
+      return;
     }
-  }
-
-  /** blocked / failed：刷新受影响的下游、启动新的 ready、唤醒 Lead、重算状态。 */
-  onTaskBlocked(taskId: string): void {
-    this.onTaskBlockedOrFailed(taskId);
-  }
-
-  onTaskFailed(taskId: string): void {
-    this.onTaskBlockedOrFailed(taskId);
-  }
-
-  private onTaskBlockedOrFailed(taskId: string): void {
-    const task = this.tasks.get(taskId);
-    this.tasks.refreshReady(this.db, task.conversationId);
-    this.startReadyTasks(task.conversationId);
-    const conversation = this.readConversation(task.conversationId);
-    if (conversation?.leadMemberId) {
-      this.ensureLeadWake(task.conversationId, conversation.leadMemberId, conversation.messageSequence);
+    if (task.status === 'blocked' || task.status === 'failed') {
+      this.startReadyTasks(task.conversationId);
+      const conversation = this.readConversation(task.conversationId);
+      if (conversation?.leadMemberId) {
+        this.ensureLeadWake(task.conversationId, conversation.leadMemberId, conversation.messageSequence);
+      }
+      this.recomputeAndEmit(task.conversationId);
+      this.events.onTask(this.tasks.get(taskId));
+      return;
     }
-    const status = this.tasks.recomputeConversationStatus(task.conversationId);
-    if (status) this.events.onConversation(task.conversationId);
-    this.events.onTask(this.tasks.get(taskId));
+    this.events.onTask(task);
+  }
+
+  private recomputeAndEmit(conversationId: string): void {
+    const status = this.tasks.recomputeConversationStatus(conversationId);
+    if (status) this.events.onConversation(conversationId);
   }
 
   onTaskInterrupted(taskId: string, reason: string): void {

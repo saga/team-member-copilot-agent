@@ -35,6 +35,7 @@ import { skillsRouter } from './routes/skills.js';
 import { knowledgeRouter } from './routes/knowledge.js';
 import { internalRouter } from './routes/internal.js';
 import { conversationsRouter } from './routes/conversations.js';
+import { modelsRouter } from './routes/models.js';
 import { executionsRouter } from './routes/executions.js';
 import { tasksRouter } from './routes/tasks.js';
 import { teamRouter } from './routes/team.js';
@@ -223,6 +224,7 @@ app.use('/api/knowledge', knowledgeRouter(localKnowledgeProvider));
 app.use('/api/team', teamRouter(structureService, teamEvents));
 app.use('/api/work-management', workManagementRouter(teamService, workManagement));
 app.use('/api/conversations', conversationsRouter(teamService, conversationFiles, conversationFileProcessor, localKnowledgeProvider));
+app.use('/api/models', modelsRouter());
 app.use('/api/executions', executionsRouter(teamService));
 app.use('/api/tasks', tasksRouter(teamService));
 // 以某个 Member 的身份说话 —— 独立的命名空间 + token 门禁，见 middleware/apiScope.ts

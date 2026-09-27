@@ -2,7 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
-import { config } from './config.js';
+import { config, modelPolicy } from './config.js';
+import { resolveMemberModel } from './model-policy.js';
 import { hashText } from './content-hash.js';
 import { runInTransaction } from './db-tx.js';
 import { now } from './db.js';
@@ -433,6 +434,7 @@ export class TeamService {
    * 而且没有任何地方看得出原因。
    */
   createMember(input: CreateMemberInput): Member {
+    if (input.model?.trim()) resolveMemberModel(modelPolicy, input.model);
     const member = this.members.create(input);
     // 新 Agent 自动加入默认 Team。membership 是组织状态，不是 persona 的一部分。
     if (this.structure) {
@@ -494,6 +496,9 @@ export class TeamService {
   }
 
   updateMember(id: string, input: UpdateMemberInput): Member {
+    // 普通任务模型只能是 Member 列表里的低档模型：Lead 模型与拼错的名字在这里就拒绝，
+    // 不能等到下一轮 turn 才发现这个人跑不起来。null/省略 = 回落默认，不校验。
+    if (input.model?.trim()) resolveMemberModel(modelPolicy, input.model);
     // 归档意味着「不再接活」，所以它必须等手上的活干完再落地。不然会留下
     // 「消息有、wake 有、execution 没有」的洞 —— 见 assertMemberNotBusy。
     const before = this.members.get(id);
@@ -1299,23 +1304,14 @@ export class TeamService {
       summary: input.summary,
       blocker: input.blocker,
     });
-    // Agent 的总结同时留一条进展消息，方便 Activity 里看到。
-    if (input.summary.trim()) {
-      const message = this.insertMemberMessage({
-        conversationId: conversation.id,
-        memberId: input.memberId,
-        content: input.summary.trim(),
-        executionId: this.latestExecutionFor(conversation.id, input.memberId) ?? input.memberId,
-        taskId: updated.id,
-      });
-      this.emit(conversation.id, { type: 'message.created', data: message });
-    }
+    // 只发 task.updated，不再插 conversation_message：Task 的进展是结构化状态，
+    // 去右侧 Task 面板看。Agent 的详细执行结果在 execution.response 里。
+    // 在这里同时插一条消息，会让同一个回答在 Activity 与 Task 里各出现一次。
     this.emit(conversation.id, { type: 'task.updated', data: updated });
-    if (input.status === 'completed') {
-      this.orchestrator.onTaskCompleted(updated.id);
-    } else if (input.status === 'blocked') {
-      // 阻塞要唤醒 Lead：否则没人知道这个任务卡住了。
-      this.orchestrator.onTaskBlocked(updated.id);
+    // 完成与阻塞都走统一入口：completed 推进下游但不唤醒 Lead，
+    // blocked/failed 才唤醒 Lead。running 只发 task.updated。
+    if (input.status === 'completed' || input.status === 'blocked') {
+      this.orchestrator.onTaskChanged(updated.id);
     } else {
       const status = this.tasks.recomputeConversationStatus(conversation.id);
       if (status) this.emit(conversation.id, { type: 'conversation.updated', data: this.getConversation(conversation.id) });
@@ -2368,6 +2364,20 @@ export class TeamService {
     return this.withRuntimeLock(runtime.id, () => this.runTurn({ ...input, runtime }));
   }
 
+  /**
+   * 这一轮真正用的模型。判据只有 turnMode，不看 Member 身上的其它字段：
+   *
+   *   Lead        → 全场最强的 leadModel（配置定，见 model-policy.ts）
+   *   Task/delegation → 这个人配的 Task 模型，未配则回落默认 Member 模型
+   *
+   * Member 配了 Lead 模型或未知名字会在这里抛 —— 宁可这一轮失败，
+   * 也不能让它带着一个越级的模型跑起来。
+   */
+  private executionModel(member: Member, turnMode: TurnMode): string {
+    if (turnMode === 'lead') return modelPolicy.lead.id;
+    return resolveMemberModel(modelPolicy, member.model);
+  }
+
   private async runTurn(input: {
     conversation: Conversation;
     member: Member;
@@ -2477,13 +2487,16 @@ export class TeamService {
         input.member,
         runtimeCapabilities.knowledge,
       );
+      // 模型在这里定、传给引擎、同时记进快照：三处是同一个值。
       // 快照写在这里而不是建 execution 时：system prompt 与能力组成都是到这里
       // 才定下来的，而它们的指纹就是快照的核心。
-      this.recordConfigSnapshot(executionId, input.member, input.conversation.teamId, systemPrompt, runtimeCapabilities.manifestHash);
+      const model = this.executionModel(input.member, input.turnMode);
+      this.recordConfigSnapshot(executionId, input.member, input.conversation.teamId, systemPrompt, runtimeCapabilities.manifestHash, model);
 
       const result = await this.copilot.runMemberTurn({
         runtime,
         member: input.member,
+        model,
         systemPrompt,
         prompt: context.prompt,
         sourceMemberId: input.sourceMemberId,
@@ -2499,7 +2512,11 @@ export class TeamService {
           contentType: file.contentType,
         })),
         onDelta: (delta) => {
+          // 累积照做（取消时半截内容要留进 execution.response），但只有 Lead 的
+          // 增量进 Activity：Task execution 静默执行，前端只在右侧看到
+          // 「Task · 执行人 · 执行中」，而不是几十行实时内容。
           streamed += delta;
+          if (input.turnMode !== 'lead') return;
           this.emit(input.conversation.id, {
             type: 'message.delta',
             data: {
@@ -2528,11 +2545,14 @@ export class TeamService {
       });
 
       // Task 执行：如果 Agent 在这一轮里已经调 update_task 把任务置成终态，
-      // 这里不再覆盖，只补一条进展消息。否则没有终态的 Task 保持 running，
-      // 等下一轮 update_task 或重试。
+      // 这里不再覆盖。否则没有终态的 Task 保持 running，等下一轮 update_task 或重试。
+      //
+      // 只有 Lead 的回答进 Activity（conversation_message）：Task Agent 的最终回答
+      // 只进 execution.response + task.result，Task 面板是它的事实源。
+      // 两边都写会让同一个回答在 Activity 与 Task 里各出现一次。
       const taskAfterTurn = input.taskId ? this.safeGetTask(input.taskId) : null;
       let message: ConversationMessage | null = null;
-      if (content) {
+      if (content && input.turnMode === 'lead') {
         message = this.insertMemberMessage({
           conversationId: input.conversation.id,
           memberId: input.member.id,
@@ -2786,10 +2806,11 @@ export class TeamService {
     teamId: string,
     systemPrompt: string,
     capabilityManifestHash: string,
+    model: string,
   ): ExecutionConfigSnapshot {
     return {
       memberRevision: member.updatedAt,
-      model: member.model ?? config.defaultModel,
+      model,
       systemPromptHash: hashText(systemPrompt),
       memoryHash: hashText(
         `${this.members.getMemory(member.id).content}\0${this.members.getTeamMemory(member.id, teamId).content}`,
@@ -2812,10 +2833,11 @@ export class TeamService {
     teamId: string,
     systemPrompt: string,
     capabilityManifestHash: string,
+    model: string,
   ): void {
     try {
       this.updateExecution(executionId, {
-        configSnapshot: this.buildConfigSnapshot(member, teamId, systemPrompt, capabilityManifestHash),
+        configSnapshot: this.buildConfigSnapshot(member, teamId, systemPrompt, capabilityManifestHash, model),
       });
     } catch (error) {
       // eslint-disable-next-line no-console

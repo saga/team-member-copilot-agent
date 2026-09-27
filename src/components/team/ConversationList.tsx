@@ -10,21 +10,21 @@ interface ConversationListProps {
 }
 
 /**
- * 副标题：进度 + 成员 + Jira。
+ * 副标题：进度 · Jira · 成员。
  *
- * 等你回答时直接把问题贴出来 —— 光写个状态名，用户还得点进去才知道要答什么。
+ * 等你回答时第一句就是「等你回答 · 进度」，问题本身贴在后面 —— 状态和问题
+ * 不要各占一行抢视觉焦点，两行（标题 + 这一行）说完。
  */
 function rowMeta(conversation: Conversation) {
-  if (conversation.status === 'waiting_user' && conversation.openQuestions[0]) {
-    const more = conversation.openQuestions.length > 1 ? `（等 ${conversation.openQuestions.length} 个）` : '';
-    return `等你回答：${conversation.openQuestions[0]}${more}`;
-  }
-  const names = conversation.members.map((m) => m.name).join(' · ');
-  const key = conversation.externalWorkRef?.key;
   const progress =
     conversation.taskProgress.total > 0
       ? `${conversation.taskProgress.completed}/${conversation.taskProgress.total}`
       : null;
+  if (conversation.status === 'waiting_user' && conversation.openQuestions[0]) {
+    return ['等你回答', progress, conversation.openQuestions[0]].filter(Boolean).join(' · ');
+  }
+  const names = conversation.members.map((m) => m.name).join(' · ');
+  const key = conversation.externalWorkRef?.key;
   return [progress, key, names].filter(Boolean).join(' · ');
 }
 

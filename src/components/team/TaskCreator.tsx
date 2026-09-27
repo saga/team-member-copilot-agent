@@ -23,6 +23,8 @@ interface TaskCreatorProps {
   open: boolean;
   /** 候选成员（已归档的不会出现在这里）。 */
   members: Member[];
+  /** Lead 自动使用的最强模型：只展示，不让用户选。 */
+  leadModelId: string | null;
   onCreate: (input: TaskDraft) => Promise<void>;
   onCancel: () => void;
 }
@@ -33,7 +35,7 @@ interface TaskCreatorProps {
  * 建完 Lead 会主动先开口（看 Jira 和上下文，缺信息就问），用户不用先想第一句话。
  * 不需要「开始执行」按钮：进入这个工作区本身就表示要完成这件事情。
  */
-export function TaskCreator({ open, members, onCreate, onCancel }: TaskCreatorProps) {
+export function TaskCreator({ open, members, leadModelId, onCreate, onCancel }: TaskCreatorProps) {
   const [title, setTitle] = useState('');
   const [memberIds, setMemberIds] = useState<string[]>([]);
   const [leadMemberId, setLeadMemberId] = useState<string | null>(null);
@@ -129,6 +131,11 @@ export function TaskCreator({ open, members, onCreate, onCancel }: TaskCreatorPr
                 label: `${member.name} · ${member.role}`,
               }))}
           />
+          {leadModelId && (
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              Lead 使用最强模型 · 自动选择（{leadModelId}）
+            </Typography.Text>
+          )}
         </div>
 
         <div>

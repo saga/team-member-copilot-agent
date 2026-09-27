@@ -1,9 +1,11 @@
 import { useState } from 'react';
-import { Alert, Button, Form, Input, Popconfirm, Space, Tag } from 'antd';
-import { api, type Member } from '../../lib/api';
+import { Alert, Button, Form, Input, Popconfirm, Select, Space, Tag } from 'antd';
+import { api, type Member, type ModelPolicy } from '../../lib/api';
 
 interface MemberEditorProps {
   member: Member;
+  /** 服务端模型策略：下拉只列 Task 可选的低档模型，Lead 模型不在里面。 */
+  modelPolicy: ModelPolicy | null;
   onSaved: (member: Member) => void;
   onCancel: () => void;
 }
@@ -16,15 +18,16 @@ interface MemberEditorProps {
  *   name / handle / role / description / style / systemPrompt / model
  *
  * 这些字段最后会拼进 system prompt（见 TeamService.buildMemberSystemPrompt），
- * 所以它们是**人格定义**，不是元数据装饰。`model` 支持留空 = 显式回落
- * COPILOT_MODEL，所以提交时要用 null 而不是空串。
+ * 所以它们是**人格定义**，不是元数据装饰。`model` 只能选策略里的 Member 模型
+ * （Lead 模型不在下拉里），留空 = 显式回落默认 Member 模型，
+ * 所以提交时要用 null 而不是空串。
  *
  * 「能用什么」**不在这里**：能力现在是三层继承的（global + team + member），
  * 而这个表单只描述一个人。把能力和身份混在一个表单里，会让「改个名字」和
  * 「给它开 bash」变成同一个保存动作 —— 而且这里只看得见 member 那一层，
  * 会显示成一个「什么能力都没有的人」。
  */
-export function MemberEditor({ member, onSaved, onCancel }: MemberEditorProps) {
+export function MemberEditor({ member, modelPolicy, onSaved, onCancel }: MemberEditorProps) {
   const [form] = Form.useForm();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -41,8 +44,8 @@ export function MemberEditor({ member, onSaved, onCancel }: MemberEditorProps) {
         description: values.description.trim(),
         style: values.style.trim(),
         systemPrompt: values.systemPrompt,
-        // 空 = 显式回落默认模型（后端按 !== undefined 判断，不会被 ?? 吃掉）
-        model: values.model.trim() || null,
+        // 空 = 显式回落默认 Member 模型（后端按 !== undefined 判断，不会被 ?? 吃掉）
+        model: values.model?.trim() || null,
       });
       onSaved(result.member);
     } catch (e) {
@@ -114,8 +117,21 @@ export function MemberEditor({ member, onSaved, onCancel }: MemberEditorProps) {
       <Form.Item name="systemPrompt" label="System Prompt">
         <Input.TextArea rows={5} placeholder="优先区分事实、推论和不确定性……" />
       </Form.Item>
-      <Form.Item name="model" label="Model（留空 = 使用服务端默认模型）">
-        <Input placeholder="gpt-5" />
+      <Form.Item
+        name="model"
+        label="Task Model"
+        extra={`普通任务使用的模型；这个成员担任 Lead 时自动使用 Lead 模型${
+          modelPolicy ? `（${modelPolicy.lead.id}）` : ''
+        }。`}
+      >
+        <Select
+          allowClear
+          placeholder={modelPolicy ? '使用团队默认 Member 模型' : '模型列表加载中…'}
+          options={(modelPolicy?.members ?? []).map((model) => ({
+            value: model.id,
+            label: model.id,
+          }))}
+        />
       </Form.Item>
 
       <span

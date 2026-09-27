@@ -900,9 +900,13 @@ Content-Type: application/json
   "description": "负责研究资料分析、事实核查和研究总结",
   "style": "严谨、简洁、引用证据",
   "systemPrompt": "优先区分事实、推论和不确定性。",
-  "model": "gpt-5"
+  "model": "gpt-5-mini"
 }
 ```
+
+`model` 只能填 `COPILOT_MEMBER_MODELS` 里的（或省略回落默认）：它是这个人做普通
+Task 时用的模型，担任 Lead 时服务端自动换成 `COPILOT_LEAD_MODEL`。填 Lead 模型
+或拼错的名字会被拒绝（`400`）。
 
 新建的 Member 自动获得默认能力组成（团队 skill、个人 skill、个人资料库、协作与检索
 工具）。要调整它（比如给它开宿主工具），走能力目录接口（用户语言的 ID，
@@ -1141,7 +1145,10 @@ scripts/
 | `PORT` | `3001` | HTTP 端口 |
 | `DATA_DIR` | `.data` | 数据根目录 |
 | `GITHUB_TOKEN` | 空 | 留空则用本机 `copilot` CLI 已登录用户 |
-| `COPILOT_MODEL` | `gpt-5` | 默认模型 |
+| `COPILOT_MODEL` | `gpt-5` | 默认模型（Lead 未单独配置时也用它） |
+| `COPILOT_LEAD_MODEL` | 跟 `COPILOT_MODEL` 同值 | Lead 模型：全场最强，担任 Lead 时自动使用，不能配给普通 Task |
+| `COPILOT_MEMBER_MODELS` | `gpt-5-mini,gpt-4.1-mini` | 普通 Task / delegation 可选模型（只能低一档），第一个是默认 |
+| `COPILOT_MODEL_STRENGTHS` | `{"gpt-5":100,…}` | 模型强度表；Member 强度达到 Lead 即拒绝启动 |
 | `COPILOT_WARMUP` | `true` | 启动时预热 Copilot client |
 | `MAX_DELEGATION_DEPTH` | `4` | `delegation_path` 最大长度 |
 | `EXECUTION_TIMEOUT_MS` | `600000` | 单次 turn 上限（SDK 默认 60s 对带工具的真实任务太短） |

@@ -27,7 +27,7 @@ const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tmca-integrity-'));
 process.env.DATA_DIR = dataDir;
 process.env.COPILOT_WARMUP = 'false';
 
-const { config } = await import('../config.js');
+const { config, modelPolicy } = await import('../config.js');
 const { db } = await import('../db.js');
 const { MemberService } = await import('../member-service.js');
 const { singleExecutionId, muteAllMembers, createTestStack } = await import('./support.js');
@@ -411,7 +411,8 @@ describe('execution 记录当时用的配置', () => {
     const firstSnapshot = first.configSnapshot;
     assert.ok(firstSnapshot, '跑完一轮必须留下配置快照');
     assert.equal(firstSnapshot.memberRevision, team.getMember(alice.id).updatedAt);
-    assert.equal(firstSnapshot.model, config.defaultModel);
+    // 这一轮是 Lead turn：快照记的必须是真实运行的 leadModel，不是 Member 身上的回落值
+    assert.equal(firstSnapshot.model, modelPolicy.lead.id);
     assert.equal(firstSnapshot.hostToolsEnabled, config.allowHostCodingTools);
     assert.match(firstSnapshot.systemPromptHash, /^[\da-f]{64}$/);
     assert.match(firstSnapshot.memoryHash, /^[\da-f]{64}$/);

@@ -263,10 +263,11 @@ export function muteAllMembers(team: TeamService, conversationId: string): void 
   }
 }
 
-/** 一次 turn 的观察记录。断言身份 / 记忆隔离时看的是 `systemPrompt`。 */
+/** 一次 turn 的观察记录。断言身份 / 记忆隔离时看的是 `systemPrompt`，断言模型策略时看 `model`。 */
 export interface StubTurn {
   executionId: string;
   memberId: string;
+  model: string;
   systemPrompt: string;
   prompt: string;
 }
@@ -336,6 +337,7 @@ export class StubCopilot {
     this.turns.push({
       executionId: input.executionId,
       memberId: input.member.id,
+      model: input.model,
       systemPrompt: input.systemPrompt,
       prompt: input.prompt,
     });

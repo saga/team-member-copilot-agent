@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import path from 'node:path';
+import { buildModelPolicy, parseModelList, parseModelStrengths, type ModelPolicy } from './model-policy.js';
 
 function env(name: string, fallback = ''): string {
   return process.env[name] ?? fallback;
@@ -17,6 +18,20 @@ export const config = {
   corsOrigin: env('CORS_ORIGIN', 'http://localhost:5173'),
   githubToken: env('GITHUB_TOKEN', '') || undefined,
   defaultModel: env('COPILOT_MODEL', 'gpt-5'),
+  /**
+   * Lead 模型：永远是全场最强的那个。
+   *
+   * 默认跟 COPILOT_MODEL 同一个值 —— 单模型部署下 Lead 和 Task 用同一个，
+   * 策略校验只看「Member 列表里没有达到 Lead 强度的」，不拦这种。
+   * 多模型部署用 COPILOT_LEAD_MODEL / COPILOT_MEMBER_MODELS / COPILOT_MODEL_STRENGTHS 显式分开。
+   */
+  leadModel: env('COPILOT_LEAD_MODEL', env('COPILOT_MODEL', 'gpt-5')),
+  /** 普通 Task / delegation 可选的模型：只能是低一档的，见 model-policy.ts。 */
+  memberModels: parseModelList(env('COPILOT_MEMBER_MODELS', 'gpt-5-mini,gpt-4.1-mini')),
+  /** 模型强度表：`{"gpt-5":100,"gpt-5-mini":60}`，Lead 必须是最高的。 */
+  modelStrengths: parseModelStrengths(
+    env('COPILOT_MODEL_STRENGTHS', '{"gpt-5":100,"gpt-5-mini":60,"gpt-4.1-mini":40}'),
+  ),
   warmup: env('COPILOT_WARMUP', 'true') === 'true',
   dataDir,
   dbPath: path.join(dataDir, 'team-member.db'),
@@ -179,3 +194,13 @@ export const config = {
     webhookSecret: env('JIRA_WEBHOOK_SECRET', ''),
   },
 };
+
+/**
+ * 全局唯一的模型策略。配置错了这里直接抛，服务拒绝启动 ——
+ * 不能让 Lead 带着和 Task 同档的模型跑起来，跑起来之后的任何检查都晚了。
+ */
+export const modelPolicy: ModelPolicy = buildModelPolicy({
+  leadModel: config.leadModel,
+  memberModels: config.memberModels,
+  strengths: config.modelStrengths,
+});

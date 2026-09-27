@@ -681,6 +681,39 @@ MUTATIONS = [
             ),
         ],
     },
+    {
+        "name": "Lead 绕过模型策略（用 Member 模型跑）",
+        "test": "server/test/model-policy.test.ts",
+        "steps": [
+            (
+                "server/team-service.ts",
+                "    if (turnMode === 'lead') return modelPolicy.lead.id;",
+                "    if (turnMode === 'lead') return resolveMemberModel(modelPolicy, member.model);",
+            )
+        ],
+    },
+    {
+        "name": "Task 完成也唤醒 Lead（最强模型看每个进度）",
+        "test": "server/test/task-service.test.ts",
+        "steps": [
+            (
+                "server/task-orchestrator.ts",
+                "    if (task.status === 'completed' || task.status === 'cancelled') {\n      this.startReadyTasks(task.conversationId);\n      this.recomputeAndEmit(task.conversationId);",
+                "    if (task.status === 'completed' || task.status === 'cancelled') {\n      this.startReadyTasks(task.conversationId);\n      const conversation = this.readConversation(task.conversationId);\n      if (conversation?.leadMemberId) {\n        this.ensureLeadWake(task.conversationId, conversation.leadMemberId, conversation.messageSequence);\n      }\n      this.recomputeAndEmit(task.conversationId);",
+            )
+        ],
+    },
+    {
+        "name": "Task Agent 的回答写进 Activity（与 Task 重复）",
+        "test": "server/test/model-policy.test.ts",
+        "steps": [
+            (
+                "server/team-service.ts",
+                "      if (content && input.turnMode === 'lead') {",
+                "      if (content) {",
+            )
+        ],
+    },
 ]
 
 

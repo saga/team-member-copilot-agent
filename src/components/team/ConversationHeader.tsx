@@ -19,9 +19,13 @@ interface ConversationHeaderProps {
 }
 
 /**
- * 工作区头：标题 / 状态 / Lead / Jira / 成员。
+ * 紧凑 Header：两行，不抢正文空间。
  *
- * 不再显示「对话类型」：用户界面里只有 Task 工作区。
+ *   标题 + Jira
+ *   状态 + 进度 + Lead
+ *
+ * 右侧只有头像组 / Files / Participants。标题、状态、进度在 Task Inspector
+ * 里不再重复 —— 那里只保留 Goal / Progress / Tasks。
  */
 export function ConversationHeader({
   conversation,
@@ -37,39 +41,38 @@ export function ConversationHeader({
   const isDm = isMemberDm(conversation);
   const [participantsOpen, setParticipantsOpen] = useState(false);
   const leadName = conversation.leadMemberId ? memberLabel(conversation.leadMemberId) : null;
+  const { total, completed } = conversation.taskProgress;
+  const progress = total > 0 ? `${completed}/${total}` : null;
+
+  const meta = isDm
+    ? conversation.members.map((member) => member.name).join(' ↔ ')
+    : [
+        CONVERSATION_STATUS_TEXT[conversation.status] ?? conversation.status,
+        progress,
+        leadName ? `Lead ${leadName}` : null,
+      ]
+        .filter(Boolean)
+        .join(' · ');
 
   return (
     <>
       <div className="conversation-header">
         <div className="conversation-header-main">
           <Space size={8} align="center">
-            <Typography.Title level={4} style={{ margin: 0 }}>
+            <Typography.Title level={4} style={{ margin: 0 }} ellipsis>
               {conversation.title}
             </Typography.Title>
-
-            {!isDm && (
-              <Tooltip title={describeConversationStatus(conversation)}>
-                <Tag color={conversation.status === 'completed' ? 'success' : 'processing'}>
-                  {CONVERSATION_STATUS_TEXT[conversation.status] ?? conversation.status}
-                </Tag>
-              </Tooltip>
-            )}
-
             {conversation.externalWorkRef?.key && (
               <Tag color="cyan">{conversation.externalWorkRef.key}</Tag>
             )}
           </Space>
-
-          <Typography.Text type="secondary">
-            {isDm
-              ? conversation.members.map((member) => member.name).join(' ↔ ')
-              : [
-                  leadName ? `Lead ${leadName}` : null,
-                  `${conversation.members.length} members`,
-                ]
-                  .filter(Boolean)
-                  .join(' · ')}
-          </Typography.Text>
+          {!isDm && (
+            <Tooltip title={describeConversationStatus(conversation)}>
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                {meta}
+              </Typography.Text>
+            </Tooltip>
+          )}
         </div>
 
         <Space>
@@ -95,7 +98,7 @@ export function ConversationHeader({
           </Avatar.Group>
 
           <Button icon={<PaperClipOutlined />} onClick={onOpenFiles}>
-            Shared{fileCount > 0 ? ` ${fileCount}` : ''}
+            Files{fileCount > 0 ? ` ${fileCount}` : ''}
           </Button>
 
           {!isDm && (

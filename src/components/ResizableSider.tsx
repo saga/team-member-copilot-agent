@@ -6,13 +6,12 @@ const { Sider } = Layout;
 /**
  * 宽度上下界。
  *
- * 下界不是「美观」而是「还能用」：会话行上是标题 + 成员名，
- * 再窄就会把标题挤到看不清、整个列表变成一条一条的色块。
- * 上界是「别把正文挤没」：正文里是对话流，左栏宽过 640 之后它就不再是侧栏。
+ * 这一列只有搜索 + 工作区列表 + 新建按钮，不需要 320+：窄一点，
+ * 把空间留给中间的 Activity 与右侧的 Task Inspector。
  */
 const MIN_WIDTH = 240;
-const MAX_WIDTH = 640;
-const DEFAULT_WIDTH = 320;
+const MAX_WIDTH = 420;
+const DEFAULT_WIDTH = 280;
 
 /** 拖动步长（键盘）；按住 Shift 走大步。 */
 const KEY_STEP = 8;

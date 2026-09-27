@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Alert, Empty, Layout, Space, Tag, Typography } from 'antd';
+import { Alert, Empty, Layout } from 'antd';
 import type { Member } from '../lib/api';
 import { useRoute } from '../lib/router';
 import { ConversationHeader } from './team/ConversationHeader';
@@ -15,7 +15,8 @@ import { TaskSidebar } from './tasks/TaskSidebar';
 import { WorkspaceNav } from './workspace/WorkspaceNav';
 import { TaskCreator } from './team/TaskCreator';
 import { ResizableSider } from './ResizableSider';
-import { STATUS_LABEL, useWorkspaceData } from './workspace/useWorkspaceData';
+import { useModelPolicy } from './team/useModelPolicy';
+import { useWorkspaceData } from './workspace/useWorkspaceData';
 import { useWorkspaceActions } from './workspace/useWorkspaceActions';
 
 const { Content } = Layout;
@@ -98,7 +99,6 @@ export function Workspace() {
     setNotice,
     memberById,
     memberLabel,
-    activeExecutions,
     memberStatus,
     scrollRef,
     openConversation,
@@ -111,6 +111,8 @@ export function Workspace() {
     actions;
 
   const editingMember = editingMemberId ? (memberById.get(editingMemberId) ?? null) : null;
+  /** 服务端模型策略：Task 创建窗口与 Member 档案共用一份。 */
+  const modelPolicy = useModelPolicy();
 
   /**
    * composer 上真正显示的文件。
@@ -249,7 +251,7 @@ export function Workspace() {
         )}
 
         {view === 'tasks' && selectedConversation && (
-          <Content style={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+          <Content className="task-workspace">
             <ConversationHeader
               conversation={selectedConversation}
               allMembers={members}
@@ -266,22 +268,58 @@ export function Workspace() {
               }
             />
 
-            {activeExecutions.length > 0 && (
-              <Space wrap style={{ padding: '8px 18px 0' }}>
-                {activeExecutions.map((execution) => (
-                  <Tag
-                    key={execution.id}
-                    color={execution.status === 'waiting_for_member' ? 'warning' : 'processing'}
-                  >
-                    {memberLabel(execution.memberId)} · {STATUS_LABEL[execution.status]}
-                  </Tag>
-                ))}
-              </Space>
-            )}
+            <div className="task-workspace-body">
+              <main className="task-workspace-main">
+                <div className="activity-scroll">
+                  <div className="activity-content">
+                    <ActivityFeed
+                      conversation={selectedConversation}
+                      messages={messages}
+                      streaming={streaming}
+                      delegations={delegations}
+                      memberLabel={memberLabel}
+                      taskLabel={(taskId) =>
+                        taskId
+                          ? (tasks.find((task) => task.id === taskId)?.title ?? null)
+                          : null
+                      }
+                      scrollRef={scrollRef}
+                    />
+                  </div>
+                </div>
 
-            <div style={{ display: 'flex', gap: 12, padding: '8px 18px 0', minHeight: 0, flex: 1 }}>
+                {notice && (
+                  <div className="task-notice">
+                    <Alert
+                      type="info"
+                      showIcon
+                      closable
+                      onClose={() => setNotice(null)}
+                      message={notice}
+                    />
+                  </div>
+                )}
+
+                <div className="task-composer">
+                  <MessageComposer
+                    conversation={selectedConversation}
+                    value={input}
+                    onChange={setInput}
+                    onSend={() => void send()}
+                    busy={busy}
+                    disabled={!conversationId}
+                    selectedFiles={selectedFiles}
+                    onRemoveFile={(fileId) =>
+                      setSelectedFileIds((current) => current.filter((id) => id !== fileId))
+                    }
+                    onUploadFile={(file) => void uploadFile(file)}
+                    onOpenFilePicker={() => setFilePickerOpen(true)}
+                  />
+                </div>
+              </main>
+
               {selectedConversation.kind === 'task' && (
-                <div style={{ width: 300, flexShrink: 0, overflowY: 'auto' }}>
+                <aside className="task-inspector">
                   <TaskPanel
                     conversation={selectedConversation}
                     tasks={tasks.filter((task) => task.conversationId === selectedConversation.id)}
@@ -289,53 +327,9 @@ export function Workspace() {
                     onRetryTask={(taskId) => void retryTask(taskId)}
                     onCancelTask={(taskId) => void cancelTask(taskId)}
                   />
-                </div>
+                </aside>
               )}
-              <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                  活动
-                </Typography.Text>
-                <ActivityFeed
-                  conversation={selectedConversation}
-                  messages={messages}
-                  streaming={streaming}
-                  delegations={delegations}
-                  memberLabel={memberLabel}
-                  taskLabel={(taskId) =>
-                    taskId
-                      ? (tasks.find((task) => task.id === taskId)?.title ?? null)
-                      : null
-                  }
-                  scrollRef={scrollRef}
-                />
-              </div>
             </div>
-
-            {notice && (
-              <Alert
-                type="info"
-                showIcon
-                closable
-                onClose={() => setNotice(null)}
-                message={notice}
-                style={{ margin: '0 18px' }}
-              />
-            )}
-
-            <MessageComposer
-              conversation={selectedConversation}
-              value={input}
-              onChange={setInput}
-              onSend={() => void send()}
-              busy={busy}
-              disabled={!conversationId}
-              selectedFiles={selectedFiles}
-              onRemoveFile={(fileId) =>
-                setSelectedFileIds((current) => current.filter((id) => id !== fileId))
-              }
-              onUploadFile={(file) => void uploadFile(file)}
-              onOpenFilePicker={() => setFilePickerOpen(true)}
-            />
           </Content>
         )}
       </Layout>
@@ -343,6 +337,7 @@ export function Workspace() {
       {editingMember && (
         <MemberProfile
           member={editingMember}
+          modelPolicy={modelPolicy}
           onSaved={applyMemberSaved}
           onClose={() => setEditingMemberId(null)}
         />
@@ -351,6 +346,7 @@ export function Workspace() {
       <TaskCreator
         open={newTaskOpen}
         members={members}
+        leadModelId={modelPolicy?.lead.id ?? null}
         onCreate={createTask}
         onCancel={() => setNewTaskOpen(false)}
       />

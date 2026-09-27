@@ -1,6 +1,6 @@
 import { useState } from 'react';
-import { Drawer, Tabs, Tag } from 'antd';
-import type { Member } from '../../lib/api';
+import { Drawer, Tabs, Tag, Typography } from 'antd';
+import type { Member, ModelPolicy } from '../../lib/api';
 import { MemberEditor } from './MemberEditor';
 import { MemberMemory } from './MemberMemory';
 import { MemberSkills } from './MemberSkills';
@@ -8,6 +8,8 @@ import { MemberActivity } from './MemberActivity';
 
 interface MemberProfileProps {
   member: Member;
+  /** 服务端模型策略：展示这个人的 Task 模型与 Lead 模型，编辑器共用。 */
+  modelPolicy: ModelPolicy | null;
   onSaved: (member: Member) => void;
   onClose: () => void;
 }
@@ -25,8 +27,9 @@ type TabKey = 'profile' | 'memory' | 'team' | 'skills';
  *   Team Context —— 只属于当前 Team 的上下文
  *   Skills  —— 这个 Member 自己的 skill 目录
  */
-export function MemberProfile({ member, onSaved, onClose }: MemberProfileProps) {
+export function MemberProfile({ member, modelPolicy, onSaved, onClose }: MemberProfileProps) {
   const [tab, setTab] = useState<TabKey>('profile');
+  const taskModel = member.model ?? modelPolicy?.defaultMemberModel ?? '团队默认';
 
   return (
     <Drawer
@@ -58,7 +61,13 @@ export function MemberProfile({ member, onSaved, onClose }: MemberProfileProps) 
         ]}
       />
       {tab === 'profile' && (
-        <MemberEditor member={member} onSaved={onSaved} onCancel={onClose} />
+        <>
+          <Typography.Paragraph type="secondary" style={{ fontSize: 12, marginBottom: 12 }}>
+            默认 Task 模型：{taskModel}
+            {modelPolicy && `；担任 Lead 时自动使用 Lead 模型 ${modelPolicy.lead.id}。`}
+          </Typography.Paragraph>
+          <MemberEditor member={member} modelPolicy={modelPolicy} onSaved={onSaved} onCancel={onClose} />
+        </>
       )}
       {tab === 'memory' && <MemberMemory member={member} kind="global" />}
       {tab === 'team' && <MemberMemory member={member} kind="team" />}

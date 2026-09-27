@@ -52,8 +52,8 @@ export function describeConversationStatus(conversation: {
       if (first) {
         const more =
           conversation.openQuestions.length > 1
-            ? `（共 ${conversation.openQuestions.length} 个，去左边看“等你回答”）`
-            : '（去左边看“等你回答”）';
+            ? `（共 ${conversation.openQuestions.length} 个，去右侧看“等你回答”）`
+            : '（去右侧看“等你回答”）';
         return `Lead 在等你回答：${first}${more} —— 答了就自动继续。`;
       }
       return 'Lead 在等你补充信息，在下面直接回复，答了就自动继续。';
@@ -63,7 +63,7 @@ export function describeConversationStatus(conversation: {
         ? `正在执行（${completed}/${total} 个任务完成），不用管，跑完会停在“已完成”。`
         : 'Lead 正在看需求、规划任务，稍等。';
     case 'blocked':
-      return '有任务卡住了，看左边红色卡片里写的缺什么，在下面补上信息就会自动继续。';
+      return '有任务卡住了，看右侧红色标注里写的缺什么，在下面补上信息就会自动继续。';
     case 'completed':
       return '全部任务做完了。要做新事情请新建一个工作区，这里不再收消息。';
     case 'cancelled':

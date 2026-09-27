@@ -47,7 +47,7 @@ export function TaskSidebar({
       </div>
       <Space direction="vertical" style={{ width: '100%', marginTop: 8 }}>
         <Button type="primary" block icon={<PlusOutlined />} onClick={onNewTask}>
-          New task
+          新建任务
         </Button>
       </Space>
     </div>

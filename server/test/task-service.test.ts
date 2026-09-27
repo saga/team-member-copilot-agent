@@ -727,6 +727,86 @@ describe('Task 生命周期补严', () => {
     assert.ok(leadRuns.n >= 1, 'Lead 应该在任务阻塞后被唤醒');
   });
 
+  it('Task 失败唤醒 Lead，下游 blocked 的变化广播到前端', async () => {
+    stub.reset();
+    stub.failMemberIds.add(bob.id);
+    try {
+      const room = team.createConversation({
+        kind: 'task',
+        title: 'FailChain',
+        memberIds: [alice.id, bob.id],
+        leadMemberId: alice.id,
+      });
+      await team.planTasks({
+        conversationId: room.id,
+        memberId: alice.id,
+        objective: '失败链',
+        requirements: { facts: [], assumptions: [], constraints: [], successCriteria: [] },
+        tasks: [
+          { key: 'a', title: 'A', assigneeMemberId: bob.id },
+          { key: 'b', title: 'B', assigneeMemberId: bob.id, dependencies: ['a'] },
+        ],
+      });
+      const seen: Array<{ id: string; status: string }> = [];
+      const off = team.subscribe(room.id, (event) => {
+        if (event.type === 'task.updated') {
+          const task = event.data as { id: string; status: string };
+          seen.push({ id: task.id, status: task.status });
+        }
+      });
+      try {
+        await waitForConversationIdle(room.id);
+      } finally {
+        off();
+      }
+
+      const tasks = team.listTasks(room.id);
+      assert.equal(tasks.find((task) => task.title === 'A')?.status, 'failed');
+      const taskB = tasks.find((task) => task.title === 'B')!;
+      assert.equal(taskB.status, 'blocked', '上游失败后下游必须 blocked，不能永久 pending');
+      // B 的 blocked 不是静默翻的：前端必须收到 task.updated，否则 UI 还是旧状态
+      assert.ok(
+        seen.some((item) => item.id === taskB.id && item.status === 'blocked'),
+        '下游变 blocked 必须广播 task.updated',
+      );
+      const leadRuns = db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM execution WHERE conversation_id = ? AND member_id = ? AND wake_reason = 'lead_message'`,
+        )
+        .get(room.id, alice.id) as unknown as { n: number };
+      assert.ok(leadRuns.n >= 1, 'Task 失败后 Lead 必须被唤醒');
+      assert.equal(team.getConversation(room.id).status, 'blocked');
+    } finally {
+      stub.failMemberIds.clear();
+      stub.reset();
+    }
+  });
+
+  it('Task 全部完成直接 completed，不唤醒 Lead', async () => {
+    stub.reset();
+    const room = team.createConversation({
+      kind: 'task',
+      title: 'NoLeadReview',
+      memberIds: [alice.id, bob.id],
+      leadMemberId: alice.id,
+    });
+    await team.planTasks({
+      conversationId: room.id,
+      memberId: alice.id,
+      objective: '顺利完成',
+      requirements: { facts: [], assumptions: [], constraints: [], successCriteria: [] },
+      tasks: [{ key: 'a', title: 'A', assigneeMemberId: bob.id }],
+    });
+    await waitForConversationIdle(room.id);
+
+    assert.equal(team.listTasks(room.id)[0].status, 'completed');
+    assert.equal(team.getConversation(room.id).status, 'completed');
+    const leadRuns = db
+      .prepare(`SELECT COUNT(*) AS n FROM execution WHERE conversation_id = ? AND member_id = ?`)
+      .get(room.id, alice.id) as unknown as { n: number };
+    assert.equal(leadRuns.n, 0, 'Task 完成是正常进展，不该把 Lead 叫起来回顾');
+  });
+
   it('建工作区时 Lead 主动先开口，不用等用户说话', async () => {
     const room = team.createConversation(
       {

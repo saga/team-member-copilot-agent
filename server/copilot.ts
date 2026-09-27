@@ -55,6 +55,13 @@ type PermissionResult = Awaited<ReturnType<PermissionHook>>;
 export interface RunMemberTurnInput {
   runtime: MemberRuntime;
   member: Member;
+  /**
+   * 这一轮真正用的模型，由 TeamService 按模型策略决定后传进来。
+   *
+   * 这一层不做任何判断：模型选择只有一个地方（TeamService.executionModel），
+   * 这里再按 member.model 回落一次，Lead 就会绕过策略。
+   */
+  model: string;
   systemPrompt: string;
   prompt: string;
   sourceMemberId?: string;
@@ -271,7 +278,7 @@ export class CopilotService {
 
       const sessionConfig = {
         sessionId: input.runtime.copilotSessionId,
-        model: input.member.model ?? config.defaultModel,
+        model: input.model,
         workingDirectory: input.runtime.workspacePath,
         systemMessage: {
           // append：保留 SDK 自己那部分 system message（工具使用说明等），

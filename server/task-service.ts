@@ -18,6 +18,12 @@ export interface TaskPlanInput {
   acceptanceCriteria?: string[];
 }
 
+/** refreshReady 一次扫出的两种变化：新就绪的与新被阻塞的。 */
+export interface DependencyRefreshResult {
+  ready: ConversationTask[];
+  blocked: ConversationTask[];
+}
+
 interface TaskRow {
   id: string;
   conversation_id: string;
@@ -312,13 +318,14 @@ export class TaskService {
     return this.get(taskId);
   }
 
-  /** 依赖全部 completed 的 pending 任务变成 ready；依赖有失败/阻塞/取消的变成 blocked。返回新变 ready 的任务。 */
-  refreshReady(db: DatabaseSync = this.db, conversationId?: string): ConversationTask[] {
+  /** 依赖全部 completed 的 pending 任务变成 ready；依赖有失败/阻塞/取消的变成 blocked。 */
+  refreshReady(db: DatabaseSync = this.db, conversationId?: string): DependencyRefreshResult {
     const scope = conversationId ?? '';
     const rows = (scope
       ? db.prepare(`SELECT * FROM conversation_task WHERE conversation_id = ? AND status = 'pending'`).all(scope)
       : db.prepare(`SELECT * FROM conversation_task WHERE status = 'pending'`).all()) as unknown as TaskRow[];
     const ready: ConversationTask[] = [];
+    const blocked: ConversationTask[] = [];
     for (const row of rows) {
       const task = mapTask(row);
       const depStates = this.dependencyStates(db, task);
@@ -331,12 +338,14 @@ export class TaskService {
           now(),
           task.id,
         );
+        const updated = db.prepare(`SELECT * FROM conversation_task WHERE id = ?`).get(task.id) as unknown as TaskRow;
+        blocked.push(mapTask(updated));
       } else if (depStates === 'completed') {
         db.prepare(`UPDATE conversation_task SET status = 'ready', updated_at = ? WHERE id = ?`).run(now(), task.id);
         ready.push({ ...task, status: 'ready' });
       }
     }
-    return ready;
+    return { ready, blocked };
   }
 
   findReady(conversationId: string): ConversationTask[] {

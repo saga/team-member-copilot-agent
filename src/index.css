@@ -23,13 +23,6 @@ body {
   font-weight: 600;
 }
 
-.app-header-sub {
-  color: rgba(255, 255, 255, 0.55);
-  font-size: 12px;
-  margin-left: 12px;
-  font-weight: 400;
-}
-
 /*
  * 顶栏上的动作按钮。
  *
@@ -168,11 +161,85 @@ body {
   max-height: none;
 }
 
+/* ── Task 工作区：Activity 主内容 + 右侧 Task Inspector ─────────────── */
+
+/*
+ * 主次只有一层：中间是 Activity（读消息、看过程），右边是 Task Inspector
+ * （目标、进度、任务状态），下面是输入框。Inspector 固定 320px，
+ * Activity 居中、最大 980px —— 再宽就是一行字从左扫到右，读不动。
+ */
+.task-workspace {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.task-workspace-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  gap: 0;
+}
+
+.task-workspace-main {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
 .activity-scroll {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 18px;
+  padding: 20px 24px 12px;
+}
+
+.activity-content {
+  width: min(100%, 980px);
+  margin: 0 auto;
+}
+
+.task-notice {
+  padding: 0 24px 8px;
+}
+
+.task-notice > * {
+  width: min(100%, 980px);
+  margin: 0 auto;
+}
+
+.task-composer {
+  padding: 10px 24px 14px;
+}
+
+.task-composer > * {
+  width: min(100%, 980px);
+  margin: 0 auto;
+}
+
+.task-inspector {
+  width: 320px;
+  flex: 0 0 320px;
+  min-height: 0;
+  overflow-y: auto;
+  border-left: 1px solid #f0f0f0;
+  background: #fafafa;
+  padding: 16px;
+}
+
+@media (max-width: 1100px) {
+  .task-inspector {
+    width: 280px;
+    flex-basis: 280px;
+  }
+}
+
+@media (max-width: 900px) {
+  .task-inspector {
+    display: none;
+  }
 }
 
 .sender-bar {
