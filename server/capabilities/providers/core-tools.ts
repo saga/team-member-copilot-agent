@@ -69,6 +69,7 @@ export interface CoreToolHost {
       assigneeMemberId?: string;
       dependencies?: string[];
       acceptanceCriteria?: string[];
+      modelTier?: 'cheap' | 'standard' | 'strong';
     }>;
   }): Promise<string>;
 
@@ -80,6 +81,7 @@ export interface CoreToolHost {
     assigneeMemberId: string;
     dependencies?: string[];
     acceptanceCriteria?: string[];
+    modelTier?: 'cheap' | 'standard' | 'strong';
   }): Promise<string>;
 
   reassignTask(input: {
@@ -237,6 +239,8 @@ export class CoreTeamToolProvider implements ToolProvider {
           'Use this only when the workspace has no tasks. ' +
           'For an existing task plan, use add_task for genuinely missing work and ' +
           'reassign_task when an unstarted task has the wrong assignee. ' +
+          'Set modelTier to strong for an unusually complex task that needs the strongest model; ' +
+          'omit it to follow the assignee default. ' +
           'Tasks start automatically once dependencies are met.',
         risk: 'coordination',
         parameters: z.object({
@@ -266,6 +270,8 @@ export class CoreTeamToolProvider implements ToolProvider {
                 assigneeMemberId: z.string().min(1),
                 dependencies: z.array(z.string()).max(20).default([]),
                 acceptanceCriteria: z.array(z.string().min(1).max(1000)).max(20).default([]),
+                // 只有 Lead 能定：复杂任务升级 Strong。省略 = 跟执行人默认。
+                modelTier: z.enum(['cheap', 'standard', 'strong']).optional(),
               }),
             )
             .min(1)
@@ -289,6 +295,7 @@ export class CoreTeamToolProvider implements ToolProvider {
           'Lead only. Add one genuinely missing task to an existing task plan. ' +
           'Do not use this to duplicate an existing task or Jira subtask. ' +
           'Dependencies are existing Conversation Task IDs. ' +
+          'Set modelTier to strong for an unusually complex task; omit it to follow the assignee default. ' +
           'The task starts automatically when its dependencies are satisfied.',
         risk: 'coordination',
         parameters: z.object({
@@ -297,6 +304,7 @@ export class CoreTeamToolProvider implements ToolProvider {
           assigneeMemberId: z.string().min(1),
           dependencies: z.array(z.string().min(1)).max(20).default([]),
           acceptanceCriteria: z.array(z.string().min(1).max(1000)).max(20).default([]),
+          modelTier: z.enum(['cheap', 'standard', 'strong']).optional(),
         }),
         execute: (context, args) =>
           this.host.addTask({
@@ -307,6 +315,9 @@ export class CoreTeamToolProvider implements ToolProvider {
             assigneeMemberId: String(args.assigneeMemberId),
             dependencies: ((args.dependencies ?? []) as unknown[]).map(String),
             acceptanceCriteria: ((args.acceptanceCriteria ?? []) as unknown[]).map(String),
+            ...((args as { modelTier?: string }).modelTier === undefined
+              ? {}
+              : { modelTier: (args as { modelTier: 'cheap' | 'standard' | 'strong' }).modelTier }),
           }),
       },
       {

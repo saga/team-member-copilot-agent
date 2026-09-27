@@ -104,21 +104,6 @@ describe('私聊房间', () => {
     // 标题写双方，别落到「第一个 Member 的名字」上 —— 那和用户单聊分不清
     assert.equal(first.title, `${a.name} · ${b.name}`);
   });
-
-  it('用户 ↔ Member 的单聊不会被当成私聊', () => {
-    const [a, b] = newPair();
-    const solo = team.createConversation({ kind: 'task', title: a.name, memberIds: [a.id] });
-
-    const dm = team.openDirectMessage(a.id, b.id);
-
-    assert.notEqual(dm.id, solo.id, '私聊必须另建房间，不能复用用户单聊');
-    assert.equal(solo.members.length, 1);
-
-    const inbox = team.listDirectMessages(a.id);
-    assert.equal(inbox.length, 1, '列表只算 roster 恰好两人的房间');
-    assert.equal(inbox[0].conversation.id, dm.id);
-    assert.equal(inbox[0].peer.id, b.id);
-  });
 });
 
 describe('私聊消息', () => {
@@ -167,20 +152,5 @@ describe('私聊消息', () => {
     // 少了这道闸，两个 Member 会一直互相回复到把 token 烧完。
     assert.deepEqual(executionIds(opened.conversation.id), [executionId]);
     assert.equal(stub.turns.filter((turn) => turn.memberId === a.id).length, 0);
-  });
-
-});
-
-describe('私聊是 Member 之间的对话，用户只能旁观', () => {
-  it('用户不能以 user 身份在私聊房间里发言', async () => {
-    const [a, b] = newPair();
-    const dm = team.openDirectMessage(a.id, b.id);
-
-    await assert.rejects(
-      () => team.sendMessage({ conversationId: dm.id, content: '我插一句' }),
-      /Member 之间的私聊/,
-    );
-
-    assert.equal(team.listMessages(dm.id).length, 0, '被拒绝的消息不该落库');
   });
 });

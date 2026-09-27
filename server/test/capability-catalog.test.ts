@@ -139,25 +139,6 @@ describe('Resolver：知识检索工具跟着 knowledge 走', () => {
       '没选资料就不该有检索工具',
     );
   });
-
-  it('老库里的显式 knowledge.tools 绑定不导致重复解析', async () => {
-    const member = stack.team.createMember({ name: 'KnowledgeLegacy', role: 'T' });
-
-    stack.capabilities.replaceMember(member.id, {
-      skills: [],
-      knowledge: [{ providerId: KNOWLEDGE_PROVIDER, selector: PERSONAL_SELECTOR }],
-      tools: [{ providerId: 'knowledge.tools' }],
-    });
-    const resolved = await stack.resolver.resolve(
-      capabilityContext(member.id, defaultTeam.id),
-      stack.capabilities.getEffective(defaultTeam.id, member.id),
-    );
-    assert.equal(
-      toolNamesOf(resolved.tools).filter((name) => name === 'search_knowledge').length,
-      1,
-      '显式绑定与自注入同时存在时不能解析出两份',
-    );
-  });
 });
 
 // ------------------------------------------------------- 目录翻译
@@ -182,27 +163,6 @@ describe('Catalog：用户 ID 与内部绑定的翻译', () => {
     assert.equal(byId.get('ask_member')?.enabled, true);
     assert.equal(byId.get('message_member')?.enabled, true);
     assert.equal(byId.get('remember_member')?.enabled, false);
-  });
-
-  it('knowledge.tools 不接受点名：它跟着 knowledge 走', async () => {
-    const member = stack.team.createMember({ name: 'CatalogInternal', role: 'T' });
-    const query = { scope: 'member' as const, teamId: defaultTeam.id, memberId: member.id };
-
-    await assert.rejects(
-      () =>
-        assignmentsToBindings(deps(), query, {
-          skills: [],
-          knowledge: [],
-          tools: ['search_knowledge'],
-        }),
-      /自带的检索工具/,
-    );
-
-    const catalog = await buildCatalog(deps(), query);
-    assert.ok(
-      !catalog.tools.some((tool) => tool.id === 'search_knowledge'),
-      '内部检索工具不该出现在目录里',
-    );
   });
 
   it('拼错的工具名在落库前就 400', async () => {

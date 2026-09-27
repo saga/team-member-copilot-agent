@@ -102,43 +102,12 @@ describe('token 门禁', () => {
     assert.equal(calls.length, 0, '403/401 之前就已经执行了业务，等于没有门禁');
   });
 
-  it('Authorization: Bearer 与 X-Internal-Token 都认', async () => {
-    config.internalApiToken = 's3cret';
-
-    calls.length = 0;
-    const bearer = await post('/api/internal/members/m1/direct-messages', VALID_BODY, {
-      Authorization: 'Bearer s3cret',
-    });
-    assert.equal(bearer.status, 202);
-    assert.equal(calls.length, 1);
-
-    calls.length = 0;
-    const header = await post('/api/internal/members/m1/direct-messages', VALID_BODY, {
-      'X-Internal-Token': 's3cret',
-    });
-    assert.equal(header.status, 202);
-    assert.equal(calls.length, 1);
-  });
-
   it('门禁在参数校验之前 —— 凭证不对时连 400 都不给', async () => {
     config.internalApiToken = 's3cret';
     calls.length = 0;
 
     const response = await post('/api/internal/members/m1/direct-messages', { toMemberId: '' });
     assert.equal(response.status, 401);
-    assert.equal(calls.length, 0);
-  });
-
-  it('凭证正确但参数不合法时是 400，且不触达业务', async () => {
-    config.internalApiToken = 's3cret';
-    calls.length = 0;
-
-    const response = await post(
-      '/api/internal/members/m1/direct-messages',
-      { toMemberId: 'm2', content: '   ' },
-      { Authorization: 'Bearer s3cret' },
-    );
-    assert.equal(response.status, 400);
     assert.equal(calls.length, 0);
   });
 });

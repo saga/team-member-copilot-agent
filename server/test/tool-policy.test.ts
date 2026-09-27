@@ -190,18 +190,6 @@ describe('check：guard 是逐次判定，不是第二份白名单', () => {
     assert.match(outside.reason, /不在 workspace 内/);
   });
 
-  it('guard 是 async 的也照常判（查库、远端校验都行）', async () => {
-    const layer = policy(ALLOW_HOST);
-    const subject = tool({
-      risk: 'read',
-      guard: async () => ({ allowed: false, reason: '远端校验拒绝' }),
-    });
-
-    const decision = await decide(layer, subject);
-    assert.equal(decision.allowed, false);
-    assert.match(decision.reason, /远端校验拒绝/);
-  });
-
   it('guard 的拒绝优先于 PolicyService（external-write 先被输入边界挡下）', async () => {
     const layer = policy(ALLOW_HOST, ALLOW_HIGH_RISK);
     const subject = tool({

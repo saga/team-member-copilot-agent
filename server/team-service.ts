@@ -3,7 +3,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { config, modelPolicy } from './config.js';
-import { classifyLeadTurn, chooseLeadModel, resolveMemberModel } from './model-policy.js';
+import { classifyLeadTurn, chooseLeadModel, resolveMemberModel, resolveTaskModel } from './model-policy.js';
 import { hashText } from './content-hash.js';
 import { runInTransaction } from './db-tx.js';
 import { now } from './db.js';
@@ -1293,6 +1293,7 @@ export class TeamService {
       assigneeMemberId?: string;
       dependencies?: string[];
       acceptanceCriteria?: string[];
+      modelTier?: 'cheap' | 'standard' | 'strong';
     }>;
   }): Promise<string> {
     const conversation = this.getConversation(input.conversationId);
@@ -1329,6 +1330,7 @@ export class TeamService {
     assigneeMemberId: string;
     dependencies?: string[];
     acceptanceCriteria?: string[];
+    modelTier?: 'cheap' | 'standard' | 'strong';
   }): Promise<string> {
     const conversation = this.getConversation(input.conversationId);
     this.requireActiveMember(conversation, input.memberId);
@@ -1343,6 +1345,7 @@ export class TeamService {
       assigneeMemberId: input.assigneeMemberId,
       dependencies: input.dependencies,
       acceptanceCriteria: input.acceptanceCriteria,
+      modelTier: input.modelTier,
     });
     this.emit(conversation.id, { type: 'task.updated', data: task });
     this.emit(conversation.id, { type: 'conversation.updated', data: this.getConversation(conversation.id) });
@@ -2508,10 +2511,12 @@ export class TeamService {
     tasks: ConversationTask[];
     wakeReason: WakeReason | null;
     prompt: string;
+    /** 当前任务锁定的档位（task turn 才有，Lead / delegation 为 null）。 */
+    taskTier?: 'cheap' | 'standard' | 'strong' | null;
   }): { model: string; purpose: ExecutionConfigSnapshot['modelPurpose'] } {
     if (input.turnMode !== 'lead') {
       return {
-        model: resolveMemberModel(modelPolicy, input.member.model),
+        model: resolveTaskModel(modelPolicy, input.member.model, input.taskTier ?? null),
         purpose: input.turnMode === 'task' ? 'member:task' : 'member:delegation',
       };
     }
@@ -2656,6 +2661,7 @@ export class TeamService {
         tasks: allTasks,
         wakeReason: input.wakeReason,
         prompt: input.prompt,
+        taskTier: currentTask?.modelTier ?? null,
       });
       this.recordConfigSnapshot(
         executionId,

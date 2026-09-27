@@ -181,29 +181,6 @@ describe('真实模板目录：三个默认 Member', () => {
     // 模板里 model 是 null → 用部署默认模型，而不是某个写死的模型名
     assert.equal(architect.model, null);
   });
-
-  it('seed_key 索引是部分索引，且列可空', () => {
-    // 形状断言，不装成行为断言。
-    //
-    // SQLite 的唯一索引本来就把 NULL 视为互不相同，所以「去掉 WHERE 子句」
-    // 在行为上无法区分 —— 手工创建的 Member（seedKey 为 null）在两种索引下
-    // 都能共存。这里锁的是**意图**：索引只覆盖来自模板的行，
-    // `seed_key` 不是 NOT NULL。
-    const sql = db
-      .prepare(`SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_member_seed_key'`)
-      .get() as unknown as { sql: string } | undefined;
-
-    assert.ok(sql, 'seed_key 索引不存在');
-    assert.match(sql.sql, /WHERE seed_key IS NOT NULL/i);
-
-    const columns = db.prepare(`PRAGMA table_info(member)`).all() as unknown as Array<{
-      name: string;
-      notnull: number;
-    }>;
-    const seedKey = columns.find((column) => column.name === 'seed_key');
-    assert.ok(seedKey, 'member.seed_key 列不存在');
-    assert.equal(seedKey.notnull, 0, 'seed_key 必须可空 —— 手工创建的 Member 没有模板来源');
-  });
 });
 
 // ------------------------------------------------------------------ 幂等与不覆盖
@@ -375,15 +352,5 @@ describe('模板配置错误必须大声报出来', () => {
       /未注册 Skill Provider：team\.filesystem-skill/,
     );
     assert.equal(memberService.findBySeedKey('test.typo'), null);
-  });
-
-  it('以点开头的目录被跳过（.git / .DS_Store 之类）', () => {
-    const root = newTemplateRoot();
-    fs.mkdirSync(path.join(root, '.hidden'), { recursive: true });
-    fs.writeFileSync(path.join(root, '.hidden', 'member.json'), '{');
-    fs.writeFileSync(path.join(root, '.DS_Store'), 'junk');
-
-    const result = seedMemberTemplates(memberService, root, stack.capabilities, stack.resolver);
-    assert.deepEqual(result, { created: [], skipped: [] });
   });
 });

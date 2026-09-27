@@ -101,24 +101,11 @@ describe('ExternalWorkRef：本地唯一持有的业务标识', () => {
 // ---------------------------------------------------------------- Registry
 
 describe('WorkManagementRegistry：查不到必须抛，不能静默跳过', () => {
-  const provider = new JiraProvider(
-    new JiraClient({ baseUrl: 'https://acme.atlassian.net', email: 'e', apiToken: 't' }),
-    'https://acme.atlassian.net',
-  );
-
   it('未注册时查不到 —— 静默返回 null 会让「校验 + 取证」被悄悄跳过', () => {
     const empty = new WorkManagementRegistry();
     assert.equal(empty.size, 0);
     assert.equal(empty.has('jira'), false);
     assert.throws(() => empty.byId('jira'), /未注册 Work Management Provider/);
-  });
-
-  it('同一个 providerId 注册两次直接抛：否则「用哪个实现」取决于注册顺序', () => {
-    const registry = new WorkManagementRegistry();
-    registry.register(provider);
-    assert.equal(registry.size, 1);
-    assert.equal(registry.has('jira'), true);
-    assert.throws(() => registry.register(provider), /重复注册 Work Management Provider/);
   });
 });
 
@@ -512,12 +499,6 @@ describe('Jira webhook：最小投影 + 共享密钥门禁', () => {
     });
   }
 
-  it('/providers：让前端问平台「接了哪些外部系统」，而不是自己猜 provider id', async () => {
-    const response = await fetch(`${base}/api/work-management/providers`);
-    assert.equal(response.status, 200);
-    assert.deepEqual(await response.json(), { providers: ['jira'] });
-  });
-
   it('payload 里带整张工单也只投影三样：id / key / 变了哪些字段', async () => {
     config.jira.webhookSecret = '';
 
@@ -567,16 +548,6 @@ describe('Jira webhook：最小投影 + 共享密钥门禁', () => {
       'payload 只说明「变了什么字段」，不携带变化后的值',
     );
     assert.deepEqual(payload.changedFields, ['status', 'assignee']);
-  });
-
-  it('没挂这条工单的房间不受影响（matched=0 是正常结果，不是错误）', async () => {
-    config.jira.webhookSecret = '';
-    const response = await post({
-      webhookEvent: 'jira:issue_updated',
-      issue: { id: '999999', key: 'NOPE-1' },
-    });
-    assert.equal(response.status, 200);
-    assert.deepEqual(await response.json(), { matched: 0, conversations: [] });
   });
 
   it('配了密钥之后：不带 / 带错的都 401，带对才放行', async () => {

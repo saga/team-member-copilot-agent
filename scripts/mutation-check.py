@@ -792,6 +792,28 @@ MUTATIONS = [
         ],
     },
     {
+        "name": "strong 任务不升级（档位被忽略）",
+        "test": "server/test/task-service.test.ts",
+        "steps": [
+            (
+                "server/model-policy.ts",
+                "  if (taskTier === 'strong') return policy.lead.strong.id;\n",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "plan 丢掉 modelTier（档位落不到任务行）",
+        "test": "server/test/task-service.test.ts",
+        "steps": [
+            (
+                "server/task-service.ts",
+                "          model_tier: normalizeModelTier(task.modelTier),\n",
+                "          model_tier: null,\n",
+            )
+        ],
+    },
+    {
         "name": "running 的任务也能换执行人（飞着的活被转手）",
         "test": "server/test/task-service.test.ts",
         "steps": [

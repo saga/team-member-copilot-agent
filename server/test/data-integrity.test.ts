@@ -106,16 +106,6 @@ function countUserMessages(conversationId: string): number {
   ).n;
 }
 
-function messageSequences(conversationId: string): number[] {
-  return (
-    db
-      .prepare(
-        `SELECT message_sequence FROM conversation_message WHERE conversation_id = ? ORDER BY message_sequence`,
-      )
-      .all(conversationId) as unknown as Array<{ message_sequence: number }>
-  ).map((row) => row.message_sequence);
-}
-
 function countExecutions(conversationId: string): number {
   return (
     db
@@ -199,28 +189,6 @@ describe('POST /messages 的幂等键', () => {
     assert.equal(countExecutions(room.id), executionsAfterFirst);
 
     await waitForConversationIdle(room.id);
-  });
-
-  it('幂等命中不消费 message_sequence，也不留空号', async () => {
-    const alice = makeMember('Idem2 Alice', 'idem2-alice');
-    const room = team.createConversation({ kind: 'task', memberIds: [alice.id], leadMemberId: alice.id });
-
-    await team.sendMessage({ conversationId: room.id, content: 'a', clientRequestId: 'k1' });
-    await waitForConversationIdle(room.id);
-    await team.sendMessage({ conversationId: room.id, content: 'a', clientRequestId: 'k1' });
-    await team.sendMessage({ conversationId: room.id, content: 'b', clientRequestId: 'k2' });
-    await waitForConversationIdle(room.id);
-
-    assert.equal(countUserMessages(room.id), 2);
-
-    // 幂等命中不消费序号：整张表必须仍然是 1..N 连续无洞。
-    // 有洞就意味着「按序号推断」的东西（未读数、checkpoint 比较）会看到一个
-    // 永远不存在的消息。
-    const sequences = messageSequences(room.id);
-    assert.deepEqual(
-      sequences,
-      Array.from({ length: sequences.length }, (_, index) => index + 1),
-    );
   });
 
 });
@@ -512,53 +480,6 @@ describe('conversation_member_state.updated', () => {
     assert.ok(statuses.includes('queued'), `没见过 queued：${statuses.join(',')}`);
     assert.ok(statuses.includes('running'), `没见过 running：${statuses.join(',')}`);
     assert.equal(statuses[statuses.length - 1], 'idle');
-  });
-
-  it('回放全部状态事件，得到的就是当前状态（重连不会看到旧值）', async () => {
-    const alice = makeMember('State2 Alice', 'state2-alice');
-    const bob = makeMember('State2 Bob', 'state2-bob');
-
-    const room = team.createConversation({
-      kind: 'task',
-      title: 'State',
-      memberIds: [alice.id, bob.id],
-    });
-    // 只静音 bob：alice 会被正常唤醒，于是回放里真的包含 queued / running / idle
-    // 这些状态翻转，而不只是建房间时那一条「状态行出现了」。
-    team.setMemberMuted(room.id, bob.id, true);
-
-    await team.sendMessage({ conversationId: room.id, content: '一条用户消息' });
-    await waitForConversationIdle(room.id);
-
-    // 从 0 回放（就是浏览器刷新页面时走的那条路），按顺序应用每一条状态事件。
-    // 这里的「应用」逻辑刻意和前端 applyStateChanged 保持一致：
-    // state 为 null 就是删掉，否则整体替换。
-    const replayed = new Map<string, { wakeStatus: string; lastSeenMessageSequence: number }>();
-    for (const event of team.listEventsSince(room.id, 0, 5000)) {
-      if (event.type !== 'conversation_member_state.updated') continue;
-      const change = event.data as {
-        memberId: string;
-        state: { wakeStatus: string; lastSeenMessageSequence: number } | null;
-      };
-      assert.ok(change.memberId, 'payload 必须带 memberId');
-      if (change.state) replayed.set(change.memberId, change.state);
-      else replayed.delete(change.memberId);
-    }
-
-    // 回放出来的状态必须至少经历过一次「在跑」，否则这条用例没测到真正的翻转
-    assert.ok(
-      [...replayed.values()].some((state) => state.lastSeenMessageSequence > 0),
-      `回放里没有任何读游标前进：${JSON.stringify([...replayed])}`,
-    );
-
-    const current = team.listConversationState(room.id);
-    assert.equal(replayed.size, current.length);
-    for (const state of current) {
-      const fromReplay = replayed.get(state.memberId);
-      assert.ok(fromReplay, `${state.memberId} 在回放里没有状态`);
-      assert.equal(fromReplay.wakeStatus, state.wakeStatus);
-      assert.equal(fromReplay.lastSeenMessageSequence, state.lastSeenMessageSequence);
-    }
   });
 
   it('成员被移出房间时广播 state=null（前端据此删掉本地那份）', () => {

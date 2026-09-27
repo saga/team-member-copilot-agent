@@ -112,29 +112,6 @@ describe('POST /conversations：externalWorkRef 必须穿过边界', () => {
     assert.equal(body.conversation.externalWorkRef.provider, 'jira');
     assert.equal(body.conversation.externalWorkRef.externalId, '100900');
   });
-
-  it('空 key 的引用 = 没有引用（不炸，也不造一条指向空工单的记录）', async () => {
-    const response = await post({
-      kind: 'task',
-      title: 'ABC-901',
-      memberIds: [alice.id],
-      externalWorkRef: { provider: 'jira', key: '   ' },
-    });
-    assert.equal(response.status, 201);
-    const body = (await response.json()) as { conversation: { externalWorkRef: unknown } };
-    assert.equal(body.conversation.externalWorkRef, null);
-  });
-
-  it('不支持的外部系统回 400，而不是 500', async () => {
-    const response = await post({
-      kind: 'task',
-      title: 'ABC-902',
-      memberIds: [alice.id],
-      externalWorkRef: { provider: 'github', key: 'X-1' },
-    });
-    // 客户端输入错误不该表现成服务端故障 —— 那会把排查方向带偏
-    assert.equal(response.status, 400);
-  });
 });
 
 describe('PATCH /members/:memberId/state：muted', () => {

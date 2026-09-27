@@ -6,8 +6,18 @@ import type {
   ConversationStatus,
   ConversationTask,
   ConversationTaskStatus,
+  TaskModelTier,
   TaskRequirements,
 } from './domain.js';
+
+/** plan/add 入口的档位校验：tool 层的 zod 管 LLM 传参，这层管直接调用。 */
+function normalizeModelTier(value: TaskModelTier | null | undefined): TaskModelTier | null {
+  if (value === null || value === undefined) return null;
+  if (value !== 'cheap' && value !== 'standard' && value !== 'strong') {
+    throw badRequest(`任务模型档位只能是 cheap / standard / strong：${String(value)}`);
+  }
+  return value;
+}
 
 export interface TaskPlanInput {
   key: string;
@@ -16,6 +26,11 @@ export interface TaskPlanInput {
   assigneeMemberId?: string;
   dependencies?: string[];
   acceptanceCriteria?: string[];
+  /**
+   * 锁定的模型档位（只有 Lead 能定）。省略 = 跟执行人默认；
+   * 'strong' 把某个复杂任务升级到 Strong 模型。
+   */
+  modelTier?: TaskModelTier | null;
 }
 
 /** refreshReady 一次扫出的两种变化：新就绪的与新被阻塞的。 */
@@ -36,6 +51,7 @@ interface TaskRow {
   result: string | null;
   blocker: string | null;
   current_execution_id: string | null;
+  model_tier: string | null;
   sort_order: number;
   created_at: string;
   updated_at: string;
@@ -174,6 +190,7 @@ export class TaskService {
           result: null,
           blocker: null,
           current_execution_id: null,
+          model_tier: normalizeModelTier(task.modelTier),
           sort_order: index,
           created_at: createdAt,
           updated_at: createdAt,
@@ -183,13 +200,13 @@ export class TaskService {
             `INSERT INTO conversation_task (
               id, conversation_id, title, description, assignee_member_id, status,
               dependencies_json, acceptance_criteria_json, result, blocker,
-              current_execution_id, sort_order, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              current_execution_id, model_tier, sort_order, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           )
           .run(
             row.id, row.conversation_id, row.title, row.description, row.assignee_member_id,
             row.status, row.dependencies_json, row.acceptance_criteria_json, row.result,
-            row.blocker, row.current_execution_id, row.sort_order, row.created_at, row.updated_at,
+            row.blocker, row.current_execution_id, row.model_tier, row.sort_order, row.created_at, row.updated_at,
           );
         created.push(mapTask(row));
       });
@@ -222,6 +239,7 @@ export class TaskService {
     assigneeMemberId: string;
     dependencies?: string[];
     acceptanceCriteria?: string[];
+    modelTier?: TaskModelTier | null;
   }): ConversationTask {
     if (this.list(input.conversationId).length >= MAX_TASKS) {
       throw badRequest(`一个工作区最多 ${MAX_TASKS} 个任务`);
@@ -255,8 +273,8 @@ export class TaskService {
         `INSERT INTO conversation_task (
           id, conversation_id, title, description, assignee_member_id, status,
           dependencies_json, acceptance_criteria_json, result, blocker,
-          current_execution_id, sort_order, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, NULL, NULL, NULL, ?, ?, ?)`,
+          current_execution_id, model_tier, sort_order, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, NULL, NULL, NULL, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -266,6 +284,7 @@ export class TaskService {
         input.assigneeMemberId,
         JSON.stringify(dependencies),
         JSON.stringify((input.acceptanceCriteria ?? []).slice(0, 20)),
+        normalizeModelTier(input.modelTier),
         sortRow.sort_order,
         createdAt,
         createdAt,
@@ -576,6 +595,7 @@ export function mapTask(row: TaskRow): ConversationTask {
     result: row.result,
     blocker: row.blocker,
     currentExecutionId: row.current_execution_id,
+    modelTier: (row.model_tier ?? null) as TaskModelTier | null,
     sortOrder: row.sort_order,
     createdAt: row.created_at,
     updatedAt: row.updated_at,

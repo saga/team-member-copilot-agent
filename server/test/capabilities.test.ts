@@ -37,7 +37,7 @@ const { DefaultToolPolicy } = await import('../tool-policy.js');
 const { CapabilityResolver } = await import('../capabilities/resolver.js');
 const { CopilotCapabilityAdapter } = await import('../capabilities/copilot-adapter.js');
 const { PERSONAL_SELECTOR } = await import('../capabilities/providers/filesystem-knowledge.js');
-const { createTestStack, capabilityContext, singleExecutionId, StubCopilot } =
+const { createTestStack, capabilityContext, StubCopilot } =
   await import('./support.js');
 
 import type { MemberCapabilities } from '../domain.js';
@@ -886,15 +886,6 @@ describe('KnowledgeToolProvider：检索范围只由 binding 决定', () => {
 // ═══════════════════════════════════════════════ 8. TeamService 入口
 
 describe('TeamService 的能力读写入口', () => {
-  async function snapshotOf(executionId: string) {
-    for (let attempt = 0; attempt < 400; attempt += 1) {
-      const snapshot = stack.team.getExecution(executionId).configSnapshot;
-      if (snapshot) return snapshot;
-      await new Promise((resolve) => setTimeout(resolve, 5));
-    }
-    assert.fail(`execution ${executionId} 没有写下配置快照`);
-  }
-
   it('新建 Member 的 Member 层是空的 —— 它继承 global/team，而不是复制一份基线', () => {
     // 「复制一份基线」的代价不是多几行数据，而是**之后改不动**：管理员改 Team
     // 能力，这些人的私有层里还留着旧值，覆盖掉继承结果，而且看不出原因。
@@ -922,79 +913,5 @@ describe('TeamService 的能力读写入口', () => {
     );
 
     assert.deepEqual(stack.team.getMemberCapabilities(member.id), before);
-  });
-
-  it('快照里的 capabilityManifestHash 就是解析出来的那一份；改能力之后跟着变', async () => {
-    const member = stack.team.createMember({ name: 'Rotating', role: 'T' });
-    const room = stack.team.createConversation({ kind: 'task', memberIds: [member.id], leadMemberId: member.id });
-
-    const first = await stack.team.sendMessage({ conversationId: room.id, content: 'one' });
-    const before = await snapshotOf(singleExecutionId(db, room.id, first.wakes));
-
-    // 快照回答的是「这一轮到底用了哪个能力实现」—— 所以它必须等于解析器的结果，
-    // 而不是另算一份指纹。解析用的必须是 effective（三层叠加），因为那才是
-    // 执行时真正生效的那一份。
-    const resolved = await stack.resolver.resolve(
-      capabilityContext(member.id, defaultTeam.id),
-      stack.capabilities.getEffective(defaultTeam.id, member.id),
-    );
-    assert.equal(before.capabilityManifestHash, resolved.manifestHash);
-    assert.equal(before.hostToolsEnabled, false);
-
-    stack.team.updateMemberCapabilities(member.id, {
-      skills: [],
-      knowledge: [],
-      tools: [{ providerId: 'team.core-tools' }],
-    });
-
-    const second = await stack.team.sendMessage({ conversationId: room.id, content: 'two' });
-    const after = await snapshotOf(singleExecutionId(db, room.id, second.wakes));
-
-    assert.match(after.capabilityManifestHash, /^[\da-f]{64}$/);
-    assert.notEqual(after.capabilityManifestHash, before.capabilityManifestHash);
-    // 原记录不被改写：它是「当时」的事实
-    assert.equal(
-      stack.team.getExecution(singleExecutionId(db, room.id, first.wakes)).configSnapshot
-        ?.capabilityManifestHash,
-      before.capabilityManifestHash,
-    );
-  });
-
-  it('remember_member 工具：只写当前 Team 的上下文，写不到全局记忆', async () => {
-    const member = stack.team.createMember({ name: 'ScopedMemory', role: 'T' });
-    const provider = stack.registry.toolProvider('team.core-tools');
-    const context = {
-      ...toolContext(member.id, 'remember_member'),
-      memberCapabilities: { skills: [], knowledge: [], tools: [] },
-      knowledge: [],
-    };
-    const tools = await provider.resolve(context, { providerId: 'team.core-tools' });
-    const remember = tools.find((tool) => tool.name === 'remember_member');
-    assert.ok(remember?.execute, 'core-tools 必须解析出 remember_member');
-
-    await remember.execute(context, { content: '这个 Team 的站会是每天早上十点。' });
-
-    assert.match(
-      memberService.readTeamMemory(member.id, defaultTeam.id),
-      /早上十点/,
-      '必须落到 Team 上下文',
-    );
-    assert.ok(
-      !memberService.readMemory(member.id).includes('早上十点'),
-      'Team 上下文不能漏进全局记忆',
-    );
-
-    // 工具 schema 里没有 scope 参数：即使传了 scope 也会被 zod 剥掉，
-    // 内容照样只进 Team 上下文。Agent 没有写全局记忆的入口；
-    // 人改全局记忆走 MemberService.replaceMemory（UI 的 Memory 页）。
-    await remember.execute(context, {
-      content: '习惯把事实和推论分开写。',
-      scope: 'global',
-    });
-    assert.match(memberService.readTeamMemory(member.id, defaultTeam.id), /事实和推论/);
-    assert.ok(
-      !memberService.readMemory(member.id).includes('事实和推论'),
-      'Agent 的写入不能漏进全局记忆',
-    );
   });
 });

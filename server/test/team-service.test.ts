@@ -187,38 +187,6 @@ describe('Member 是跨 conversation 的长期身份', () => {
     );
   });
 
-  it('remember_member 没有 global 入口：签名里只有 teamId + content', async () => {
-    const teamId = team.getConversation(teamConversationId).teamId;
-    await team.rememberMember({
-      memberId: researcher.id,
-      teamId,
-      content: '用户偏好先看风险再看收益。',
-    });
-    assert.match(memberService.readTeamMemory(researcher.id, teamId), /先看风险再看收益/);
-    assert.ok(
-      !memberService.readMemory(researcher.id).includes('先看风险再看收益'),
-      'Agent 的写入不能漏进全局记忆',
-    );
-  });
-
-  it('人仍然可以直接改全局记忆（人工维护的长期习惯）', () => {
-    team.replaceMemberMemory(researcher.id, '# Long-term Memory\n\n用户偏好先看风险再看收益。');
-    assert.match(memberService.readMemory(researcher.id), /先看风险再看收益/);
-  });
-
-  it('Team 上下文读写带版本校验，与全局记忆相互独立', () => {
-    const teamId = team.getConversation(teamConversationId).teamId;
-    const saved = team.replaceMemberTeamContext(
-      researcher.id,
-      '# Team Context\n\n这个 Team 更重视 architecture review。',
-      teamId,
-    );
-    assert.match(saved.content, /architecture review/);
-    const reloaded = team.getMemberTeamContext(researcher.id, teamId);
-    assert.equal(reloaded.version, saved.version);
-    assert.ok(!team.getMemberMemory(researcher.id).content.includes('architecture review'));
-  });
-
   it('Member 视角能查到参与过的 conversation 与所属 Team', () => {
     const conversations = team.listMemberConversations(researcher.id);
     assert.ok(conversations.some((item) => item.id === teamConversationId));

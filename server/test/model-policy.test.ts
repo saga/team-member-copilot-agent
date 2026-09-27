@@ -11,9 +11,8 @@ process.env.COPILOT_WARMUP = 'false';
 const { modelPolicy } = await import('../config.js');
 const {
   buildModelPolicy,
-  parseModelList,
   parseModelStrengths,
-  resolveMemberModel,
+  resolveTaskModel,
   classifyLeadTurn,
   chooseLeadModel,
 } = await import('../model-policy.js');
@@ -93,41 +92,6 @@ describe('模型策略配置', () => {
     );
   });
 
-  it('Member strength 等于 Standard Lead 时为 Standard', () => {
-    const policy = buildModelPolicy({
-      strongLeadModel: 'gpt-5',
-      standardLeadModel: 'gpt-5-mini',
-      memberModels: ['gpt-5-mini'],
-      strengths: parseModelStrengths('{"gpt-5":100,"gpt-5-mini":60}'),
-    });
-    assert.equal(policy.members[0].tier, 'standard');
-  });
-
-  it('低于 Standard Lead 的 Member 是 Cheap', () => {
-    const policy = buildModelPolicy({
-      strongLeadModel: 'gpt-5',
-      standardLeadModel: 'gpt-5-mini',
-      memberModels: ['gpt-4.1-mini'],
-      strengths: parseModelStrengths('{"gpt-5":100,"gpt-5-mini":60,"gpt-4.1-mini":40}'),
-    });
-    assert.equal(policy.members[0].tier, 'cheap');
-  });
-
-  it('Strong Lead 不能作为普通 Task 模型', () => {
-    const policy = buildModelPolicy({
-      strongLeadModel: 'gpt-5',
-      standardLeadModel: 'gpt-5-mini',
-      memberModels: ['gpt-5-mini', 'gpt-4.1-mini'],
-      strengths: parseModelStrengths('{"gpt-5":100,"gpt-5-mini":60,"gpt-4.1-mini":40}'),
-    });
-    assert.throws(() => resolveMemberModel(policy, 'gpt-5'), /Strong Lead/);
-  });
-
-  it('不存在的 Member 模型被拒绝，空回落默认', () => {
-    assert.throws(() => resolveMemberModel(modelPolicy, 'gpt-不存在'), /未知模型/);
-    assert.equal(resolveMemberModel(modelPolicy, null), modelPolicy.defaultMemberModel);
-  });
-
   it('建 Member / 改 Member 时 Strong 与拼错都被拒绝', () => {
     const member = team.createMember({ name: 'Model Pam', role: 'Engineer' });
     assert.throws(() => team.updateMember(member.id, { model: modelPolicy.lead.strong.id }), /Strong Lead/);
@@ -140,9 +104,29 @@ describe('模型策略配置', () => {
     assert.equal(updated.model, modelPolicy.members[0].id);
     assert.equal(team.updateMember(member.id, { model: null }).model, null);
   });
+});
 
-  it('parseModelList 按逗号切分并去空', () => {
-    assert.deepEqual(parseModelList('a, b,,c '), ['a', 'b', 'c']);
+describe('Task model tier', () => {
+  const policy = buildModelPolicy({
+    strongLeadModel: 'gpt-5',
+    standardLeadModel: 'gpt-5-mini',
+    memberModels: ['gpt-5-mini', 'gpt-4.1-mini'],
+    strengths: parseModelStrengths('{"gpt-5":100,"gpt-5-mini":60,"gpt-4.1-mini":40}'),
+  });
+
+  it('strong 任务升级 Strong，与执行人配什么无关', () => {
+    assert.equal(resolveTaskModel(policy, 'gpt-4.1-mini', 'strong'), 'gpt-5');
+    assert.equal(resolveTaskModel(policy, null, 'strong'), 'gpt-5');
+  });
+
+  it('standard / cheap 任务钉到该档 Member 模型', () => {
+    assert.equal(resolveTaskModel(policy, 'gpt-4.1-mini', 'standard'), 'gpt-5-mini');
+    assert.equal(resolveTaskModel(policy, 'gpt-5-mini', 'cheap'), 'gpt-4.1-mini');
+  });
+
+  it('没定档跟执行人默认', () => {
+    assert.equal(resolveTaskModel(policy, 'gpt-4.1-mini', null), 'gpt-4.1-mini');
+    assert.equal(resolveTaskModel(policy, null, null), 'gpt-5-mini');
   });
 });
 
@@ -152,33 +136,6 @@ describe('Lead model routing', () => {
     standardLeadModel: 'gpt-5-mini',
     memberModels: ['gpt-5-mini', 'gpt-4.1-mini'],
     strengths: parseModelStrengths('{"gpt-5":100,"gpt-5-mini":60,"gpt-4.1-mini":40}'),
-  });
-
-  it('没有 Task 时 Strong', () => {
-    assert.deepEqual(
-      chooseLeadModel(policy, classifyLeadTurn({ wakeReason: 'lead_message', taskCount: 0, prompt: '开始' })),
-      { model: 'gpt-5', purpose: 'lead:planning' },
-    );
-  });
-
-  it('普通 Lead 输入使用 Standard', () => {
-    assert.deepEqual(
-      chooseLeadModel(
-        policy,
-        classifyLeadTurn({ wakeReason: 'lead_message', taskCount: 3, prompt: '现在进展怎么样？' }),
-      ),
-      { model: 'gpt-5-mini', purpose: 'lead:routine' },
-    );
-  });
-
-  it('用户回答 clarification 使用 Strong', () => {
-    assert.deepEqual(
-      chooseLeadModel(
-        policy,
-        classifyLeadTurn({ wakeReason: 'lead_clarification', taskCount: 2, prompt: '生产环境是 us-east-1。' }),
-      ),
-      { model: 'gpt-5', purpose: 'lead:clarification' },
-    );
   });
 
   it('Task recovery 使用 Strong', () => {

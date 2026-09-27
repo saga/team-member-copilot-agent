@@ -333,6 +333,7 @@ describe('schema 就位（PRAGMA user_version）', () => {
             'result',
             'blocker',
             'current_execution_id',
+            'model_tier',
             'sort_order',
             'created_at',
             'updated_at',

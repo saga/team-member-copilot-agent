@@ -20,7 +20,7 @@ import type { DatabaseSync } from 'node:sqlite';
  *
  * 程序不认识任何别的编号 —— 没有升级代码，认出来也无从下手。
  */
-export const SCHEMA_VERSION = 19;
+export const SCHEMA_VERSION = 20;
 
 /**
  * 当前 schema 的完整定义，按最终形状写。
@@ -458,6 +458,10 @@ CREATE TABLE conversation_task (
   result TEXT,
   blocker TEXT,
   current_execution_id TEXT,
+  -- 这个任务锁定的模型档位。NULL = 跟执行人默认（Member 配什么用什么）。
+  -- 只有 Lead 能在 plan/add 里定（'strong' 把某个复杂任务升级到 Strong 模型），
+  -- update_task / reassign 改不到它 —— 执行人不能给自己升级。
+  model_tier TEXT CHECK (model_tier IN ('cheap', 'standard', 'strong')),
   sort_order INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,

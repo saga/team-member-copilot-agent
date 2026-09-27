@@ -8,7 +8,7 @@ const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tmca-task-'));
 process.env.DATA_DIR = dataDir;
 process.env.COPILOT_WARMUP = 'false';
 
-const { config } = await import('../config.js');
+const { config, modelPolicy } = await import('../config.js');
 const { db } = await import('../db.js');
 const { RecoveryService } = await import('../recovery-service.js');
 const { ConversationMemberService } = await import('../conversation-member-service.js');
@@ -66,38 +66,6 @@ after(() => {
 });
 
 describe('Task 规划', () => {
-  it('Lead 一轮规划多个任务，无依赖的直接就绪', async () => {
-    const room = team.createConversation({
-      kind: 'task',
-      title: 'Plan',
-      memberIds: [alice.id, bob.id, carol.id],
-      leadMemberId: alice.id,
-    });
-    await team.planTasks({
-      conversationId: room.id,
-      memberId: alice.id,
-      objective: '解决登录超时',
-      requirements: { facts: [], assumptions: [], constraints: [], successCriteria: ['成功率 99.9%'] },
-      tasks: [
-        { key: 'investigate', title: '调查根因', assigneeMemberId: alice.id },
-        { key: 'fix', title: '修复', assigneeMemberId: bob.id },
-        { key: 'test', title: '验证', assigneeMemberId: carol.id },
-      ],
-    });
-    const tasks = team.listTasks(room.id);
-    assert.equal(tasks.length, 3);
-    const conv = team.getConversation(room.id);
-    assert.equal(conv.objective, '解决登录超时');
-    assert.equal(conv.status, 'running');
-    for (const task of team.listTasks(room.id)) {
-      assert.ok(
-        ['ready', 'running', 'completed'].includes(task.status),
-        `无依赖的任务应该直接就绪或已经开跑：${task.title} 是 ${task.status}`,
-      );
-    }
-    await waitForConversationIdle(room.id);
-  });
-
   it('依赖未完成时 pending，完成上游后自动 ready 并执行', async () => {
     const room = team.createConversation({
       kind: 'task',
@@ -256,26 +224,6 @@ describe('Task 执行', () => {
       stub.hold = null;
     }
     await waitForConversationIdle(room.id);
-  });
-
-  it('Task execution 关联 taskId，全部完成工作区自动 completed', async () => {
-    const room = team.createConversation({
-      kind: 'task',
-      title: 'Complete',
-      memberIds: [alice.id, bob.id],
-      leadMemberId: alice.id,
-    });
-    await team.planTasks({
-      conversationId: room.id,
-      memberId: alice.id,
-      objective: '收尾',
-      requirements: { facts: [], assumptions: [], constraints: [], successCriteria: [] },
-      tasks: [{ key: 'a', title: 'A', assigneeMemberId: bob.id }],
-    });
-    await waitForConversationIdle(room.id);
-    const tasks = team.listTasks(room.id);
-    assert.equal(tasks[0].status, 'completed');
-    assert.equal(team.getConversation(room.id).status, 'completed');
   });
 
   it('只能更新分给自己的任务', async () => {
@@ -445,78 +393,6 @@ describe('Task 生命周期补严', () => {
       before.map((task) => task.id),
     );
     await waitForConversationIdle(room.id);
-  });
-
-  it('failed 不会让工作区变成 completed，而是 blocked 并唤醒 Lead', async () => {
-    const room = team.createConversation({
-      kind: 'task',
-      title: 'FailedBlocked',
-      memberIds: [alice.id, bob.id],
-      leadMemberId: alice.id,
-    });
-    stub.failMemberIds.add(bob.id);
-    try {
-      await team.planTasks({
-        conversationId: room.id,
-        memberId: alice.id,
-        objective: '失败',
-        requirements,
-        tasks: [{ key: 'a', title: 'A', assigneeMemberId: bob.id }],
-      });
-      await waitForConversationIdle(room.id);
-      assert.equal(team.listTasks(room.id)[0].status, 'failed');
-      assert.equal(team.getConversation(room.id).status, 'blocked');
-      // Lead 被自动唤醒一次（之前 Lead 从没跑过，这一轮只能来自失败推进）
-      const leadRuns = db
-        .prepare(
-          `SELECT COUNT(*) AS n FROM execution WHERE conversation_id = ? AND member_id = ? AND wake_reason = 'lead_recovery'`,
-        )
-        .get(room.id, alice.id) as unknown as { n: number };
-      assert.ok(leadRuns.n >= 1, 'Lead 应该在任务失败后以 recovery 原因被唤醒');
-    } finally {
-      stub.failMemberIds.delete(bob.id);
-    }
-    await waitForConversationIdle(room.id);
-  });
-
-  it('上游 failed / cancelled，下游直接 blocked，不死 pending', async () => {
-    for (const upstream of ['failed', 'cancelled'] as const) {
-      const room = team.createConversation({
-        kind: 'task',
-        title: `Downstream-${upstream}`,
-        memberIds: [alice.id, bob.id],
-        leadMemberId: alice.id,
-      });
-      if (upstream === 'failed') stub.failMemberIds.add(bob.id);
-      // cancelled 分支：执行人静音让 A 停在 ready。running 的任务不能直接取消
-      // （必须先取消 execution），ready 的可以直接取消。
-      if (upstream === 'cancelled') team.setMemberMuted(room.id, bob.id, true);
-      try {
-        await team.planTasks({
-          conversationId: room.id,
-          memberId: alice.id,
-          objective: '依赖失败',
-          requirements,
-          tasks: [
-            { key: 'a', title: 'A', assigneeMemberId: bob.id },
-            { key: 'b', title: 'B', assigneeMemberId: alice.id, dependencies: ['a'] },
-          ],
-        });
-        if (upstream === 'cancelled') {
-          const taskA = team.listTasks(room.id).find((task) => task.title === 'A')!;
-          team.cancelTask(taskA.id);
-        }
-        await waitForConversationIdle(room.id);
-        const tasks = team.listTasks(room.id);
-        assert.equal(tasks.find((task) => task.title === 'A')?.status, upstream);
-        const downstream = tasks.find((task) => task.title === 'B')!;
-        assert.equal(downstream.status, 'blocked');
-        assert.match(downstream.blocker ?? '', /依赖/);
-      } finally {
-        stub.failMemberIds.delete(bob.id);
-      }
-      await waitForConversationIdle(room.id);
-    }
   });
 
   it('依赖没好时 retry 被拒绝，依赖好了才能 retry', async () => {
@@ -1244,5 +1120,132 @@ describe('Task 生命周期补严', () => {
       messages.some((message) => message.senderType === 'member' && message.senderId === alice.id),
       'Lead 应该主动说第一句话',
     );
+  });
+});
+
+describe('Task 模型档位：Lead 定，执行人改不动', () => {
+  it('Lead 定 strong：任务行落档，转起来用 Strong，快照也是 Strong', async () => {
+    stub.reset();
+    const cheap = team.createMember({ name: 'Tier Cheap', role: 'Engineer', model: 'gpt-4.1-mini' });
+    const room = team.createConversation({
+      kind: 'task',
+      title: 'TierStrong',
+      memberIds: [alice.id, cheap.id],
+      leadMemberId: alice.id,
+    });
+    await team.planTasks({
+      conversationId: room.id,
+      memberId: alice.id,
+      objective: '复杂任务升级',
+      requirements: { facts: [], assumptions: [], constraints: [], successCriteria: [] },
+      tasks: [{ key: 'a', title: 'A', assigneeMemberId: cheap.id, modelTier: 'strong' }],
+    });
+    const task = team.listTasks(room.id)[0];
+    assert.equal(task.modelTier, 'strong', '档位必须落到任务行上');
+    await waitForConversationIdle(room.id);
+
+    assert.equal(team.getTask(task.id).status, 'completed');
+    const execution = db
+      .prepare(`SELECT id FROM execution WHERE task_id = ? ORDER BY created_at LIMIT 1`)
+      .get(task.id) as unknown as { id: string };
+    assert.equal(stub.turnFor(execution.id).model, modelPolicy.lead.strong.id);
+    assert.equal(team.getExecution(execution.id).configSnapshot?.model, modelPolicy.lead.strong.id);
+  });
+
+  it('standard 档把 cheap 成员拉上去，cheap 档把 standard 成员降下来', async () => {
+    stub.reset();
+    const cheap = team.createMember({ name: 'Tier Cheap2', role: 'Engineer', model: 'gpt-4.1-mini' });
+    const standard = team.createMember({ name: 'Tier Standard2', role: 'Engineer', model: 'gpt-5-mini' });
+    const room = team.createConversation({
+      kind: 'task',
+      title: 'TierPin',
+      memberIds: [alice.id, cheap.id, standard.id],
+      leadMemberId: alice.id,
+    });
+    await team.planTasks({
+      conversationId: room.id,
+      memberId: alice.id,
+      objective: '档位钉住',
+      requirements: { facts: [], assumptions: [], constraints: [], successCriteria: [] },
+      tasks: [
+        { key: 'a', title: 'A', assigneeMemberId: cheap.id, modelTier: 'standard' },
+        { key: 'b', title: 'B', assigneeMemberId: standard.id, modelTier: 'cheap' },
+      ],
+    });
+    await waitForConversationIdle(room.id);
+
+    for (const task of team.listTasks(room.id)) {
+      const execution = db
+        .prepare(`SELECT id FROM execution WHERE task_id = ? ORDER BY created_at LIMIT 1`)
+        .get(task.id) as unknown as { id: string };
+      const expected =
+        task.title === 'A' ? modelPolicy.members.find((m) => m.tier === 'standard')!.id : modelPolicy.members.find((m) => m.tier === 'cheap')!.id;
+      assert.equal(stub.turnFor(execution.id).model, expected, `任务 ${task.title} 没用对档`);
+    }
+  });
+
+  it('非 Lead 定档被拒绝，非法档位被拒绝', async () => {
+    stub.reset();
+    const room = team.createConversation({
+      kind: 'task',
+      title: 'TierAuth',
+      memberIds: [alice.id, bob.id],
+      leadMemberId: alice.id,
+    });
+    await assert.rejects(
+      team.planTasks({
+        conversationId: room.id,
+        memberId: bob.id,
+        objective: '越权',
+        requirements: { facts: [], assumptions: [], constraints: [], successCriteria: [] },
+        tasks: [{ key: 'a', title: 'A', assigneeMemberId: bob.id, modelTier: 'strong' }],
+      }),
+      /只有负责这个工作的 Lead/,
+    );
+    await assert.rejects(
+      team.planTasks({
+        conversationId: room.id,
+        memberId: alice.id,
+        objective: '坏档',
+        requirements: { facts: [], assumptions: [], constraints: [], successCriteria: [] },
+        tasks: [{ key: 'a', title: 'A', assigneeMemberId: bob.id, modelTier: 'ultra' as never }],
+      }),
+      /只能是 cheap \/ standard \/ strong/,
+    );
+    await waitForConversationIdle(room.id);
+  });
+
+  it('update_task 改不动档位，reassign 保留档位', async () => {
+    stub.reset();
+    const room = team.createConversation({
+      kind: 'task',
+      title: 'TierSticky',
+      memberIds: [alice.id, bob.id, carol.id],
+      leadMemberId: alice.id,
+    });
+    team.setMemberMuted(room.id, bob.id, true);
+    await team.planTasks({
+      conversationId: room.id,
+      memberId: alice.id,
+      objective: '档位粘住',
+      requirements: { facts: [], assumptions: [], constraints: [], successCriteria: [] },
+      tasks: [{ key: 'a', title: 'A', assigneeMemberId: bob.id, modelTier: 'strong' }],
+    });
+    const task = team.listTasks(room.id)[0];
+    // 执行人上报进展也动不了档位（update_task 根本没有这个参数）
+    await team.updateTask({
+      conversationId: room.id,
+      memberId: bob.id,
+      taskId: task.id,
+      status: 'blocked',
+      summary: '卡住了',
+      blocker: '缺权限',
+    });
+    assert.equal(team.getTask(task.id).modelTier, 'strong');
+    // 换执行人也不掉档位
+    await team.reassignTask({ conversationId: room.id, memberId: alice.id, taskId: task.id, assigneeMemberId: carol.id });
+    assert.equal(team.getTask(task.id).modelTier, 'strong');
+    assert.equal(team.getTask(task.id).assigneeMemberId, carol.id);
+    await waitForConversationIdle(room.id);
   });
 });

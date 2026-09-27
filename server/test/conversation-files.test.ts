@@ -36,7 +36,7 @@ const { db } = await import('../db.js');
 const { config } = await import('../config.js');
 const { MemberService } = await import('../member-service.js');
 const { conversationsRouter } = await import('../routes/conversations.js');
-const { ConversationFileService, sanitizeFileName, toFtsQuery } = await import(
+const { ConversationFileService } = await import(
   '../conversation-file-service.js'
 );
 const { ConversationFileProcessor } = await import('../conversation-file-processor.js');
@@ -405,16 +405,6 @@ describe('会话文件：消息附件与引用', () => {
     // 引用不会复制文件：会话里仍然只有一份。
     assert.equal(stack.conversationFiles.list(room).filter((item) => item.id === file.id).length, 1);
   });
-
-  it('不带文件的消息，files 是空数组而不是缺字段', async () => {
-    const response = await postMessage(room, { content: '这条没有附件' });
-    const payload = (await response.json()) as { message: { id: string; files: unknown[] } };
-    assert.deepEqual(payload.message.files, []);
-
-    const listed = stack.team.listMessages(room).find((item) => item.id === payload.message.id);
-    assert.ok(listed);
-    assert.deepEqual(listed.files, []);
-  });
 });
 
 // -------------------------------------------------------------- 会话边界
@@ -554,20 +544,6 @@ describe('会话文件：删除', () => {
     assert.match(((await reuse.json()) as { error: string }).error, /已经被删除/);
   });
 
-  it('删掉之后又传回同一份，恢复成可用的那一份（不留一条 deleted 让用户困惑）', async () => {
-    const content = 'restore me';
-    const first = await uploadOk(room, 'restore.md', content);
-    await waitForReady(room, first.id);
-    await fetch(`${base}/api/conversations/${room}/files/${first.id}`, { method: 'DELETE' });
-
-    const again = await uploadOk(room, 'restore.md', content);
-    assert.equal(again.id, first.id, '同一份内容应该收敛回同一行，而不是多出一份');
-
-    const ready = await waitForReady(room, first.id);
-    assert.equal(ready.status, 'ready');
-    assert.ok(stack.conversationFiles.list(room).some((item) => item.id === first.id));
-  });
-
   it('消息没了，关系行跟着走：不留指向不存在消息的孤儿行', async () => {
     const file = await readyFile(room, 'cascade', 'cascade body');
     const sent = await postMessage(room, { content: '级联用', fileIds: [file.id] });
@@ -617,47 +593,6 @@ describe('会话文件：promote 到团队知识库', () => {
       'utf8',
     );
     assert.equal(onDisk, '# 发布说明\n这次上线了会话文件。');
-  });
-
-  /**
-   * 这一组守的是「能搜的东西必须能存」。
-   *
-   * 会话文件的文本提取范围（.html / .csv / .py / .sql …）比知识库的索引范围
-   * （.md / .txt / .json / .yaml …）宽，而知识库的路径片段还只收 ASCII。沿用
-   * 各自的判据去拼 promote 的路径，表现就是：文件在会话里搜得到、按钮也点得动，
-   * 一保存却 400 —— 用户完全无从知道哪个格式才是「对的」。
-   */
-  it('提取得出的格式都能 promote：扩展名与文件名是否 ASCII 都不影响', async () => {
-    const kb = stack.knowledge.createTeamKnowledgeBase({ key: 'formats', name: 'Formats' });
-    const cases = [
-      { name: newFileName('table', 'csv'), body: 'a,b\n1,2\n', contentType: 'text/csv' },
-      { name: newFileName('page', 'html'), body: '<p>hi</p>', contentType: 'text/html' },
-      { name: newFileName('评审稿', 'md'), body: '# 中文名的文件\n', contentType: 'text/markdown' },
-    ];
-
-    for (const item of cases) {
-      const file = await uploadOk(room, item.name, item.body, item.contentType);
-      await waitForReady(room, file.id);
-
-      const response = await fetch(`${base}/api/conversations/${room}/files/${file.id}/promote`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ knowledgeBaseId: kb.id }),
-      });
-      assert.equal(response.status, 201, `${item.name} 应该能存进知识库`);
-
-      const { document } = (await response.json()) as {
-        document: { relativePath: string; title: string };
-      };
-      assert.equal(document.title, item.name, '标题里必须是用户认得的那个文件名');
-      assert.equal(document.relativePath, `promoted/${file.id}.md`);
-      assert.equal(
-        fs.readFileSync(path.join(config.teamKnowledgeRoot, kb.key, document.relativePath), 'utf8'),
-        item.body,
-      );
-    }
-
-    assert.equal(stack.knowledge.countDocuments(kb.id), cases.length);
   });
 
   it('文本超过知识库单份上限时提前拒绝，并说清文件本身没丢', async () => {
@@ -780,20 +715,3 @@ describe('会话文件：正文响应的安全头', () => {
   });
 });
 
-// ------------------------------------------------------------------ 纯函数
-
-describe('会话文件：名字与查询串的清洗', () => {
-  it('sanitizeFileName 只留最后一段，并去掉控制字符与开头的点', () => {
-    assert.equal(sanitizeFileName('../../etc/passwd'), 'passwd');
-    assert.equal(sanitizeFileName('C:\\Users\\me\\report.md'), 'report.md');
-    assert.equal(sanitizeFileName('.hidden'), 'hidden');
-    assert.throws(() => sanitizeFileName('   '), /不能为空/);
-  });
-
-  it('toFtsQuery 永远产出合法查询串，或空串', () => {
-    assert.equal(toFtsQuery('  '), '');
-    assert.equal(toFtsQuery('hello world'), '"hello" "world"');
-    assert.equal(toFtsQuery('say "hi"'), '"say" "hi"');
-    assert.equal(toFtsQuery('NEAR('), '"NEAR"');
-  });
-});

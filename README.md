@@ -89,7 +89,7 @@ Lead 只负责澄清与规划，执行由各 Task 的执行人推进，依赖由
 | **Member** | 业务上的长期 AI 同事。持久身份 + role + style + system prompt + model + 能力组成 + 全局长期记忆 + Team 上下文。身份跨 Team 稳定（同一个人），记忆按 Team 隔离。 |
 | **Capability** | 三层能力引用：`global` / `team` / `member`，存在同一张 `capability_binding` 表里（`scope_type` + `scope_id`）。**`effective = global + team + member` 才是「能用什么」的唯一答案**，任何单层都不是。 |
 | **Conversation** | Task 工作区。`task`（用户真正使用的工作会话，有 `objective` / `leadMemberId` / `status` / `requirements` / `openQuestions`，可挂 Jira）/ `direct`（Member ↔ Member 内部私聊）。状态机：`intake → waiting_user → running → completed`，异常 `blocked`，终止 `cancelled`。完成条件由 Task 状态决定，不由 LLM 宣布。 |
-| **Task** | `conversation_task` 表。`pending → ready → running → completed`（异常 `blocked` / `failed`，终止 `cancelled`）；依赖用 `dependencies_json` 表达（第一版只要列表，不要树）；上限 20 个；循环依赖拒绝落库；只能由执行人自己 `update_task`；同一个 Member 同时只跑一个 Task。初始计划一次性 `plan_tasks`，之后缺失的工作由 Lead `add_task` 补充，未开始任务的错误分派由 Lead `reassign_task` 纠正（running 及终态不能换人）。 |
+| **Task** | `conversation_task` 表。`pending → ready → running → completed`（异常 `blocked` / `failed`，终止 `cancelled`）；依赖用 `dependencies_json` 表达（第一版只要列表，不要树）；上限 20 个；循环依赖拒绝落库；只能由执行人自己 `update_task`；同一个 Member 同时只跑一个 Task。初始计划一次性 `plan_tasks`，之后缺失的工作由 Lead `add_task` 补充，未开始任务的错误分派由 Lead `reassign_task` 纠正（running 及终态不能换人）。单个任务可锁模型档位（`modelTier`：null 跟执行人默认，`strong` 升级 Strong；只有 Lead 能定，执行人改不到）。 |
 | **MemberRuntime** | 某 Member 在某 Conversation 中的运行实例。一个 runtime 拥有一个稳定的 Copilot Session 和一个独立 workspace。 |
 | **CopilotSession** | Runtime 的执行引擎状态。**内部实现细节，不是业务对象。** |
 | **Execution** | Agent 实际跑了一轮。记录 `parent_execution_id` / `delegation_path` / `external_work_ref`（开始时从 conversation 快照）/ `external_work_snapshot`（开始时向外部系统取证），构成完整审计链。状态：`queued` / `running` / `waiting_for_member` / `completed` / `failed` / `cancelled` / `interrupted`。 |
@@ -1128,7 +1128,7 @@ server/                       # Express + Copilot SDK 后端
     member-skills.test.ts          # 三个 scope 的 skill 安装 / 卸载 / zip 安全闸（穿越、symlink、体积、同名覆盖）
     runtime-reliability.test.ts    # schema 形状 / 序号 / 增量上下文 / durable event / 恢复 / 死锁
     runtime-correctness.test.ts    # resume 分类 / 超时 abort / 工具授权接线 / cancel 状态机 / retry
-    task-service.test.ts             # Task 规划 / 依赖 / 并行串行 / 执行人归属 / Lead 单点 / 澄清 / 阻塞重试 / 重启恢复
+    task-service.test.ts             # Task 规划 / 依赖 / 并行串行 / 执行人归属 / Lead 单点 / 澄清 / 阻塞重试 / 重启恢复 / 模型档位
     model-policy.test.ts             # Strong > Standard >= Member / Lead 按原因与意图分档 / 快照记真实模型与 purpose
     experience-store.test.ts         # 经验存取 / Team 与 member 隔离 / 去重 / 存→下一轮 prompt 的完整回路
     conversations-api.test.ts      # 真实 HTTP：externalWorkRef 过边界 / 静音 state patch / SSE 流式增量

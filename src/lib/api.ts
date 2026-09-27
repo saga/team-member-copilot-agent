@@ -272,6 +272,9 @@ export type ConversationTaskStatus =
   | 'failed'
   | 'cancelled';
 
+/** Task 锁定的模型档位（Lead 在 plan/add 里定）；null = 跟执行人默认。 */
+export type TaskModelTier = 'cheap' | 'standard' | 'strong';
+
 export interface ConversationTask {
   id: string;
   conversationId: string;
@@ -284,6 +287,7 @@ export interface ConversationTask {
   result: string | null;
   blocker: string | null;
   currentExecutionId: string | null;
+  modelTier: TaskModelTier | null;
   sortOrder: number;
   createdAt: string;
   updatedAt: string;

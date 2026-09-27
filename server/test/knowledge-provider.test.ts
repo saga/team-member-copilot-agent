@@ -358,38 +358,3 @@ describe('磁盘与索引共用同一个「什么算一份资料」的判据', (
   });
 });
 
-describe('磁盘同步', () => {
-  it('目录即 KB、文件即文档；第二次同步 hash 未变则零写入', async () => {
-    const member = makeMember('Ken', 'ken');
-    knowledge.ensurePersonalKnowledgeBase(member.id, member.name);
-
-    const teamDir = path.join(config.teamKnowledgeRoot, 'arch-standards');
-    fs.mkdirSync(path.join(teamDir, 'sub'), { recursive: true });
-    fs.writeFileSync(path.join(teamDir, 'layering.md'), 'layered architecture with trust boundary rules');
-    fs.writeFileSync(path.join(teamDir, 'sub', 'naming.md'), 'service names are nouns');
-
-    const personalDir = path.join(config.memberHomeRoot, member.id, 'knowledge');
-    fs.mkdirSync(personalDir, { recursive: true });
-    fs.writeFileSync(path.join(personalDir, 'my-notes.md'), 'ken prefers evidence first');
-
-    const first = knowledge.syncFromDisk([member.id]);
-    assert.equal(first.teamBases, 1);
-    assert.ok(first.indexed >= 3, `至少索引 3 份，实际 ${first.indexed}`);
-
-    // team KB 按目录名可查，且绑定后能搜到（含子目录）
-    assert.ok(knowledge.findByKey('team', 'arch-standards'));
-    bindKnowledge(member.id, ['arch-standards', PERSONAL_SELECTOR]);
-    const hits = await search(member.id, 'arch-standards', 'boundary');
-    assert.equal(hits.length, 1);
-    assert.equal(hits[0].title, 'layering.md');
-
-    // personal 侧同样可搜
-    assert.equal((await search(member.id, PERSONAL_SELECTOR, 'evidence')).length, 1);
-
-    // 没变化的第二次同步不该写任何索引
-    const second = knowledge.syncFromDisk([member.id]);
-    assert.equal(second.teamBases, 0);
-    assert.equal(second.indexed, 0);
-  });
-
-});

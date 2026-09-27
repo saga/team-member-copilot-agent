@@ -131,6 +131,9 @@ export type ConversationTaskStatus =
   | 'failed'
   | 'cancelled';
 
+/** Task 锁定的模型档位：Lead 在 plan/add 里定，执行人改不到。 */
+export type TaskModelTier = 'cheap' | 'standard' | 'strong';
+
 export interface ConversationTask {
   id: string;
   conversationId: string;
@@ -143,6 +146,11 @@ export interface ConversationTask {
   result: string | null;
   blocker: string | null;
   currentExecutionId: string | null;
+  /**
+   * 这个任务锁定的模型档位。null = 跟执行人默认（Member 配什么用什么）；
+   * 'strong' = 复杂任务升级到 Strong 模型。只能由 Lead 定。
+   */
+  modelTier: TaskModelTier | null;
   sortOrder: number;
   createdAt: string;
   updatedAt: string;

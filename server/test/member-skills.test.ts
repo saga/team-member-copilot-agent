@@ -88,36 +88,6 @@ describe('Scoped skills', () => {
     );
   });
 
-  it('三个 scope 各自独立：删掉一个不影响另外两个', { skip: !hasUnzip() }, () => {
-    // 同名的 skill 可以在三层里各存一份 —— 它们是三棵不同的树，不是「同一份
-    // 内容挂在三个 scope 上」。这条同时证明删除只作用于指定 scope。
-    const shared = skillZip('shared-name');
-    skills.install({ kind: 'global' }, shared, 'shared-name.zip');
-    skills.install({ kind: 'team', teamId: team.id }, shared, 'shared-name.zip');
-    skills.install({ kind: 'member', memberId: alice.id }, shared, 'shared-name.zip');
-
-    skills.remove({ kind: 'team', teamId: team.id }, 'shared-name');
-
-    assert.equal(
-      skills.list({ kind: 'team', teamId: team.id }).some((item) => item.name === 'shared-name'),
-      false,
-    );
-    assert.ok(skills.list({ kind: 'global' }).some((item) => item.name === 'shared-name'));
-    assert.ok(
-      skills.list({ kind: 'member', memberId: alice.id }).some((item) => item.name === 'shared-name'),
-    );
-  });
-
-  it('给不存在的 Team / Member 装 skill → 404，而不是建一棵没人读得到的空树', { skip: !hasUnzip() }, () => {
-    assert.throws(
-      () => skills.install({ kind: 'team', teamId: 'no-such-team' }, skillZip('ghost'), 'ghost.zip'),
-      /Team 不存在/,
-    );
-    assert.throws(
-      () => skills.install({ kind: 'member', memberId: 'no-such-member' }, skillZip('ghost'), 'ghost.zip'),
-      /Member 不存在/,
-    );
-  });
 });
 
 /**

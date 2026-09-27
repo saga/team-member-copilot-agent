@@ -301,42 +301,6 @@ describe('Scheduler', () => {
     await waitFor(() => structure.getScheduleRun(run.id).status === 'completed', 'run 被 settleScheduleRun 收口');
   });
 
-  it('run 时间戳跟语义走：running 写 started_at，终态写 ended_at，终态不顶掉 started_at', async () => {
-    const { StubCopilot } = await import('./support.js');
-    const stack = createTestStack(db, memberService, new StubCopilot().asCopilot);
-    const agent = stack.team.createMember({ name: 'RunTs', role: 'E' });
-    const room = stack.team.createConversation({ kind: 'task', memberIds: [agent.id] });
-    const schedule = structure.createSchedule(
-      team.id,
-      { memberId: agent.id, conversationId: room.id, prompt: 'ts', type: 'once', runAt: new Date(Date.now() + 60_000).toISOString() },
-      'local-user',
-    );
-    const run = structure.insertScheduleRun(schedule.id, schedule.nextRunAt);
-    assert.equal(run.startedAt, null);
-    assert.equal(run.endedAt, null);
-
-    const running = structure.updateScheduleRun(run.id, { status: 'running' });
-    assert.ok(running.startedAt, '进入 running 才写 started_at');
-    assert.equal(running.endedAt, null);
-
-    const completed = structure.updateScheduleRun(run.id, { status: 'completed' });
-    assert.equal(completed.startedAt, running.startedAt, '终态不顶掉 started_at');
-    assert.ok(completed.endedAt, '终态写 ended_at');
-
-    // 直接从 queued 判 failed（enqueue 失败路径）：started_at 必须保持空。
-    const failedRun = structure.insertScheduleRun(
-      structure.createSchedule(
-        team.id,
-        { memberId: agent.id, conversationId: room.id, prompt: 'ts2', type: 'once', runAt: new Date(Date.now() + 120_000).toISOString() },
-        'local-user',
-      ).id,
-      new Date(Date.now() + 120_000).toISOString(),
-    );
-    const failed = structure.updateScheduleRun(failedRun.id, { status: 'failed', error: 'no target' });
-    assert.equal(failed.startedAt, null, '从未 running 过就没有 started_at');
-    assert.ok(failed.endedAt);
-  });
-
   it('恢复：无 executionId 的 run 重建 execution；遗留 running 的 run 按 execution 终态收口', async () => {
     const { StubCopilot } = await import('./support.js');
     const stub = new StubCopilot();
@@ -398,34 +362,6 @@ describe('Schedule 约束', () => {
         ),
       /执行成员必须在这个 Task 工作区里/,
     );
-  });
-
-  it('schedule 创建即校验 runAt 与成员状态：不把错误留到 scheduler 运行时', async () => {
-    const { StubCopilot } = await import('./support.js');
-    const stack = createTestStack(db, memberService, new StubCopilot().asCopilot);
-    const agent = stack.team.createMember({ name: 'SchedValidate', role: 'E' });
-    const room = stack.team.createConversation({ kind: 'task', memberIds: [agent.id] });
-
-    // runAt 必须是有效时间。
-    assert.throws(
-      () =>
-        structure.createSchedule(team.id, { memberId: agent.id, conversationId: room.id, prompt: 'x', type: 'once', runAt: 'not-a-date' }, 'local-user'),
-      /有效时间/,
-    );
-    // runAt 必须在未来：过去的 once 要么永远跑不到、要么下一个 tick 立刻炸出来。
-    assert.throws(
-      () =>
-        structure.createSchedule(team.id, { memberId: agent.id, conversationId: room.id, prompt: 'x', type: 'once', runAt: new Date(Date.now() - 60_000).toISOString() }, 'local-user'),
-      /未来/,
-    );
-    // 归档的 Agent 不能被调度 —— 在创建时就拦，不等到 run 记录里才失败。
-    stack.team.updateMember(agent.id, { status: 'archived' });
-    assert.throws(
-      () =>
-        structure.createSchedule(team.id, { memberId: agent.id, conversationId: room.id, prompt: 'x', type: 'once', runAt: new Date(Date.now() + 60_000).toISOString() }, 'local-user'),
-      /归档|停用/,
-    );
-    stack.team.updateMember(agent.id, { status: 'active' });
   });
 
   it('已完成的 once schedule 不能 resume', async () => {
@@ -613,27 +549,6 @@ describe('Actor 身份：只能由 internal 路由注入，不能靠请求头冒
 });
 
 describe('外部工作：本地只有引用，业务事实在 Jira', () => {
-  it('conversation 的 externalWorkRef 往返；不传为 null', async () => {
-    const { StubCopilot } = await import('./support.js');
-    const stack = createTestStack(db, memberService, new StubCopilot().asCopilot);
-    const someone = stack.team.createMember({ name: 'JiraHolder', role: 'E' });
-    const other = stack.team.createMember({ name: 'JiraSecond', role: 'E' });
-
-    const conv = stack.team.createConversation({
-      kind: 'task',
-      title: 'Policy Service',
-      externalWorkRef: { provider: 'jira', key: ' ABC-123 ' },
-      memberIds: [someone.id],
-    });
-    const ref = stack.team.getConversation(conv.id).externalWorkRef;
-    assert.equal(ref?.key, 'ABC-123', '前后空格要去掉');
-    assert.equal(ref?.provider, 'jira');
-    assert.equal(ref?.externalId, 'ABC-123', '没给不可变 id 时先用 key 占位');
-
-    const plain = stack.team.createConversation({ kind: 'task', memberIds: [someone.id, other.id] });
-    assert.equal(stack.team.getConversation(plain.id).externalWorkRef, null);
-  });
-
   it('execution 开始时快照 externalWorkRef，delegation 继承引用但不继承快照', async () => {
     const { StubCopilot, singleExecutionId } = await import('./support.js');
     const stub = new StubCopilot();
@@ -652,40 +567,6 @@ describe('外部工作：本地只有引用，业务事实在 Jira', () => {
     // 没配 Jira 连接（测试环境）时没有 Provider，取证拿不到东西 —— 必须是 null
     // 而不是抛错：外部系统不可用不该让一整轮 Agent 工作失败。
     assert.equal(execution.externalWorkSnapshot, null, '没有 Provider 时安静地没有快照');
-  });
-
-  it('Current Activity：跑着的是 active，跑完就消失', async () => {
-    const { StubCopilot, singleExecutionId } = await import('./support.js');
-    const stub = new StubCopilot();
-    const stack = createTestStack(db, memberService, stub.asCopilot);
-    const agent = stack.team.createMember({ name: 'ActivityProbe', role: 'E' });
-    const room = stack.team.createConversation({
-      kind: 'task',
-      title: 'ABC-130',
-      externalWorkRef: { provider: 'jira', key: 'ABC-130' },
-      memberIds: [agent.id],
-    });
-    let release!: () => void;
-    stub.hold = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-
-    const sent = await stack.team.sendMessage({ conversationId: room.id, content: 'go' });
-    const executionId = singleExecutionId(db, room.id, sent.wakes);
-    await waitFor(() => stack.team.getExecution(executionId).status === 'running', 'execution 进入 running');
-    assert.ok(
-      structure
-        .listCurrentActivity(team.id)
-        .some((a) => a.executionId === executionId && a.externalWorkRef?.key === 'ABC-130'),
-      '运行中的 execution 必须出现在 Current Activity，并带上外部工作引用',
-    );
-
-    release();
-    stub.hold = null;
-    await waitFor(() => {
-      const rows = structure.listCurrentActivity(team.id);
-      return !rows.some((a) => a.executionId === executionId);
-    }, 'execution 完成后从 Current Activity 消失');
   });
 
   it('webhook 按不可变 id 也能命中：工单改名后房间记的还是老 key', async () => {

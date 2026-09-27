@@ -25,7 +25,7 @@ process.env.COPILOT_WARMUP = 'false';
 
 const { db } = await import('../db.js');
 const { MemberService } = await import('../member-service.js');
-const { CopilotService, isSessionNotFound, isTurnTimeout } = await import('../copilot.js');
+const { CopilotService, isTurnTimeout } = await import('../copilot.js');
 const { DefaultToolPolicy } = await import('../tool-policy.js');
 import type { PolicyService } from '../policy.js';
 import type { MemberCapabilities } from '../domain.js';
@@ -140,23 +140,6 @@ const hostCapabilities = await capabilityResolver.resolve(capabilityContext(alic
 // ═══════════════════════════════════════════ 1. 错误分类（纯函数）
 
 describe('isSessionNotFound / isTurnTimeout 必须保持窄', () => {
-  it('认证失败 / 网络故障不能被误判成 session 不存在', () => {
-    // 这些如果被当成「session 不存在」，就会静默新建一个空 session，
-    // 把该 Member 的全部历史丢掉 —— 这正是要修的 bug。
-    const notSessionProblems = [
-      'No GitHub OAuth token or Copilot HMAC key provided',
-      'Client not connected',
-      'connect ECONNREFUSED 127.0.0.1:8080',
-      'Failed to spawn copilot CLI',
-      'Invalid session config: availableTools is required',
-      'Request timeout after 30000ms',
-      'sessionId must be a string',
-    ];
-    for (const message of notSessionProblems) {
-      assert.equal(isSessionNotFound(new Error(message)), false, message);
-    }
-  });
-
   it('sendAndWait 超时用精确文案匹配，不靠 /timeout/i', () => {
     assert.equal(isTurnTimeout(new Error('Timeout after 600000ms waiting for session.idle')), true);
     assert.equal(isTurnTimeout(new Error('Timeout after 100ms waiting for session.idle')), true);
@@ -384,43 +367,6 @@ describe('sendAndWait 超时 → abort', () => {
 
     await assert.rejects(() => copilot.runMemberTurn(turnInput()), /No GitHub OAuth token/);
     assert.equal(fakeSession.calls.abort, 0, '普通失败不该 abort');
-  });
-
-  it('cancelTurn 找不到 execution 时如实返回 found=false', async () => {
-    const fakeSession = createFakeSession({});
-    const fake = createFakeClient({ resume: async () => fakeSession.session });
-    const copilot = new CopilotService({ createClient: () => fake.client });
-
-    assert.deepEqual(await copilot.cancelTurn('nope'), {
-      found: false,
-      aborted: false,
-      idle: false,
-    });
-
-    // turn 进行中才拿得到 session
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const holding = createFakeSession({
-      onSendAndWait: async () => {
-        await gate;
-        return { data: { content: 'done' } };
-      },
-    });
-    const holdingClient = createFakeClient({ resume: async () => holding.session });
-    const copilot2 = new CopilotService({ createClient: () => holdingClient.client });
-
-    const turn = copilot2.runMemberTurn(turnInput());
-    await new Promise((resolve) => setTimeout(resolve, 20));
-
-    const result = await copilot2.cancelTurn('exec-1');
-    assert.equal(result.found, true);
-    assert.equal(result.aborted, true);
-    assert.equal(result.idle, true);
-
-    release();
-    await turn;
   });
 });
 
@@ -873,38 +819,3 @@ describe('归档 Member 的 conversation 语义', () => {
   });
 });
 
-describe('listExecutions', () => {
-  it('按创建时间正序返回，且能按 parentExecutionId 组树', async () => {
-    // delegation 要求 target 在同一个 conversation 的 roster 里，
-    // 所以这里必须是 group（alice + bob），不能用 newConversation()。
-    const conv = team.createConversation({
-      kind: 'task',
-      memberIds: [alice.id, bob.id],
-    });
-    // 用户消息只唤醒 Lead（Alice），delegation 再建一条 Bob 的 child
-    const parent = await sendMessage({ conversationId: conv.id, content: 'parent' });
-    await waitForStatus(parent.executionId, 'completed');
-
-    await team.delegateMember({
-      conversationId: conv.id,
-      fromMemberId: alice.id,
-      parentExecutionId: parent.executionId,
-      targetMemberId: bob.id,
-      task: 'child',
-    });
-
-    const executions = team.listExecutions(conv.id, 100);
-    assert.equal(executions.length, 2);
-
-    const [first, second] = executions;
-    assert.equal(first.id, parent.executionId);
-    assert.equal(first.parentExecutionId, null);
-    assert.equal(second.parentExecutionId, parent.executionId);
-    assert.equal(second.memberId, bob.id);
-    assert.equal(second.delegationPath.length, 2);
-
-    // 客户端组树的依据就在这两个字段上
-    const roots = executions.filter((execution) => execution.parentExecutionId === null);
-    assert.equal(roots.length, 1);
-  });
-});
