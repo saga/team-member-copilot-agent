@@ -5,7 +5,7 @@ import { CurrentWorkSection } from './TeamSections';
 import { ScheduleSection } from './ScheduleSection';
 
 /**
- * Team 管理面：工作面只管聊天，这里管「这个 Team 是什么样」。
+ * Team 管理面：工作面只管理 Task 工作区，这里管「这个 Team 是什么样」。
  *
  * 三个页签各管一件事 —— 成员是谁、正在跑什么、定时了什么。
  * Capabilities 不在这里，它在 Settings。

@@ -1,4 +1,5 @@
 import type { Conversation } from '../../lib/api';
+import { CONVERSATION_STATUS_TEXT } from './constants';
 
 interface ConversationListProps {
   conversations: Conversation[];
@@ -9,12 +10,16 @@ interface ConversationListProps {
 }
 
 /**
- * 副标题：成员 + Jira。
+ * 副标题：进度 + 成员 + Jira。
  */
 function rowMeta(conversation: Conversation) {
   const names = conversation.members.map((m) => m.name).join(' · ');
   const key = conversation.externalWorkRef?.key;
-  return key ? `${key} · ${names}` : names;
+  const progress =
+    conversation.taskProgress.total > 0
+      ? `${conversation.taskProgress.completed}/${conversation.taskProgress.total}`
+      : null;
+  return [progress, key, names].filter(Boolean).join(' · ');
 }
 
 const STATUS_ORDER: Record<string, number> = {
@@ -66,7 +71,9 @@ export function ConversationList({ conversations, selectedId, onSelect, search }
             >
               <div className="conversation-item-title">
                 <span className="conversation-item-name">{conversation.title}</span>
-                <span className="conversation-item-badge">{conversation.status}</span>
+                <span className="conversation-item-badge">
+                  {CONVERSATION_STATUS_TEXT[conversation.status] ?? conversation.status}
+                </span>
               </div>
               <div className="conversation-item-meta">{rowMeta(conversation)}</div>
             </div>

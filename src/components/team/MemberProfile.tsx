@@ -16,7 +16,7 @@ type TabKey = 'profile' | 'memory' | 'team' | 'skills';
 
 /**
  * Member 的详情抽屉。用 Drawer 而不用 Modal：这是「对象详情」，
- * 不是一次性对话框 —— 用户会开着它对照聊天内容改。
+ * 不是一次性对话框 —— 用户会开着它对照工作区内容改。
  *
  * 四个页签对应 Member 模型的四块：
  *

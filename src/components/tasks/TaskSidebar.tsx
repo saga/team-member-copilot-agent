@@ -4,7 +4,7 @@ import { PlusOutlined, SearchOutlined } from '@ant-design/icons';
 import type { Conversation } from '../../lib/api';
 import { ConversationList } from '../team/ConversationList';
 
-interface ConversationSidebarProps {
+interface TaskSidebarProps {
   conversations: Conversation[];
   selectedConversationId: string | null;
   onSelectConversation: (conversationId: string) => void;
@@ -12,27 +12,26 @@ interface ConversationSidebarProps {
 }
 
 /**
- * 工作区第二列：只装工作区。
+ * 工作区第二列：只装 Task 工作区。
  *
- * 这里只允许出现 Search、Tasks 分组、New task。创建表单不在这里 ——
+ * 这里只允许出现搜索、Tasks 分组、New task。创建表单不在这里 ——
  * 按钮只负责打开挂在页面根部的 Modal。
  */
-export function ConversationSidebar({
+export function TaskSidebar({
   conversations,
   selectedConversationId,
   onSelectConversation,
   onNewTask,
-}: ConversationSidebarProps) {
+}: TaskSidebarProps) {
   const [search, setSearch] = useState('');
 
   return (
     <div style={{ padding: 8, display: 'flex', flexDirection: 'column', height: '100%' }}>
-      {/* 这一列装的全是会话，不再放「Conversations」总标题 ——
-          它和第一个分区头 Discussions 撞名，看着像上下级却说不清；分区头才承载类型信息。 */}
+      {/* 这一列装的全是 Task 工作区，不放总标题 —— 分区头才承载类型信息。 */}
       <Input
         allowClear
         size="small"
-        placeholder="Search"
+        placeholder="搜索任务"
         prefix={<SearchOutlined style={{ color: '#bbb' }} />}
         value={search}
         onChange={(e) => setSearch(e.target.value)}

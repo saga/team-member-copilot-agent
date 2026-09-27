@@ -19,11 +19,12 @@ interface MemberManagerProps {
 }
 
 /**
- * Discussion 的 Participants 抽屉：加人 / 移人 / 静音。
+ * 工作区的 Participants 抽屉：加人 / 移人 / 静音。
  *
  * 约束在 UI 上也表达出来，而不是只在点下去之后等后端报错：
- * Task 工作区 至少要两个成员。后端 `assertConversationKindShape()` 会拦，但把
- * 「移出」按钮留在那里让人点、再弹一个 400，是最差的交互。
+ * Task 工作区 1~20 个成员；任务开始后（running / blocked / completed /
+ * cancelled）roster 冻结，加人和移人按钮直接禁用。后端同样会拦，但把
+ * 按钮留在那里让人点、再弹一个错误，是最差的交互。
  * 归档的 Member 保留在 roster 里（历史事实），但不能被重新加进来。
  */
 export function MemberManager({
@@ -45,6 +46,9 @@ export function MemberManager({
 
   // 移出后 roster 必须仍是合法 Task 工作区（≥ 1）
   const removeDisabled = conversation.members.length <= 1;
+  // 任务开始后 roster 冻结：只有准备中 / 等待补充时能增删成员。
+  const rosterFrozen =
+    conversation.status !== 'intake' && conversation.status !== 'waiting_user';
 
   async function run(memberId: string, action: () => Promise<void>) {
     setBusyMemberId(memberId);
@@ -125,13 +129,15 @@ export function MemberManager({
                     danger
                     onClick={() => remove(member.id)}
                     loading={busy}
-                    disabled={removeDisabled || hasWork}
+                    disabled={removeDisabled || hasWork || rosterFrozen}
                     title={
-                      removeDisabled
-                        ? 'Discussion 至少需要两个成员'
-                        : hasWork
-                          ? `${member.name} 还有未完成的工作，等它跑完或先取消对应的 execution`
-                          : `移出 ${member.name}`
+                      rosterFrozen
+                        ? '任务已经开始，不能修改成员'
+                        : removeDisabled
+                          ? 'Task 工作区至少保留一个成员'
+                          : hasWork
+                            ? `${member.name} 还有未完成的工作，等它跑完或先取消对应的 execution`
+                            : `移出 ${member.name}`
                     }
                   >
                     Remove
@@ -149,15 +155,20 @@ export function MemberManager({
           onChange={(value) => {
             if (value) add(value);
           }}
-          disabled={addable.length === 0}
-          placeholder={addable.length === 0 ? '没有可加入的成员' : 'Add member…'}
+          disabled={addable.length === 0 || rosterFrozen}
+          placeholder={
+            rosterFrozen ? '任务已经开始，不能修改成员' : addable.length === 0 ? '没有可加入的成员' : 'Add member…'
+          }
           style={{ minWidth: 240 }}
           options={addable.map((member) => ({ value: member.id, label: `${member.name} · ${member.role}` }))}
         />
       </div>
 
-      {removeDisabled && (
-        <Alert type="info" showIcon message="Discussion 至少保留两个成员；要变单聊请直接和该成员开一个会话。" style={{ marginTop: 8 }} />
+      {rosterFrozen && (
+        <Alert type="info" showIcon message="任务已经开始，成员不能再变：要换人请新建一个工作区。" style={{ marginTop: 8 }} />
+      )}
+      {removeDisabled && !rosterFrozen && (
+        <Alert type="info" showIcon message="Task 工作区至少保留一个成员。" style={{ marginTop: 8 }} />
       )}
       {error && <Alert type="error" showIcon message={error} style={{ marginTop: 8 }} />}
     </Drawer>

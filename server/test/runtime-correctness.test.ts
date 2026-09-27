@@ -862,8 +862,10 @@ describe('归档 Member 的 conversation 语义', () => {
         () => team.createConversation({ kind: 'task', memberIds: [bob.id] }),
         /已归档/,
       );
-      // 5) 也不能被加进已有工作区
-      assert.throws(() => team.addMember(conv.id, bob.id), /已归档/);
+      // 5) 也不能被加进已有工作区（用新建的 intake 工作区：running 的工作区
+      //    roster 已冻结，会先报「不能修改成员」而不是「已归档」）
+      const fresh = team.createConversation({ kind: 'task', memberIds: [alice.id] });
+      assert.throws(() => team.addMember(fresh.id, bob.id), /已归档/);
     } finally {
       team.updateMember(bob.id, { status: 'active' });
     }

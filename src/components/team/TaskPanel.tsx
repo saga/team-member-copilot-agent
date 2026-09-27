@@ -1,5 +1,6 @@
-import { Button, Space, Tag, Typography } from 'antd';
+import { Button, Progress, Space, Tag, Typography } from 'antd';
 import type { Conversation, ConversationTask } from '../../lib/api';
+import { TASK_STATUS_TEXT } from './constants';
 
 interface TaskPanelProps {
   conversation: Conversation;
@@ -30,7 +31,10 @@ const STATUS_ICON: Record<ConversationTask['status'], string> = {
 };
 
 /**
- * 工作区左侧：目标 + 任务列表 + 进展。
+ * 工作区左侧：目标 + 进度 + 任务列表。
+ *
+ * 只读：不编辑标题、不改依赖、不拖拽排序、不改执行人。Task 的正常变更路径
+ * 是 Lead 的 plan（仅一次）和执行人的 update_task，这里只有 Retry / Cancel。
  *
  * 不拆成五六个小组件：第一版一个文件够了，第二个调用方出现时再抽。
  */
@@ -71,6 +75,15 @@ export function TaskPanel({ conversation, tasks, memberLabel, onRetryTask, onCan
         )}
       </div>
 
+      {tasks.length > 0 && (
+        <Progress
+          percent={Math.round((done / tasks.length) * 100)}
+          size="small"
+          showInfo={false}
+          style={{ marginBottom: 0 }}
+        />
+      )}
+
       {tasks.length === 0 && (
         <Typography.Text type="secondary" style={{ fontSize: 12 }}>
           还没有任务。Lead 确认目标后会在这里列出任务并自动开始。
@@ -94,7 +107,9 @@ export function TaskPanel({ conversation, tasks, memberLabel, onRetryTask, onCan
             </Space>
             <div style={{ marginTop: 2 }}>
               <Space size={4}>
-                <Tag color={STATUS_COLOR[task.status]}>{task.status}</Tag>
+                <Tag color={STATUS_COLOR[task.status]}>
+                  {TASK_STATUS_TEXT[task.status] ?? task.status}
+                </Tag>
                 <Tag>{memberLabel(task.assigneeMemberId)}</Tag>
               </Space>
             </div>

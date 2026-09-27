@@ -108,6 +108,17 @@ export class TaskService {
     rosterMemberIds: string[];
     leadMemberId: string | null;
   }): ConversationTask[] {
+    // plan 只允许一次：已有任务时直接拒绝，而不是删掉重建 —— 重建会破坏
+    // Task 历史、Execution 关联以及正在执行的任务。
+    if (this.list(input.conversationId).length > 0) {
+      throw badRequest('这个工作区已经存在任务，不能重新创建任务计划');
+    }
+    const convRow = this.db.prepare(`SELECT status FROM conversation WHERE id = ?`).get(input.conversationId) as
+      | { status: ConversationStatus }
+      | undefined;
+    if (convRow && convRow.status !== 'intake' && convRow.status !== 'waiting_user') {
+      throw badRequest('任务已经开始，不能重新创建任务计划');
+    }
     const objective = input.objective.trim();
     if (!objective) throw badRequest('这次工作的目标不能为空');
     if (input.tasks.length === 0) throw badRequest('任务列表不能为空');
@@ -143,8 +154,7 @@ export class TaskService {
     const idByKey = new Map(input.tasks.map((task) => [task.key.trim(), randomUUID()]));
     this.db.exec('BEGIN');
     try {
-      // 已有任务全部清掉：plan 是 Lead 对整项工作的重新规划，不是增量追加。
-      this.db.prepare(`DELETE FROM conversation_task WHERE conversation_id = ?`).run(input.conversationId);
+      // plan 只允许一次（入口已拒绝已有任务），这里直接插入，不删旧行。
       input.tasks.forEach((task, index) => {
         const row: TaskRow = {
           id: idByKey.get(task.key.trim())!,
@@ -282,9 +292,14 @@ export class TaskService {
     if (task.status !== 'failed' && task.status !== 'blocked' && task.status !== 'cancelled') {
       throw badRequest(`这个任务当前是 ${task.status}，不需要重试`);
     }
+    // 依赖没好时重试只会立刻再卡住：先让调用方处理依赖任务。
+    if (!this.dependenciesCompleted(task)) {
+      throw badRequest('任务依赖尚未完成，不能重试：请先处理它依赖的任务');
+    }
     this.db
       .prepare(`UPDATE conversation_task SET status = 'ready', blocker = NULL, updated_at = ? WHERE id = ?`)
       .run(now(), taskId);
+    this.recomputeConversationStatus(task.conversationId);
     return this.get(taskId);
   }
 
@@ -297,7 +312,7 @@ export class TaskService {
     return this.get(taskId);
   }
 
-  /** 依赖全部 completed 的 pending 任务变成 ready。返回新变 ready 的任务。 */
+  /** 依赖全部 completed 的 pending 任务变成 ready；依赖有失败/阻塞/取消的变成 blocked。返回新变 ready 的任务。 */
   refreshReady(db: DatabaseSync = this.db, conversationId?: string): ConversationTask[] {
     const scope = conversationId ?? '';
     const rows = (scope
@@ -306,7 +321,17 @@ export class TaskService {
     const ready: ConversationTask[] = [];
     for (const row of rows) {
       const task = mapTask(row);
-      if (this.dependenciesCompleted(task)) {
+      const depStates = this.dependencyStates(db, task);
+      if (depStates === 'failed') {
+        // 依赖里有 failed / blocked / cancelled：下游不会再就绪，直接标 blocked，
+        // 否则它会永久 pending，而工作区一直停在 running。
+        const bad = this.dependencyStatusList(db, task).find((s) => s !== 'completed') ?? 'failed';
+        db.prepare(`UPDATE conversation_task SET status = 'blocked', blocker = ?, updated_at = ? WHERE id = ?`).run(
+          `依赖的任务没有完成（${bad}），等它处理完后重试这个任务`,
+          now(),
+          task.id,
+        );
+      } else if (depStates === 'completed') {
         db.prepare(`UPDATE conversation_task SET status = 'ready', updated_at = ? WHERE id = ?`).run(now(), task.id);
         ready.push({ ...task, status: 'ready' });
       }
@@ -330,24 +355,52 @@ export class TaskService {
       .prepare(`SELECT status FROM conversation_task WHERE conversation_id = ?`)
       .all(conversationId) as unknown as Array<{ status: ConversationTaskStatus }>;
     if (rows.length === 0) return null;
-    const open = rows.filter((row) => ['pending', 'ready', 'running', 'blocked'].includes(row.status));
     const timestamp = now();
-    if (open.length === 0) {
-      this.db.prepare(`UPDATE conversation SET status = 'completed', updated_at = ? WHERE id = ?`).run(timestamp, conversationId);
-      return 'completed';
-    }
-    if (rows.some((row) => row.status === 'blocked')) {
-      this.db.prepare(`UPDATE conversation SET status = 'blocked', updated_at = ? WHERE id = ?`).run(timestamp, conversationId);
-      return 'blocked';
-    }
-    const current = this.db.prepare(`SELECT status FROM conversation WHERE id = ?`).get(conversationId) as
-      | { status: ConversationStatus }
-      | undefined;
-    if (current && (current.status === 'completed' || current.status === 'blocked' || current.status === 'intake' || current.status === 'waiting_user')) {
+    // failed 也是未解决：把它漏掉会让「全部失败」的工作区变成 completed。
+    const runnable = rows.some((row) => ['pending', 'ready', 'running'].includes(row.status));
+    if (runnable) {
       this.db.prepare(`UPDATE conversation SET status = 'running', updated_at = ? WHERE id = ?`).run(timestamp, conversationId);
       return 'running';
     }
-    return current?.status ?? null;
+    if (rows.some((row) => row.status === 'blocked' || row.status === 'failed')) {
+      this.db.prepare(`UPDATE conversation SET status = 'blocked', updated_at = ? WHERE id = ?`).run(timestamp, conversationId);
+      return 'blocked';
+    }
+    if (rows.every((row) => row.status === 'completed')) {
+      this.db.prepare(`UPDATE conversation SET status = 'completed', updated_at = ? WHERE id = ?`).run(timestamp, conversationId);
+      return 'completed';
+    }
+    if (rows.every((row) => row.status === 'cancelled')) {
+      this.db.prepare(`UPDATE conversation SET status = 'cancelled', updated_at = ? WHERE id = ?`).run(timestamp, conversationId);
+      return 'cancelled';
+    }
+    // 混合终态（completed + cancelled）：没有可做的了，按完成收敛。
+    this.db.prepare(`UPDATE conversation SET status = 'completed', updated_at = ? WHERE id = ?`).run(timestamp, conversationId);
+    return 'completed';
+  }
+
+  /**
+   * 依赖状态三态：'completed' 全完成、'failed' 有失败/阻塞/取消、'waiting' 还有未完成的。
+   * 缺失的依赖行按未完成处理 —— 宁可等，也不要对着不存在的任务放行。
+   */
+  private dependencyStates(db: DatabaseSync, task: ConversationTask): 'completed' | 'failed' | 'waiting' {
+    if (task.dependencies.length === 0) return 'completed';
+    const states = this.dependencyStatusList(db, task);
+    if (states.length !== task.dependencies.length) return 'waiting';
+    if (states.some((s) => s === 'failed' || s === 'blocked' || s === 'cancelled')) return 'failed';
+    if (states.every((s) => s === 'completed')) return 'completed';
+    return 'waiting';
+  }
+
+  private dependencyStatusList(db: DatabaseSync, task: ConversationTask): string[] {
+    if (task.dependencies.length === 0) return [];
+    const placeholders = task.dependencies.map(() => '?').join(',');
+    const rows = db
+      .prepare(
+        `SELECT status FROM conversation_task WHERE conversation_id = ? AND id IN (${placeholders})`,
+      )
+      .all(task.conversationId, ...task.dependencies) as unknown as Array<{ status: string }>;
+    return rows.map((row) => row.status);
   }
 
   private dependenciesCompleted(task: ConversationTask): boolean {

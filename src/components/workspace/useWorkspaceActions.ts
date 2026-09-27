@@ -11,7 +11,7 @@ export interface WorkspaceActionDeps {
   setInput: (value: string) => void;
   setBusy: (busy: boolean) => void;
   setError: (error: string | null) => void;
-  /** 建完房间后跳转落点（/chat/:id），由 Workspace 的路由 hook 提供。 */
+  /** 建完工作区后跳转落点（/tasks/:id），由 Workspace 的路由 hook 提供。 */
   navigate: (route: Route, options?: { replace?: boolean }) => void;
   /** 这条消息要带的文件（composer 上的 chip）。 */
   selectedFileIds: string[];
@@ -52,12 +52,11 @@ export function useWorkspaceActions(deps: WorkspaceActionDeps) {
       memberIds: input.memberIds,
       leadMemberId: input.leadMemberId,
       externalWorkRef: input.jiraKey ? { provider: 'jira', key: input.jiraKey } : null,
-    });
-    const created = result.conversation;
+    });    const created = result.conversation;
     data.upsertConversation(created);
     data.openConversation(created.id);
     deps.setNewTaskOpen(false);
-    deps.navigate({ view: 'chat', conversationId: created.id });
+    deps.navigate({ view: 'tasks', conversationId: created.id });
     data.setNotice('工作区建好了，在下面说清楚要达成什么，Lead 会先确认目标再规划任务。');
   }
 

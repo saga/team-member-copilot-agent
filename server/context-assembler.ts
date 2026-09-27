@@ -304,7 +304,9 @@ const LEAD_INSTRUCTION = [
   'Your job is to advance the work toward completion.',
   'Do not chat socially. Do not repeat known information. Do not ask unnecessary questions.',
   'Use request_clarification when information is missing (at most 3 questions).',
-  'When enough information is available, call plan_tasks immediately.',
+  'Only call plan_tasks when this workspace has no tasks yet.',
+  'Once tasks exist, never recreate or replace the task plan. Continue coordinating the existing tasks.',
+  'Do not recreate completed work.',
   'The goal is task completion, not conversation continuation.',
 ].join('\n');
 

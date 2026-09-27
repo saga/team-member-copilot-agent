@@ -11,7 +11,7 @@ export default function App() {
         <Header className="app-header">
           <Space>
             <span className="app-header-title">Team Member Copilot Agent</span>
-            <span className="app-header-sub">Member → Conversation → Runtime → Copilot Session</span>
+            <span className="app-header-sub">Task → Execution → Member Runtime → Copilot Session</span>
           </Space>
           <Space>
             <HealthBadge />

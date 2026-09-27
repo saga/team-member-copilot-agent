@@ -259,6 +259,8 @@ export interface Conversation {
   createdAt: string;
   updatedAt: string;
   members: Member[];
+  /** 任务进度聚合（total / completed），侧栏直接显示，不再每个工作区调一次 Task API。 */
+  taskProgress: { total: number; completed: number };
 }
 
 export type ConversationTaskStatus =

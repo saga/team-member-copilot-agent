@@ -3,7 +3,7 @@ import { Alert, Empty, Layout, Space, Tag, Typography } from 'antd';
 import type { Member } from '../lib/api';
 import { useRoute } from '../lib/router';
 import { ConversationHeader } from './team/ConversationHeader';
-import { ConversationMessages } from './team/ConversationMessages';
+import { ActivityFeed } from './team/ActivityFeed';
 import { TaskPanel } from './team/TaskPanel';
 import { ConversationFilesDrawer } from './team/ConversationFilesDrawer';
 import { ConversationFilePicker } from './team/ConversationFilePicker';
@@ -11,7 +11,7 @@ import { MessageComposer } from './team/MessageComposer';
 import { MemberProfile } from './team/MemberProfile';
 import { TeamManagement } from './team/TeamManagement';
 import { CapabilitySettings } from './team/CapabilitySettings';
-import { ConversationSidebar } from './chat/ConversationSidebar';
+import { TaskSidebar } from './tasks/TaskSidebar';
 import { WorkspaceNav } from './workspace/WorkspaceNav';
 import { TaskCreator } from './team/TaskCreator';
 import { ResizableSider } from './ResizableSider';
@@ -29,9 +29,9 @@ const { Content } = Layout;
  *
  * 三个面各管一层，互不掺和：
  *
- *   chat     —— 日常对话（第二列只有会话）
+ *   tasks    —— Task 工作区（第二列只有工作区列表）
  *   team     —— 成员 / Current Work / Automation
- *   settings —— Capabilities（Admin 面，不在聊天顶栏）
+ *   settings —— Capabilities（Admin 面，不在工作区顶栏）
  */
 export function Workspace() {
   /**
@@ -49,7 +49,7 @@ export function Workspace() {
   /**
    * 正在编辑档案的 Member。
    *
-   * 刻意和「进入单聊」分开：member row 上 Chat / Edit 是两个独立动作。
+   * 刻意和「进入工作区」分开：member row 上 New task / Edit 是两个独立动作。
    * 把二者塞进同一个 handler，会让「想改一下它的 system prompt」变成
    * 「顺手开了一个新会话」。编辑是瞬态模态，不进 URL。
    */
@@ -134,7 +134,7 @@ export function Workspace() {
   // 先到、roster 后到，提前打开没有意义。路由指明的会话不存在（过期链接）就
   // 停在空态，不报错也不瞎猜一个会话。
   useEffect(() => {
-    if (route.view !== 'chat' || conversations.length === 0) return;
+    if (route.view !== 'tasks' || conversations.length === 0) return;
     if (route.conversationId && !conversations.some((item) => item.id === route.conversationId)) {
       return;
     }
@@ -143,25 +143,25 @@ export function Workspace() {
     }
   }, [route, conversations, conversationId, openConversation]);
 
-  // 默认落点：首次加载时 URL 没指明会话（/ 或 /chat），自动落到第一个会话并把
+  // 默认落点：首次加载时 URL 没指明工作区（/ 或 /tasks），自动落到第一个工作区并把
   // 地址补全（replace，不塞历史）。只做这一次，之后选会话永远是用户说了算。
   useEffect(() => {
-    if (bootstrappedRef.current || view !== 'chat' || conversations.length === 0) return;
+    if (bootstrappedRef.current || view !== 'tasks' || conversations.length === 0) return;
     bootstrappedRef.current = true;
     if (!route.conversationId) {
-      navigate({ view: 'chat', conversationId: conversations[0].id }, { replace: true });
+      navigate({ view: 'tasks', conversationId: conversations[0].id }, { replace: true });
     }
   }, [view, route, conversations, navigate]);
 
   /** 用户点侧栏切会话：立即打开并写入历史（后退可以回到上一个会话）。 */
   function selectConversation(id: string) {
     openConversation(id);
-    navigate({ view: 'chat', conversationId: id });
+    navigate({ view: 'tasks', conversationId: id });
   }
 
   /**
    * 从 Member 行进 Settings：落在「这个人」的增量能力上。
-   * Settings 是 Admin 面，入口在管理面和小菜单，不在聊天顶栏。
+   * Settings 是 Admin 面，入口在管理面和小菜单，不在工作区顶栏。
    */
   function manageMemberCapabilities(member: Member) {
     navigate({ view: 'settings', scope: 'member', memberId: member.id });
@@ -172,8 +172,8 @@ export function Workspace() {
       <WorkspaceNav
         view={view}
         onChange={(next) => {
-          if (next === 'chat') {
-            navigate({ view: 'chat', conversationId });
+          if (next === 'tasks') {
+            navigate({ view: 'tasks', conversationId });
           } else if (next === 'team') {
             navigate({ view: 'team' });
           } else {
@@ -182,9 +182,9 @@ export function Workspace() {
         }}
       />
 
-      {view === 'chat' && (
+      {view === 'tasks' && (
         <ResizableSider>
-          <ConversationSidebar
+          <TaskSidebar
             conversations={conversations}
             selectedConversationId={conversationId}
             onSelectConversation={selectConversation}
@@ -237,18 +237,18 @@ export function Workspace() {
               onTargetChange={(scope, memberId) =>
                 navigate({ view: 'settings', scope, memberId }, { replace: true })
               }
-              onClose={() => navigate({ view: 'chat', conversationId })}
+              onClose={() => navigate({ view: 'tasks', conversationId })}
             />
           </div>
         )}
 
-        {view === 'chat' && !selectedConversation && (
+        {view === 'tasks' && !selectedConversation && (
           <Content style={{ display: 'grid', placeItems: 'center', color: '#999' }}>
-            <Empty description="先选择一个 Team Member" />
+            <Empty description="先在左边选一个工作区，没有就新建一个" />
           </Content>
         )}
 
-        {view === 'chat' && selectedConversation && (
+        {view === 'tasks' && selectedConversation && (
           <Content style={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>
             <ConversationHeader
               conversation={selectedConversation}
@@ -293,9 +293,9 @@ export function Workspace() {
               )}
               <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
                 <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                  动态
+                  活动
                 </Typography.Text>
-                <ConversationMessages
+                <ActivityFeed
                   conversation={selectedConversation}
                   messages={messages}
                   streaming={streaming}
@@ -361,7 +361,7 @@ export function Workspace() {
           conversationId={selectedConversation.id}
           files={conversationFiles}
           busy={busy}
-          onUseInChat={(file) => {
+          onAttachFile={(file) => {
             if (!selectedFileIds.includes(file.id)) {
               setSelectedFileIds((current) => [...current, file.id]);
             }

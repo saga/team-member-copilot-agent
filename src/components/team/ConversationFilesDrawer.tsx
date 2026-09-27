@@ -10,21 +10,21 @@ interface ConversationFilesDrawerProps {
   conversationId: string;
   files: ConversationFile[];
   busy?: boolean;
-  onUseInChat: (file: ConversationFile) => void;
+  onAttachFile: (file: ConversationFile) => void;
   onUpload: (file: File) => void;
   onDelete: (file: ConversationFile) => void;
   onClose: () => void;
 }
 
 /**
- * Shared Files：这个会话里共享了哪些文件。
+ * Shared Files：这个工作区里共享了哪些文件。
  *
  * 它和 Capabilities 里的 Knowledge 页签是**两个问题**，刻意不合并：
  *
- *   Shared Files —— 这场对话里有什么（ACL = 会话成员，随聊天存续）
+ *   Shared Files —— 这次工作里有什么（ACL = 工作区成员，随工作区存续）
  *   Knowledge    —— 这个 Member 被授权能看哪些长期资料（ACL = 能力绑定）
  *
- * 混成一个界面，用户就会以为「上传到聊天」等于「进了公司知识库」，
+ * 混成一个界面，用户就会以为「上传文件」等于「进了公司知识库」，
  * 而这两件事中间隔着一个显式动作（保存到知识库）。
  */
 export function ConversationFilesDrawer({
@@ -32,7 +32,7 @@ export function ConversationFilesDrawer({
   conversationId,
   files,
   busy,
-  onUseInChat,
+  onAttachFile,
   onUpload,
   onDelete,
   onClose,
@@ -187,7 +187,7 @@ export function ConversationFilesDrawer({
                   file={file}
                   actions={
                     <Space direction="vertical" size={2} align="end">
-                      <Button size="small" onClick={() => onUseInChat(file)}>
+                      <Button size="small" onClick={() => onAttachFile(file)}>
                         在会话中引用
                       </Button>
                       <Button

@@ -13,7 +13,7 @@ import {
   type ExecutionStatus,
   type Member,
 } from '../../lib/api';
-import type { DelegationLog, StreamState } from '../team/ConversationMessages';
+import type { DelegationLog, StreamState } from '../team/ActivityFeed';
 import type { MemberStatus, MemberStatusLookup } from '../team/constants';
 
 /** 还在推进中的 execution 状态；到了其它状态就说明这条 execution 已经收尾。 */

@@ -610,6 +610,77 @@ MUTATIONS = [
             )
         ],
     },
+    {
+        "name": "plan 允许重复规划（第二次 plan 覆盖旧任务历史）",
+        "test": "server/test/task-service.test.ts",
+        "steps": [
+            (
+                "server/task-service.ts",
+                "    if (this.list(input.conversationId).length > 0) {\n      throw badRequest('这个工作区已经存在任务，不能重新创建任务计划');\n    }\n",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "failed 不算未解决（全部失败的工作区变成 completed）",
+        "test": "server/test/task-service.test.ts",
+        "steps": [
+            (
+                "server/task-service.ts",
+                "    if (rows.some((row) => row.status === 'blocked' || row.status === 'failed')) {",
+                "    if (rows.some((row) => row.status === 'blocked')) {",
+            )
+        ],
+    },
+    {
+        "name": "依赖失败不传染下游（B 永久 pending）",
+        "test": "server/test/task-service.test.ts",
+        "steps": [
+            (
+                "server/task-service.ts",
+                "    if (states.some((s) => s === 'failed' || s === 'blocked' || s === 'cancelled')) return 'failed';",
+                "    if (states.some((s) => s === 'failed' || s === 'blocked' || s === 'cancelled')) return 'waiting';",
+            )
+        ],
+    },
+    {
+        "name": "retry 不查依赖（上游没好也能重试下游）",
+        "test": "server/test/task-service.test.ts",
+        "steps": [
+            (
+                "server/task-service.ts",
+                "    if (!this.dependenciesCompleted(task)) {\n      throw badRequest('任务依赖尚未完成，不能重试：请先处理它依赖的任务');\n    }\n",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "完成的工作区继续收用户消息（已完成又被点燃）",
+        "test": "server/test/task-service.test.ts",
+        "steps": [
+            (
+                "server/team-service.ts",
+                "    if (conversation.status === 'completed' || conversation.status === 'cancelled') {\n      throw conflict('这个工作已经结束，不能再发消息：要继续做事请新建一个工作区');\n    }\n",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "任务开始后仍能增删成员（roster 随意变）",
+        "test": "server/test/task-service.test.ts",
+        "steps": [
+            (
+                "server/team-service.ts",
+                "    if (conversation.status !== 'intake' && conversation.status !== 'waiting_user') {\n      throw conflict('任务已经开始，不能修改成员');\n    }\n\n    const member = this.members.get(memberId);",
+                "\n    const member = this.members.get(memberId);",
+            ),
+            (
+                "server/team-service.ts",
+                "    if (conversation.status !== 'intake' && conversation.status !== 'waiting_user') {\n      throw conflict('任务已经开始，不能修改成员');\n    }\n\n    // 移出前必须没有在飞的活。",
+                "\n    // 移出前必须没有在飞的活。",
+            ),
+        ],
+    },
 ]
 
 

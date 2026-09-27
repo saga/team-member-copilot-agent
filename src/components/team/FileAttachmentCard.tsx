@@ -3,7 +3,7 @@ import { Button, Space, Tag, Tooltip } from 'antd';
 import type { ConversationFile } from '../../lib/api';
 import { api } from '../../lib/api';
 
-/** 文件大小：聊天里只需要一个量级，不需要精确到字节。 */
+/** 文件大小：列表里只需要一个量级，不需要精确到字节。 */
 export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;

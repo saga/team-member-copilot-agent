@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Collapse, Spin, Typography } from 'antd';
 import { api, type Conversation, type Member, type Team } from '../../lib/api';
+import { CONVERSATION_STATUS_TEXT } from './constants';
 
 /**
  * Member 视角的动态：参与过哪些 conversation、在哪些 Team 里。
@@ -71,7 +72,8 @@ export function MemberActivity({ member }: { member: Member }) {
                             {conversation.title}
                           </Typography.Text>
                           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                            {conversation.kind} · {new Date(conversation.updatedAt).toLocaleString()}
+                            {CONVERSATION_STATUS_TEXT[conversation.status] ?? conversation.status} ·{' '}
+                            {new Date(conversation.updatedAt).toLocaleString()}
                           </Typography.Text>
                         </div>
                       ))}

@@ -1,13 +1,13 @@
 import { Button, Tooltip } from 'antd';
-import { MessageOutlined, SettingOutlined, TeamOutlined } from '@ant-design/icons';
+import { SettingOutlined, TeamOutlined, UnorderedListOutlined } from '@ant-design/icons';
 
-export type WorkspaceView = 'chat' | 'team' | 'settings';
+export type WorkspaceView = 'tasks' | 'team' | 'settings';
 
 /**
  * 窄导航 Rail：工作面 / 管理面 / 设置的三选一。
  *
  * 只有三个固定入口，不随 Team 内容变化 —— 它回答「我现在在哪一层」，
- * 而第二列（会话列表 / 成员管理 / 能力配置）回答「这一层里看什么」。
+ * 而第二列（工作区列表 / 成员管理 / 能力配置）回答「这一层里看什么」。
  * 两层各管各的，左边就不会再同时出现 Members、Work、Schedules、
  * Conversations 四个不同层次的东西。
  */
@@ -19,7 +19,7 @@ export function WorkspaceNav({
   onChange: (view: WorkspaceView) => void;
 }) {
   const items: Array<{ key: WorkspaceView; label: string; icon: React.ReactNode }> = [
-    { key: 'chat', label: 'Chat', icon: <MessageOutlined /> },
+    { key: 'tasks', label: 'Tasks', icon: <UnorderedListOutlined /> },
     { key: 'team', label: 'Team', icon: <TeamOutlined /> },
     { key: 'settings', label: 'Settings', icon: <SettingOutlined /> },
   ];

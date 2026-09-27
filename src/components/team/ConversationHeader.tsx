@@ -3,7 +3,7 @@ import { Avatar, Badge, Button, Space, Tag, Tooltip, Typography } from 'antd';
 import { PaperClipOutlined, TeamOutlined } from '@ant-design/icons';
 import type { Conversation, ConversationMemberState, Member } from '../../lib/api';
 import { MemberManager } from './MemberManager';
-import { isMemberDm, type MemberStatusLookup } from './constants';
+import { CONVERSATION_STATUS_TEXT, isMemberDm, type MemberStatusLookup } from './constants';
 
 interface ConversationHeaderProps {
   conversation: Conversation;
@@ -47,7 +47,11 @@ export function ConversationHeader({
               {conversation.title}
             </Typography.Title>
 
-            {!isDm && <Tag color={conversation.status === 'completed' ? 'success' : 'processing'}>{conversation.status}</Tag>}
+            {!isDm && (
+              <Tag color={conversation.status === 'completed' ? 'success' : 'processing'}>
+                {CONVERSATION_STATUS_TEXT[conversation.status] ?? conversation.status}
+              </Tag>
+            )}
 
             {conversation.externalWorkRef?.key && (
               <Tag color="cyan">{conversation.externalWorkRef.key}</Tag>

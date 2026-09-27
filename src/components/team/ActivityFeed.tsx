@@ -18,7 +18,7 @@ export interface DelegationLog {
   status: 'running' | 'done' | 'error';
 }
 
-interface ConversationMessagesProps {
+interface ActivityFeedProps {
   conversation: Conversation;
   messages: ConversationMessage[];
   /** executionId → 正在流式产出的半截内容。 */
@@ -32,7 +32,7 @@ interface ConversationMessagesProps {
 }
 
 /**
- * 消息流（Ant Design X Bubble）。
+ * 工作进展流（Ant Design X Bubble）。
  *
  * 三类内容按角色分：user 靠右、member（ai）靠左、system 居中。
  * 流式回复单独渲染成一条 typing 气泡而不是追加到已有消息上 ——
@@ -40,8 +40,10 @@ interface ConversationMessagesProps {
  *
  * 附件跟消息一起渲染：附件是这条消息的一部分（「请评估这个方案」里的「这个」
  * 指的就是它），后置成一条独立的文件事件流会让人对不上是哪条消息在说它。
+ *
+ * 这里是「工作过程中发生了什么」，不是聊天：Member 消息头带上所属任务。
  */
-export function ConversationMessages({
+export function ActivityFeed({
   conversation,
   messages,
   streaming,
@@ -49,11 +51,11 @@ export function ConversationMessages({
   memberLabel,
   taskLabel,
   scrollRef,
-}: ConversationMessagesProps) {
+}: ActivityFeedProps) {
   void conversation;
   if (messages.length === 0 && Object.keys(streaming).length === 0) {
     return (
-      <div className="chat-scroll" ref={scrollRef}>
+      <div className="activity-scroll" ref={scrollRef}>
         <Empty description="说清楚要达成什么，Lead 会先确认目标再规划任务。整个工作过程都会记录在这里。" />
       </div>
     );
@@ -66,11 +68,6 @@ export function ConversationMessages({
       placement: (message.senderType === 'user' ? 'end' : 'start') as 'end' | 'start',
       content: (
         <>
-          {taskLabel(message.taskId) && (
-            <div style={{ fontSize: 12, color: '#999', marginBottom: 2 }}>
-              Task：{taskLabel(message.taskId)}
-            </div>
-          )}
           {message.content}
           {message.files.length > 0 && (
             <div className="message-files">
@@ -83,7 +80,9 @@ export function ConversationMessages({
       ),
       header:
         message.senderType === 'member'
-          ? memberLabel(message.senderId)
+          ? taskLabel(message.taskId)
+            ? `${memberLabel(message.senderId)} · ${taskLabel(message.taskId)}`
+            : memberLabel(message.senderId)
           : message.senderType === 'user'
             ? 'You'
             : 'System',
@@ -108,7 +107,7 @@ export function ConversationMessages({
   ];
 
   return (
-    <div className="chat-scroll" ref={scrollRef}>
+    <div className="activity-scroll" ref={scrollRef}>
       <Bubble.List items={items} />
       {delegations.length > 0 && (
         <Timeline

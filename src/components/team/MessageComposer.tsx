@@ -43,11 +43,16 @@ export function MessageComposer({
   onOpenFilePicker,
 }: MessageComposerProps) {
   const readOnly = isMemberDm(conversation);
+  // 结束的工作区不再接受输入：blocked / waiting / running 仍然可以补充信息，
+  // completed / cancelled 要做新工作就新建一个工作区。
+  const finished = conversation.status === 'completed' || conversation.status === 'cancelled';
   const [dragging, setDragging] = useState(false);
   void conversation.externalWorkRef;
   const placeholder = readOnly
     ? '这是 Member 之间的私聊，你可以旁观，但不能替他们发言。'
-    : '补充需求、回答澄清问题或调整当前任务…';
+    : finished
+      ? '这项工作已完成，要继续做事请新建一个工作区。'
+      : '补充需求、回答澄清问题或调整当前任务…';
 
   return (
     <div
@@ -78,7 +83,7 @@ export function MessageComposer({
         onChange={onChange}
         onSubmit={() => onSend()}
         loading={busy}
-        disabled={disabled || readOnly}
+        disabled={disabled || readOnly || finished}
         placeholder={placeholder}
         submitType="enter"
         prefix={

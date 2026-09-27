@@ -298,6 +298,13 @@ export class StubCopilot {
    */
   holdMemberIds: Set<string> | null = null;
   /**
+   * 这些 Member 的 turn 直接抛错，用来模拟引擎执行失败。
+   *
+   * 走正常 turn 永远落不到 `failed`：成功就 completed，取消就 cancelled。
+   * 要覆盖 Task failed → 下游 blocked → 工作区 blocked 这条链，必须让引擎真炸一次。
+   */
+  readonly failMemberIds = new Set<string>();
+  /**
    * 逐字符把回复喂给 `onDelta`，模拟真实引擎的流式输出。
    *
    * 必须显式打开：哨兵过滤（NoReplyStreamGate）只在流式路径上有意义 ——
@@ -335,6 +342,9 @@ export class StubCopilot {
     if (this.hold && (!this.holdMemberIds || this.holdMemberIds.has(input.member.id))) {
       await this.hold;
     }
+    if (this.failMemberIds.has(input.member.id)) {
+      throw new Error(`stub engine failure (${input.member.name})`);
+    }
 
     const reason = this.wakeReasonOf?.(input.executionId) ?? null;
     const skip =
@@ -355,6 +365,7 @@ export class StubCopilot {
     this.mode = 'reply';
     this.hold = null;
     this.holdMemberIds = null;
+    this.failMemberIds.clear();
     this.streamDeltas = false;
     this.skipMemberIds.clear();
     this.speakOnlyOnReasons = null;

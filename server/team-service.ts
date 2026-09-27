@@ -525,7 +525,22 @@ export class TeamService {
         `,
       )
       .all() as unknown as ConversationRow[];
-    return rows.map((row) => this.hydrateConversation(row));
+    // 一次聚合拿全列表的任务进度：每个工作区再调一次 Task API 是 N+1。
+    const progressRows = this.db
+      .prepare(
+        `
+        SELECT conversation_id AS conversation_id,
+               COUNT(*) AS total,
+               SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed
+        FROM conversation_task
+        GROUP BY conversation_id
+        `,
+      )
+      .all() as unknown as Array<{ conversation_id: string; total: number; completed: number }>;
+    const progress = new Map(
+      progressRows.map((row) => [row.conversation_id, { total: row.total, completed: row.completed }]),
+    );
+    return rows.map((row) => this.hydrateConversation(row, progress));
   }
 
   /**
@@ -695,6 +710,10 @@ export class TeamService {
     if (conversation.kind !== 'task') {
       throw badRequest('只有 Task 工作区允许增减成员');
     }
+    // 任务一旦开始，roster 就冻结：中途换人会让 Task 归属无法解释。
+    if (conversation.status !== 'intake' && conversation.status !== 'waiting_user') {
+      throw conflict('任务已经开始，不能修改成员');
+    }
 
     const member = this.members.get(memberId);
     if (member.status !== 'active') {
@@ -735,6 +754,9 @@ export class TeamService {
     if (conversation.kind !== 'task') {
       throw badRequest('只有 Task 工作区允许增减成员');
     }
+    if (conversation.status !== 'intake' && conversation.status !== 'waiting_user') {
+      throw conflict('任务已经开始，不能修改成员');
+    }
 
     // 移出前必须没有在飞的活。否则 scheduler 手里的那条 queued wake 会在
     // runWake 里撞上 requireActiveMember / requireConversationMember 抛错，
@@ -761,14 +783,15 @@ export class TeamService {
         UPDATE conversation
         SET
           lead_member_id = CASE
-            WHEN lead_member_id = ? THEN NULL
+            WHEN lead_member_id = ? THEN ?
             ELSE lead_member_id
           END,
           updated_at = ?
         WHERE id = ?
         `,
       )
-      .run(memberId, now(), conversationId);
+      // Lead 被移除时自动由剩下成员的第一个接替：Task 工作区不能没有 Lead。
+      .run(memberId, remaining[0]?.id ?? null, now(), conversationId);
 
     // 房间状态跟着 roster 一起走：人走了，它的读游标 / 唤醒状态也不该留下
     this.states.remove(conversationId, memberId);
@@ -844,6 +867,11 @@ export class TeamService {
     }
     if (conversation.kind !== 'task') {
       throw badRequest('只有 Task 工作区接受用户消息');
+    }
+    // 结束的工作区不再接受普通消息：已完成的工作不会被一句话重新点燃，
+    // 要做新工作就新建一个工作区。
+    if (conversation.status === 'completed' || conversation.status === 'cancelled') {
+      throw conflict('这个工作已经结束，不能再发消息：要继续做事请新建一个工作区');
     }
 
     const clientRequestId = input.clientRequestId?.trim() || null;
@@ -1121,6 +1149,7 @@ export class TeamService {
     const task = this.tasks.retry(taskId);
     this.emit(task.conversationId, { type: 'task.updated', data: task });
     this.orchestrator.startReadyTasks(task.conversationId);
+    this.emit(task.conversationId, { type: 'conversation.updated', data: this.getConversation(task.conversationId) });
     return this.tasks.get(taskId);
   }
 
@@ -1250,6 +1279,9 @@ export class TeamService {
     this.emit(conversation.id, { type: 'task.updated', data: updated });
     if (input.status === 'completed') {
       this.orchestrator.onTaskCompleted(updated.id);
+    } else if (input.status === 'blocked') {
+      // 阻塞要唤醒 Lead：否则没人知道这个任务卡住了。
+      this.orchestrator.onTaskBlocked(updated.id);
     } else {
       const status = this.tasks.recomputeConversationStatus(conversation.id);
       if (status) this.emit(conversation.id, { type: 'conversation.updated', data: this.getConversation(conversation.id) });
@@ -1375,6 +1407,10 @@ export class TeamService {
       ? this.findMessageBySequence(wake.conversationId, wake.triggerSequence)
       : null;
 
+    // retry 链：Task 当前挂的那条 execution 就是上一轮失败的运行，
+    // 新 execution 指回去，审计链不断。首次执行时为 null。
+    const retryOfExecutionId = task?.currentExecutionId ?? null;
+
     const execution: ExecutionRecord = {
       id: randomUUID(),
       conversationId: conversation.id,
@@ -1391,7 +1427,7 @@ export class TeamService {
       response: null,
       error: null,
       waitingForRuntimeId: null,
-      retryOfExecutionId: null,
+      retryOfExecutionId,
       decision: null,
       triggerMessageSequence: wake.triggerSequence,
       wakeReason: wake.reason,
@@ -1427,10 +1463,12 @@ export class TeamService {
       if (task) {
         const message = error instanceof Error ? error.message : String(error);
         const cancelled = error instanceof ExecutionCancelledError;
-        if (!cancelled) this.tasks.markFailed(task.id, message);
-        this.emit(task.conversationId, { type: 'task.updated', data: this.tasks.get(task.id) });
-        this.tasks.recomputeConversationStatus(task.conversationId);
-        this.emit(task.conversationId, { type: 'conversation.updated', data: this.getConversation(task.conversationId) });
+        if (!cancelled) {
+          this.tasks.markFailed(task.id, message);
+          this.orchestrator.onTaskChanged(task.id);
+        } else {
+          this.emit(task.conversationId, { type: 'task.updated', data: this.tasks.get(task.id) });
+        }
       }
       throw error;
     }
@@ -2496,9 +2534,10 @@ export class TeamService {
         // Agent 这一轮里没有显式改任务状态：turn 结束即任务完成，
         // turn 的回复就是任务结果。显式置 blocked / failed 的不受影响。
         this.tasks.markCompleted(taskAfterTurn.id, content || undefined);
-        this.orchestrator.onTaskCompleted(taskAfterTurn.id);
+        this.orchestrator.onTaskChanged(taskAfterTurn.id);
       } else if (taskAfterTurn && ['completed', 'failed', 'blocked', 'cancelled'].includes(taskAfterTurn.status)) {
-        this.orchestrator.onTaskCompleted(taskAfterTurn.id);
+        // Agent 已在 turn 内调 update_task 改了终态：按最新状态推进一次。
+        this.orchestrator.onTaskChanged(taskAfterTurn.id);
       } else if (taskAfterTurn && message) {
         this.emit(input.conversation.id, { type: 'task.updated', data: this.tasks.get(taskAfterTurn.id) });
       } else if (!taskAfterTurn && input.turnMode === 'lead') {
@@ -3163,7 +3202,10 @@ export class TeamService {
       .run(sequence, now(), conversationId, memberId);
   }
 
-  private hydrateConversation(row: ConversationRow): Conversation {
+  private hydrateConversation(
+    row: ConversationRow,
+    progress?: Map<string, { total: number; completed: number }>,
+  ): Conversation {
     // 刻意**不**过滤 m.status = 'active'。
     //
     // conversation_member / default_member_id / conversation_message / execution
@@ -3201,6 +3243,7 @@ export class TeamService {
       messageSequence: row.message_sequence,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
+      taskProgress: progress?.get(row.id) ?? this.taskProgressOf(row.id),
       members: memberRows.map((member) => ({
         id: member.id,
         handle: member.handle,
@@ -3216,6 +3259,21 @@ export class TeamService {
         updatedAt: member.updated_at,
       })),
     };
+  }
+
+  /** 单个工作区的任务进度：列表页走批量聚合，只有这里走单查。 */
+  private taskProgressOf(conversationId: string): { total: number; completed: number } {
+    const row = this.db
+      .prepare(
+        `
+        SELECT COUNT(*) AS total,
+               COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0) AS completed
+        FROM conversation_task
+        WHERE conversation_id = ?
+        `,
+      )
+      .get(conversationId) as unknown as { total: number; completed: number };
+    return { total: row.total, completed: row.completed };
   }
 
   private insertExecution(execution: ExecutionRecord): void {
