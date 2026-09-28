@@ -267,11 +267,41 @@ export function parseSelectorList(selector: string | undefined): Set<string> | n
  * 它是「解析」与「执行」之间唯一的中间物：引擎只拿到这个，看不到任何 Provider。
  * `manifestHash` 落在 execution 快照里，回答「这一轮到底用了哪个能力实现」。
  */
+/**
+ * 一轮生效的 MCP Server（定义的子集 + 本轮选中的工具）。
+ *
+ * 只带引擎需要的东西：连接字段进 sessionConfig，risk 进授权判定，
+ * version 进 manifest。secret（headers / env 的值）不进快照、不进日志。
+ */
+export interface RuntimeMcpServer {
+  id: string;
+  displayName: string;
+  type: 'local' | 'http' | 'sse';
+  url?: string;
+  headers?: Record<string, string>;
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  cwd?: string;
+  timeout?: number;
+  /** 本轮允许的工具（已排序，manifest 稳定）。 */
+  tools: string[];
+  toolPolicies: Record<string, ToolRisk>;
+  version: string;
+}
+
 export interface RuntimeCapabilities {
   skills: SkillArtifact[];
   knowledge: ResolvedKnowledgeBinding[];
   tools: RuntimeTool[];
+  mcpServers: RuntimeMcpServer[];
   /** 按名字索引，授权判定用它 —— 名字来自引擎，必须能反查到声明的性质。 */
   toolIndex: Map<string, RuntimeTool>;
+  /**
+   * MCP 工具的候选索引：别名 → 同名候选。SDK 的 wire 名（`github-search_code`）
+   * 只是其中一种，引擎实际报上来的名字按哪种写，取决于 SDK 版本 ——
+   * 所以一个工具挂多个别名，命中多个时按歧义拒绝。
+   */
+  mcpToolIndex: Map<string, RuntimeTool[]>;
   manifestHash: string;
 }

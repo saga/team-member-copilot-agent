@@ -846,6 +846,72 @@ MUTATIONS = [
             )
         ],
     },
+    {
+        "name": "MCP 未声明工具静默落空（配了个寂寞）",
+        "test": "server/test/mcp.test.ts",
+        "steps": [
+            (
+                "server/capabilities/resolver.ts",
+                "      for (const toolName of toolNames) {\n        if (!server.tools[toolName]) {\n          throw new Error(`MCP Server ${server.id} 不存在工具 ${toolName}：请检查授权绑定的 selector`);\n        }\n      }\n",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "MCP local 门禁移除（服务机器上随便起子进程）",
+        "test": "server/test/mcp.test.ts",
+        "steps": [
+            (
+                "server/mcp/registry.ts",
+                "    if (!options.allowLocal) {\n",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "MCP 允许 * 通配（将来新增的工具自动进授权）",
+        "test": "server/test/mcp.test.ts",
+        "steps": [
+            (
+                "server/mcp/registry.ts",
+                "    if (name === '*') {\n      throw new Error(`MCP Server ${server.id} 不能用 \"*\" 声明工具：必须显式列出每个工具（${filePath}）`);\n    }\n",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "MCP 重名工具猜一个执行（分不清调谁）",
+        "test": "server/test/mcp.test.ts",
+        "steps": [
+            (
+                "server/capabilities/copilot-adapter.ts",
+                "    if (candidates.length > 1) {\n",
+                "    if (candidates.length > 1 && false) {\n",
+            )
+        ],
+    },
+    {
+        "name": "manifest 不记 MCP 组成（用没用 GitHub 审计不出）",
+        "test": "server/test/mcp.test.ts",
+        "steps": [
+            (
+                "server/capabilities/resolver.ts",
+                "    mcpServers: [...mcpServers]\n      .sort(byKey((server) => server.id))\n",
+                "    mcpServers: [] as never[]\n      .sort(byKey((server: never) => server))\n",
+            )
+        ],
+    },
+    {
+        "name": "MCP 空 selector 不等于全部（绑了 server 却没工具）",
+        "test": "server/test/mcp.test.ts",
+        "steps": [
+            (
+                "server/capabilities/resolver.ts",
+                "      const toolNames = selected ? [...selected] : Object.keys(server.tools);\n",
+                "      const toolNames = selected ? [...selected] : [];\n",
+            )
+        ],
+    },
 ]
 
 

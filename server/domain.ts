@@ -46,6 +46,11 @@ export interface MemberCapabilities {
   skills: CapabilityBinding[];
   knowledge: CapabilityBinding[];
   tools: CapabilityBinding[];
+  /**
+   * MCP 授权绑定：`{ providerId: 'mcp.github', selector: 'search_code ...' }。
+   * 可选 —— 缺省等于没绑；定义（怎么连）只在 MCP registry 里，不在这里。
+   */
+  mcp?: CapabilityBinding[];
 }
 
 /**

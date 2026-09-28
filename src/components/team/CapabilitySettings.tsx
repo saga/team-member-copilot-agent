@@ -26,6 +26,7 @@ import {
 } from '@ant-design/icons';
 import {
   api,
+  type CatalogMcpServer,
   type CatalogScope,
   type CatalogTool,
   type Member,
@@ -38,6 +39,8 @@ interface Draft {
   skills: string[];
   knowledge: string[];
   tools: string[];
+  /** 选中的 MCP 工具 ID（`mcp.<server>.<tool>`）。 */
+  mcp: string[];
 }
 
 const SCOPE_HINT: Record<Scope, ReactNode> = {
@@ -51,6 +54,42 @@ const SCOPE_HINT: Record<Scope, ReactNode> = {
 };
 
 const LAYER_ORDER: Scope[] = ['global', 'team', 'member'];
+
+/**
+ * 一个 MCP Server 的工具开关组：server 名 + 逐个工具的 checkbox。
+ *
+ * 显示 risk 与审批标记 —— 管理员必须看得出「开这个工具意味着什么」，
+ * 尤其是 external-write（每次调用要过 Policy 审批）。
+ */
+function McpServerBlock({
+  server,
+  selected,
+  onToggle,
+}: {
+  server: CatalogMcpServer;
+  selected: string[];
+  onToggle: (id: string) => void;
+}) {
+  return (
+    <div>
+      <strong>{server.name}</strong>
+      {server.description ? (
+        <div style={{ color: '#666', fontSize: 12 }}>{server.description}</div>
+      ) : null}
+      <div style={{ marginTop: 4 }}>
+        {server.tools.map((tool) => (
+          <div key={tool.id} style={{ marginBottom: 6 }}>
+            <Checkbox checked={selected.includes(tool.id)} onChange={() => onToggle(tool.id)}>
+              <strong>{tool.name}</strong>{' '}
+              <Tag style={{ marginInlineEnd: 0 }}>{tool.risk}</Tag>{' '}
+              {tool.needsApproval ? <Tag color="orange">Needs approval</Tag> : null}
+            </Checkbox>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 interface CapabilitySettingsProps {
   onClose: () => void;
@@ -75,6 +114,7 @@ function draftFromCatalog(catalog: ScopeCatalog): Draft {
     skills: catalog.skills.filter((item) => item.enabled).map((item) => item.id),
     knowledge: catalog.knowledge.filter((item) => item.enabled).map((item) => item.id),
     tools: catalog.tools.filter((item) => item.enabled).map((item) => item.id),
+    mcp: catalog.mcp.flatMap((server) => server.tools.filter((tool) => tool.enabled).map((tool) => tool.id)),
   };
 }
 
@@ -501,6 +541,33 @@ export function CapabilitySettings({
     );
   }
 
+  function renderMcp(target: Scope) {
+    const catalog = catalogs[target];
+    const draft = drafts[target];
+    if (!catalog || !draft) return <Spin size="small" tip="Loading…" />;
+
+    if (catalog.mcp.length === 0) {
+      return (
+        <div style={{ color: '#999', fontSize: 12 }}>
+          还没有配置 MCP Server。在服务端 `config/mcp-servers.json` 里定义后，这里会出现可勾选的工具。
+        </div>
+      );
+    }
+
+    return (
+      <Space direction="vertical" style={{ width: '100%' }} size="middle">
+        {catalog.mcp.map((server) => (
+          <McpServerBlock
+            key={server.id}
+            server={server}
+            selected={draft.mcp}
+            onToggle={(id) => toggle(target, 'mcp', id)}
+          />
+        ))}
+      </Space>
+    );
+  }
+
   function renderInherited(target: Scope) {
     if (target !== 'member') return null;
     const catalog = catalogs.member;
@@ -537,6 +604,10 @@ export function CapabilitySettings({
         <div>
           <div style={{ fontSize: 12, color: '#666' }}>Actions</div>
           <div>{renderRefs(inherited.tools)}</div>
+        </div>
+        <div>
+          <div style={{ fontSize: 12, color: '#666' }}>MCP</div>
+          <div>{renderRefs(inherited.mcp)}</div>
         </div>
       </Space>
     );
@@ -624,6 +695,16 @@ export function CapabilitySettings({
                     </Space>
                   ),
                   children: renderActions(target),
+                },
+                {
+                  key: 'mcp',
+                  label: (
+                    <Space size={6}>
+                      <span>MCP Servers</span>
+                      <Tag style={{ marginInlineEnd: 0 }}>{draft?.mcp.length ?? 0} enabled</Tag>
+                    </Space>
+                  ),
+                  children: renderMcp(target),
                 },
               ]}
             />

@@ -100,14 +100,14 @@ describe('Admin boundary：改 capability boundary 的写入要 token，读不�
     const noToken = await fetch(`${base}/api/capabilities/catalog`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ scope: 'member', memberId: member.id, skills: [], knowledge: [], tools: [] }),
+      body: JSON.stringify({ scope: 'member', memberId: member.id, skills: [], knowledge: [], tools: [], mcp: [] }),
     });
     assert.ok(noToken.status === 401 || noToken.status === 403, `期望 401/403，实际 ${noToken.status}`);
 
     const withToken = await fetch(`${base}/api/capabilities/catalog`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json', Authorization: 'Bearer admin-secret' },
-      body: JSON.stringify({ scope: 'member', memberId: member.id, skills: [], knowledge: [], tools: [] }),
+      body: JSON.stringify({ scope: 'member', memberId: member.id, skills: [], knowledge: [], tools: [], mcp: [] }),
     });
     assert.equal(withToken.status, 200);
 

@@ -1,8 +1,16 @@
-import { BuiltInTools, defineTool, ToolSet, type ToolInvocation, type Tool } from '@github/copilot-sdk';
+import {
+  BuiltInTools,
+  defineTool,
+  ToolSet,
+  type MCPServerConfig,
+  type ToolInvocation,
+  type Tool,
+} from '@github/copilot-sdk';
 import type { ToolPolicy } from '../tool-policy.js';
 import type {
   CapabilityContext,
   RuntimeCapabilities,
+  RuntimeMcpServer,
   RuntimeTool,
   ToolDecision,
   ToolExecutionContext,
@@ -30,6 +38,8 @@ export interface CopilotCapabilities {
   tools: Tool<unknown>[];
   /** 交给 session 的 `availableTools`。 */
   availableTools: ToolSet;
+  /** 交给 session 的 `mcpServers`：SDK 原生运行 MCP，生命周期不归我们管。 */
+  mcpServers: Record<string, MCPServerConfig>;
   /**
    * 逐次授权。返回 `null` = 找不到这个工具的来历（从未声明过），调用方必须拒绝。
    */
@@ -65,9 +75,18 @@ export class CopilotCapabilityAdapter {
       tools.push(this.defineCustomTool(tool, context));
     }
 
+    // MCP 工具的可见性：逐个按规范 wire 名（`github-search_code`）声明，
+    // 不用 `mcp:*` —— 通配等于把「这个 server 将来新增的工具」也提前放行了。
+    for (const server of capabilities.mcpServers) {
+      for (const toolName of server.tools) {
+        availableTools.addMcp(`${server.id}-${toolName}`);
+      }
+    }
+
     return {
       tools,
       availableTools,
+      mcpServers: buildMcpServerConfigs(capabilities.mcpServers),
       checkToolUse: (toolName, args) => this.check(toolName, args, capabilities, context),
     };
   }
@@ -138,14 +157,73 @@ export class CopilotCapabilityAdapter {
     }
 
     const tool = capabilities.toolIndex.get(toolName);
-    if (!tool) {
+    if (tool) {
+      return this.evaluateToolUse(tool, context, normalizeArgs(args));
+    }
+
+    // MCP 工具走同一套 Policy：先按别名反查是哪个 server 的哪个工具，
+    // 再按它声明的 risk 判定。SDK 原生能力不是绕过授权的理由。
+    const candidates = capabilities.mcpToolIndex.get(toolName) ?? [];
+    if (candidates.length === 0) {
       // 声明之外的任何名字 —— 引擎的其它 built-in、skill 带来的工具、拼错的名字。
       // 全部拒绝：放行一个来历不明的工具，等于授权层不存在。
       return { allowed: false, reason: `未为该工具定义策略（${toolName}），授权层默认拒绝` };
     }
-
-    return this.evaluateToolUse(tool, context, normalizeArgs(args));
+    if (candidates.length > 1) {
+      const where = candidates.map((item) => item.providerId).join('、');
+      return {
+        allowed: false,
+        reason:
+          `工具 ${toolName} 在多个 MCP Server 上重名（${where}），无法确定是调哪一个，已拒绝执行：` +
+          '请收窄授权绑定的 selector，让这个名字只剩一个来源',
+      };
+    }
+    return this.evaluateToolUse(candidates[0], context, normalizeArgs(args));
   }
+}
+
+/**
+ * RuntimeMcpServer → SDK session 配置。只做形状翻译：
+ * `cwd` → SDK 的 `workingDirectory`，其余直通。定义里没有的字段
+ * （displayName / version / toolPolicies）不进 session。
+ */
+function buildMcpServerConfigs(mcpServers: RuntimeMcpServer[]): Record<string, MCPServerConfig> {
+  return Object.fromEntries(
+    mcpServers.map((server) => {
+      if (server.type === 'http' || server.type === 'sse') {
+        // 空 url 不交给 SDK：它会在 session 建立时报一个不知所云的错。
+        // 正常路径下 loader 已经拦过，这里是最后一道闸。
+        if (!server.url?.trim()) {
+          throw new Error(`MCP Server ${server.id} 缺少 url，不能交给引擎`);
+        }
+        return [
+          server.id,
+          {
+            type: server.type,
+            url: server.url,
+            ...(server.headers === undefined ? {} : { headers: server.headers }),
+            tools: server.tools,
+            ...(server.timeout === undefined ? {} : { timeout: server.timeout }),
+          },
+        ];
+      }
+      if (!server.command?.trim()) {
+        throw new Error(`MCP Server ${server.id} 缺少 command，不能交给引擎`);
+      }
+      return [
+        server.id,
+        {
+          type: 'local' as const,
+          command: server.command,
+          args: server.args ?? [],
+          ...(server.env === undefined ? {} : { env: server.env }),
+          ...(server.cwd === undefined ? {} : { workingDirectory: server.cwd }),
+          tools: server.tools,
+          ...(server.timeout === undefined ? {} : { timeout: server.timeout }),
+        },
+      ];
+    }),
+  );
 }
 
 function normalizeArgs(value: unknown): Record<string, unknown> {

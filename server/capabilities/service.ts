@@ -7,7 +7,7 @@ import type {
   MemberCapabilities,
 } from '../domain.js';
 
-type CapabilityType = 'skill' | 'knowledge' | 'tool';
+type CapabilityType = 'skill' | 'knowledge' | 'tool' | 'mcp';
 
 interface BindingRow {
   scope_type: CapabilityScopeType;
@@ -27,6 +27,7 @@ const EMPTY_CAPABILITIES: MemberCapabilities = {
   skills: [],
   knowledge: [],
   tools: [],
+  mcp: [],
 };
 
 /**
@@ -258,6 +259,7 @@ export class CapabilityService {
       skills: rows.filter((row) => row.capability_type === 'skill').map(toBinding),
       knowledge: rows.filter((row) => row.capability_type === 'knowledge').map(toBinding),
       tools: rows.filter((row) => row.capability_type === 'tool').map(toBinding),
+      mcp: rows.filter((row) => row.capability_type === 'mcp').map(toBinding),
     };
   }
 
@@ -296,6 +298,7 @@ export class CapabilityService {
       ...capabilities.skills.map((binding) => ({ type: 'skill' as const, binding })),
       ...capabilities.knowledge.map((binding) => ({ type: 'knowledge' as const, binding })),
       ...capabilities.tools.map((binding) => ({ type: 'tool' as const, binding })),
+      ...(capabilities.mcp ?? []).map((binding) => ({ type: 'mcp' as const, binding })),
     ];
 
     const insert = this.db.prepare(
@@ -371,6 +374,7 @@ function mergeCapabilities(...layers: MemberCapabilities[]): MemberCapabilities 
     skills: mergeBindings(layers.map((layer) => layer.skills)),
     knowledge: mergeBindings(layers.map((layer) => layer.knowledge)),
     tools: mergeBindings(layers.map((layer) => layer.tools)),
+    mcp: mergeBindings(layers.map((layer) => layer.mcp ?? [])),
   };
 }
 

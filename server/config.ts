@@ -145,6 +145,20 @@ export const config = {
    */
   allowHostCodingTools: env('HOST_CODING_TOOLS', 'false') === 'true',
   /**
+   * MCP Server 定义文件（`{"servers": [...]}`，见 config/mcp-servers.json）。
+   *
+   * 默认空：不接 MCP 也能跑，和「没配 Jira 就没有工单工具」同一约定。
+   * token / secret 只放环境变量，JSON 里写 `${VAR}` 引用 —— 定义文件本身
+   * 不落任何凭证。
+   */
+  mcpServersFile: path.resolve(env('MCP_SERVERS_FILE', 'config/mcp-servers.json')),
+  /**
+   * 是否允许注册 local/stdio MCP Server：SDK 会在服务机器上为它启动子进程。
+   *
+   * 默认关闭。远程（http / sse）不受影响，优先用远程。
+   */
+  mcpLocalEnabled: env('MCP_LOCAL_ENABLED', 'false') === 'true',
+  /**
    * Internal Member runtime API 的共享 token。
    *
    * 空 = 不做门禁（localhost 单用户原型）。真正的部署必须配置它，或者把这组

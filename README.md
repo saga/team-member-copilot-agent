@@ -266,6 +266,27 @@ Provider 里声明它的 `risk` / `requiresHostAccess`，授权层不动。硬�
 > 这些工具既不声明给引擎也不放行；`HOST_CODING_TOOLS=true` 且没有 sandbox 时，
 > `bash` 可以触达宿主机边界，不要直接用于多租户生产环境。
 
+### MCP：只做连接能力，不做第二套 Runtime
+
+MCP Server 的运行与工具调用是 Copilot SDK 原生的（`sessionConfig.mcpServers`），
+本仓库不实现 MCP 协议、不维护 MCP 连接。能力层只做三件事：
+
+```
+config/mcp-servers.json     定义：怎么连 + 允许哪些工具（显式 allowlist，无 "*"）
+        ↓ capability binding（global / team / member，只写引用 + 选了哪些工具）
+CapabilityResolver          解析出本轮的 server + 工具 + risk，进 manifestHash
+        ↓
+CopilotCapabilityAdapter    翻译成 SDK 的 mcpServers + availableTools（mcp:<server>-<tool> 逐个声明）
+        ↓
+hooks.onPreToolUse          MCP 工具名按别名反查回声明的 risk，走同一套 ToolPolicy
+```
+
+- token / secret 只放环境变量，JSON 里写 `${VAR}` 引用；目录与 UI 永远看不到连接信息。
+- 未声明的工具名一律拒绝；同一个名字在多个 server 上出现时按歧义拒绝（收窄 selector 解决）。
+- `external-write` 的 MCP 工具和其它工具一样落到 PolicyService（默认拒绝）。
+- local/stdio server 默认不注册（`MCP_LOCAL_ENABLED=true` 才行）：它会在服务机器上起子进程。
+- 定义文件不存在 = 不接 MCP，不影响启动；模板里不预置 MCP 绑定（没有真实 server 的引用会让启动直接失败）。
+
 ## Runtime reliability
 
 「能跑的 Team Agent Demo」和「可靠的 Team Runtime」之间差的是下面几件事。当前实现把它们都收在 `server/` 里，没有引入 K8s sandbox、LLM router、policy service 或 scheduler。
@@ -1122,6 +1143,7 @@ server/                       # Express + Copilot SDK 后端
     capabilities.test.ts           # Provider 隔离 / 未知 Provider / 同名冲突 / manifest hash / 三层合并与去重 / tool guard / open 二次 ACL
     capability-catalog.test.ts     # Tool selector 过滤 / knowledge 自带检索工具 / 目录与绑定的翻译与校验
     tool-policy.test.ts            # 只看 risk 与部署许可，不看工具名 / 声明与放行不允许漂移
+    mcp.test.ts                    # 定义加载与校验（allowlist / local 门禁）/ 解析与 manifest / 可见性与策略回退
     internal-api.test.ts           # 路径归属 + token 门禁
     team-service.test.ts           # delegation cycle / depth / runtime 隔离 / kind 形状约束
     member-dm.test.ts              # Member ↔ Member 私聊房间唯一性 + 自动对谈抑制
@@ -1167,6 +1189,8 @@ scripts/
 | `MAX_CONVERSATION_FILES_PER_CONVERSATION` | `500` | 单个会话最多留几份文件（不含已软删除的） |
 | `MAX_EXTRACTED_TEXT_CHARS` | `500000` | 单份文件提取出的文本上限（字符），超过截断。超过知识库单份上限的文本仍可搜，但 promote 会被拒 |
 | `HOST_CODING_TOOLS` | `false` | 是否允许 `bash` / `edit` / `grep` / `web_fetch`。**不随能力绑定打开** |
+| `MCP_SERVERS_FILE` | `config/mcp-servers.json` | MCP Server 定义文件（怎么连 + 允许哪些工具）。文件不存在 = 不接 MCP，不影响启动 |
+| `MCP_LOCAL_ENABLED` | `false` | 是否允许注册 local/stdio MCP Server（SDK 会在服务机器上起子进程）。远程不受影响 |
 | `JIRA_BASE_URL` / `JIRA_EMAIL` / `JIRA_API_TOKEN` | 空 | Jira Cloud 连接。三项齐了才注册 `atlassian.jira-tools`（jira_search / jira_get_issue / jira_add_comment / jira_transition_issue）并让控制面能取证；不配置则本地只有引用、没有工单工具，execution 也不会有 `external_work_snapshot` |
 | `JIRA_WEBHOOK_SECRET` | 空 | Jira webhook 的共享密钥（`X-Jira-Webhook-Secret` 头）。空 = 端点无门禁（仅限本机单用户） |
 | `INTERNAL_API_TOKEN` | 空 | Internal API 门禁；空 = 不校验（仅限本机单用户） |

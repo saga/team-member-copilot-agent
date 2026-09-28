@@ -43,6 +43,9 @@ const selectionSchema = z.object({
   skills: z.array(z.string().min(1).max(220)).max(200),
   knowledge: z.array(z.string().min(1).max(220)).max(200),
   tools: z.array(z.string().min(1).max(200)).max(200),
+  // 必填：PUT 是整层全量替换，缺字段会被读成「这一类全关」。老客户端不发就 400，
+  // 不能静默把已配好的 MCP 绑定清掉。
+  mcp: z.array(z.string().min(1).max(220)).max(200),
 });
 
 export interface CapabilitiesRouterOptions {
@@ -119,6 +122,7 @@ export function capabilitiesRouter(
           skills: parsed.data.skills,
           knowledge: parsed.data.knowledge,
           tools: parsed.data.tools,
+          mcp: parsed.data.mcp,
         });
 
         if (parsed.data.scope === 'global') team.updateGlobalCapabilities(bindings);

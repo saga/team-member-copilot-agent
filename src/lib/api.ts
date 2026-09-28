@@ -98,9 +98,29 @@ export interface CatalogInheritedRef {
 }
 
 /**
+ * 一个 MCP Server 及其工具开关。连接信息（url / headers / command）
+ * 永远不到前端：这里只回答「有哪些 server、每个有哪些工具、开没开」。
+ */
+export interface CatalogMcpServer {
+  /** `mcp.<serverId>`。 */
+  id: string;
+  name: string;
+  description: string;
+  tools: Array<{
+    /** `mcp.<serverId>.<toolName>`。 */
+    id: string;
+    name: string;
+    risk: string;
+    needsApproval: boolean;
+    enabled: boolean;
+  }>;
+  enabled: boolean;
+}
+
+/**
  * 某一层的能力目录。
  *
- * skills / knowledge / tools 只描述**这一层自己的选择**；
+ * skills / knowledge / tools / mcp 只描述**这一层自己的选择**；
  * member 层的 `inherited` 额外回答「上面两层给了什么」。
  */
 export interface ScopeCatalog {
@@ -108,10 +128,12 @@ export interface ScopeCatalog {
   skills: CatalogSkill[];
   knowledge: CatalogKnowledge[];
   tools: CatalogTool[];
+  mcp: CatalogMcpServer[];
   inherited?: {
     skills: CatalogInheritedRef[];
     knowledge: CatalogInheritedRef[];
     tools: CatalogInheritedRef[];
+    mcp: CatalogInheritedRef[];
   };
 }
 
@@ -668,6 +690,7 @@ export const api = {
     skills: string[];
     knowledge: string[];
     tools: string[];
+    mcp: string[];
   }): Promise<{ teamId: string; catalog: ScopeCatalog }> {
     return fetch(`${API_BASE}/api/capabilities/catalog`, {
       method: 'PUT',

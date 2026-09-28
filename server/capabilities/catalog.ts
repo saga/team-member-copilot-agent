@@ -54,6 +54,30 @@ export interface CatalogTool {
   unavailableReason?: string;
 }
 
+/**
+ * 一个 MCP Server 及其工具开关。
+ *
+ * secret（headers / env 的值）永远不到这里：目录只回答「有哪些 server、
+ * 每个 server 有哪些工具、开没开」，连接信息只活在服务端的定义文件里。
+ */
+export interface CatalogMcpServer {
+  /** `mcp.<serverId>`。 */
+  id: string;
+  name: string;
+  description: string;
+  tools: Array<{
+    /** `mcp.<serverId>.<toolName>`，配置与执行用同一个名字。 */
+    id: string;
+    name: string;
+    risk: ToolRisk;
+    /** external-write / privileged 落到 Policy，需要独立审批。 */
+    needsApproval: boolean;
+    enabled: boolean;
+  }>;
+  /** 这一层有没有选中它上面的任何工具。 */
+  enabled: boolean;
+}
+
 /** Member 视角下从上层继承来的能力：只读展示，不在这里改。 */
 export interface CatalogInheritedRef {
   id: string;
@@ -66,19 +90,22 @@ export interface ScopeCatalog {
   skills: CatalogSkill[];
   knowledge: CatalogKnowledge[];
   tools: CatalogTool[];
+  mcp: CatalogMcpServer[];
   /** 只有 member scope 有：上面两层给了什么。 */
   inherited?: {
     skills: CatalogInheritedRef[];
     knowledge: CatalogInheritedRef[];
     tools: CatalogInheritedRef[];
+    mcp: CatalogInheritedRef[];
   };
 }
 
-/** 管理员提交的选择：三种用户语言的 ID 数组，不含 providerId / selector。 */
+/** 管理员提交的选择：四种用户语言的 ID 数组，不含 providerId / selector。 */
 export interface CatalogSelection {
   skills: string[];
   knowledge: string[];
   tools: string[];
+  mcp: string[];
 }
 
 export interface CatalogQuery {
@@ -342,15 +369,69 @@ export async function buildCatalog(
     );
   });
 
-  if (query.scope !== 'member') return { scope: query.scope, skills, knowledge, tools };
+  const mcp = buildMcpCatalog(deps, own);
+
+  if (query.scope !== 'member') return { scope: query.scope, skills, knowledge, tools, mcp };
 
   return {
     scope: query.scope,
     skills,
     knowledge,
     tools,
+    mcp,
     inherited: buildInherited(deps, query, visible),
   };
+}
+
+/**
+ * MCP 目录：已注册的 Server 全列出来，每个的工具逐个带开关。
+ *
+ * 只读定义文件里的东西（id / 名字 / 工具 / risk），连接信息（url / headers /
+ * command / env）一步都不往外拿 —— 管理员配的是「开哪个工具」，不是连接串。
+ */
+function buildMcpCatalog(deps: CatalogDeps, own: MemberCapabilities): CatalogMcpServer[] {
+  const enabledByServer = new Map<string, Set<string> | null>();
+  for (const binding of own.mcp ?? []) {
+    const selected = parseSelectorList(binding.selector);
+    enabledByServer.set(binding.providerId, selected);
+  }
+  return deps.registry.listMcpServers().map((server) => {
+    const providerId = `mcp.${server.id}`;
+    const selected = enabledByServer.get(providerId);
+    const tools = Object.keys(server.tools)
+      .sort()
+      .map((toolName) => ({
+        id: mcpToolIdOf(server.id, toolName),
+        name: toolName,
+        risk: server.tools[toolName].risk,
+        needsApproval: server.tools[toolName].risk === 'external-write' || server.tools[toolName].risk === 'privileged',
+        enabled: selected === undefined ? false : selected === null ? true : selected.has(toolName),
+      }));
+    return {
+      id: providerId,
+      name: server.displayName,
+      description: server.description ?? '',
+      tools,
+      enabled: tools.some((tool) => tool.enabled),
+    };
+  });
+}
+
+/** MCP 工具的用户 ID：`mcp.<serverId>.<toolName>`，按第一个点切分即无歧义。 */
+export function mcpToolIdOf(serverId: string, toolName: string): string {
+  return `mcp.${serverId}.${toolName}`;
+}
+
+function parseMcpToolId(id: string): { serverId: string; toolName: string } {
+  if (!id.startsWith('mcp.') || id.length <= 'mcp.'.length) {
+    throw badRequest(`MCP 工具 ID 不合法：${id}`);
+  }
+  const rest = id.slice('mcp.'.length);
+  const dot = rest.indexOf('.');
+  if (dot <= 0 || dot === rest.length - 1) {
+    throw badRequest(`MCP 工具 ID 不合法：${id}`);
+  }
+  return { serverId: rest.slice(0, dot), toolName: rest.slice(dot + 1) };
 }
 
 /** Member 视角：上面两层给了什么（只读）。选中状态不归这里管。 */
@@ -417,16 +498,56 @@ function buildInherited(
     }
   }
 
-  return { skills, knowledge, tools };
+  // 继承来的 MCP 工具：展示名带上 server，定义被删掉的行按原文展示、
+  // 照样可关闭（和 knowledge 的 dangling key 同一处理）。
+  const mcp: CatalogInheritedRef[] = [];
+  for (const layer of layers) {
+    for (const binding of layer.caps.mcp ?? []) {
+      const only = parseSelectorList(binding.selector);
+      const names = mcpToolNamesOf(deps, binding.providerId, only);
+      for (const name of names) {
+        mcp.push({ id: mcpToolIdOf(mcpServerIdOf(binding.providerId), name), name, from: layer.from });
+      }
+    }
+  }
+
+  return { skills, knowledge, tools, mcp };
+}
+
+/** 某层 mcp 绑定选中的工具名。定义没了时按 selector 原文展示（只为关闭）。 */
+function mcpToolNamesOf(
+  deps: CatalogDeps,
+  providerId: string,
+  only: Set<string> | null,
+): string[] {
+  let server: { id: string; displayName: string; tools: Record<string, unknown> } | null = null;
+  try {
+    server = deps.registry.mcpServer(providerId);
+  } catch {
+    server = null;
+  }
+  if (!server) {
+    return only ? [...only].sort() : [];
+  }
+  const names = Object.keys(server.tools).sort();
+  return only ? names.filter((name) => only.has(name)) : names;
+}
+
+function mcpServerIdOf(providerId: string): string {
+  if (!providerId.startsWith('mcp.') || providerId.length <= 'mcp.'.length) {
+    throw badRequest(`MCP providerId 不合法：${providerId}`);
+  }
+  return providerId.slice('mcp.'.length);
 }
 
 /**
  * 管理员的选择 → 内部绑定。PUT 目录的唯一翻译入口。
  *
- * 三条纪律：
+ * 四条纪律：
  *   skill 按名字必须装在这一层（没装就 400，别写出一条永远解析为空的绑定）
  *   knowledge 必须是已存在的库（拼错 key 在这里就失败，不等到第一轮 turn）
  *   tool 必须是可见的运行时工具名（内部检索工具不接受点名，它跟着 knowledge 走）
+ *   mcp 必须是已注册 server 上的已声明工具（写错 server 或工具名在这里就 400）
  */
 export async function assignmentsToBindings(
   deps: CatalogDeps,
@@ -484,7 +605,30 @@ export async function assignmentsToBindings(
     selector: names.join(' '),
   }));
 
-  return { skills, knowledge, tools };
+  // MCP 选择同样永远写显式名单：定义里将来多一个工具，不该自动进授权。
+  const mcpByServer = new Map<string, string[]>();
+  for (const id of [...new Set(selection.mcp)]) {
+    const { serverId, toolName } = parseMcpToolId(id);
+    const providerId = `mcp.${serverId}`;
+    let server;
+    try {
+      server = deps.registry.mcpServer(providerId);
+    } catch {
+      throw badRequest(`MCP Server 不存在：${serverId}`);
+    }
+    if (!server.tools[toolName]) {
+      throw badRequest(`MCP Server ${serverId} 没有这个工具：${toolName}`);
+    }
+    const list = mcpByServer.get(providerId) ?? [];
+    list.push(toolName);
+    mcpByServer.set(providerId, list);
+  }
+  const mcp = [...mcpByServer].map(([providerId, names]) => ({
+    providerId,
+    selector: [...new Set(names)].sort().join(' '),
+  }));
+
+  return { skills, knowledge, tools, mcp };
 }
 
 function skillNameOf(id: string): string {

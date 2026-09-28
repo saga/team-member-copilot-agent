@@ -293,6 +293,9 @@ export class CopilotService {
         // availableTools 只决定「模型看得见什么」；真正的授权在下面的 hook 里
         // 每次调用重新判一遍。两者出自同一份解析结果，所以不会各自漂移。
         availableTools: copilotCapabilities.availableTools,
+        // MCP Server 的运行与工具调用是 SDK 原生的：这里只递配置，
+        // 授权仍走 onPreToolUse（MCP 工具名按别名反查回声明的 risk）。
+        mcpServers: copilotCapabilities.mcpServers,
         hooks: {
           onPreToolUse: (hookInput: PreToolUseInput) =>
             this.checkToolUse(hookInput, copilotCapabilities),

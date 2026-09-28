@@ -25,6 +25,7 @@ import { JiraProvider } from './work-management/jira-provider.js';
 import { WorkManagementRegistry } from './work-management/types.js';
 import { DefaultToolPolicy } from './tool-policy.js';
 import { DenyHighRiskPolicyService } from './policy.js';
+import { loadMcpServerDefinitions } from './mcp/registry.js';
 import { TeamStructureService } from './team-structure-service.js';
 import { SchedulerService } from './scheduler-service.js';
 import { TeamEventService } from './team-event-service.js';
@@ -111,6 +112,15 @@ registry.registerToolProvider(
 );
 registry.registerToolProvider(new KnowledgeToolProvider());
 registry.registerToolProvider(new HostCodingToolProvider());
+
+// MCP Server 定义：只注册，不运行。运行与工具调用是 Copilot SDK 的事
+// （sessionConfig.mcpServers），这里只决定「有哪些 server 实现可用」。
+// 谁能用哪个 server 的哪些工具，是各层 capability binding 的事，见 resolver。
+for (const server of loadMcpServerDefinitions(config.mcpServersFile, {
+  allowLocal: config.mcpLocalEnabled,
+})) {
+  registry.registerMcpServer(server);
+}
 
 // 外部工作系统适配层。Jira 连接三项齐了才注册 —— 没有连接就没有 Provider，
 // 控制面因此走「无业务上下文」路径（不取证、不校验），而不是拿着一个调不通的

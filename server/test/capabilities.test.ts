@@ -370,12 +370,14 @@ describe('CapabilityService：一张表装三层绑定', () => {
       skills: [{ providerId: 'team.filesystem-skills' }],
       knowledge: [{ providerId: KNOWLEDGE_PROVIDER, selector: PERSONAL_SELECTOR }],
       tools: [{ providerId: 'knowledge.tools' }],
+      mcp: [],
     });
 
     assert.deepEqual(capabilities.replaceMember(member.id, { skills: [], knowledge: [], tools: [] }), {
       skills: [],
       knowledge: [],
       tools: [],
+      mcp: [],
     });
   });
 
@@ -544,7 +546,7 @@ describe('Capability scope layering', () => {
     const config = capabilities.getConfig(defaultTeam.id, member.id);
 
     assert.deepEqual(config.global.tools, [{ providerId: 'team.core-tools' }]);
-    assert.deepEqual(config.team, { skills: [], knowledge: [], tools: [] });
+    assert.deepEqual(config.team, { skills: [], knowledge: [], tools: [], mcp: [] });
     assert.deepEqual(config.member.skills, [{ providerId: 'member.filesystem-skills' }]);
     assert.deepEqual(
       config.effective.tools.map((item) => item.providerId),
@@ -625,7 +627,9 @@ describe('Adapter：声明与授权同源', () => {
       skills: [],
       knowledge: [],
       tools: [],
+      mcpServers: [],
       toolIndex: new Map(),
+      mcpToolIndex: new Map(),
       manifestHash: 'x',
     };
 
@@ -930,6 +934,7 @@ describe('TeamService 的能力读写入口', () => {
       skills: [],
       knowledge: [],
       tools: [],
+      mcp: [],
     });
   });
 

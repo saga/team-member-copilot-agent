@@ -1,8 +1,9 @@
 import type { MemberCapabilities } from '../domain.js';
+import type { McpServerDefinition } from '../mcp/types.js';
 import type { KnowledgeProvider, SkillProvider, ToolProvider } from './types.js';
 
 export interface ProviderDescriptor {
-  kind: 'skill' | 'knowledge' | 'tool';
+  kind: 'skill' | 'knowledge' | 'tool' | 'mcp';
   id: string;
   version: string;
 }
@@ -30,6 +31,11 @@ export class CapabilityRegistry {
   private readonly skills = new Map<string, SkillProvider>();
   private readonly knowledge = new Map<string, KnowledgeProvider>();
   private readonly tools = new Map<string, ToolProvider>();
+  /**
+   * MCP Server 定义（`mcp.<id>` → 定义）。键带 `mcp.` 前缀，和三类 Provider
+   * 共用全局唯一性：binding 里只有一个 providerId，没有类型可分。
+   */
+  private readonly mcp = new Map<string, McpServerDefinition>();
 
   registerSkillProvider(provider: SkillProvider): void {
     this.assertProviderIdAvailable(provider.id);
@@ -47,6 +53,26 @@ export class CapabilityRegistry {
   }
 
   /**
+   * 注册一个 MCP Server 定义。注意这不是 ToolProvider：MCP 的运行与调用是
+   * SDK 的事，这里只登记「怎么连 + 有哪些工具」，解析时翻译成 session 配置。
+   */
+  registerMcpServer(server: McpServerDefinition): void {
+    const providerId = `mcp.${server.id}`;
+    this.assertProviderIdAvailable(providerId);
+    this.mcp.set(providerId, server);
+  }
+
+  mcpServer(id: string): McpServerDefinition {
+    const server = this.mcp.get(id);
+    if (!server) throw new Error(`未注册 MCP Server：${id}`);
+    return server;
+  }
+
+  listMcpServers(): McpServerDefinition[] {
+    return [...this.mcp.values()].sort((a, b) => a.id.localeCompare(b.id));
+  }
+
+  /**
    * Provider ID 跨三类全局唯一。
    *
    * binding 里只有 `providerId`，没有类型 —— 类型由 binding 所在的数组表达。
@@ -58,6 +84,7 @@ export class CapabilityRegistry {
       ['skill', this.skills],
       ['knowledge', this.knowledge],
       ['tool', this.tools],
+      ['mcp', this.mcp],
     ] as const) {
       if (map.has(id)) {
         throw new Error(`重复 Capability Provider：${id}（已被 ${kind} Provider 占用）`);
@@ -103,6 +130,9 @@ export class CapabilityRegistry {
     for (const [id, provider] of this.tools) {
       descriptors.push({ kind: 'tool', id, version: provider.version });
     }
+    for (const [id, server] of this.mcp) {
+      descriptors.push({ kind: 'mcp', id, version: server.version });
+    }
     return descriptors.sort((a, b) =>
       `${a.kind}\u0000${a.id}`.localeCompare(`${b.kind}\u0000${b.id}`),
     );
@@ -123,5 +153,6 @@ export class CapabilityRegistry {
     for (const binding of capabilities.skills) this.skillProvider(binding.providerId);
     for (const binding of capabilities.knowledge) this.knowledgeProvider(binding.providerId);
     for (const binding of capabilities.tools) this.toolProvider(binding.providerId);
+    for (const binding of capabilities.mcp ?? []) this.mcpServer(binding.providerId);
   }
 }

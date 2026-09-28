@@ -6,9 +6,11 @@ import type {
   CapabilityContext,
   ResolvedKnowledgeBinding,
   RuntimeCapabilities,
+  RuntimeMcpServer,
   RuntimeTool,
   SkillArtifact,
   ToolProviderContext,
+  ToolRisk,
 } from './types.js';
 
 /**
@@ -110,6 +112,8 @@ export class CapabilityResolver {
       }
     }
 
+    const mcpServers = this.resolveMcpServers(capabilities);
+
     const dedupedSkills = dedupe(skillEntries, (entry) => entry.artifact.name, 'Skill');
     const dedupedTools = dedupe(tools, (tool) => tool.name, 'Tool');
 
@@ -127,15 +131,60 @@ export class CapabilityResolver {
       skills: dedupedSkills.map((entry) => entry.artifact),
       knowledge,
       tools: visibleTools,
+      mcpServers,
       toolIndex: new Map(visibleTools.map((tool) => [tool.name, tool])),
+      mcpToolIndex: buildMcpToolIndex(mcpServers),
       manifestHash: manifestHashOf(
         capabilities,
         dedupedSkills,
         knowledge,
         visibleTools,
         toolProviderVersions,
+        mcpServers,
       ),
     };
+  }
+
+  /**
+   * MCP 授权绑定的解析：`mcp.<serverId>` + selector（工具名单）。
+   *
+   * 空 selector = 该 server 定义的全部工具（和 skill / tool 同一套语义）。
+   * selector 里出现定义中没有的工具名直接抛：MCP 工具的可见性决定 SDK 会话
+   * 形状，拼错的名字静默落空等于「配了个寂寞」，必须在解析时就失败。
+   */
+  private resolveMcpServers(capabilities: MemberCapabilities): RuntimeMcpServer[] {
+    const servers: RuntimeMcpServer[] = [];
+    for (const binding of capabilities.mcp ?? []) {
+      const server = this.registry.mcpServer(binding.providerId);
+      const selected = parseSelectorList(binding.selector);
+      const toolNames = selected ? [...selected] : Object.keys(server.tools);
+      for (const toolName of toolNames) {
+        if (!server.tools[toolName]) {
+          throw new Error(`MCP Server ${server.id} 不存在工具 ${toolName}：请检查授权绑定的 selector`);
+        }
+      }
+      toolNames.sort();
+      const toolPolicies: Record<string, ToolRisk> = {};
+      for (const toolName of toolNames) {
+        toolPolicies[toolName] = server.tools[toolName].risk;
+      }
+      servers.push({
+        id: server.id,
+        displayName: server.displayName,
+        type: server.type,
+        ...(server.url === undefined ? {} : { url: server.url }),
+        ...(server.headers === undefined ? {} : { headers: server.headers }),
+        ...(server.command === undefined ? {} : { command: server.command }),
+        ...(server.args === undefined ? {} : { args: server.args }),
+        ...(server.env === undefined ? {} : { env: server.env }),
+        ...(server.cwd === undefined ? {} : { cwd: server.cwd }),
+        ...(server.timeout === undefined ? {} : { timeout: server.timeout }),
+        tools: toolNames,
+        toolPolicies,
+        version: server.version,
+      });
+    }
+    return servers.sort((a, b) => a.id.localeCompare(b.id));
   }
 }
 
@@ -144,6 +193,56 @@ export class CapabilityResolver {
  * 管理界面不展示、配置里不出现 —— 由上面的自注入逻辑负责。
  */
 const KNOWLEDGE_TOOLS_ID = 'knowledge.tools';
+
+/**
+ * MCP 工具在引擎侧可能出现的名字形态。
+ *
+ * SDK 文档只给了 canonical wire 名（`github-list_issues`），hook 里实际
+ * 报上来的写法取决于 SDK 版本 —— 所以一个工具挂多个别名。命中多个不同
+ * (server, tool) 时按歧义拒绝（见 adapter.check），绝不猜一个执行。
+ */
+export function mcpToolAliases(serverId: string, toolName: string): string[] {
+  return [
+    `${serverId}-${toolName}`,
+    `mcp:${serverId}:${toolName}`,
+    `mcp:${toolName}`,
+    `${serverId}_${toolName}`,
+    `${serverId}.${toolName}`,
+    `mcp__${serverId}__${toolName}`,
+    toolName,
+  ];
+}
+
+/** 别名 → 候选（server, tool）列表。同一个 (server, tool) 只保留一次。 */
+export function buildMcpToolIndex(mcpServers: RuntimeMcpServer[]): Map<string, RuntimeTool[]> {
+  const index = new Map<string, RuntimeTool[]>();
+  const seen = new Set<string>();
+  const add = (alias: string, tool: RuntimeTool, key: string) => {
+    if (seen.has(`${alias}\u0000${key}`)) return;
+    seen.add(`${alias}\u0000${key}`);
+    const list = index.get(alias) ?? [];
+    list.push(tool);
+    index.set(alias, list);
+  };
+  for (const server of mcpServers) {
+    for (const toolName of server.tools) {
+      const key = `${server.id}\u0000${toolName}`;
+      const tool: RuntimeTool = {
+        providerId: `mcp.${server.id}`,
+        implementation: 'mcp',
+        kind: 'custom',
+        // 审计里看到的是规范名，不是 hook 报上来的别名 —— 别名只用于反查。
+        name: `${server.id}-${toolName}`,
+        description: `MCP tool ${toolName} from server ${server.id} (${server.displayName})`,
+        risk: server.toolPolicies[toolName],
+      };
+      for (const alias of mcpToolAliases(server.id, toolName)) {
+        add(alias, tool, key);
+      }
+    }
+  }
+  return index;
+}
 
 function hasBinding(capabilities: MemberCapabilities, providerId: string): boolean {
   return capabilities.tools.some((binding) => binding.providerId === providerId);
@@ -203,6 +302,7 @@ function manifestHashOf(
   knowledge: ResolvedKnowledgeBinding[],
   tools: RuntimeTool[],
   toolProviderVersions: Map<string, string>,
+  mcpServers: RuntimeMcpServer[],
 ): string {
   const payload = {
     bindings: {
@@ -242,6 +342,19 @@ function manifestHashOf(
         kind: tool.kind,
         risk: tool.risk,
         requiresHostAccess: tool.requiresHostAccess ?? false,
+      })),
+    mcpServers: [...mcpServers]
+      .sort(byKey((server) => server.id))
+      .map((server) => ({
+        id: server.id,
+        type: server.type,
+        // 工具名排序后序列化：selector 写 `a b` 和 `b a` 是同一组授权，
+        // 哈希不应该因为顺序不同而漂移。
+        tools: [...server.tools].sort(),
+        toolPolicies: Object.fromEntries(
+          [...server.tools].sort().map((name) => [name, server.toolPolicies[name]]),
+        ),
+        version: server.version,
       })),
   };
 

@@ -152,6 +152,7 @@ describe('Catalog：用户 ID 与内部绑定的翻译', () => {
       skills: [],
       knowledge: [],
       tools: ['ask_member', 'message_member'],
+      mcp: [],
     });
     assert.deepEqual(bindings.tools, [
       { providerId: 'team.core-tools', selector: 'ask_member message_member' },
@@ -175,6 +176,7 @@ describe('Catalog：用户 ID 与内部绑定的翻译', () => {
           skills: [],
           knowledge: [],
           tools: ['ghost_tool'],
+          mcp: [],
         }),
       (error: unknown) =>
         error instanceof Error &&
@@ -203,6 +205,7 @@ describe('Catalog：用户 ID 与内部绑定的翻译', () => {
       skills: [],
       knowledge: ['kb.catalog-core', 'kb.personal'],
       tools: [],
+      mcp: [],
     });
     assert.deepEqual(bindings.knowledge, [
       { providerId: KNOWLEDGE_PROVIDER, selector: 'catalog-core' },
@@ -225,6 +228,7 @@ describe('Catalog：用户 ID 与内部绑定的翻译', () => {
           skills: [],
           knowledge: ['kb.bad key!'],
           tools: [],
+          mcp: [],
         }),
       /知识库 key 不合法/,
     );
@@ -245,7 +249,7 @@ describe('Catalog：用户 ID 与内部绑定的翻译', () => {
     const bindings = await assignmentsToBindings(
       deps(),
       { scope: 'team', teamId: defaultTeam.id },
-      { skills: [], knowledge: [], tools: [] },
+      { skills: [], knowledge: [], tools: [], mcp: [] },
     );
     assert.deepEqual(bindings.knowledge, []);
 

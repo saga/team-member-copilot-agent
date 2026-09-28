@@ -20,7 +20,7 @@ import type { DatabaseSync } from 'node:sqlite';
  *
  * 程序不认识任何别的编号 —— 没有升级代码，认出来也无从下手。
  */
-export const SCHEMA_VERSION = 20;
+export const SCHEMA_VERSION = 21;
 
 /**
  * 当前 schema 的完整定义，按最终形状写。
@@ -109,7 +109,7 @@ CREATE TABLE capability_binding (
     CHECK (scope_type IN ('global', 'team', 'member')),
   scope_id TEXT NOT NULL,
   capability_type TEXT NOT NULL
-    CHECK (capability_type IN ('skill', 'knowledge', 'tool')),
+    CHECK (capability_type IN ('skill', 'knowledge', 'tool', 'mcp')),
   provider_id TEXT NOT NULL,
   selector TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,

@@ -90,4 +90,6 @@ const capabilitiesSchema = z.object({
   skills: z.array(bindingSchema).max(100),
   knowledge: z.array(bindingSchema).max(100),
   tools: z.array(bindingSchema).max(100),
+  // 缺省等于没绑：老模板文件里没有这个键，不能因此启动失败。
+  mcp: z.array(bindingSchema).max(100).default([]),
 });

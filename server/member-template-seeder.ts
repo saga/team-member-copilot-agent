@@ -87,6 +87,9 @@ const memberTemplateSchema = z.object({
     skills: z.array(capabilityBindingSchema).max(50),
     knowledge: z.array(capabilityBindingSchema).max(50),
     tools: z.array(capabilityBindingSchema).max(50),
+    // 缺省等于没绑：老模板文件里没有这个键，不能因此启动失败。
+    // 写了就会走同一套 providerId 校验，写错照样启动失败。
+    mcp: z.array(capabilityBindingSchema).max(50).default([]),
   }),
   /** 关掉一个模板不会删掉已建出来的 Member，只是不再 provision 它。 */
   enabled: z.boolean().default(true),
