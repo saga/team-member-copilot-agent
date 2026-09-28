@@ -338,6 +338,21 @@ conversation_message = Team 共享历史
 
 水位线覆盖**读到的全部消息**（包括被过滤的那些），否则下一轮还会重复读到它们。checkpoint **只在 turn 成功后推进** —— 失败时保持不变，宁可重复也不要丢上下文。
 
+**谁负责压缩：SDK，不是我们。** Copilot Session 会随轮次无限增长，压缩交给 SDK 的 Infinite Session：到 `COPILOT_COMPACTION_BACKGROUND_THRESHOLD`（默认 `0.80`）时后台异步压缩（当前这一轮不受影响），到 `COPILOT_COMPACTION_BUFFER_THRESHOLD`（默认 `0.95`）时必须阻塞压缩。压缩结果作为 checkpoint 持久化在 `COPILOT_BASE_DIRECTORY` 下，`resumeSession` 时恢复。应用侧只做两件事：**透传阈值** + 记录 `session.compaction_start` / `session.compaction_complete` 遥测（只打日志，不落库）。
+
+四层边界刻意划清，不互相覆盖：
+
+```
+conversation_message                = 永久原始记录（不删、不改、不摘要）
+Goal / Task / Execution / Approval  = 结构化业务事实
+Member / Team Memory                = 跨 Conversation 的长期记忆
+Copilot Session                     = 当前 Agent 的工作上下文 → 由 SDK 自动 compact
+```
+
+所以这里没有 ConversationSummaryService，也没有「每 N 轮自动摘要」：那等于把永久原始记录降级成摘要的副本，而摘要一旦和原始记录不一致，就没有权威来源了。同理 SDK 自带的 Memory 显式关闭（`memory: { enabled: false }`）—— 长期记忆只由 Member / Team Memory 承担，两套记忆并存会让「哪套生效」不可预测。
+
+> **多副本前提**：SDK 不提供「同一个 session 被两个进程并发访问」的互斥，`withLock(runtime.id)` 只在单进程内有效。单副本直接可用；多副本必须先做完 Worker Lease + execution 归属 + session 归属（见 §Worker Lease）。
+
 ### 3. Durable event + SSE replay
 
 ```
@@ -1175,6 +1190,7 @@ scripts/
 |------|------|------|
 | `PORT` | `3001` | HTTP 端口 |
 | `DATA_DIR` | `.data` | 数据根目录 |
+| `COPILOT_BASE_DIRECTORY` | `<DATA_DIR>/copilot` | Copilot SDK 的 session state / compaction checkpoint 根目录。**容器里必须指到持久卷**，否则每次重启都从零开始（resume 失败会静默回落到新建 session）。刻意和 Member workspace 分开 |
 | `GITHUB_TOKEN` | 空 | 留空则用本机 `copilot` CLI 已登录用户 |
 | `COPILOT_MODEL` | `gpt-5` | 默认模型（Strong Lead 未单独配置时的回落值） |
 | `COPILOT_LEAD_MODEL` | 跟 `COPILOT_MODEL` 同值 | 旧配置名，仍兼容；等价于 `COPILOT_LEAD_STRONG_MODEL` |
@@ -1186,8 +1202,10 @@ scripts/
 | `MAX_DELEGATION_DEPTH` | `4` | `delegation_path` 最大长度 |
 | `EXECUTION_TIMEOUT_MS` | `600000` | 单次 turn 上限（SDK 默认 60s 对带工具的真实任务太短） |
 | `RECOVER_ON_STARTUP` | `true` | 启动时跑 `RecoveryService`（单进程独占 DB 才安全） |
-| `MAX_CONTEXT_MESSAGES` | `100` | 注入 prompt 的 shared message 条数上限（从最新往前取，至少 1 条） |
-| `MAX_CONTEXT_CHARS` | `60000` | 注入 prompt 的字符数上限（含每条 32 字符的固定开销），与条数上限同时生效 |
+| `MAX_CONTEXT_MESSAGES` | `60` | 注入 prompt 的 shared message 条数上限（从最新往前取，至少 1 条）。只是这一轮的输入之一：Member 自己的 Copilot Session 带着自己的历史，Goal / Task / Approval 是结构化事实，Memory 管跨会话长期记忆 |
+| `MAX_CONTEXT_CHARS` | `32000` | 注入 prompt 的字符数上限（含每条 32 字符的固定开销），与条数上限同时生效。两条都超时按先到的截，被截掉的部分会在 transcript 前显式说明 |
+| `COPILOT_COMPACTION_BACKGROUND_THRESHOLD` | `0.80` | 占模型上下文窗口的比例。到这条线时 SDK **后台异步**压缩（当前这一轮不受影响）。SDK 官方默认值 |
+| `COPILOT_COMPACTION_BUFFER_THRESHOLD` | `0.95` | 到这条线时必须**阻塞**压缩，否则下一轮没地方放。必须 > background 阈值。SDK 官方默认值 |
 | `CONVERSATION_FILE_ROOT` | `<DATA_DIR>/conversations` | 会话文件（聊天附件）的存储根：`<root>/<conversationId>/files/<fileId>/` |
 | `MAX_CONVERSATION_FILE_BYTES` | `52428800` | 单个上传文件上限。按「raw body 一次性读进内存」定的，不是「文件多了会怎样」 |
 | `MAX_CONVERSATION_FILES_PER_MESSAGE` | `10` | 一条消息最多带几个文件（也是 `fileIds` 的上限） |

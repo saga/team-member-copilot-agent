@@ -11,6 +11,18 @@ function intEnv(name: string, fallback: number): number {
   return Number.isInteger(value) && value > 0 ? value : fallback;
 }
 
+/**
+ * 0~1 之间的比例配置（比如 compaction 阈值 0.80）。
+ *
+ * 不能复用 intEnv：intEnv 要求 Number.isInteger，会把 0.80 判成非法然后静默回退，
+ * 于是「调了阈值但没生效」—— 而且不会有任何报错，只在跑爆上下文时才暴露。
+ * 这里显式要求 0 < value < 1，越界同样回退（沿用 intEnv 的静默风格）。
+ */
+function ratioEnv(name: string, fallback: number): number {
+  const value = Number(env(name, String(fallback)));
+  return Number.isFinite(value) && value > 0 && value < 1 ? value : fallback;
+}
+
 const configuredMemberModels = parseModelList(env('COPILOT_MEMBER_MODELS', 'gpt-5-mini,gpt-4.1-mini'));
 const legacyDefaultModel = env('COPILOT_MODEL', 'gpt-5');
 // COPILOT_LEAD_MODEL 是旧配置名，仍兼容；新配置优先用 COPILOT_LEAD_STRONG_MODEL。
@@ -87,7 +99,35 @@ export const config = {
    * 配置而不是硬编码路径。
    */
   capabilityTemplatesDir: path.resolve(env('CAPABILITY_TEMPLATES_DIR', 'config/capability-templates')),
-  copilotBaseDirectory: path.join(dataDir, 'copilot'),
+  /**
+   * Copilot SDK 的 session 持久化根目录（session state / checkpoints）。
+   *
+   * ── 为什么它必须是可配置的、且要落在持久卷上 ────────────────────────
+   *
+   * Infinite Session 把「compaction 之后的 checkpoint」写在 baseDirectory 下。
+   * 容器里如果这是个临时层，重启后 checkpoint 连同 session state 一起丢，
+   * 于是 resume 失败 → acquireSession 回落到 createSession，看起来「没坏」，
+   * 实际上是每次重启都从零开始，历史全没了。所以它必须能指到挂载的持久卷。
+   *
+   * 刻意和 MemberRuntime.workspacePath 分开：workspace 是 Agent 的工作目录
+   * （它的产物、它 cwd 下的文件），这里是 SDK 的会话状态。混在一起的话，
+   * 「清一次 workspace」会连带把会话历史删掉。见计划 §十五。
+   */
+  copilotBaseDirectory: path.resolve(env('COPILOT_BASE_DIRECTORY', path.join(dataDir, 'copilot'))),
+  /**
+   * 后台 compaction 触发阈值（占模型上下文窗口的比例）。
+   *
+   * SDK 到这条线时**异步**压缩历史，当前这一轮不受影响。默认 0.80 是官方默认值，
+   * 一般不用改；只有在模型窗口很小、希望更早压缩时才往下调。
+   */
+  copilotCompactionBackgroundThreshold: ratioEnv('COPILOT_COMPACTION_BACKGROUND_THRESHOLD', 0.8),
+  /**
+   * buffer 耗尽阈值：到这条线时必须**阻塞**压缩，否则下一轮就没地方放了。
+   *
+   * 必须 > background 阈值，否则后台压缩还没机会跑就先撞上阻塞线。
+   * 默认 0.95 是官方默认值。这里只做透传，真正的压缩由 SDK 负责。
+   */
+  copilotCompactionBufferExhaustionThreshold: ratioEnv('COPILOT_COMPACTION_BUFFER_THRESHOLD', 0.95),
   localUserId: env('LOCAL_USER_ID', 'local-user'),
   maxDelegationDepth: intEnv('MAX_DELEGATION_DEPTH', 4),
   /**
@@ -144,20 +184,32 @@ export const config = {
    */
   executionTimeoutMs: intEnv('EXECUTION_TIMEOUT_MS', 600_000),
   /**
-   * 单轮注进入 prompt 的 shared message 条数上限。
+   * 单轮注入到 prompt 的 shared message 条数上限。
    *
    * 没有它时会有一个很具体的事故：一个 Member 沉默很久（或被静音一段时间）
    * 之后第一次被唤醒，checkpoint 停在很久以前，于是整段房间历史被一次性灌进
    * prompt —— 既超出模型窗口，也把这一轮的真实意图埋在最底下。
+   *
+   * ── 为什么现在从 100 收紧到 60 ────────────────────────────────────
+   *
+   * shared transcript 只是 Member 这一轮的**输入之一**，不是它的全部记忆：
+   *   · Member 自己的 Copilot Session 已经带着它自己的历史（SDK 自动 compact）；
+   *   · Goal / Task / Execution / Approval 是结构化事实，单独注入；
+   *   · Member / Team Memory 是跨 Conversation 的长期记忆。
+   * 所以这里不需要「把房间全灌进去」。灌太多反而有两个坏处：和 Session 里
+   * 已有的历史重复计费，以及把这一轮真正要处理的消息挤到 prompt 底部。
    */
-  maxContextMessages: intEnv('MAX_CONTEXT_MESSAGES', 100),
+  maxContextMessages: intEnv('MAX_CONTEXT_MESSAGES', 60),
   /**
    * 单轮注入的 shared message 字符数上限（按 transcript 渲染后的长度算）。
    *
-   * 和条数上限是两条独立的闸门：100 条长文和 100 条短句的差别是一个数量级。
+   * 和条数上限是两条独立的闸门：60 条长文和 60 条短句的差别是一个数量级。
    * 两条都超的话按先到的那个截。见 context-assembler.ts 的 selectWindow()。
+   *
+   * 32k 是按「shared 窗口只承载最近一段房间动态」定的，理由同上：完整历史在
+   * Member 的 Session 里，这里超出的部分交给 SDK 的 compaction，而不是自己塞满。
    */
-  maxContextChars: intEnv('MAX_CONTEXT_CHARS', 60_000),
+  maxContextChars: intEnv('MAX_CONTEXT_CHARS', 32_000),
   /**
    * 会话文件（聊天附件）的四道闸。
    *

@@ -387,6 +387,21 @@ describe('sendAndWait 超时 → abort', () => {
 
 interface CapturedSessionConfig {
   availableTools?: { toArray(): string[] } | string[];
+  /**
+   * Infinite Session 配置：上下文压缩由 SDK 负责，但**开关必须由我们透传**。
+   * 少接这根线的话，SDK 默认行为会顶上（enabled 默认 true），于是「我们以为
+   * 自己配了阈值」和「实际用的阈值」不一致，而且没有任何断言会红。
+   */
+  infiniteSessions?: {
+    enabled?: boolean;
+    backgroundCompactionThreshold?: number;
+    bufferExhaustionThreshold?: number;
+  };
+  /**
+   * SDK 自带的 Memory 必须显式关掉：长期记忆在本项目里由 Member / Team Memory
+   * 承担。漏传的话 SDK 默认值会生效，变成两套记忆打架。
+   */
+  memory?: { enabled: boolean };
   hooks?: {
     onPreToolUse?: (input: {
       sessionId: string;
@@ -529,6 +544,56 @@ describe('工具授权层真的接到了引擎上', () => {
       'deny',
       '正在跑的这一轮突然多出了宿主工具 —— 能力必须在 turn 开始时冻结',
     );
+  });
+});
+
+// ═══════════════════════════════════════════ 2.6 Infinite Session 接到引擎上
+
+/**
+ * 上下文压缩是「配了但没接上」的典型现场：
+ *
+ *   config.ts 有阈值        ← copilot-compaction.test.ts 覆盖
+ *   阈值真的交给 SDK        ← 这个 block
+ *
+ * SDK 对 `infiniteSessions` 和 `memory` 都有**默认值**（enabled 默认 true、
+ * 阈值 0.80/0.95）。所以忘传这两个字段时不会有任何报错 —— 引擎照跑，只是用的
+ * 是默认值而不是我们配置的值；而 `memory` 忘关更是静默开启一套我们不想用的记忆。
+ * 默认值把这类漏接线变成了「看起来正常」，所以必须显式断言。
+ */
+describe('Infinite Session 配置真的接到了引擎上', () => {
+  it('infiniteSessions 透传配置阈值，memory 显式关闭', async () => {
+    const { config } = await runTurnCapturing();
+
+    assert.deepEqual(
+      config.infiniteSessions,
+      {
+        enabled: true,
+        backgroundCompactionThreshold: 0.8,
+        bufferExhaustionThreshold: 0.95,
+      },
+      '压缩开关与阈值必须显式下发，否则 SDK 会静默用自己的默认值',
+    );
+    assert.deepEqual(
+      config.memory,
+      { enabled: false },
+      'SDK Memory 必须显式关闭 —— 长期记忆由 Member / Team Memory 承担',
+    );
+  });
+
+  it('阈值来自配置而不是硬编码 —— 改配置能改到引擎拿到的值', async () => {
+    const { config: realConfig } = await import('../config.js');
+    const original = realConfig.copilotCompactionBackgroundThreshold;
+    realConfig.copilotCompactionBackgroundThreshold = 0.5;
+    try {
+      const { config } = await runTurnCapturing();
+      assert.equal(
+        config.infiniteSessions?.backgroundCompactionThreshold,
+        0.5,
+        'engine 拿到的阈值必须等于配置值 —— 硬编码会让调参变成假的',
+      );
+    } finally {
+      realConfig.copilotCompactionBackgroundThreshold = original;
+    }
   });
 });
 

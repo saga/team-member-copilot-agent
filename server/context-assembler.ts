@@ -229,12 +229,25 @@ export class ContextAssembler {
 
       // 略过的部分必须说出来。不说的话，模型会把 transcript 当成房间的全部，
       // 然后给出「没有人提过 X」这种被截断本身制造出来的结论。
+      //
+      // 这里的措辞刻意把三件事分开讲清楚：
+      //   · 这是**有界的窗口**，不是房间的全部 —— 省略是设计，不是事故；
+      //   · Goal / Task status / approvals 是**结构化事实**，不受这个截断影响，
+      //     所以它们比「从消息里推断出来的东西」更可信；
+      //   · 省略 ≠ 没发生过。缺细节时去取或去问，而不是假设不存在。
+      // 最后一条是这个 notice 存在的全部理由：截断本身会制造「从没人提过」的
+      // 假结论，而模型不会自己意识到它看到的是残缺的。
       const notice =
         elidedCount > 0
-          ? `(${elidedCount} earlier message${elidedCount === 1 ? '' : 's'} in this room ` +
-            `were omitted to stay within the context size limit. Only the most recent ` +
-            `${sharedMessages.length} are shown. If something looks missing, say so ` +
-            `instead of assuming it was never discussed.)`
+          ? `(This is a bounded window of the shared room history: ${elidedCount} earlier ` +
+            `message${elidedCount === 1 ? '' : 's'} in this room were omitted because the ` +
+            `shared-room context is bounded, and only the most recent ` +
+            `${sharedMessages.length} are shown. The Goal, Task status, and approvals are ` +
+            `tracked as structured facts and are authoritative — they are not affected by ` +
+            `this truncation, so trust them over anything you might infer from the ` +
+            `messages below. Do not treat omitted history as evidence that something was ` +
+            `never discussed: if an older detail matters, retrieve it (e.g. search the ` +
+            `room or its files) or ask, instead of assuming it does not exist.)`
           : '';
 
       sections.push(header, [notice, this.transcript(sharedMessages)].filter(Boolean).join('\n\n'));

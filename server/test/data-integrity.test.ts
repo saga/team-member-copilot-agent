@@ -297,6 +297,19 @@ describe('ContextAssembler 的单轮上限', () => {
       // 当成房间的全部，据此下「没人提过这个」的错误结论。
       assert.equal(context.consumedThroughSequence, total);
       assert.match(context.prompt, /8 earlier messages .* were omitted/);
+      // 新措辞把三件事分开说清楚，缺一条都会让模型得出错误结论：
+      //   1) 窗口是**有界**的（省略是设计，不是事故）
+      //   2) Goal / Task status / approvals 是结构化事实，不受截断影响
+      //   3) 省略 ≠ 没发生过，缺细节要去取或去问
+      assert.match(context.prompt, /shared-room context is bounded/);
+      assert.match(
+        context.prompt,
+        /Goal, Task status, and approvals are tracked as structured facts/,
+      );
+      assert.match(
+        context.prompt,
+        /Do not treat omitted history as evidence that something was never discussed/,
+      );
       assert.match(context.prompt, /消息 11/);
       assert.doesNotMatch(context.prompt, /消息 8/);
     } finally {

@@ -338,6 +338,32 @@ export class CopilotService {
         // SDK 默认 false。不打开的话 assistant.message_delta 根本不会发，
         // 前端的实时增量就永远是空的。
         streaming: true,
+        /**
+         * Infinite Session：把「上下文快满了怎么办」交给 SDK，而不是自己实现一套
+         * 摘要 / 压缩系统。
+         *
+         * SDK 到 backgroundCompactionThreshold 时**后台**压缩（这一轮不受影响），
+         * 到 bufferExhaustionThreshold 时**阻塞**压缩（否则下一轮没地方放）。
+         * 压缩结果作为 checkpoint 持久化在 copilotBaseDirectory 下，resume 时恢复。
+         *
+         * 关键点：压缩的是「这个 Member 自己的 Copilot Session」，也就是它作为
+         * Agent 的工作上下文 —— 不是 conversation_message（那是永久原始记录，
+         * 不动），也不是 Member / Team Memory（那是跨 Conversation 的长期记忆）。
+         */
+        infiniteSessions: {
+          enabled: true,
+          backgroundCompactionThreshold: config.copilotCompactionBackgroundThreshold,
+          bufferExhaustionThreshold: config.copilotCompactionBufferExhaustionThreshold,
+        },
+        /**
+         * 显式关掉 SDK 的 Memory。
+         *
+         * 长期记忆在本项目里由 Member / Team Memory 承担（跨 Conversation、
+         * 可审计、有自己的存储），不是 SDK Memory。两个都开着会变成两套记忆互相
+         * 打架，且哪套生效不可预测。这里必须显式 false —— 不能省，因为
+         * MemoryConfiguration.enabled 是必填字段。
+         */
+        memory: { enabled: false },
       };
 
       // resumeSession 的第二个参数是 ResumeSessionConfig（没有 sessionId 字段）。
@@ -361,6 +387,56 @@ export class CopilotService {
         // 某些后端只发全量 message 不发 delta：用全量兜底，避免流式无输出。
         const full = event.data.content;
         if (full && !content) input.onDelta?.(full);
+      });
+      /**
+       * Compaction 事件只做**遥测**，不做业务。
+       *
+       * 这里刻意不落库、不改 conversation、不触发任何 LLM 调用：
+       *   · 压缩是 SDK 的内部动作，不是业务事实，写进 DB 只会制造一个
+       *     「和 SDK 真实状态可能不一致」的副本；
+       *   · 每轮都写一次 summary 会把 conversation_message 的历史语义污染掉。
+       * 需要知道「这台机器有没有在压缩、压了多少」时，看日志就够了。
+       */
+      const offCompactionStart = session.on('session.compaction_start', (event) => {
+        // eslint-disable-next-line no-console
+        console.info(
+          JSON.stringify({
+            event: 'copilot.compaction_start',
+            sessionId: input.runtime.copilotSessionId,
+            executionId: input.executionId,
+            conversationId: input.conversationId,
+            memberId: input.member.id,
+            model: event.data.model,
+            currentTokens: event.data.currentTokens,
+            tokenLimit: event.data.tokenLimit,
+            conversationTokens: event.data.conversationTokens,
+            systemTokens: event.data.systemTokens,
+            toolDefinitionsTokens: event.data.toolDefinitionsTokens,
+            trigger: event.data.trigger,
+          }),
+        );
+      });
+      const offCompactionComplete = session.on('session.compaction_complete', (event) => {
+        // eslint-disable-next-line no-console
+        console.info(
+          JSON.stringify({
+            event: 'copilot.compaction_complete',
+            sessionId: input.runtime.copilotSessionId,
+            executionId: input.executionId,
+            conversationId: input.conversationId,
+            memberId: input.member.id,
+            success: event.data.success,
+            error: event.data.error,
+            statusCode: event.data.statusCode,
+            trigger: event.data.trigger,
+            messagesRemoved: event.data.messagesRemoved,
+            tokensRemoved: event.data.tokensRemoved,
+            preCompactionTokens: event.data.preCompactionTokens,
+            postCompactionTokens: event.data.postCompactionTokens,
+            checkpointNumber: event.data.checkpointNumber,
+            requestId: event.data.requestId,
+          }),
+        );
       });
 
       try {
@@ -401,6 +477,8 @@ export class CopilotService {
       } finally {
         offDelta();
         offMessage();
+        offCompactionStart();
+        offCompactionComplete();
         this.activeSessions.delete(input.executionId);
         try {
           // SDK 已把 session 状态持久化，断开只释放内存；失败不影响业务状态。
