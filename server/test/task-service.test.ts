@@ -262,7 +262,7 @@ describe('Task 执行', () => {
       memberIds: [alice.id, bob.id],
       leadMemberId: alice.id,
     });
-    const result = await team.sendMessage({ conversationId: room.id, content: '补充一个要求' });
+    const result = await team.sendMessage({ actorId: 'test-user', conversationId: room.id, content: '补充一个要求' });
     assert.equal(result.wakes.length, 1);
     assert.equal(result.wakes[0].memberId, alice.id);
     assert.equal(result.wakes[0].reason, 'lead_message');
@@ -285,7 +285,7 @@ describe('Task 执行', () => {
     });
     assert.equal(team.getConversation(room.id).status, 'waiting_user');
     assert.deepEqual(team.getConversation(room.id).openQuestions, ['生产环境是哪个集群？']);
-    await team.sendMessage({ conversationId: room.id, content: '是 prod-1' });
+    await team.sendMessage({ actorId: 'test-user', conversationId: room.id, content: '是 prod-1' });
     assert.equal(team.getConversation(room.id).status, 'running');
     await waitForConversationIdle(room.id);
   });
@@ -516,7 +516,7 @@ describe('Task 生命周期补严', () => {
     });
     assert.equal(team.getConversation(doneRoom.id).status, 'completed');
     await assert.rejects(
-      team.sendMessage({ conversationId: doneRoom.id, content: '再加一个需求' }),
+      team.sendMessage({ actorId: 'test-user', conversationId: doneRoom.id, content: '再加一个需求' }),
       /已经结束/,
     );
 
@@ -539,7 +539,7 @@ describe('Task 生命周期补严', () => {
     team.cancelTask(team.listTasks(cancelledRoom.id)[0].id);
     assert.equal(team.getConversation(cancelledRoom.id).status, 'cancelled');
     await assert.rejects(
-      team.sendMessage({ conversationId: cancelledRoom.id, content: '再想想' }),
+      team.sendMessage({ actorId: 'test-user', conversationId: cancelledRoom.id, content: '再想想' }),
       /已经结束/,
     );
     await waitForConversationIdle(doneRoom.id);
@@ -683,7 +683,7 @@ describe('Task 生命周期补严', () => {
         memberIds: [alice.id, bob.id],
         leadMemberId: alice.id,
       });
-      await team.sendMessage({ conversationId: room.id, content: '开工' });
+      await team.sendMessage({ actorId: 'test-user', conversationId: room.id, content: '开工' });
       // 等 Lead turn 真正跑起来再让 worker 失败，否则测不到“正忙”
       for (let attempt = 0; attempt < 400; attempt += 1) {
         const running = db

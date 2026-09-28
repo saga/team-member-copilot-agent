@@ -43,7 +43,8 @@ import { teamRouter } from './routes/team.js';
 import { workManagementRouter, describeWebhookBoundary } from './routes/work-management.js';
 import { mcpRouter } from './routes/mcp.js';
 import { errorHandler } from './middleware/errorHandler.js';
-import { initTeamScope } from './middleware/teamScope.js';
+import { initTeamScope, requireTeamMember } from './middleware/teamScope.js';
+import { requireHumanAuth } from './middleware/auth.js';
 
 /**
  * 依赖装配集中在这里，index.ts 和 route 都不再各自 new service()。
@@ -235,26 +236,34 @@ app.use(cors({ origin: config.corsOrigin }));
 app.use(express.json({ limit: '1mb' }));
 
 app.use('/api/health', healthRouter);
-app.use('/api/members', membersRouter(teamService));
+// Human API 统一先过 OIDC，再过 Team 成员门禁。health / internal /
+// work-management webhook 不走这里（各自独立门禁）。
+const humanApi = [requireHumanAuth(), requireTeamMember()];
+app.use('/api/members', ...humanApi, membersRouter(teamService));
 // 更具体的先挂：/api/capabilities/skills/* 是「磁盘上装了哪些 skill」，
 // /api/capabilities/* 是「启用了哪些能力来源」。两者刻意分开。
-app.use('/api/capabilities/skills', skillsRouter(skillService));
+app.use('/api/capabilities/skills', ...humanApi, skillsRouter(skillService));
 app.use(
   '/api/capabilities',
+  ...humanApi,
   capabilitiesRouter(teamService, registry, skillService, localKnowledgeProvider, {
     hostToolsEnabled: config.allowHostCodingTools,
   }),
 );
-app.use('/api/knowledge', knowledgeRouter(localKnowledgeProvider));
-app.use('/api/team', teamRouter(structureService, teamEvents));
+app.use('/api/knowledge', ...humanApi, knowledgeRouter(localKnowledgeProvider));
+app.use('/api/team', ...humanApi, teamRouter(structureService, teamEvents, teamService));
 app.use('/api/work-management', workManagementRouter(teamService, workManagement));
-app.use('/api/conversations', conversationsRouter(teamService, conversationFiles, conversationFileProcessor, localKnowledgeProvider));
-app.use('/api/models', modelsRouter());
-app.use('/api/executions', executionsRouter(teamService));
-app.use('/api/tasks', tasksRouter(teamService));
+app.use(
+  '/api/conversations',
+  ...humanApi,
+  conversationsRouter(teamService, conversationFiles, conversationFileProcessor, localKnowledgeProvider),
+);
+app.use('/api/models', ...humanApi, modelsRouter());
+app.use('/api/executions', ...humanApi, executionsRouter(teamService));
+app.use('/api/tasks', ...humanApi, tasksRouter(teamService));
 // 以某个 Member 的身份说话 —— 独立的命名空间 + token 门禁，见 middleware/apiScope.ts
 app.use('/api/internal', internalRouter(teamService));
-app.use('/api/mcp', mcpRouter(mcpServerService));
+app.use('/api/mcp', ...humanApi, mcpRouter(mcpServerService));
 
 // 未匹配的 /api/* 返回 JSON 404，不要掉进下面的 SPA fallback 拿到一份 HTML
 app.use('/api', (_req, res) => {

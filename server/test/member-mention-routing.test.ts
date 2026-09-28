@@ -49,8 +49,7 @@ describe('User @mention routing', () => {
       leadMemberId: lead.id,
     });
 
-    const result = await team.sendMessage({
-      conversationId: conversation.id,
+    const result = await team.sendMessage({ actorId: 'test-user', conversationId: conversation.id,
       content: `@${architect.handle} 你怎么看这个方案？`,
     });
     assert.equal(result.wakes.length, 1);
@@ -86,101 +85,31 @@ describe('User @mention routing', () => {
     );
   });
 
-  it('@多个 Member 时按用户输入顺序串行回答，后面的 Member 看到前面的回答', async () => {
+  it('@A @B @C creates three independent wakes', async () => {
     stub.reset();
-    const lead = team.createMember({ name: 'Multi Lead', role: 'Lead' });
-    const security = team.createMember({ name: 'Multi Security', role: 'Security Reviewer' });
-    const engineer = team.createMember({ name: 'Multi Engineer', role: 'Software Engineer' });
+    const lead = team.createMember({ name: 'Parallel Lead', role: 'Lead' });
+    const alice = team.createMember({ name: 'Parallel Alice', role: 'Engineer' });
+    const bob = team.createMember({ name: 'Parallel Bob', role: 'Reviewer' });
+    const charlie = team.createMember({ name: 'Parallel Charlie', role: 'Analyst' });
     const conversation = team.createConversation({
       kind: 'task',
-      title: 'Ordered mentions',
-      memberIds: [lead.id, security.id, engineer.id],
+      title: 'Parallel mentions',
+      memberIds: [lead.id, alice.id, bob.id, charlie.id],
       leadMemberId: lead.id,
     });
 
     const result = await team.sendMessage({
       conversationId: conversation.id,
-      content:
-        `@${security.handle} @${engineer.handle} ` + '分别从安全和工程实现角度看看这个设计。',
+      actorId: 'user-1',
+      content: `@${alice.handle} @${bob.handle} @${charlie.handle} 请分析`,
     });
-    // 第一次只启动 Security。
-    assert.equal(result.wakes.length, 1);
-    assert.equal(result.wakes[0].memberId, security.id);
-    assert.equal(result.wakes[0].reason, 'user_mention');
 
-    await waitForConversationIdle(conversation.id);
-
-    const executions = db
-      .prepare(
-        `SELECT id, member_id, wake_reason, status, trigger_message_sequence FROM execution
-         WHERE conversation_id = ? ORDER BY created_at`,
-      )
-      .all(conversation.id) as unknown as Array<{
-      id: string;
-      member_id: string;
-      wake_reason: string;
-      status: string;
-      trigger_message_sequence: number | null;
-    }>;
-    // 不应该有 Lead execution。
-    assert.equal(
-      executions.some((execution) => execution.member_id === lead.id),
-      false,
-    );
-    assert.equal(executions.length, 2);
+    assert.equal(result.wakes.length, 3);
     assert.deepEqual(
-      executions.map((execution) => execution.member_id),
-      [security.id, engineer.id],
+      result.wakes.map((x) => x.memberId),
+      [alice.id, bob.id, charlie.id],
     );
-    assert.ok(executions.every((execution) => execution.wake_reason === 'user_mention'));
-    // 两轮必须属于同一条 User message。
-    assert.equal(executions[0].trigger_message_sequence, executions[1].trigger_message_sequence);
-
-    // 最关键的断言：Engineer 的 prompt 必须看到 Security 已经产生的回答。
-    const engineerExecution = executions.find(
-      (execution) => execution.member_id === engineer.id,
-    );
-    assert.ok(engineerExecution);
-    const engineerTurn = stub.turnFor(engineerExecution.id);
-    assert.match(engineerTurn.prompt, /reply from Multi Security/);
-
-    const messages = team.listMessages(conversation.id);
-    assert.ok(messages.some((message) => message.senderId === security.id));
-    assert.ok(messages.some((message) => message.senderId === engineer.id));
-  });
-
-  it('mention 顺序严格跟随用户输入，而不是 conversation roster 顺序', async () => {
-    stub.reset();
-    const lead = team.createMember({ name: 'Order Lead', role: 'Lead' });
-    const security = team.createMember({ name: 'Order Security', role: 'Security Reviewer' });
-    const engineer = team.createMember({ name: 'Order Engineer', role: 'Software Engineer' });
-    const conversation = team.createConversation({
-      kind: 'task',
-      title: 'Mention order',
-      // roster 故意反过来
-      memberIds: [lead.id, engineer.id, security.id],
-      leadMemberId: lead.id,
-    });
-
-    const result = await team.sendMessage({
-      conversationId: conversation.id,
-      content: `@${security.handle} ` + `@${engineer.handle} 看一下。`,
-    });
-    assert.equal(result.wakes.length, 1);
-    assert.equal(result.wakes[0].memberId, security.id);
-
     await waitForConversationIdle(conversation.id);
-
-    const rows = db
-      .prepare(
-        `SELECT member_id FROM execution
-         WHERE conversation_id = ? AND wake_reason = 'user_mention' ORDER BY created_at`,
-      )
-      .all(conversation.id) as unknown as Array<{ member_id: string }>;
-    assert.deepEqual(
-      rows.map((row) => row.member_id),
-      [security.id, engineer.id],
-    );
   });
 
   it('没有匹配到有效 @Member 时继续走 Lead', async () => {
@@ -194,8 +123,7 @@ describe('User @mention routing', () => {
       leadMemberId: lead.id,
     });
 
-    const result = await team.sendMessage({
-      conversationId: conversation.id,
+    const result = await team.sendMessage({ actorId: 'test-user', conversationId: conversation.id,
       content: '@does-not-exist 这个方案怎么看？',
     });
     assert.equal(result.wakes.length, 1);
@@ -226,8 +154,7 @@ describe('User @mention routing', () => {
     });
     team.setMemberMuted(conversation.id, architect.id, true);
 
-    const result = await team.sendMessage({
-      conversationId: conversation.id,
+    const result = await team.sendMessage({ actorId: 'test-user', conversationId: conversation.id,
       content: `@${architect.handle} 看一下？`,
     });
     assert.equal(result.wakes.length, 0);
@@ -287,8 +214,7 @@ describe('Bootstrap 竞态：用户消息取消自动首轮', () => {
         .get(conversation.id, lead.id) as unknown as { id: string; status: string } | undefined;
       assert.ok(bootstrap, 'bootstrap execution 必须先跑起来');
 
-      const result = await team.sendMessage({
-        conversationId: conversation.id,
+      const result = await team.sendMessage({ actorId: 'test-user', conversationId: conversation.id,
         content: `@${engineer.handle} 你是谁？`,
       });
       assert.equal(result.wakes.length, 1);
@@ -347,8 +273,7 @@ describe('Bootstrap 竞态：用户消息取消自动首轮', () => {
     });
     assert.equal(team.getConversation(conversation.id).status, 'waiting_user');
 
-    await team.sendMessage({
-      conversationId: conversation.id,
+    await team.sendMessage({ actorId: 'test-user', conversationId: conversation.id,
       content: `@${engineer.handle} 你是谁？`,
     });
     await waitForConversationIdle(conversation.id);

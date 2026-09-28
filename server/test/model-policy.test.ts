@@ -184,7 +184,7 @@ describe('执行时模型选择', () => {
       memberIds: [lead.id],
       leadMemberId: lead.id,
     });
-    const result = await team.sendMessage({ conversationId: room.id, content: '帮我开始这个工作' });
+    const result = await team.sendMessage({ actorId: 'test-user', conversationId: room.id, content: '帮我开始这个工作' });
     const executionId = singleExecutionId(db, room.id, result.wakes);
     await waitForConversationIdle(room.id);
 
@@ -211,7 +211,7 @@ describe('执行时模型选择', () => {
       requirements,
       tasks: [{ key: 'a', title: 'A', assigneeMemberId: worker.id }],
     });
-    const result = await team.sendMessage({ conversationId: room.id, content: '现在进展怎么样？' });
+    const result = await team.sendMessage({ actorId: 'test-user', conversationId: room.id, content: '现在进展怎么样？' });
     const executionId = singleExecutionId(db, room.id, result.wakes);
     await waitForConversationIdle(room.id);
 
@@ -233,7 +233,7 @@ describe('执行时模型选择', () => {
       memberId: lead.id,
       questions: ['生产环境是什么？'],
     });
-    const result = await team.sendMessage({ conversationId: room.id, content: '生产环境是 us-east-1。' });
+    const result = await team.sendMessage({ actorId: 'test-user', conversationId: room.id, content: '生产环境是 us-east-1。' });
     const executionId = singleExecutionId(db, room.id, result.wakes);
     await waitForConversationIdle(room.id);
 

@@ -1201,7 +1201,9 @@ scripts/
 | `INTERNAL_API_TOKEN` | 空 | Internal API 门禁；空 = 不校验（仅限本机单用户） |
 | `ADMIN_API_TOKEN` | 空 | Admin 写入（capabilities / knowledge 管理 / skills 安装 / 建 Member / 归档）门禁；空 = 不校验（仅限本机单用户）。Team owner/admin 与 token 任一通过 |
 | `TEAM_NAME` | `AI Team` | 默认 Team 名，启动 ensure，不提供新建入口 |
-| `LOCAL_ACTOR_ID` | `local-user` | 无用户系统时 human actor 占位 |
+| `LOCAL_ACTOR_ID` | `local-user` | 无用户系统时 human actor 占位（仅 `AUTH_DEV_MODE=true` 时生效） |
+| `AUTH_DEV_MODE` | `false` | 本地开发模式：无 Bearer 时回落 `LOCAL_ACTOR_ID`。生产必须 `false` + 配齐 OIDC |
+| `OIDC_ISSUER` / `OIDC_AUDIENCE` / `OIDC_JWKS_URL` | 空 | 生产 Human 认证（JWT）。不齐则拒绝启动；Human API 还要求调用方是 Team 的 active human 成员 |
 | `SCHEDULER_INTERVAL_MS` | `2000` | Scheduler tick 间隔（once + interval，不做 Calendar/RRULE） |
 | `MEMBER_TEMPLATES_DIR` | `config/member-templates` | 默认 Member 模板目录（Member 层 provisioning baseline） |
 | `CAPABILITY_TEMPLATES_DIR` | `config/capability-templates` | global / team 两层能力 baseline 目录 |
@@ -1237,7 +1239,7 @@ runtime 仍然是宿主机上的进程 —— 没有沙箱时 `bash` 能走到 w
 
 - **Execution UI**：`ExecutionStrip` / `ExecutionTree`（客户端按 `parentExecutionId` 组树）+ retry / cancel 按钮。`TeamChat.tsx` 已拆到 `src/components/team/`，但 execution 视图还没有独立组件。
 - **多副本**：`RecoveryService` 与 `cancelRequests` 目前都假设单进程。多副本前要把「谁是 owner」和取消信号都升级成 DB lease / 跨进程通道。
-- **认证**：`local-user` 是占位。接 Entra ID / AD / OIDC 时只改请求上下文，业务数据模型不动。
+- **认证**：`local-user` 是占位，仅 `AUTH_DEV_MODE=true` 时生效。生产走 OIDC/JWT（`requireHumanAuth`）+ Team Membership + Conversation ACL 三层。
 - **会话记忆 vs Member 记忆**：`conversation_message` 是会话上下文，全局 `members/<id>/memory/MEMORY.md` 是跨 Team 的长期记忆，`members/<id>/teams/<teamId>/MEMORY.md` 是 Team 上下文，三者不要混。
 - **Member 记忆提案**：让模型用 `propose_member_memory` 提议、由应用审核后再落盘，而不是让 `remember_member` 直接写。
 - **Restore to template**：把某个 Member 恢复成模板 baseline（含 preview diff）。provisioning 刻意不做这件事 —— 它必须是显式操作，不能是启动副作用。届时再引入 `templateRevision` / `profileRevision`。

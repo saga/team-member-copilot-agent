@@ -1100,17 +1100,6 @@ MUTATIONS = [
         ],
     },
     {
-        "name": "mention chain 不推进（第二位永远等不到）",
-        "test": "server/test/member-mention-routing.test.ts",
-        "steps": [
-            (
-                "server/team-service.ts",
-                "          this.advanceMentionChain(input.conversation.id, input.triggerMessageSequence);\n",
-                "",
-            )
-        ],
-    },
-    {
         "name": "mention 按 roster 排序（用户输入顺序丢失）",
         "test": "server/test/member-mention-routing.test.ts",
         "steps": [
@@ -1118,6 +1107,61 @@ MUTATIONS = [
                 "server/member-mentions.ts",
                 "  const result: Member[] = [];\n  const seen = new Set<string>();\n  for (const match of content.matchAll(MEMBER_MENTION_RE)) {\n    const handle = match[1]?.trim().toLowerCase();\n    if (!handle) continue;\n    const member = memberByHandle.get(handle);\n    if (!member) continue;\n    if (seen.has(member.id)) continue;\n    seen.add(member.id);\n    result.push(member);\n  }\n  return result;\n",
                 "  const result: Member[] = [];\n  const seen = new Set<string>();\n  const requested = new Set<string>();\n  for (const match of content.matchAll(MEMBER_MENTION_RE)) {\n    const handle = match[1]?.trim().toLowerCase();\n    if (handle) requested.add(handle);\n  }\n  for (const member of members) {\n    if (member.status !== 'active') continue;\n    if (!requested.has(member.handle.toLowerCase())) continue;\n    if (seen.has(member.id)) continue;\n    seen.add(member.id);\n    result.push(member);\n  }\n  return result;\n",
+            )
+        ],
+    },
+    {
+        "name": "用户消息不记 actor（发言人永远是 local-user）",
+        "test": "server/test/auth.test.ts",
+        "steps": [
+            (
+                "server/team-service.ts",
+                "      senderType: 'user',\n      senderId: input.actorId,\n",
+                "      senderType: 'user',\n      senderId: config.localUserId,\n",
+            )
+        ],
+    },
+    {
+        "name": "member DM 伪装成 Lead turn（reason 回退）",
+        "test": "server/test/member-dm.test.ts",
+        "steps": [
+            (
+                "server/team-service.ts",
+                "      wakes.push({ memberId: target.id, reason: 'member_message', taskId: null, triggerSequence: message.messageSequence });\n",
+                "      wakes.push({ memberId: target.id, reason: 'lead_message', taskId: null, triggerSequence: message.messageSequence });\n",
+            )
+        ],
+    },
+    {
+        "name": "同成员双跑（reserve 跳过失效）",
+        "test": "server/test/task-orchestrator.test.ts",
+        "steps": [
+            (
+                "server/task-orchestrator.ts",
+                "      if (this.hasActiveExecution(conversationId, task.assigneeMemberId)) {\n        continue;\n      }\n",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "学经验默认全 Team 可见（未审批也共享）",
+        "test": "server/test/experience-store.test.ts",
+        "steps": [
+            (
+                "server/experience-store.ts",
+                "    // 默认只给自己：team scope 是影响所有人的写入，必须经过审批。\n    const scope = input.scope ?? 'member';\n",
+                "    // 默认只给自己：team scope 是影响所有人的写入，必须经过审批。\n    const scope = input.scope ?? 'team';\n",
+            )
+        ],
+    },
+    {
+        "name": "team 候选不审批也可见（审批门形同虚设）",
+        "test": "server/test/experience-store.test.ts",
+        "steps": [
+            (
+                "server/experience-store.ts",
+                "        return item.scope === 'team' && item.reviewStatus === 'approved';\n",
+                "        return item.scope === 'team';\n",
             )
         ],
     },

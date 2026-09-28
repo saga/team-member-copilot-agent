@@ -49,6 +49,13 @@ let server: Server | null = null;
  *   8. 启动 Scheduler → listen
  */
 async function bootstrap(): Promise<void> {
+  // 生产模式必须配 OIDC：没有真实用户系统就拒绝启动，而不是悄悄回落
+  // 到 LOCAL_ACTOR_ID。本地开发与测试走 AUTH_DEV_MODE=true。
+  if (!config.authDevMode) {
+    if (!config.oidc.issuer || !config.oidc.audience || !config.oidc.jwksUrl) {
+      throw new Error('生产模式必须配置 OIDC_ISSUER / OIDC_AUDIENCE / OIDC_JWKS_URL');
+    }
+  }
   // eslint-disable-next-line no-console
   console.log(
     migration.created

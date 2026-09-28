@@ -543,3 +543,32 @@ body {
   outline-offset: -4px;
   border-radius: 8px;
 }
+
+/* ── Modal 可调大小 ──────────────────────────────────────────────── */
+/* 所有 Modal 统一可拖右下角放大缩小，不固定死长宽。原生 resize 句柄：
+   零 JS，所有现在/未来的 Modal 自动生效；缩小后内容区自己滚，不撑破屏。 */
+.ant-modal {
+  resize: both;
+  overflow: hidden;
+  min-width: 320px;
+  max-width: calc(100vw - 32px);
+  max-height: calc(100vh - 48px);
+}
+
+.ant-modal-container {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+.ant-modal-header,
+.ant-modal-footer {
+  flex-shrink: 0;
+}
+
+.ant-modal-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}

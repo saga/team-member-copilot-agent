@@ -524,6 +524,7 @@ export interface ExecutionRecord {
  *   lead_recovery      Task 失败/阻塞，唤醒 Lead 做整体判断
  *   goal_changed       Goal 改版本，唤醒 Lead 重新规划
  *   user_mention       用户明确 @ 某个 Member，直接唤醒这个 Member
+ *   member_message     Member 私聊消息，唤醒对端
  *   task_ready         Task 依赖满足，唤醒执行人
  *   schedule           定时唤醒
  */
@@ -534,6 +535,7 @@ export type WakeReason =
   | 'lead_recovery'
   | 'goal_changed'
   | 'user_mention'
+  | 'member_message'
   | 'task_ready'
   | 'schedule';
 

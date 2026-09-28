@@ -66,23 +66,29 @@ export class TaskOrchestrator {
     const changed = this.tasks.refreshReady(this.db, conversationId);
     for (const task of changed.ready) this.events.onTask(task);
     for (const task of changed.blocked) this.events.onTask(task);
+
     const started: ConversationTask[] = [];
     for (const task of this.tasks.findReady(conversationId)) {
-      // 注意这里没有 isBusy 跳过：scheduler 本来就按 (conversation, member)
-      // 串行，忙时入队只是排进 pending，当前 turn 跑完接着跑。跳过等于丢弃 —
-      // 同一个成员的任务链（A 完成后 B 才能跑）会在 A 的 turn 内外各被跳过一次，
-      // 然后永远没人再 kick，B 烂在 ready。重复入队由 scheduler 的 mergeWake
-      // 合并（同 taskId 只留一条），不会跑重。
-      //
-      // 跨 Goal 保护：findReady 只读当前版本，这里是双保险 —— 万一读到旧行，
-      // 也不执行它（旧计划已失效，执行旧 Task 等于把上一版工作又跑一遍）。
       const conversation = this.readConversation(conversationId);
-      if (!conversation || task.goalRevision !== conversation.goalRevision) {
+      if (!conversation) continue;
+      if (task.goalRevision !== conversation.goalRevision) {
         continue;
       }
-      if (this.hasActiveExecution(conversationId, task.assigneeMemberId)) continue;
+
+      // 一个 Member 一次只 reserve 一个 ready Task：同一轮里第一个入队后，
+      // pending 里就有了，同成员后面的直接跳过（hasPendingWake）。
+      // runtime / scheduler 已经有工作时，不覆盖 pending wake。
+      // 注意只看 pending，不看在跑：见 hasPendingWake 上的注释。
+      if (this.hasActiveExecution(conversationId, task.assigneeMemberId)) {
+        continue;
+      }
+      if (this.scheduler.hasPendingWake(conversationId, task.assigneeMemberId)) {
+        continue;
+      }
+
       const state = this.states.get(conversationId, task.assigneeMemberId);
       if (state.muted) continue;
+
       this.scheduler.enqueue({
         conversationId,
         memberId: task.assigneeMemberId,
@@ -92,6 +98,7 @@ export class TaskOrchestrator {
       });
       started.push(task);
     }
+
     return started;
   }
 

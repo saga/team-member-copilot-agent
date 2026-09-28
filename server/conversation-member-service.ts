@@ -432,6 +432,7 @@ const KNOWN_WAKE_REASONS: Record<Exclude<WakeReason, 'schedule'>, true> = {
   lead_recovery: true,
   goal_changed: true,
   user_mention: true,
+  member_message: true,
   task_ready: true,
 };
 

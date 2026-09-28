@@ -194,6 +194,17 @@ export const config = {
   teamName: env('TEAM_NAME', 'AI Team'),
   /** 没有真正用户系统时的 human actor 占位。接 Entra/OIDC 后只换 teamScope 的解析。 */
   localActorId: env('LOCAL_ACTOR_ID', 'local-user'),
+  /**
+   * human 认证模式。false = 生产模式：必须配 OIDC，走真实 JWT；
+   * true = 本地开发：无 Bearer 时回落 LOCAL_ACTOR_ID。
+   * 测试与本地 dev 用 true，生产必须 false（见 index.ts 启动检查）。
+   */
+  authDevMode: env('AUTH_DEV_MODE', 'false') === 'true',
+  oidc: {
+    issuer: env('OIDC_ISSUER', ''),
+    audience: env('OIDC_AUDIENCE', ''),
+    jwksUrl: env('OIDC_JWKS_URL', ''),
+  },
   /** Scheduler tick 间隔（毫秒）。只做 once + interval，不做 Calendar/RRULE。 */
   schedulerIntervalMs: intEnv('SCHEDULER_INTERVAL_MS', 2000),
   /**

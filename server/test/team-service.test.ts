@@ -81,6 +81,7 @@ const sendRaw = team.sendMessage.bind(team);
  */
 async function sendMessage(input: {
   conversationId: string;
+  actorId: string;
   content: string;
   replyToMessageId?: string;
 }) {
@@ -206,12 +207,10 @@ describe('Conversation / Runtime 边界', () => {
 
     // Runtime 是懒创建的：先各跑一轮，runtime 才落库
     // （团队工作区的 Lead 恰好是 researcher，所以这一轮由他处理）
-    const inTeam = await sendMessage({
-      conversationId: teamConversationId,
+    const inTeam = await sendMessage({ actorId: 'test-user', conversationId: teamConversationId,
       content: '团队会话里的一轮',
     });
-    const inSolo = await sendMessage({
-      conversationId: other.id,
+    const inSolo = await sendMessage({ actorId: 'test-user', conversationId: other.id,
       content: '单独会话里的一轮',
     });
     await waitForStatus(inTeam.executionId, 'completed');
@@ -309,7 +308,7 @@ describe('Conversation / Runtime 边界', () => {
 
     let lastExecutionId = '';
     for (const text of ['first', 'second', 'third']) {
-      const result = await sendMessage({ conversationId: conversation.id, content: text });
+      const result = await sendMessage({ actorId: 'test-user', conversationId: conversation.id, content: text });
       lastExecutionId = result.executionId;
       // 必须等这一轮收尾再发下一条：scheduler 会把同一个 Member 上排队的
       // 唤醒合并成一轮，连着发会让后两条并进前一轮，拿不到各自的 execution。
@@ -359,8 +358,7 @@ describe('Member 生命周期边界', () => {
     });
 
     await whileBusy(async () => {
-      const { executionId } = await sendMessage({
-        conversationId: conversation.id,
+      const { executionId } = await sendMessage({ actorId: 'test-user', conversationId: conversation.id,
         content: '先别停',
       });
       await waitForStatus(executionId, 'running');
@@ -387,8 +385,7 @@ describe('Member 生命周期边界', () => {
     });
 
     await whileBusy(async () => {
-      const first = await sendMessage({
-        conversationId: group.id,
+      const first = await sendMessage({ actorId: 'test-user', conversationId: group.id,
         content: '第一轮',
       });
       await waitForStatus(first.executionId, 'running');
@@ -396,6 +393,7 @@ describe('Member 生命周期边界', () => {
       // 忙也不丢：第二条入队排着，由 scheduler 合并，而不是丢掉。
       const second = await sendRaw({
         conversationId: group.id,
+        actorId: 'test-user',
         content: '第二轮',
       });
       assert.equal(second.wakes.length, 1, '忙时消息照样排队');
@@ -420,7 +418,7 @@ describe('Member 生命周期边界', () => {
     });
 
     // 先让 analyst（Lead）在房间里跑一轮，把 runtime 用起来
-    const first = await sendMessage({ conversationId: group.id, content: '记录一下' });
+    const first = await sendMessage({ actorId: 'test-user', conversationId: group.id, content: '记录一下' });
     await waitForStatus(first.executionId, 'completed');
     await waitForConversationIdle(group.id);
 
@@ -458,8 +456,7 @@ describe('Execution 审计链', () => {
 
 describe('delegation 业务控制', () => {
   it('A → B 成功，并留下 parent + delegationPath', async () => {
-    const { executionId } = await sendMessage({
-      conversationId: teamConversationId,
+    const { executionId } = await sendMessage({ actorId: 'test-user', conversationId: teamConversationId,
       content: '先研究这个问题',
     });
     await waitForStatus(executionId, 'completed');
@@ -487,8 +484,7 @@ describe('delegation 业务控制', () => {
   });
 
   it('A → B → C → A 被拒绝（cycle 跨层级）', async () => {
-    const { executionId } = await sendMessage({
-      conversationId: teamConversationId,
+    const { executionId } = await sendMessage({ actorId: 'test-user', conversationId: teamConversationId,
       content: '多层 cycle 测试起点',
     });
     await waitForStatus(executionId, 'completed');
@@ -539,8 +535,7 @@ describe('delegation 业务控制', () => {
   });
 
   it('超过 maxDelegationDepth 被拒绝（depth）', async () => {
-    const { executionId } = await sendMessage({
-      conversationId: teamConversationId,
+    const { executionId } = await sendMessage({ actorId: 'test-user', conversationId: teamConversationId,
       content: 'depth 测试起点',
     });
     await waitForStatus(executionId, 'completed');
@@ -585,8 +580,7 @@ describe('delegation 业务控制', () => {
   });
 
   it('parent execution 不属于当前 Member 时被拒绝', async () => {
-    const { executionId } = await sendMessage({
-      conversationId: teamConversationId,
+    const { executionId } = await sendMessage({ actorId: 'test-user', conversationId: teamConversationId,
       content: 'parent 归属测试',
     });
     await waitForStatus(executionId, 'completed');

@@ -72,6 +72,18 @@ export class MemberTurnScheduler {
   }
 
   /**
+   * 有没有还没开跑的 pending wake（不含正在跑的那一轮）。
+   *
+   * startReadyTasks 用它而不是 isBusy 做跳过判据：turn 收尾的 onTaskChanged
+   * 跑在 inFlight 释放之前，用 isBusy 会把“刚跑完、等着接下一棒”的 Task
+   * 也跳掉，而收尾之后再也没有人 kick —— 任务烂在 ready。用 hasPending 只跳
+   * 过“真有排队的”，在跑的那一轮收尾时会自己把下一棒推进来。
+   */
+  hasPendingWake(conversationId: string, memberId: string): boolean {
+    return this.pending.has(keyOf(conversationId, memberId));
+  }
+
+  /**
    * 按条件删掉还没开跑的 pending wake（用户消息取消 bootstrap 用）。
    *
    * 只动 pending：在跑的轮次碰不得（abort 是 execution 层的事）。
@@ -167,7 +179,8 @@ function keyOf(conversationId: string, memberId: string): string {
  * 三种 Lead 原因同级：都是「Lead 要说话」，谁的新消息序号大听谁的。
  */
 const REASON_PRIORITY: Record<Exclude<WakeReason, 'schedule'>, number> = {
-  goal_changed: 4,
+  goal_changed: 5,
+  member_message: 4,
   // 用户明确点名高于普通自动 Task wake，但低于 Goal 重新规划。
   user_mention: 3,
   task_ready: 2,

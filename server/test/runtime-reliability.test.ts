@@ -620,6 +620,7 @@ const sendRaw = team.sendMessage.bind(team);
  */
 async function sendMessage(input: {
   conversationId: string;
+  actorId: string;
   content: string;
   replyToMessageId?: string;
 }) {
@@ -641,14 +642,14 @@ describe('ContextAssembler：增量上下文而不是整段重放', () => {
     // Task 工作区里用户消息只唤醒 Lead：两轮都是 Alice 处理，
     // 「谁在什么时候读到了什么」可断言。
 
-    const first = await sendMessage({ conversationId: conv.id, content: 'LEAD-FIRST' });
+    const first = await sendMessage({ actorId: 'test-user', conversationId: conv.id, content: 'LEAD-FIRST' });
     await waitForStatus(first.executionId, 'completed');
 
     const turn1 = stub.turnsFor(alice.id).at(-1);
     assert.ok(turn1);
     assert.match(turn1.prompt, /Recent relevant updates|LEAD-FIRST/);
 
-    const second = await sendMessage({ conversationId: conv.id, content: 'LEAD-SECOND' });
+    const second = await sendMessage({ actorId: 'test-user', conversationId: conv.id, content: 'LEAD-SECOND' });
     await waitForStatus(second.executionId, 'completed');
 
     const turn2 = stub.turnsFor(alice.id).at(-1);
@@ -677,7 +678,7 @@ describe('checkpoint 只在 turn 成功后推进', () => {
       leadMemberId: bob.id,
     });
 
-    const ok = await sendMessage({ conversationId: conv.id, content: 'OK-1' });
+    const ok = await sendMessage({ actorId: 'test-user', conversationId: conv.id, content: 'OK-1' });
     await waitForStatus(ok.executionId, 'completed');
     const afterSuccess = runtimeRow(conv.id, bob.id);
     assert.ok(afterSuccess);
@@ -686,7 +687,7 @@ describe('checkpoint 只在 turn 成功后推进', () => {
 
     stub.failWith = 'boom';
     try {
-      const failed = await sendMessage({ conversationId: conv.id, content: 'WILL-FAIL' });
+      const failed = await sendMessage({ actorId: 'test-user', conversationId: conv.id, content: 'WILL-FAIL' });
       await waitForStatus(failed.executionId, 'failed');
     } finally {
       stub.failWith = null;
@@ -712,7 +713,7 @@ describe('wait-for 环检测（跨 delegation 树的死锁保护）', () => {
       memberIds: [alice.id, bob.id],
     });
 
-    const aliceRun = await sendMessage({ conversationId: conv.id, content: 'A' });
+    const aliceRun = await sendMessage({ actorId: 'test-user', conversationId: conv.id, content: 'A' });
     await waitForStatus(aliceRun.executionId, 'completed');
 
     // Bob 的 execution 走 Task 建出来：用户消息只唤醒 Lead，
@@ -810,7 +811,7 @@ describe('durable conversation_event 与 SSE 回放', () => {
     });
 
     try {
-      const sent = await sendMessage({ conversationId: conv.id, content: 'hello' });
+      const sent = await sendMessage({ actorId: 'test-user', conversationId: conv.id, content: 'hello' });
       await waitForStatus(sent.executionId, 'completed');
     } finally {
       unsubscribe();
@@ -856,7 +857,7 @@ describe('durable conversation_event 与 SSE 回放', () => {
       leadMemberId: bob.id,
     });
 
-    const first = await sendMessage({ conversationId: conv.id, content: 'history' });
+    const first = await sendMessage({ actorId: 'test-user', conversationId: conv.id, content: 'history' });
     await waitForStatus(first.executionId, 'completed');
 
     const history = team.listEventsSince(conv.id, 0);
@@ -869,7 +870,7 @@ describe('durable conversation_event 与 SSE 回放', () => {
 
     try {
       // 订阅建立后立刻产生的新事件必须被推送到
-      const second = await sendMessage({ conversationId: conv.id, content: 'live' });
+      const second = await sendMessage({ actorId: 'test-user', conversationId: conv.id, content: 'live' });
       await waitForStatus(second.executionId, 'completed');
     } finally {
       unsubscribe();
@@ -1064,12 +1065,12 @@ describe('redispatchWake：恢复出来的是同一轮', () => {
     });
 
     // 用户消息只唤醒 Lead（Alice）。Bob 从头到尾没被唤醒，读游标停在 0。
-    const first = await sendMessage({ conversationId: room.id, content: '先看这个' });
+    const first = await sendMessage({ actorId: 'test-user', conversationId: room.id, content: '先看这个' });
     await waitForStatus(first.executionId, 'completed');
     await waitForConversationIdle(room.id);
 
     // 再堆一条，把房间水位推高 —— 这样「原样重放」和「猜一个」会明显不同
-    const second = await sendMessage({ conversationId: room.id, content: '再补一条' });
+    const second = await sendMessage({ actorId: 'test-user', conversationId: room.id, content: '再补一条' });
     await waitForStatus(second.executionId, 'completed');
     await waitForConversationIdle(room.id);
 
@@ -1130,7 +1131,7 @@ describe('retryExecution', () => {
     stub.failWith = 'transient';
     let failedId = '';
     try {
-      const failed = await sendMessage({ conversationId: conv.id, content: 'try' });
+      const failed = await sendMessage({ actorId: 'test-user', conversationId: conv.id, content: 'try' });
       failedId = failed.executionId;
       await waitForStatus(failedId, 'failed');
     } finally {
@@ -1156,7 +1157,7 @@ describe('retryExecution', () => {
       release = resolve;
     });
     try {
-      const running = await sendMessage({ conversationId: conv.id, content: 'again' });
+      const running = await sendMessage({ actorId: 'test-user', conversationId: conv.id, content: 'again' });
       assert.throws(() => team.retryExecution(running.executionId), /仍在进行中/);
       release();
       await waitForStatus(running.executionId, 'completed');

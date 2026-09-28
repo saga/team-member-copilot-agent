@@ -8,6 +8,7 @@ import { parseSince } from './conversations.js';
 import {
   currentTeamId,
   requireTeamMember,
+  requireTeamRole,
   isTeamAdmin,
   resolveActor,
 } from '../middleware/teamScope.js';
@@ -35,8 +36,39 @@ function adminOrRole(req: { headers: unknown; query: unknown } & { [k: string]: 
 }
 
 
-export function teamRouter(structure: TeamStructureService, teamEvents: TeamEventService) {
+export function teamRouter(
+  structure: TeamStructureService,
+  teamEvents: TeamEventService,
+  team?: { approveTeamExperience(teamId: string, experienceId: string, approver: string): unknown; rejectTeamExperience(teamId: string, experienceId: string): void },
+) {
   const router = Router();
+
+  // §21：team 经验候选的审批。只允许 owner/admin。
+  router.post('/experiences/:id/approve', requireTeamRole('owner', 'admin'), (req, res) => {
+    try {
+      if (!team) throw new Error('TeamService 未初始化');
+      const id = req.params.id;
+      if (typeof id !== 'string' || !id) throw new Error('缺少 experience id');
+      const actor = resolveActor(req);
+      res.json({
+        experience: team.approveTeamExperience(currentTeamId(), id, actor.principalId),
+      });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  router.post('/experiences/:id/reject', requireTeamRole('owner', 'admin'), (req, res) => {
+    try {
+      if (!team) throw new Error('TeamService 未初始化');
+      const id = req.params.id;
+      if (typeof id !== 'string' || !id) throw new Error('缺少 experience id');
+      team.rejectTeamExperience(currentTeamId(), id);
+      res.json({ ok: true });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
 
   /**
    * Team 级实时事件（Member Activity / Schedule / Presence / External Work /

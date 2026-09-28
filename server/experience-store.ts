@@ -23,6 +23,16 @@ export interface ExperienceRecord {
    * 经验作用域：member = 只给这个 Member，team = Team 内共享。
    */
   scope: 'member' | 'team';
+  /**
+   * team scope 必须经过审批才可见：Agent 随手写的 team 经验在批准前
+   * 只是候选，不能污染别人的检索。
+   */
+  reviewStatus: 'approved' | 'pending';
+  /** 哪一轮产生的经验（审计与回溯用）。 */
+  sourceExecutionId: string | null;
+  createdByMemberId: string;
+  approvedBy: string | null;
+  approvedAt: string | null;
   confidence: number;
   createdAt: string;
   lastUsedAt: string | null;
@@ -48,6 +58,7 @@ export class ExperienceStore {
   add(input: {
     memberId: string;
     teamId: string;
+    sourceExecutionId?: string | null;
     kind: ExperienceKind;
     trigger: string;
     lesson: string;
@@ -60,6 +71,8 @@ export class ExperienceStore {
     if (!trigger) throw new Error('Experience trigger 不能为空');
     if (!lesson) throw new Error('Experience lesson 不能为空');
 
+    // 默认只给自己：team scope 是影响所有人的写入，必须经过审批。
+    const scope = input.scope ?? 'member';
     const record: ExperienceRecord = {
       id: randomUUID(),
       memberId: input.memberId,
@@ -68,7 +81,12 @@ export class ExperienceStore {
       trigger: trigger.slice(0, 1000),
       lesson: lesson.slice(0, 4000),
       evidence: input.evidence ? normalize(input.evidence).slice(0, 4000) : null,
-      scope: input.scope ?? 'team',
+      scope,
+      reviewStatus: scope === 'team' ? 'pending' : 'approved',
+      sourceExecutionId: input.sourceExecutionId ?? null,
+      createdByMemberId: input.memberId,
+      approvedBy: scope === 'team' ? null : input.memberId,
+      approvedAt: scope === 'team' ? null : new Date().toISOString(),
       confidence: clamp(input.confidence ?? 0.8, 0, 1),
       createdAt: new Date().toISOString(),
       lastUsedAt: null,
@@ -104,7 +122,12 @@ export class ExperienceStore {
     if (queryTokens.size === 0) return [];
 
     const records = this.readAll(input.teamId)
-      .filter((item) => item.scope === 'team' || item.memberId === input.memberId)
+      .filter((item) => {
+        if (item.scope === 'member') {
+          return item.memberId === input.memberId;
+        }
+        return item.scope === 'team' && item.reviewStatus === 'approved';
+      })
       .map((item) => ({ item, score: scoreExperience(item, queryTokens) }))
       .filter((item) => item.score > 0)
       .sort((a, b) => b.score - a.score || b.item.createdAt.localeCompare(a.item.createdAt))
@@ -145,13 +168,65 @@ export class ExperienceStore {
       try {
         const parsed = JSON.parse(line) as ExperienceRecord;
         if (parsed && typeof parsed.id === 'string' && typeof parsed.teamId === 'string' && typeof parsed.lesson === 'string') {
-          result.push(parsed);
+          // 旧行没有审批字段：以前默认全 Team 可见，按 approved 读，
+          // 否则一次升级会让历史经验集体消失。
+          result.push({
+            ...parsed,
+            scope: parsed.scope ?? 'team',
+            reviewStatus: parsed.reviewStatus ?? 'approved',
+            sourceExecutionId: parsed.sourceExecutionId ?? null,
+            createdByMemberId: parsed.createdByMemberId ?? parsed.memberId,
+            approvedBy: parsed.approvedBy ?? null,
+            approvedAt: parsed.approvedAt ?? null,
+          });
         }
       } catch {
         // 一条坏行不能断掉整库的检索：跳过它。
       }
     }
     return result;
+  }
+
+  /** 全部经验（含待审候选）：调用方自己按权限过滤，store 不做门禁。 */
+  list(teamId: string): ExperienceRecord[] {
+    return this.readAll(teamId);
+  }
+
+  /**
+   * 驳回一条 team scope 候选：直接删掉，已批准的不能驳回（那是另一个动作）。
+   */
+  rejectTeam(teamId: string, experienceId: string): void {
+    const all = this.readAll(teamId);
+    const record = all.find((item) => item.id === experienceId);
+    if (!record) throw new Error(`Experience 不存在：${experienceId}`);
+    if (record.scope !== 'team') throw new Error('只有 team scope 的经验需要审批');
+    if (record.reviewStatus !== 'pending') throw new Error('只能驳回待审批的候选');
+    this.writeAll(
+      teamId,
+      all.filter((item) => item.id !== experienceId),
+    );
+  }
+
+  /**
+   * 审批一条 team scope 候选（§21 API 用）。只有 owner/admin 能调，
+   * 门禁在 route 层；这里只做状态翻转。
+   */
+  approveTeam(teamId: string, experienceId: string, approver: string): ExperienceRecord {
+    const all = this.readAll(teamId);
+    const record = all.find((item) => item.id === experienceId);
+    if (!record) throw new Error(`Experience 不存在：${experienceId}`);
+    if (record.scope !== 'team') throw new Error('只有 team scope 的经验需要审批');
+    const approved: ExperienceRecord = {
+      ...record,
+      reviewStatus: 'approved',
+      approvedBy: approver,
+      approvedAt: new Date().toISOString(),
+    };
+    this.writeAll(
+      teamId,
+      all.map((item) => (item.id === experienceId ? approved : item)),
+    );
+    return approved;
   }
 
   private writeAll(teamId: string, records: ExperienceRecord[]): void {

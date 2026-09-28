@@ -7,6 +7,8 @@ import type {
 import type { ConversationFileService } from '../conversation-file-service.js';
 import type { StoredConversationEvent } from '../domain.js';
 import { config } from '../config.js';
+import { currentPrincipal } from '../middleware/auth.js';
+import { requireConversationAccess } from '../middleware/conversationAccess.js';
 import { sendError } from '../middleware/errorHandler.js';
 import { canAdmin } from '../middleware/adminAccess.js';
 import { FileTypeRejectedError } from '../file-extractor.js';
@@ -159,6 +161,10 @@ export function conversationsRouter(
     res.json({ conversations: team.listConversations() });
   });
 
+  // :id 之下的所有读写统一先做 Conversation ACL（human 看 Team 归属，
+  // agent 看是不是这个房间的成员）。
+  router.use('/:id', requireConversationAccess(team, 'id'));
+
   router.post('/', (req, res) => {
     const parsed = createConversationSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
@@ -224,7 +230,13 @@ export function conversationsRouter(
     }
     try {
       // 202：消息已落库、execution 已入队，结果通过 SSE 推。
-      const result = await team.sendMessage({ conversationId: req.params.id, ...parsed.data });
+      // 发言人是当前登录用户，不再是写死的 local user。
+      const principal = currentPrincipal(req);
+      const result = await team.sendMessage({
+        conversationId: req.params.id,
+        actorId: principal.principalId,
+        ...parsed.data,
+      });
       res.status(202).json(result);
     } catch (error) {
       sendError(res, error);
@@ -283,7 +295,7 @@ export function conversationsRouter(
       const result = await team.updateGoal({
         conversationId: req.params.id,
         actorType: 'user',
-        actorId: config.localUserId,
+        actorId: currentPrincipal(req).principalId,
         objective: parsed.data.objective,
         requirements: parsed.data.requirements
           ? {

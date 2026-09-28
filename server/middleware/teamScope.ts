@@ -1,5 +1,5 @@
 import type { NextFunction, Request, Response } from 'express';
-import { config } from '../config.js';
+import { currentPrincipal } from './auth.js';
 import { forbidden } from '../http-error.js';
 import type { TeamParticipantKind, TeamRole } from '../domain.js';
 import type { TeamStructureService } from '../team-structure-service.js';
@@ -7,9 +7,8 @@ import type { TeamStructureService } from '../team-structure-service.js';
 /**
  * Team 级 Actor 与 Role 门禁。
  *
- * Human actor：浏览器请求，无真正认证时 principalId = LOCAL_ACTOR_ID。
+ * Human actor：浏览器请求，principalId 来自 OIDC（req.principal）。
  * Agent actor：/api/internal 下的调用，principalId = 路径里的 Member id。
- * 后面接 Entra/OIDC 时只替换 resolveActor，不动每个路由。
  */
 export interface ActorContext {
   kind: TeamParticipantKind;
@@ -28,7 +27,7 @@ export function initTeamScope(service: TeamStructureService, teamId: string): vo
 export function resolveActor(req: Request): ActorContext {
   const agentId = (req as { agentMemberId?: unknown }).agentMemberId;
   if (typeof agentId === 'string' && agentId) return { kind: 'agent', principalId: agentId };
-  return { kind: 'human', principalId: config.localActorId };
+  return { kind: 'human', principalId: currentPrincipal(req).principalId };
 }
 
 function teamOf(req: Request): string {

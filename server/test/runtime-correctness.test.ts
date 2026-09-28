@@ -562,6 +562,7 @@ const sendRaw = team.sendMessage.bind(team);
  */
 async function sendMessage(input: {
   conversationId: string;
+  actorId: string;
   content: string;
   replyToMessageId?: string;
 }) {
@@ -586,7 +587,7 @@ describe('Execution cancel 状态机', () => {
     });
 
     try {
-      const sent = await sendMessage({ conversationId: conv.id, content: 'long task' });
+      const sent = await sendMessage({ actorId: 'test-user', conversationId: conv.id, content: 'long task' });
       await waitForStatus(sent.executionId, 'running');
 
       const cancelPromise = team.cancelExecution(sent.executionId);
@@ -618,7 +619,7 @@ describe('Execution cancel 状态机', () => {
     });
 
     try {
-      const sent = await sendMessage({ conversationId: conv.id, content: 'long task' });
+      const sent = await sendMessage({ actorId: 'test-user', conversationId: conv.id, content: 'long task' });
       await waitForStatus(sent.executionId, 'running');
 
       const cancelPromise = team.cancelExecution(sent.executionId);
@@ -652,7 +653,7 @@ describe('Execution cancel 状态机', () => {
 
     try {
       // Alice 占住自己的 runtime（用户消息只唤醒 Lead）
-      const aliceHeld = await sendMessage({ conversationId: conv.id, content: 'blocker' });
+      const aliceHeld = await sendMessage({ actorId: 'test-user', conversationId: conv.id, content: 'blocker' });
       await waitForStatus(aliceHeld.executionId, 'running');
 
       // Bob 的 parent execution 走 Task 建出来（Lead 是 Alice，直接调 service）
@@ -727,7 +728,7 @@ describe('Execution cancel 状态机', () => {
 
   it('已结束 / waiting_for_member 的 execution 不能 cancel', async () => {
     const conv = newConversation();
-    const sent = await sendMessage({ conversationId: conv.id, content: 'done' });
+    const sent = await sendMessage({ actorId: 'test-user', conversationId: conv.id, content: 'done' });
     await waitForStatus(sent.executionId, 'completed');
 
     await assert.rejects(() => team.cancelExecution(sent.executionId), /已经结束/);

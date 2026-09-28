@@ -171,7 +171,7 @@ describe('Scheduler', () => {
     // 先制造一条聊天消息：messageSequence > 0。旧的实现会把 scheduled prompt
     // 伪装成「最近一条消息」重放 —— 这条断言锁死 prompt 保真。
     muteAllMembers(stack.team, room.id);
-    await stack.team.sendMessage({ conversationId: room.id, content: '聊天里最后一条消息' });
+    await stack.team.sendMessage({ actorId: 'test-user', conversationId: room.id, content: '聊天里最后一条消息' });
 
     const PROMPT = '严格按 schedule 的 prompt 执行';
     const schedule = structure.createSchedule(
@@ -491,12 +491,23 @@ describe('Actor 身份：只能由 internal 路由注入，不能靠请求头冒
     // 这条断言守的是一个具体的洞：一旦 resolveActor 改信请求头，任何能访问
     // 服务的人都能以任意 Member 的身份说话、claim、发消息 —— 而请求日志上
     // 看不出任何异常。
-    const forged = { headers: { 'x-agent-id': 'm-forged' }, query: {} } as unknown as Request;
+    const forged = {
+      headers: { 'x-agent-id': 'm-forged' },
+      query: {},
+      principal: { kind: 'human', principalId: 'test-user', claims: {} },
+    } as unknown as Request;
     assert.deepEqual(
       resolveActor(forged),
-      { kind: 'human', principalId: config.localActorId },
-      '请求头不能成为身份来源',
+      { kind: 'human', principalId: 'test-user' },
+      '请求头不能成为身份来源，有 principal 也只认 principal',
     );
+  });
+
+  it('没有认证中间件时 resolveActor 直接抛错，不再回落 local user', () => {
+    // 生产 app.ts 一定先挂 requireHumanAuth；裸调 resolveActor 说明装配错了，
+    // 必须炸出来，不能悄悄当成 local-user 继续跑。
+    const naked = { headers: {}, query: {} } as unknown as Request;
+    assert.throws(() => resolveActor(naked), /未认证/);
   });
 
   it('只有 /api/internal/members/:id 注入 agent 身份，普通 /api 路径没有注入点', async () => {
@@ -518,7 +529,15 @@ describe('Actor 身份：只能由 internal 路由注入，不能靠请求头冒
     app.use('/api/internal', (req, res) => {
       res.json({ actor: resolveActor(req) });
     });
-    // 普通 /api 路径的探针 —— 这里没有任何东西注入身份。
+    // 普通 /api 路径的探针：生产由 requireHumanAuth 写 principal，这里手动 stub。
+    app.use('/api', (req, _res, next) => {
+      (req as { principal?: unknown }).principal = {
+        kind: 'human',
+        principalId: 'test-user',
+        claims: {},
+      };
+      next();
+    });
     app.use('/api', (req, res) => {
       res.json({ actor: resolveActor(req) });
     });
@@ -539,7 +558,7 @@ describe('Actor 身份：只能由 internal 路由注入，不能靠请求头冒
       });
       assert.deepEqual(
         await outside.json(),
-        { actor: { kind: 'human', principalId: config.localActorId } },
+        { actor: { kind: 'human', principalId: 'test-user' } },
         '同样的头在普通路径上必须毫无效果',
       );
     } finally {
@@ -561,7 +580,7 @@ describe('外部工作：本地只有引用，业务事实在 Jira', () => {
       memberIds: [agent.id],
     });
 
-    const sent = await stack.team.sendMessage({ conversationId: room.id, content: 'start work' });
+    const sent = await stack.team.sendMessage({ actorId: 'test-user', conversationId: room.id, content: 'start work' });
     const execution = stack.team.getExecution(singleExecutionId(db, room.id, sent.wakes));
     assert.equal(execution.externalWorkRef?.key, 'ABC-128', '引用快照取自 conversation');
     // 没配 Jira 连接（测试环境）时没有 Provider，取证拿不到东西 —— 必须是 null

@@ -407,7 +407,7 @@ describe('execution 开始时的取证：控制面直连 Provider', () => {
       memberIds: [agent.id],
     });
 
-    const sent = await stack.team.sendMessage({ conversationId: room.id, content: 'start' });
+    const sent = await stack.team.sendMessage({ actorId: 'test-user', conversationId: room.id, content: 'start' });
     assert.equal(sent.wakes.length, 1, '期望恰好一个唤醒');
     const executionId = findExecutionId(db, room.id);
 

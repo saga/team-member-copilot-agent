@@ -399,12 +399,13 @@ export type ExecutionKind = 'interactive' | 'member_delegate' | 'member_work';
 /**
  * 一轮 turn 的性质，决定 prompt 里给 Member 的指令。
  *
- *   lead       —— 用户在推动整个工作，Lead 处理需求/变化/阻塞
- *   mention    —— 用户明确 @ 点名，直接回答用户，不做协调
- *   task       —— 当前 Member 正在执行指定 Task
- *   delegation —— ask_member 派来的明确子任务，必须交付结果
+ *   lead           —— 用户在推动整个工作，Lead 处理需求/变化/阻塞
+ *   mention        —— 用户明确 @ 点名，直接回答用户，不做协调
+ *   task           —— 当前 Member 正在执行指定 Task
+ *   delegation     —— ask_member 派来的明确子任务，必须交付结果
+ *   member_message —— Member 私聊里回对端的话，按自己身份回，不做协调
  */
-export type TurnMode = 'lead' | 'mention' | 'task' | 'delegation';
+export type TurnMode = 'lead' | 'mention' | 'task' | 'delegation' | 'member_message';
 
 /**
  * 为什么唤醒这个 Member。确定性规则产出，不经过 LLM 路由。
@@ -415,6 +416,7 @@ export type TurnMode = 'lead' | 'mention' | 'task' | 'delegation';
  * lead_recovery      Task 失败/阻塞后唤醒 Lead
  * goal_changed       Goal 改变后重新规划
  * user_mention       用户明确 @Member
+ * member_message     Member 私聊消息
  * task_ready         Task 依赖满足
  * schedule           定时唤醒
  */
@@ -425,6 +427,7 @@ export type WakeReason =
   | 'lead_recovery'
   | 'goal_changed'
   | 'user_mention'
+  | 'member_message'
   | 'task_ready'
   | 'schedule';
 
@@ -443,6 +446,7 @@ export type LeadModelPurpose =
 export type ModelPurpose =
   | `lead:${LeadModelPurpose}`
   | 'member:mention'
+  | 'member:message'
   | 'member:task'
   | 'member:delegation';
 

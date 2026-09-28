@@ -282,6 +282,14 @@ export class ContextAssembler {
       return sections.join('\n\n');
     }
 
+    // 私聊回话：按自己的 Member 身份直接回对端。绝不能拿 Lead 的指令
+    // （“你是这个工作区的 Lead”“缺信息就问用户”），否则私聊对端会
+    // 开始协调一个它根本不负责的工作区。
+    if (input.turnMode === 'member_message') {
+      sections.push('User message:', input.currentPrompt, MEMBER_DM_INSTRUCTION);
+      return sections.join('\n\n');
+    }
+
     sections.push('User message:', input.currentPrompt, LEAD_INSTRUCTION);
     return sections.join('\n\n');
   }
@@ -408,6 +416,14 @@ const MEMBER_MENTION_INSTRUCTION = [
   'Do not create or re-plan the workspace task plan.',
   'Use available knowledge and tools when useful.',
   'Keep the answer focused on the question you were directly asked.',
+].join('\n');
+
+const MEMBER_DM_INSTRUCTION = [
+  'You are replying in a direct conversation with another Member.',
+  'Answer directly from your own role, expertise, and available capabilities.',
+  'Do not act as a coordinator: you are not the Lead of any workspace here.',
+  'Do not create or re-plan any task plan.',
+  'Keep the answer focused on what the other Member asked.',
 ].join('\n');
 
 const LEAD_INSTRUCTION = [

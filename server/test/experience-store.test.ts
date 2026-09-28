@@ -35,7 +35,10 @@ describe('ExperienceStore：存与取', () => {
       lesson: '先检查现有 subtasks，再创建缺失工作',
     });
     assert.equal(experience.kind, 'user_feedback');
-    assert.equal(experience.scope, 'team');
+    // 默认只给自己，不默认全 Team 可见。
+    assert.equal(experience.scope, 'member');
+    assert.equal(experience.reviewStatus, 'approved');
+    assert.equal(experience.createdByMemberId, 'alice');
     assert.ok(experience.id);
     assert.ok(experience.createdAt);
   });
@@ -175,12 +178,12 @@ describe('Experience 回路：存 → 下一轮 prompt', () => {
     });
 
     // 用户纠正 → Lead 存经验（第一轮 prompt 里还没有它）。
-    const first = await team.sendMessage({ conversationId: room.id, content: '处理 Jira Story 要小心' });
+    const first = await team.sendMessage({ actorId: 'test-user', conversationId: room.id, content: '处理 Jira Story 要小心' });
     const firstId = singleExecutionId(db, room.id, first.wakes);
     await waitForConversationIdle(room.id);
     assert.doesNotMatch(stub.turnFor(firstId).prompt, /先检查现有 subtasks/);
 
-    await team.learnExperience({
+    const saved = await team.learnExperience({
       conversationId: room.id,
       memberId: lead.id,
       kind: 'user_feedback',
@@ -189,9 +192,23 @@ describe('Experience 回路：存 → 下一轮 prompt', () => {
       scope: 'team',
       confidence: 0.95,
     });
+    assert.match(saved, /待.*审核/);
 
-    // 下一次类似任务：控制面自动检索并注入，不需要 Agent 记得检索。
-    const second = await team.sendMessage({ conversationId: room.id, content: '处理 ABC-123 这个 Jira Story' });
+    // 审批前：team 候选对检索不可见。
+    const pending = await team.sendMessage({ actorId: 'test-user', conversationId: room.id, content: '处理 ABC-123 这个 Jira Story' });
+    const pendingId = singleExecutionId(db, room.id, pending.wakes);
+    await waitForConversationIdle(room.id);
+    assert.doesNotMatch(stub.turnFor(pendingId).prompt, /先检查现有 subtasks/);
+
+    // 审批后：下一次类似任务自动检索并注入，不需要 Agent 记得检索。
+    const approved = team.approveTeamExperience(
+      room.teamId,
+      team.listTeamExperiences(room.teamId).find((item) => item.reviewStatus === 'pending')!.id,
+      'owner-1',
+    );
+    assert.equal(approved.reviewStatus, 'approved');
+
+    const second = await team.sendMessage({ actorId: 'test-user', conversationId: room.id, content: '处理 ABC-123 这个 Jira Story' });
     const secondId = singleExecutionId(db, room.id, second.wakes);
     await waitForConversationIdle(room.id);
     assert.match(stub.turnFor(secondId).prompt, /先检查现有 subtasks/);

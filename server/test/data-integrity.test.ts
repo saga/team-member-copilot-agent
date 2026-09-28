@@ -124,12 +124,11 @@ describe('replyToMessageId 必须指得着，而且是同一个房间里的', ()
     const room = team.createConversation({ kind: 'task', memberIds: [alice.id], leadMemberId: alice.id });
     const other = team.createConversation({ kind: 'task', memberIds: [bob.id], leadMemberId: bob.id });
 
-    const elsewhere = await team.sendMessage({ conversationId: other.id, content: '别的房间' });
+    const elsewhere = await team.sendMessage({ actorId: 'test-user', conversationId: other.id, content: '别的房间' });
 
     await assert.rejects(
       () =>
-        team.sendMessage({
-          conversationId: room.id,
+        team.sendMessage({ actorId: 'test-user', conversationId: room.id,
           content: '引用一条不存在的消息',
           replyToMessageId: 'no-such-message',
         }),
@@ -138,8 +137,7 @@ describe('replyToMessageId 必须指得着，而且是同一个房间里的', ()
 
     await assert.rejects(
       () =>
-        team.sendMessage({
-          conversationId: room.id,
+        team.sendMessage({ actorId: 'test-user', conversationId: room.id,
           content: '引用别的房间的消息',
           replyToMessageId: elsewhere.message.id,
         }),
@@ -164,8 +162,7 @@ describe('POST /messages 的幂等键', () => {
 
     const key = 'req-0001';
 
-    const first = await team.sendMessage({
-      conversationId: room.id,
+    const first = await team.sendMessage({ actorId: 'test-user', conversationId: room.id,
       content: '只应该出现一次',
       clientRequestId: key,
     });
@@ -173,8 +170,7 @@ describe('POST /messages 的幂等键', () => {
 
     const executionsAfterFirst = countExecutions(room.id);
 
-    const retry = await team.sendMessage({
-      conversationId: room.id,
+    const retry = await team.sendMessage({ actorId: 'test-user', conversationId: room.id,
       content: '只应该出现一次',
       clientRequestId: key,
     });
@@ -253,7 +249,7 @@ describe('ContextAssembler 的单轮上限', () => {
 
     const total = 12;
     for (let index = 1; index <= total; index += 1) {
-      await team.sendMessage({ conversationId: room.id, content: `消息 ${index}` });
+      await team.sendMessage({ actorId: 'test-user', conversationId: room.id, content: `消息 ${index}` });
     }
     await waitForConversationIdle(room.id);
 
@@ -321,8 +317,8 @@ describe('ContextAssembler 的单轮上限', () => {
     });
     await muteAllMembers(team, room.id);
 
-    await team.sendMessage({ conversationId: room.id, content: 'x'.repeat(4000) });
-    await team.sendMessage({ conversationId: room.id, content: 'y'.repeat(4000) });
+    await team.sendMessage({ actorId: 'test-user', conversationId: room.id, content: 'x'.repeat(4000) });
+    await team.sendMessage({ actorId: 'test-user', conversationId: room.id, content: 'y'.repeat(4000) });
     await waitForConversationIdle(room.id);
 
     const originalChars = config.maxContextChars;
@@ -371,7 +367,7 @@ describe('execution 记录当时用的配置', () => {
     const alice = makeMember('Snapshot Alice', 'snapshot-alice');
     const room = team.createConversation({ kind: 'task', memberIds: [alice.id], leadMemberId: alice.id });
 
-    const sent = await team.sendMessage({ conversationId: room.id, content: '第一轮' });
+    const sent = await team.sendMessage({ actorId: 'test-user', conversationId: room.id, content: '第一轮' });
     const executionId = singleExecutionId(db, room.id, sent.wakes);
     await waitForConversationIdle(room.id);
 
@@ -461,7 +457,7 @@ describe('conversation_member_state.updated', () => {
     });
 
     try {
-      await team.sendMessage({ conversationId: room.id, content: '跑一轮' });
+      await team.sendMessage({ actorId: 'test-user', conversationId: room.id, content: '跑一轮' });
       await waitForConversationIdle(room.id);
     } finally {
       unsubscribe();

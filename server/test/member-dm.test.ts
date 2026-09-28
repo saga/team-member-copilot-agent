@@ -123,7 +123,7 @@ describe('私聊消息', () => {
 
     assert.equal(result.wakes.length, 1);
     assert.equal(result.wakes[0].memberId, b.id);
-    assert.equal(result.wakes[0].reason, 'lead_message');
+    assert.equal(result.wakes[0].reason, 'member_message');
 
     const executionId = executionIdForWake(db, result.conversation.id, result.wakes[0]);
     await waitForStatus(executionId, 'completed');
@@ -134,6 +134,22 @@ describe('私聊消息', () => {
     assert.equal(messages.length, 2);
     assert.equal(messages[1].senderType, 'member');
     assert.equal(messages[1].senderId, b.id);
+  });
+
+  it('member DM uses member_message turn mode', async () => {
+    const [a, b] = newPair();
+    const result = await team.sendDirectMessage({
+      fromMemberId: a.id,
+      toMemberId: b.id,
+      content: 'hello',
+    });
+
+    const executionId = executionIdForWake(db, result.conversation.id, result.wakes[0]);
+    await waitForStatus(executionId, 'completed');
+    await waitForConversationIdle(result.conversation.id);
+
+    const executions = team.listExecutions(result.conversation.id);
+    assert.equal(executions[0].wakeReason, 'member_message');
   });
 
   it('B 的回复不再唤醒 A —— 私聊不会自己一直对谈下去', async () => {

@@ -100,6 +100,7 @@ export interface CoreToolHost {
   learnExperience(input: {
     conversationId: string;
     memberId: string;
+    executionId?: string | null;
     kind: 'success' | 'failure' | 'user_feedback' | 'preference' | 'strategy';
     trigger: string;
     lesson: string;
@@ -497,27 +498,29 @@ export class CoreTeamToolProvider implements ToolProvider {
           'Store a reusable lesson from this work so it can be retrieved in future similar tasks. ' +
           'Use this when the user corrects your approach, when you discover a reusable success/failure pattern, ' +
           'or when a workflow-specific strategy should be remembered. ' +
-          'Store the reusable lesson, not a transcript or temporary detail.',
+          'Store the reusable lesson, not a transcript or temporary detail. ' +
+          'team scope only creates a pending candidate; it is invisible to other Members until approved.',
         risk: 'self-write',
         parameters: z.object({
           kind: z.enum(['success', 'failure', 'user_feedback', 'preference', 'strategy']),
           trigger: z.string().min(1).max(1000),
           lesson: z.string().min(1).max(4000),
           evidence: z.string().max(4000).optional(),
-          scope: z.enum(['member', 'team']).default('team'),
+          scope: z.enum(['member', 'team']).default('member'),
           confidence: z.number().min(0).max(1).default(0.8),
         }),
         execute: (context, args) =>
           this.host.learnExperience({
             conversationId: context.conversationId,
             memberId: context.memberId,
+            executionId: context.executionId,
             kind: (args as { kind: 'success' | 'failure' | 'user_feedback' | 'preference' | 'strategy' }).kind,
             trigger: String((args as { trigger: string }).trigger),
             lesson: String((args as { lesson: string }).lesson),
             ...((args as { evidence?: string }).evidence === undefined
               ? {}
               : { evidence: String((args as { evidence?: string }).evidence) }),
-            scope: (args as { scope?: string }).scope === 'member' ? 'member' : 'team',
+            scope: (args as { scope?: string }).scope === 'team' ? 'team' : 'member',
             confidence: Number((args as { confidence?: number }).confidence ?? 0.8),
           }),
       },

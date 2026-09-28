@@ -252,7 +252,7 @@ describe('Goal revision', () => {
     const originalCancelTurn = stubAny.cancelTurn;
     stubAny.cancelTurn = async () => ({ found: false, aborted: false, idle: false });
     try {
-      await team.sendMessage({ conversationId: room.id, content: '先按 v1 做' });
+      await team.sendMessage({ actorId: 'test-user', conversationId: room.id, content: '先按 v1 做' });
       let leadExecutionId: string | null = null;
       for (let attempt = 0; attempt < 400; attempt += 1) {
         const row = db
@@ -345,7 +345,7 @@ describe('Goal revision', () => {
     });
     stub.holdMemberIds = new Set([alice.id]);
     try {
-      await team.sendMessage({ conversationId: room.id, content: '按 v1 做' });
+      await team.sendMessage({ actorId: 'test-user', conversationId: room.id, content: '按 v1 做' });
       let leadExecutionId: string | null = null;
       for (let attempt = 0; attempt < 400; attempt += 1) {
         const row = db

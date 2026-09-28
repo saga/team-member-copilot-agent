@@ -8,12 +8,12 @@ import { hashText } from './content-hash.js';
 import { runInTransaction } from './db-tx.js';
 import { now } from './db.js';
 import { ContextAssembler } from './context-assembler.js';
-import { ExperienceStore, type ExperienceKind } from './experience-store.js';
+import { ExperienceStore, type ExperienceKind, type ExperienceRecord } from './experience-store.js';
 import { ConversationMemberService } from './conversation-member-service.js';
 import { MemberTurnScheduler } from './member-turn-scheduler.js';
 import { TaskOrchestrator } from './task-orchestrator.js';
 import { TaskService, parseRequirements, parseStringArray, type TaskPlanInput } from './task-service.js';
-import { badRequest, conflict, notFound } from './http-error.js';
+import { badRequest, conflict, forbidden, notFound } from './http-error.js';
 import { findMentionedMembers } from './member-mentions.js';
 import { MemberConversationService, isMemberDm, type MemberDirectMessage } from './member-conversation-service.js';
 import type { ConversationFileService } from './conversation-file-service.js';
@@ -617,6 +617,23 @@ export class TeamService {
     return this.hydrateConversation(row);
   }
 
+  /** Human 访问 Conversation 的前提：是这个 Conversation 所在 Team 的 active 成员。 */
+  requireTeamHumanAccess(teamId: string, principalId: string): void {
+    if (!this.structure) {
+      throw forbidden('Team structure 未初始化');
+    }
+    try {
+      this.structure.requireActiveMembership(teamId, 'human', principalId);
+    } catch (error) {
+      // Team 里查无此人也是 403：这不是“资源不存在”，是“你没资格”。
+      // conversation 本身不存在是另一回事，getConversation 在前面报 404。
+      if ((error as { status?: unknown }).status === 404) {
+        throw forbidden(`不是这个 Team 的成员：${principalId}`);
+      }
+      throw error;
+    }
+  }
+
   /**
    * 建工作区。Task 工作区默认让 Lead 主动先开口（`autoStartLead`）：
    * 用户建完不用先想第一句话，Lead 会先看 Jira 和上下文，缺信息就直接问。
@@ -945,6 +962,8 @@ export class TeamService {
 
   async sendMessage(input: {
     conversationId: string;
+    /** 当前登录用户（OIDC sub）。用户消息的归属，不再是写死的 local user。 */
+    actorId: string;
     content: string;
     replyToMessageId?: string;
     clientRequestId?: string;
@@ -985,7 +1004,7 @@ export class TeamService {
       conversationId: conversation.id,
       messageSequence: this.nextMessageSequence(conversation.id),
       senderType: 'user',
-      senderId: config.localUserId,
+      senderId: input.actorId,
       replyToMessageId,
       taskId: null,
       clientRequestId,
@@ -1053,24 +1072,21 @@ export class TeamService {
       });
     }
 
+    // @A @B @C 直接并行唤醒，不做隐式串行工作流：crash / retry /
+    // partial completion 下串行链很难正确恢复。真要严格顺序用 Task 依赖表达。
     if (mentionedMembers.length > 0) {
-      // 同一条 User message 中的多个 @Member 是一个有序 mention chain：
-      // 第一位立即执行，后面的等前一位完成后再 enqueue（见 advanceMentionChain）。
-      // 全部同时启动的话，后面的 Member 看不到前面的回答，只能各说各的。
-      const firstMentioned = mentionedMembers.find(
-        (member) => !this.states.get(conversation.id, member.id).muted,
-      );
-      // muted 是明确的控制面设置，@mention 也不能绕过。
-      if (firstMentioned) {
+      for (const member of mentionedMembers) {
+        // muted 是明确的控制面设置，@mention 也不能绕过。
+        if (this.states.get(conversation.id, member.id).muted) continue;
         this.scheduler.enqueue({
           conversationId: conversation.id,
-          memberId: firstMentioned.id,
+          memberId: member.id,
           taskId: null,
           reason: 'user_mention',
           triggerSequence: created.messageSequence,
         });
         wakes.push({
-          memberId: firstMentioned.id,
+          memberId: member.id,
           reason: 'user_mention',
           taskId: null,
           triggerSequence: created.messageSequence,
@@ -1103,46 +1119,6 @@ export class TeamService {
     }
 
     return { message: created, wakes, deduplicated: false };
-  }
-
-  /**
-   * mention chain 推进：同一条 User message 点了 @A @B，A 回答完后叫 B。
-   *
-   * B 看到的是 A 已经写进 Conversation 的回答（+ 确定性补充区兜底窗口截断），
-   * 所以只做增量补充。判据是 execution 行：同 trigger + user_mention +
-   * completed 的才算“真正回答过”，光 enqueue 不算。
-   */
-  private advanceMentionChain(conversationId: string, triggerMessageSequence: number): void {
-    const conversation = this.getConversation(conversationId);
-    const trigger = this.findMessageBySequence(conversationId, triggerMessageSequence);
-    if (!trigger) return;
-    if (trigger.senderType !== 'user') return;
-    const mentionedMembers = findMentionedMembers(trigger.content, conversation.members);
-    if (mentionedMembers.length <= 1) return;
-
-    const rows = this.db
-      .prepare(
-        `SELECT DISTINCT member_id FROM execution
-         WHERE conversation_id = ? AND trigger_message_sequence = ?
-           AND wake_reason = 'user_mention' AND status = 'completed'`,
-      )
-      .all(conversationId, triggerMessageSequence) as Array<{ member_id: string }>;
-    const completed = new Set(rows.map((row) => row.member_id));
-    const next = mentionedMembers.find(
-      (member) =>
-        !completed.has(member.id) && !this.states.get(conversationId, member.id).muted,
-    );
-    if (!next) return;
-
-    // 下一位直接进入 scheduler：如果它此时正在执行自己的 Task，
-    // scheduler 会把 mention 放到它的下一轮，不插队。
-    this.scheduler.enqueue({
-      conversationId,
-      memberId: next.id,
-      taskId: null,
-      reason: 'user_mention',
-      triggerSequence: triggerMessageSequence,
-    });
   }
 
   /**
@@ -1278,6 +1254,7 @@ export class TeamService {
 
     // 私聊直接唤醒对端，不经过任何 dispatcher。忙也不丢：scheduler 自己负责
     // idle → 立即执行、busy → pending、pending → coalesce。
+    // 私聊是 member_message，不是 Lead turn：对端按自己的 Member 身份回话。
     const state = this.states.get(conversation.id, target.id);
     const wakes: WakePlan[] = [];
     if (!state.muted) {
@@ -1285,11 +1262,11 @@ export class TeamService {
         conversationId: conversation.id,
         memberId: target.id,
         taskId: null,
-        reason: 'lead_message',
+        reason: 'member_message',
         triggerSequence: message.messageSequence,
       };
       this.scheduler.enqueue(wake);
-      wakes.push({ memberId: target.id, reason: 'lead_message', taskId: null, triggerSequence: message.messageSequence });
+      wakes.push({ memberId: target.id, reason: 'member_message', taskId: null, triggerSequence: message.messageSequence });
     }
 
     return {
@@ -1960,6 +1937,15 @@ export class TeamService {
     if (task) this.emit(task.conversationId, { type: 'task.updated', data: this.tasks.get(task.id) });
 
     try {
+      // user_mention / member_message 都不是 Lead turn：否则被唤醒的 Member
+      // 会拿到 Lead 的指令、写 Lead 的消息头，还可能触发 Lead 的自唤醒。
+      const turnMode: TurnMode = task
+        ? 'task'
+        : wake.reason === 'user_mention'
+          ? 'mention'
+          : wake.reason === 'member_message'
+            ? 'member_message'
+            : 'lead';
       await this.executeMemberTurn({
         conversation,
         member,
@@ -1967,9 +1953,7 @@ export class TeamService {
         prompt: execution.prompt,
         taskId: task?.id ?? null,
         triggerMessageSequence: wake.triggerSequence,
-        // user_mention 不是 Lead turn：否则被点名的 Member 会拿到 Lead 的
-        // 指令、写 Lead 的消息头，还可能触发 Lead 的自唤醒。
-        turnMode: task ? 'task' : wake.reason === 'user_mention' ? 'mention' : 'lead',
+        turnMode,
         wakeReason: wake.reason,
       });
     } catch (error) {
@@ -2306,6 +2290,7 @@ export class TeamService {
   async learnExperience(input: {
     conversationId: string;
     memberId: string;
+    executionId?: string | null;
     kind: ExperienceKind;
     trigger: string;
     lesson: string;
@@ -2315,17 +2300,36 @@ export class TeamService {
   }): Promise<string> {
     const conversation = this.getConversation(input.conversationId);
     this.requireActiveMember(conversation, input.memberId);
+    const scope = input.scope ?? 'member';
     const experience = this.experiences.add({
       memberId: input.memberId,
       teamId: conversation.teamId,
+      sourceExecutionId: input.executionId ?? null,
       kind: input.kind,
       trigger: input.trigger,
       lesson: input.lesson,
       evidence: input.evidence,
-      scope: input.scope ?? 'team',
+      scope,
       confidence: input.confidence ?? 0.8,
     });
-    return `已保存可复用经验：${experience.lesson}`;
+    return scope === 'team'
+      ? `已保存 team 经验候选，待 owner/admin 审核后其他成员才能检索到：${experience.lesson}`
+      : `已保存可复用经验：${experience.lesson}`;
+  }
+
+  /** §21：审批一条 team scope 经验候选。owner/admin 门禁在 route 层。 */
+  approveTeamExperience(teamId: string, experienceId: string, approver: string): ExperienceRecord {
+    return this.experiences.approveTeam(teamId, experienceId, approver);
+  }
+
+  /** §21：驳回一条 team scope 经验候选（删掉）。owner/admin 门禁在 route 层。 */
+  rejectTeamExperience(teamId: string, experienceId: string): void {
+    this.experiences.rejectTeam(teamId, experienceId);
+  }
+
+  /** §21：列出经验（含待审候选，供审批界面用）。可见性由调用方按权限过滤。 */
+  listTeamExperiences(teamId: string): ExperienceRecord[] {
+    return this.experiences.list(teamId);
   }
 
   /**
@@ -2594,8 +2598,9 @@ export class TeamService {
   private turnModeFor(_conversation: Conversation, execution: ExecutionRecord): TurnMode {
     if (execution.kind === 'member_delegate') return 'delegation';
     if (execution.taskId) return 'task';
-    // crash 后恢复：@点名的那一轮还是 mention，不能恢复成 lead。
+    // crash 后恢复：@点名的那一轮还是 mention，私聊还是私聊，都不能恢复成 lead。
     if (execution.wakeReason === 'user_mention') return 'mention';
+    if (execution.wakeReason === 'member_message') return 'member_message';
     return 'lead';
   }
 
@@ -2960,11 +2965,14 @@ export class TeamService {
     taskTier?: 'cheap' | 'standard' | 'strong' | null;
   }): { model: string; purpose: ExecutionConfigSnapshot['modelPurpose'] } {
     if (input.turnMode !== 'lead') {
-      // @点名直接复用 Member 模型策略，不单独搞一套。
+      // @点名 / 私聊直接复用 Member 模型策略，不单独搞一套。
       let purpose: ExecutionConfigSnapshot['modelPurpose'];
       switch (input.turnMode) {
         case 'mention':
           purpose = 'member:mention';
+          break;
+        case 'member_message':
+          purpose = 'member:message';
           break;
         case 'task':
           purpose = 'member:task';
@@ -3197,7 +3205,10 @@ export class TeamService {
       const goalStale =
         input.execution.goalRevision !== this.currentGoalRevision(input.conversation.id);
       let message: ConversationMessage | null = null;
-      const userFacingTurn = input.turnMode === 'lead' || input.turnMode === 'mention';
+      const userFacingTurn =
+        input.turnMode === 'lead' ||
+        input.turnMode === 'mention' ||
+        input.turnMode === 'member_message';
       if (content && userFacingTurn && !goalStale) {
         message = this.insertMemberMessage({
           conversationId: input.conversation.id,
@@ -3226,16 +3237,6 @@ export class TeamService {
       });
 
       if (message) this.emit(input.conversation.id, { type: 'message.created', data: message });
-
-      if (input.turnMode === 'mention' && message && !goalStale) {
-        if (input.triggerMessageSequence !== null) {
-          this.advanceMentionChain(input.conversation.id, input.triggerMessageSequence);
-        }
-        // mention 可能优先于一个 task_ready wake 进来：完成后重新扫描 ready，
-        // 避免被优先级替换掉的那条 Task 推进永远等不到。
-        this.orchestrator.startReadyTasks(input.conversation.id);
-      }
-
       this.emitExecution(this.getExecution(executionId));
       this.touchConversation(input.conversation.id);
       this.touchAgentPresence(input.member.id);

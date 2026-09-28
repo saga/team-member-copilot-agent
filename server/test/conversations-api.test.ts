@@ -48,8 +48,21 @@ before(async () => {
   alice = stack.team.createMember({ name: 'ConvApiA', role: 'A' });
   bob = stack.team.createMember({ name: 'ConvApiB', role: 'B' });
 
+  // 测试里直接挂 router：认证中间件在生产由 app.ts 挂，这里手动 stub
+  // 一个已登录 human（principal 由 requireHumanAuth 写，这里直接写）。
+  const defaultTeam = stack.structure.ensureDefaultTeam();
+  stack.structure.ensureHumanOwner(defaultTeam.id, 'test-user');
+
   const app = express();
   app.use(express.json({ limit: '1mb' }));
+  app.use((_req, _res, next) => {
+    (_req as { principal?: unknown }).principal = {
+      kind: 'human',
+      principalId: 'test-user',
+      claims: {},
+    };
+    next();
+  });
   app.use(
     '/api/conversations',
     conversationsRouter(
