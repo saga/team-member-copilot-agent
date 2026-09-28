@@ -643,7 +643,7 @@ CREATE TABLE execution (
   -- 这一轮最终判断了什么以及唤醒它的那条消息
   decision TEXT,
   trigger_message_sequence INTEGER,
-  -- 为什么唤醒这个 Member（lead_message / lead_clarification / lead_recovery / task_ready / schedule）。
+  -- 为什么唤醒这个 Member（lead_message / lead_clarification / lead_recovery / goal_changed / user_mention / task_ready / schedule）。
   -- 落库是为了重启恢复时能忠实重放同一轮，而不是猜一个。
   wake_reason TEXT,
   -- 这一轮跑的时候，这个 Member 的配置长什么样。

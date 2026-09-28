@@ -400,25 +400,29 @@ export type ExecutionKind = 'interactive' | 'member_delegate' | 'member_work';
  * 一轮 turn 的性质，决定 prompt 里给 Member 的指令。
  *
  *   lead       —— 用户在推动整个工作，Lead 处理需求/变化/阻塞
+ *   mention    —— 用户明确 @ 点名，直接回答用户，不做协调
  *   task       —— 当前 Member 正在执行指定 Task
  *   delegation —— ask_member 派来的明确子任务，必须交付结果
  */
-export type TurnMode = 'lead' | 'task' | 'delegation';
+export type TurnMode = 'lead' | 'mention' | 'task' | 'delegation';
 
 /**
  * 为什么唤醒这个 Member。确定性规则产出，不经过 LLM 路由。
  *
- *   lead_message      用户给 Task 工作区发普通消息，唤醒 Lead
- *   lead_clarification 用户回答了 Lead 的澄清问题，唤醒 Lead 继续推进
- *   lead_recovery     Task 失败/阻塞，唤醒 Lead 做整体判断
- *   task_ready        Task 依赖满足，唤醒执行人
- *   schedule          定时唤醒
+ * lead_message       用户给 Task 工作区发普通消息，唤醒 Lead
+ * lead_clarification 用户回答了 Lead 的澄清问题，唤醒 Lead
+ * lead_recovery      Task 失败/阻塞，唤醒 Lead 做整体判断
+ * goal_changed       Goal 发生变化，唤醒 Lead 重新规划
+ * user_mention       用户明确 @ 某个 Member，直接唤醒这个 Member
+ * task_ready         Task 依赖满足，唤醒执行人
+ * schedule           定时唤醒
  */
 export type WakeReason =
   | 'lead_message'
   | 'lead_clarification'
   | 'lead_recovery'
   | 'goal_changed'
+  | 'user_mention'
   | 'task_ready'
   | 'schedule';
 
@@ -436,6 +440,7 @@ export type LeadModelPurpose =
 /** 某一轮用了哪个档位的模型、为什么：审计与成本分析只看它。 */
 export type ModelPurpose =
   | `lead:${LeadModelPurpose}`
+  | 'member:mention'
   | 'member:task'
   | 'member:delegation';
 

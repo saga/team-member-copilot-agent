@@ -248,6 +248,11 @@ export class ContextAssembler {
       return sections.join('\n\n');
     }
 
+    if (input.turnMode === 'mention') {
+      sections.push('User message:', input.currentPrompt, MEMBER_MENTION_INSTRUCTION);
+      return sections.join('\n\n');
+    }
+
     sections.push('User message:', input.currentPrompt, LEAD_INSTRUCTION);
     return sections.join('\n\n');
   }
@@ -323,6 +328,17 @@ export class ContextAssembler {
     return new Map(rows.map((row) => [row.id, row.name]));
   }
 }
+
+const MEMBER_MENTION_INSTRUCTION = [
+  'You were directly addressed by the user with an @mention in this task workspace.',
+  'Answer the user directly from your own role, expertise, and available capabilities.',
+  'Do not route the user back through the Lead merely because you are not the Lead.',
+  'Do not act as a coordinator unless the user explicitly asks you to coordinate the team.',
+  'Do not create or re-plan the workspace task plan.',
+  'Use available knowledge and tools when useful.',
+  'If another Member is genuinely needed for a narrow piece of information, you may use the available collaboration capability, but your primary response is still to the user.',
+  'Keep the answer focused on the question you were directly asked.',
+].join('\n');
 
 const LEAD_INSTRUCTION = [
   'You are the Lead of this task workspace.',

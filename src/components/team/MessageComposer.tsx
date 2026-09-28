@@ -46,7 +46,10 @@ interface MessageComposerProps {
  *
  * Enter 发送 / Shift+Enter 换行由 Sender 处理。
  *
- * 用户不需要知道「发给谁」：Task 工作区里消息只唤醒 Lead。
+ * Task 工作区的普通消息默认交给 Lead。
+ *
+ * 明确选择 `@Member` 后，服务端会直接唤醒被点名的 Member，
+ * 不经过 Lead 转发。
  *
  * Member 之间的私聊是只读的。服务端会 400，这里直接把输入框锁掉，
  * 别让人先打一段字再被拒。

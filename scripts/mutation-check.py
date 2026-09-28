@@ -1056,6 +1056,28 @@ MUTATIONS = [
         ],
     },
     {
+        "name": "@mention 被忽略（点名也走 Lead）",
+        "test": "server/test/member-mention-routing.test.ts",
+        "steps": [
+            (
+                "server/team-service.ts",
+                "    if (mentionedMembers.length > 0) {\n",
+                "    if (false) {\n",
+            )
+        ],
+    },
+    {
+        "name": "mention 回答不落库（@ 了但 Activity 看不见）",
+        "test": "server/test/member-mention-routing.test.ts",
+        "steps": [
+            (
+                "server/team-service.ts",
+                "      const userFacingTurn = input.turnMode === 'lead' || input.turnMode === 'mention';\n",
+                "      const userFacingTurn = input.turnMode === 'lead';\n",
+            )
+        ],
+    },
+    {
         "name": "Goal 唤醒走普通消息通道（不用 Strong 规划）",
         "test": "server/test/goal-revision.test.ts",
         "steps": [

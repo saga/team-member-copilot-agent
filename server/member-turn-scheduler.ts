@@ -146,6 +146,9 @@ function keyOf(conversationId: string, memberId: string): string {
 const REASON_PRIORITY: Record<Exclude<WakeReason, 'schedule'>, number> = {
   goal_changed: 3,
   task_ready: 2,
+  // 用户明确点名和 Task 就绪同级：都是「这个 Member 现在有事做」。
+  // 同级拼触发序号，用户的 @ 永远最新，所以点名不会被顶掉。
+  user_mention: 2,
   lead_message: 1,
   lead_clarification: 1,
   lead_recovery: 1,

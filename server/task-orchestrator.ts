@@ -13,7 +13,8 @@ export interface TaskEvents {
 /**
  * Task 的推进器：只做状态之间的衔接，不跑 Agent。
  *
- *   用户消息 → Lead 唤醒
+ *   用户普通消息 → Lead 唤醒
+ *   用户 @Member  → 目标 Member 直接唤醒（sendMessage 里直接入队，不经过这里）
  *   plan 后 → 找 ready → 按执行人入队
  *   Task 完成 → 刷新依赖 → 找下一批 ready → 重算工作区状态
  *   Task 阻塞/失败 → 唤醒 Lead 做整体判断

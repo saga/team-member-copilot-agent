@@ -14,6 +14,7 @@ import { MemberTurnScheduler } from './member-turn-scheduler.js';
 import { TaskOrchestrator } from './task-orchestrator.js';
 import { TaskService, parseRequirements, parseStringArray, type TaskPlanInput } from './task-service.js';
 import { badRequest, conflict, notFound } from './http-error.js';
+import { findMentionedMembers } from './member-mentions.js';
 import { MemberConversationService, isMemberDm, type MemberDirectMessage } from './member-conversation-service.js';
 import type { ConversationFileService } from './conversation-file-service.js';
 import {
@@ -1013,7 +1014,31 @@ export class TeamService {
 
     const wakes: WakePlan[] = [];
     const fresh = this.getConversation(conversation.id);
-    if (fresh.leadMemberId) {
+
+    // 用户明确 @Member（@architect 看一下这个方案）就直接唤醒被点名的 Member，
+    // 而不是 User → Lead → Architect。只有没有明确 mention 时，普通用户消息
+    // 才走 Lead。
+    const mentionedMembers = findMentionedMembers(created.content, fresh.members);
+    if (mentionedMembers.length > 0) {
+      for (const member of mentionedMembers) {
+        // muted 是明确的控制面设置，@mention 也不能绕过。
+        if (this.states.get(conversation.id, member.id).muted) continue;
+        this.scheduler.enqueue({
+          conversationId: conversation.id,
+          memberId: member.id,
+          taskId: null,
+          reason: 'user_mention',
+          triggerSequence: created.messageSequence,
+        });
+        wakes.push({
+          memberId: member.id,
+          reason: 'user_mention',
+          taskId: null,
+          triggerSequence: created.messageSequence,
+        });
+      }
+    } else if (fresh.leadMemberId) {
+      // 没有明确点名：保持原来的 Lead-first 行为。
       const enqueued = this.orchestrator.ensureLeadWake(
         conversation.id,
         fresh.leadMemberId,
@@ -1834,7 +1859,9 @@ export class TeamService {
         prompt: execution.prompt,
         taskId: task?.id ?? null,
         triggerMessageSequence: wake.triggerSequence,
-        turnMode: task ? 'task' : 'lead',
+        // user_mention 不是 Lead turn：否则被点名的 Member 会拿到 Lead 的
+        // 指令、写 Lead 的消息头，还可能触发 Lead 的自唤醒。
+        turnMode: task ? 'task' : wake.reason === 'user_mention' ? 'mention' : 'lead',
         wakeReason: wake.reason,
       });
     } catch (error) {
@@ -2459,6 +2486,8 @@ export class TeamService {
   private turnModeFor(_conversation: Conversation, execution: ExecutionRecord): TurnMode {
     if (execution.kind === 'member_delegate') return 'delegation';
     if (execution.taskId) return 'task';
+    // crash 后恢复：@点名的那一轮还是 mention，不能恢复成 lead。
+    if (execution.wakeReason === 'user_mention') return 'mention';
     return 'lead';
   }
 
@@ -2823,9 +2852,22 @@ export class TeamService {
     taskTier?: 'cheap' | 'standard' | 'strong' | null;
   }): { model: string; purpose: ExecutionConfigSnapshot['modelPurpose'] } {
     if (input.turnMode !== 'lead') {
+      // @点名直接复用 Member 模型策略，不单独搞一套。
+      let purpose: ExecutionConfigSnapshot['modelPurpose'];
+      switch (input.turnMode) {
+        case 'mention':
+          purpose = 'member:mention';
+          break;
+        case 'task':
+          purpose = 'member:task';
+          break;
+        case 'delegation':
+          purpose = 'member:delegation';
+          break;
+      }
       return {
         model: resolveTaskModel(modelPolicy, input.member.model, input.taskTier ?? null),
-        purpose: input.turnMode === 'task' ? 'member:task' : 'member:delegation',
+        purpose,
       };
     }
     const leadPurpose = classifyLeadTurn({
@@ -3036,8 +3078,9 @@ export class TeamService {
       // Task 执行：如果 Agent 在这一轮里已经调 update_task 把任务置成终态，
       // 这里不再覆盖。否则没有终态的 Task 保持 running，等下一轮 update_task 或重试。
       //
-      // 只有 Lead 的回答进 Activity（conversation_message）：Task Agent 的最终回答
-      // 只进 execution.response + task.result，Task 面板是它的事实源。
+      // Lead 和用户明确 @点名的 Member 的回答进入 Activity。
+      // Task Agent 的最终回答只进 execution.response + task.result，
+      // Task 面板是它的事实源。
       // 两边都写会让同一个回答在 Activity 与 Task 里各出现一次。
       const taskAfterTurn = input.taskId ? this.safeGetTask(input.taskId) : null;
       // Goal 在本轮中途被改掉（user 改 Goal / Lead 调 update_goal）：这一轮看到
@@ -3046,7 +3089,8 @@ export class TeamService {
       const goalStale =
         input.execution.goalRevision !== this.currentGoalRevision(input.conversation.id);
       let message: ConversationMessage | null = null;
-      if (content && input.turnMode === 'lead' && !goalStale) {
+      const userFacingTurn = input.turnMode === 'lead' || input.turnMode === 'mention';
+      if (content && userFacingTurn && !goalStale) {
         message = this.insertMemberMessage({
           conversationId: input.conversation.id,
           memberId: input.member.id,

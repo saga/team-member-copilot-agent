@@ -196,7 +196,9 @@ export function resolveMemberModel(policy: ModelPolicy, model: string | null | u
 }
 
 /**
- * Task 执行用的模型。档位由任务定（Lead 在 plan/add 里锁），不是执行人自己定：
+ * Mention / Task / delegation 执行用的模型：这个 Member 配置的 Member 模型，
+ * 未配置时回落默认 Member 模型。档位由任务定（Lead 在 plan/add 里锁），
+ * 不是执行人自己定：
  *
  *   null       → 跟执行人默认（Member 配什么用什么）
  *   'strong'   → Strong 模型（复杂任务升级）
@@ -205,6 +207,8 @@ export function resolveMemberModel(policy: ModelPolicy, model: string | null | u
  *
  * 同档没有可选模型时回落默认 Member 模型，不抛错 —— 档位是成本偏好，
  * 不是身份校验，缺货时用默认跑起来比失败强。
+ *
+ * Lead → Standard / Strong（见 classifyLeadTurn + chooseLeadModel）。
  */
 export function resolveTaskModel(
   policy: ModelPolicy,

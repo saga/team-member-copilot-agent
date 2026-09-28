@@ -522,6 +522,7 @@ export interface ExecutionRecord {
  *   lead_clarification 用户回答了澄清问题，唤醒 Lead 继续推进
  *   lead_recovery      Task 失败/阻塞，唤醒 Lead 做整体判断
  *   goal_changed       Goal 改版本，唤醒 Lead 重新规划
+ *   user_mention       用户明确 @ 某个 Member，直接唤醒这个 Member
  *   task_ready         Task 依赖满足，唤醒执行人
  *   schedule           定时唤醒
  */
@@ -530,6 +531,7 @@ export type WakeReason =
   | 'lead_clarification'
   | 'lead_recovery'
   | 'goal_changed'
+  | 'user_mention'
   | 'task_ready'
   | 'schedule';
 
