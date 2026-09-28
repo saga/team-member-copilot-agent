@@ -59,6 +59,39 @@ export class JiraProvider implements WorkManagementProvider {
     await this.client.addComment(ref.key, body);
   }
 
+  /**
+   * 条件加评论：先读一次拿版本，再带 `If-Unmodified-Since` 写。
+   *
+   * 两次调用里，**第二次**才是真正的判定点：
+   *
+   *   读 → 比 → 写     窗口在「比」和「写」之间，挡不住竞态
+   *   读 → 带版本写    Jira 在事务里比，412 就作废（这才是关掉窗口的那一步）
+   *
+   * 第一次读不是多余：它让「已变化」这条错误能带上一句人话（版本从 A 变成 B），
+   * 而不是一个光秃秃的 412。错误信息的质量决定了这类问题能不能被排查。
+   */
+  async addCommentIfVersion(
+    ref: ExternalWorkRef,
+    body: string,
+    expectedVersion: string,
+  ): Promise<void> {
+    const current = await this.client.getIssue(ref.key);
+
+    if (current.fields.updated !== expectedVersion) {
+      throw new Error(
+        `Jira issue ${ref.key} 已变化（${expectedVersion} → ${current.fields.updated}），拒绝执行旧 Command`,
+      );
+    }
+
+    await this.client.addComment(ref.key, body, expectedVersion);
+  }
+
+  /** 这条工单当前的并发版本号（Jira：`fields.updated`）。 */
+  async versionOf(ref: ExternalWorkRef): Promise<string | null> {
+    const issue = await this.client.getIssue(ref.key);
+    return issue.fields.updated ?? null;
+  }
+
   async transition(ref: ExternalWorkRef, transitionId: string): Promise<void> {
     await this.client.transition(ref.key, transitionId);
   }

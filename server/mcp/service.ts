@@ -5,7 +5,9 @@ import { now } from '../db.js';
 import { badRequest, conflict, notFound } from '../http-error.js';
 import type { CapabilityRegistry } from '../capabilities/registry.js';
 import { loadMcpServerDefinitions } from './registry.js';
-import type { McpServerDefinition, McpServerType } from './types.js';
+import type { McpAuthType, McpServerDefinition, McpServerType } from './types.js';
+
+export type { McpAuthType };
 
 /**
  * MCP Server 定义的运行时 source of truth（`mcp_server` 表）。
@@ -16,8 +18,6 @@ import type { McpServerDefinition, McpServerType } from './types.js';
  *
  * 每次变更都同步 CapabilityRegistry：resolver / catalog 读的永远是同一份。
  */
-
-export type McpAuthType = 'none' | 'bearer' | 'apiKey';
 
 /** 读接口的形状：连接串的值永远脱敏，只回答「配没配」。 */
 export interface McpServerView {
@@ -32,8 +32,20 @@ export interface McpServerView {
   timeout: number | null;
   version: string;
   authType: McpAuthType;
-  /** 有没有存着可用的 secret（值永远不返回）。 */
+  /**
+   * 有没有配凭证引用。
+   *
+   * 它回答的是「指向了一个密钥库条目」，不是「那个条目存在」—— 后者要等一次
+   * 真正的解析才知道。这个区别是刻意的：管理界面不该为了显示一个绿点去读密钥库。
+   */
   secretConfigured: boolean;
+  /**
+   * 密钥库里的引用名（例如 `prod/jira/copilot`）。
+   *
+   * 它不是秘密 —— 它只是「去哪找」的指针，所以可以回显；而**值**永远拿不到。
+   * 回显它是必要的：否则管理员改完配置后无法确认自己指的是哪一条。
+   */
+  secretRef: string | null;
   /** 环境变量名清单（值不返回）：编辑器据此显示“已配 3 个”，改动走合并。 */
   envKeys: string[];
   tools: Array<{ name: string; description: string; risk: string }>;
@@ -42,10 +54,21 @@ export interface McpServerView {
   updatedAt: string;
 }
 
+/** 认证头名。出现在 `headers` 输入里就说明有人想把凭证写进 DB —— 直接拒。 */
+const CREDENTIAL_HEADERS = new Set(['authorization', 'x-api-key', 'cookie', 'proxy-authorization']);
+
 /**
- * API 输入形状（create / update 共用）。和文件形状的区别：
- * secret 单独一个字段（读接口从不回显，客户端不可能原样回填 headers），
- * tools 是行数组（UI 按行编辑）。存进 DB / 定义时再翻译成存储形状。
+ * API 输入形状（create / update 共用）。
+ *
+ * ── 没有 `secret` 这个字段 ───────────────────────────────────────────
+ *
+ * 旧版本有一个 `secret: string`，写进 `headers_json`。它被**移除**而不是
+ * 被改名：留着一个能存凭证的入口，就等于「DB 不存凭证」这条纪律只靠自觉。
+ * 现在唯一的凭证入口是 `secretRef`（一个名字），值在运行时从密钥库取。
+ *
+ * `headers` 仍然可以填，但认证头被显式拒绝 —— 它们是凭证的另一种写法。
+ * 这条校验是这次改动里唯一真正起作用的地方：`headers` 是自由字典，不拦它，
+ * 想写 token 的人只是换了个字段名。
  */
 export const mcpServerApiInputSchema = z.object({
   id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]*$/, 'MCP server id 只能是字母数字及 - _，且以字母数字开头'),
@@ -54,7 +77,22 @@ export const mcpServerApiInputSchema = z.object({
   type: z.enum(['local', 'http', 'sse']),
   url: z.string().max(2000).optional(),
   authType: z.enum(['none', 'bearer', 'apiKey']).optional(),
-  secret: z.string().max(2000).optional(),
+  headers: z
+    .record(z.string(), z.string().max(2000))
+    .optional()
+    .refine(
+      (headers) => !headers || !Object.keys(headers).some((key) => CREDENTIAL_HEADERS.has(key.toLowerCase())),
+      {
+        message:
+          '认证头不能写在 headers 里（那等于把凭证存进数据库）：请用 secretRef 指向密钥库条目，值在运行时解析',
+      },
+    ),
+  secretRef: z
+    .string()
+    .trim()
+    .max(500)
+    .refine((ref) => ref === '' || /^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(ref), 'secretRef 只能是字母数字及 . _ / -')
+    .optional(),
   command: z.string().min(1).max(500).optional(),
   args: z.array(z.string().max(500)).max(50).optional(),
   env: z.record(z.string(), z.string()).optional(),
@@ -96,6 +134,8 @@ interface McpServerRow {
   tools_json: string;
   version: string;
   enabled: number;
+  secret_ref: string | null;
+  auth_type: McpAuthType | null;
   last_test_at: string | null;
   last_test_ok: number | null;
   last_test_error: string | null;
@@ -156,7 +196,7 @@ export class McpServerService {
     }
     const definition = toDefinition(
       parsed.data,
-      resolveAuthHeaders(null, parsed.data, parsed.data.id),
+      parsed.data.headers ?? {},
       parsed.data.env ?? {},
       this.allowLocal,
     );
@@ -166,9 +206,14 @@ export class McpServerService {
   }
 
   /**
-   * 全量替换（PUT 语义），只有两样东西是合并语义：
-   * secret（读接口从不回显，没传 = 保持现状）与 env（同理）。
-   * 其余字段以请求为准 —— 包括 enabled 开关。
+   * 全量替换（PUT 语义），只有三样东西是合并语义：
+   * `headers`（自定义非敏感头）、`env`、`secretRef`。
+   *
+   * 为什么 `secretRef` 没传 = 保持现状：它是「去哪找凭证」的指针，而客户端
+   * 拿到的视图里已经有它了 —— 但要求每次编辑都原样回填一个指向生产密钥库的
+   * 名字，会让「只想改个工具名」变成一次凭证重新指向的风险。没传就保持。
+   *
+   * 传空串 = 显式清掉引用（这是唯一能取消凭证的方式，所以必须能表达）。
    */
   update(id: string, input: unknown): McpServerView {
     const current = this.requireRow(id);
@@ -176,16 +221,20 @@ export class McpServerService {
     if (!parsed.success) {
       throw badRequest(`MCP Server 不合法：${parsed.error.issues.map((issue) => `${issue.path.join('.') || '<root>'}: ${issue.message}`).join('; ')}`);
     }
-    const previous = parseJson<Record<string, string>>(current.headers_json, 'headers');
+    const previousHeaders = parseJson<Record<string, string>>(current.headers_json, 'headers');
     const previousEnv = parseJson<Record<string, string>>(current.env_json, 'env');
-    const nextHeaders = resolveAuthHeaders(previous, parsed.data, id);
+    const nextHeaders =
+      parsed.data.headers === undefined ? previousHeaders : { ...previousHeaders, ...parsed.data.headers };
     const nextEnv = parsed.data.env === undefined ? previousEnv : { ...previousEnv, ...parsed.data.env };
-    const definition = toDefinition(parsed.data, nextHeaders, nextEnv, this.allowLocal);
+    const nextSecretRef =
+      parsed.data.secretRef === undefined ? current.secret_ref : parsed.data.secretRef === '' ? null : parsed.data.secretRef;
+    const nextAuthType = parsed.data.authType === undefined ? current.auth_type : parsed.data.authType;
+    const definition = toDefinition(parsed.data, nextHeaders, nextEnv, this.allowLocal, nextSecretRef, nextAuthType);
     this.db
       .prepare(
         `UPDATE mcp_server SET display_name = ?, description = ?, type = ?, url = ?,
           headers_json = ?, command = ?, args_json = ?, env_json = ?, cwd = ?, timeout = ?,
-          tools_json = ?, version = ?, enabled = ?, updated_at = ? WHERE id = ?`,
+          tools_json = ?, version = ?, enabled = ?, secret_ref = ?, auth_type = ?, updated_at = ? WHERE id = ?`,
       )
       .run(
         definition.displayName,
@@ -201,6 +250,8 @@ export class McpServerService {
         JSON.stringify(definition.tools),
         definition.version,
         parsed.data.enabled ? 1 : 0,
+        nextSecretRef,
+        nextAuthType,
         now(),
         id,
       );
@@ -243,8 +294,9 @@ export class McpServerService {
       .prepare(
         `INSERT INTO mcp_server (
           id, display_name, description, type, url, headers_json, command, args_json,
-          env_json, cwd, timeout, tools_json, version, enabled, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          env_json, cwd, timeout, tools_json, version, enabled, secret_ref, auth_type,
+          created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         server.id,
@@ -261,6 +313,8 @@ export class McpServerService {
         JSON.stringify(server.tools),
         server.version,
         enabled ? 1 : 0,
+        server.secretRef ?? null,
+        server.authType ?? null,
         now(),
         now(),
       );
@@ -280,7 +334,7 @@ export class McpServerService {
 
 /**
  * 输入 → 定义：local 门禁在这里再判一次（文件加载判过，但 UI 创建走不到 loader）。
- * headers / env 由调用方按合并规则算好传进来（见 resolveAuthHeaders），
+ * headers / env / secretRef 由调用方按合并规则算好传进来，
  * enabled 由调用方单独处理 —— 定义只说怎么连，不说开不开。
  */
 function toDefinition(
@@ -288,6 +342,8 @@ function toDefinition(
   headers: Record<string, string>,
   env: Record<string, string>,
   allowLocal: boolean,
+  secretRef: string | null = input.secretRef === undefined || input.secretRef === '' ? null : input.secretRef,
+  authType: McpAuthType | null = input.authType ?? null,
 ): McpServerDefinition {
   if (input.type === 'local' && !allowLocal) {
     throw badRequest(
@@ -310,54 +366,21 @@ function toDefinition(
     env,
     ...(input.cwd === undefined ? {} : { cwd: input.cwd }),
     ...(input.timeout === undefined ? {} : { timeout: input.timeout }),
+    ...(secretRef === null ? {} : { secretRef }),
+    ...(authType === null ? {} : { authType }),
     tools,
     version: input.version,
   };
 }
 
 /**
- * 认证 slot → headers。规则只有四条：
- *   没传 secret 也没选认证 = 不碰（读接口不回显，只能这样表达“保持现状”）
- *   传了 secret 但没选认证 = 400（不知道往哪个 header 写）
- *   选了 none = 清掉两个认证 header（其它自定义 header 保留，归文件管）
- *   选了 bearer/apiKey + 给了 secret = 写入；没给 secret 时同类型沿用旧值，
- *   换类型必须给新 secret（旧 secret 不能跨类型复用）。
+ * 从**非敏感** header 里认出认证方式。
+ *
+ * 只在老数据上还有用：新写入的行的认证方式在 `auth_type` 列里。留着这个函数
+ * 是因为升级上来的库里可能存在历史行 —— 它们的 headers 里确实还有明文凭证
+ * （那时没有别的存法）。读接口据此仍然显示「配了认证」，而不是显示「没配」，
+ * 于是管理员有机会看见它、把它换成 secretRef。
  */
-function resolveAuthHeaders(
-  current: Record<string, string> | null,
-  input: Pick<McpServerInput, 'authType' | 'secret'>,
-  serverId: string,
-): Record<string, string> {
-  const secretProvided = input.secret !== undefined && input.secret !== '';
-  if (secretProvided && (input.authType === undefined || input.authType === 'none')) {
-    throw badRequest(`MCP Server ${serverId} 传了 secret 但没选认证方式：authType 必须是 bearer 或 apiKey`);
-  }
-  if (input.authType === undefined) {
-    return { ...(current ?? {}) };
-  }
-  const next: Record<string, string> = {};
-  for (const [key, value] of Object.entries(current ?? {})) {
-    const lower = key.toLowerCase();
-    if (lower !== BEARER_HEADER && lower !== API_KEY_HEADER) next[key] = value;
-  }
-  if (input.authType === 'none') return next;
-  if (!secretProvided) {
-    if (detectAuthType(current) === input.authType && current) {
-      for (const [key, value] of Object.entries(current)) {
-        const lower = key.toLowerCase();
-        if ((input.authType === 'bearer' && lower === BEARER_HEADER) || (input.authType === 'apiKey' && lower === API_KEY_HEADER)) {
-          next[key] = value;
-        }
-      }
-      return next;
-    }
-    throw badRequest(`MCP Server ${serverId} 切换认证方式必须提供新的 secret`);
-  }
-  next[input.authType === 'bearer' ? 'Authorization' : 'X-Api-Key'] =
-    input.authType === 'bearer' ? `Bearer ${input.secret}` : (input.secret as string);
-  return next;
-}
-
 function detectAuthType(headers: Record<string, string> | null): McpAuthType | 'none' {
   if (!headers) return 'none';
   const lowered = Object.fromEntries(Object.entries(headers).map(([key, value]) => [key.toLowerCase(), value]));
@@ -380,6 +403,8 @@ function rowToDefinition(row: McpServerRow): McpServerDefinition {
     env: parseJson<Record<string, string>>(row.env_json, 'env'),
     ...(row.cwd === null ? {} : { cwd: row.cwd }),
     ...(row.timeout === null ? {} : { timeout: row.timeout }),
+    ...(row.secret_ref === null ? {} : { secretRef: row.secret_ref }),
+    ...(row.auth_type === null ? {} : { authType: row.auth_type }),
     tools: parseJson<McpServerDefinition['tools']>(row.tools_json, 'tools'),
     version: row.version,
   };
@@ -403,8 +428,11 @@ export function seedMcpServersOnBoot(input: {
 
 function toView(row: McpServerRow): McpServerView {
   const headers = parseJson<Record<string, string>>(row.headers_json, 'headers');
-  const authType = detectAuthType(headers);
-  const secretConfigured = authType !== 'none';
+  // 认证方式优先取列里的（新写入的行）；老行没有这一列，回落到从 header 里认。
+  const authType = row.auth_type ?? detectAuthType(headers);
+  // 「配了凭证」有两个来源：新写法（secret_ref）与老写法（headers 里还有明文）。
+  // 两者都报 true —— 老行必须显示成「已配」，否则管理员看不到它、也就不会去换。
+  const secretConfigured = row.secret_ref !== null || detectAuthType(headers) !== 'none';
   const tools = parseJson<Record<string, { risk: string }>>(row.tools_json, 'tools');
   return {
     id: row.id,
@@ -419,6 +447,7 @@ function toView(row: McpServerRow): McpServerView {
     version: row.version,
     authType,
     secretConfigured,
+    secretRef: row.secret_ref,
     envKeys: Object.keys(parseJson<Record<string, string>>(row.env_json, 'env')).sort(),
     tools: Object.keys(tools)
       .sort()

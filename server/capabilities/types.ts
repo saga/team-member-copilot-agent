@@ -172,10 +172,35 @@ export type ToolRisk =
  */
 export type ToolImplementation = 'app' | 'copilot-builtin' | 'mcp' | 'http' | 'script' | 'sdk';
 
+/**
+ * 一次工具调用的判定结果。
+ *
+ * ── 为什么除了 allowed / reason 还要带这些 id ─────────────────────────
+ *
+ * `allowed` 只回答「这次行不行」，回答不了合规要问的三件事：
+ *
+ *   policyDecisionId / policyRevision         谁批的、按哪版政策批的
+ *   entitlementId / entitlementRevision       命中了哪条数据授权
+ *   approvalRequired                          是「不许」还是「要人批」
+ *
+ * 没有它们时，审计只能记下「调用了 jira_add_comment 并被拒」—— 而「被哪条
+ * 规则拒的」正是事后排查与合规检查唯一的入口。这些字段由 tool-policy 逐层
+ * 填进来，最终落到 `tool_execution_audit` / `policy_decision_audit`。
+ *
+ * 全部可选：guard 与低风险路径没有 Policy / Entitlement 决策可报，
+ * 强行给它们编一个 id 会让「有 id = 过了那道闸」这条推断失效。
+ */
 export interface ToolDecision {
   allowed: boolean;
   /** 允许或拒绝的理由。拒绝时必须写清楚为什么，它会进日志。 */
   reason: string;
+
+  policyDecisionId?: string;
+  entitlementId?: string;
+  policyRevision?: string;
+  entitlementRevision?: string;
+
+  approvalRequired?: boolean;
 }
 
 export interface CapabilityToolArguments {

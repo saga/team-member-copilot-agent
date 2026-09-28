@@ -13,6 +13,7 @@ import {
   schedulerService,
   conversationFileProcessor,
   workManagement,
+  workerLease,
   describeWebhookBoundary,
   initTeamScope,
 } from './app.js';
@@ -55,6 +56,17 @@ async function bootstrap(): Promise<void> {
     if (!config.oidc.issuer || !config.oidc.audience || !config.oidc.jwksUrl) {
       throw new Error('生产模式必须配置 OIDC_ISSUER / OIDC_AUDIENCE / OIDC_JWKS_URL');
     }
+  }
+  // 多副本 + 启动恢复 + 没有租约 = 一定会双跑。
+  //
+  // 具体怎么坏：两个副本同时启动，各自把对方正在跑的 execution 标成 interrupted，
+  // 然后各自重新提交一遍 —— 同一个 Jira 评论写两次。这类副作用不可撤销，
+  // 所以宁可拒绝启动，也不要「先跑起来再说」。
+  //
+  // 只警告不拦是不行的：日志里的警告不会阻止部署，而这个配置一旦上线，
+  // 表现是「偶尔有一条评论重复」，几乎不可能被联想到启动参数。
+  if (config.recoverOnStartup && config.workerReplicas > 1 && !config.workerLeaseEnabled) {
+    throw new Error('WORKER_REPLICAS > 1 时必须启用 WORKER_LEASE_ENABLED=true');
   }
   // eslint-disable-next-line no-console
   console.log(
@@ -147,7 +159,19 @@ async function bootstrap(): Promise<void> {
   console.log(`[server] conversation files recovery: requeued=${recoveredFiles}`);
 
   if (config.recoverOnStartup) {
-    const report = new RecoveryService(db, new ConversationMemberService(db)).recover();
+    // 传 leases 只在多副本部署下有意义：单进程时「running」必然属于刚崩掉的
+    // 自己，全部回收是对的；多副本时必须先问「有没有别的副本正持有它」。
+    //
+    // 注意这里传的是**同一个** workerLease 实例（来自 app.ts）：租约的 owner
+    // 是本进程的身份，换一个实例就等于换一个身份，恢复流程会把自己正在跑的活
+    // 当成别人的。当前恢复在 listen 之前、还没有 claim 发生，但共用实例让这个
+    // 前提不依赖于「启动顺序恰好如此」。
+    const recovery = new RecoveryService(
+      db,
+      new ConversationMemberService(db),
+      config.workerLeaseEnabled ? workerLease : undefined,
+    );
+    const report = recovery.recover();
     // eslint-disable-next-line no-console
     console.log(
       `[server] recovery: interrupted=${report.interrupted} ` +
@@ -155,7 +179,10 @@ async function bootstrap(): Promise<void> {
         `runtimesReset=${report.runtimesReset} ` +
         `activeCleared=${report.activeExecutionCleared} ` +
         `requeue=${report.requeuedExecutionIds.length} ` +
-        `lostWakes=${report.lostWakes.length}`,
+        `lostWakes=${report.lostWakes.length} ` +
+        // 「跳过了几条」必须打出来：多副本时这个数字不为零是正常的，但没人
+        // 知道它就等于「有些 execution 莫名没被回收」，而那是要查的事。
+        `skippedLeased=${report.skippedLeased}`,
     );
 
     // 这些 execution 从来没开始跑过（进程在真正执行前就挂了），重跑是安全的。

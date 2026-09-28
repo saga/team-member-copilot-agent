@@ -2,6 +2,7 @@ import { hashText } from '../content-hash.js';
 import type { CapabilityBinding, MemberCapabilities } from '../domain.js';
 import type { CapabilityRegistry } from './registry.js';
 import { parseSelectorList } from './types.js';
+import type { SecretProvider } from '../mcp/secret-provider.js';
 import type {
   CapabilityContext,
   ResolvedKnowledgeBinding,
@@ -29,7 +30,17 @@ import type {
  * 让「模型调了这个工具」和「另一个实现被调用」同时成立，且没有任何日志。
  */
 export class CapabilityResolver {
-  constructor(private readonly registry: CapabilityRegistry) {}
+  /**
+   * `secrets` 可选：只有配了 `secretRef` 的 MCP Server 才需要它。
+   *
+   * 不传时，遇到带 secretRef 的 server 会**抛**而不是跳过 —— 一个指向密钥库
+   * 却拿不到值的 server，会在 SDK 建连时以一个和「凭证没配」毫无关系的错误
+   * 失败，那种错误没人能排查。宁可在这里说清楚。
+   */
+  constructor(
+    private readonly registry: CapabilityRegistry,
+    private readonly secrets?: SecretProvider,
+  ) {}
 
   /** 校验 Provider ID 都存在（写能力组成之前调用，把错误挡在落库之前）。 */
   validate(capabilities: MemberCapabilities): void {
@@ -112,7 +123,7 @@ export class CapabilityResolver {
       }
     }
 
-    const mcpServers = this.resolveMcpServers(capabilities);
+    const mcpServers = await this.resolveMcpServers(capabilities);
 
     const dedupedSkills = dedupe(skillEntries, (entry) => entry.artifact.name, 'Skill');
     const dedupedTools = dedupe(tools, (tool) => tool.name, 'Tool');
@@ -151,8 +162,17 @@ export class CapabilityResolver {
    * 空 selector = 该 server 定义的全部工具（和 skill / tool 同一套语义）。
    * selector 里出现定义中没有的工具名直接抛：MCP 工具的可见性决定 SDK 会话
    * 形状，拼错的名字静默落空等于「配了个寂寞」，必须在解析时就失败。
+   *
+   * ── 凭证在这一步才被取出来 ─────────────────────────────────────────
+   *
+   * 定义里只有 `secretRef`（一个名字），值在**每一轮解析时**从密钥库取。
+   * 不在启动时取一次缓存住，是因为密钥库会轮换：缓存住意味着「轮换之后必须
+   * 重启服务」，而重启一个正在跑 Agent 团队的服务是有代价的。
+   *
+   * 取到的 header 与定义里的非敏感 header 合并，**密钥库优先** —— 同名时
+   * 以更受控的那一侧为准（定义是管理员随手填的，密钥库有访问控制）。
    */
-  private resolveMcpServers(capabilities: MemberCapabilities): RuntimeMcpServer[] {
+  private async resolveMcpServers(capabilities: MemberCapabilities): Promise<RuntimeMcpServer[]> {
     const servers: RuntimeMcpServer[] = [];
     for (const binding of capabilities.mcp ?? []) {
       const server = this.registry.mcpServer(binding.providerId);
@@ -162,6 +182,9 @@ export class CapabilityResolver {
         warnDisabledOnce(server.id);
         continue;
       }
+      const secretHeaders = await this.resolveSecretHeaders(server);
+      const headers =
+        secretHeaders === null ? server.headers : { ...(server.headers ?? {}), ...secretHeaders };
       const selected = parseSelectorList(binding.selector);
       const toolNames = selected ? [...selected] : Object.keys(server.tools);
       for (const toolName of toolNames) {
@@ -181,7 +204,7 @@ export class CapabilityResolver {
         enabled: true,
         type: server.type,
         ...(server.url === undefined ? {} : { url: server.url }),
-        ...(server.headers === undefined ? {} : { headers: server.headers }),
+        ...(headers === undefined ? {} : { headers }),
         ...(server.command === undefined ? {} : { command: server.command }),
         ...(server.args === undefined ? {} : { args: server.args }),
         ...(server.env === undefined ? {} : { env: server.env }),
@@ -193,6 +216,27 @@ export class CapabilityResolver {
       });
     }
     return servers.sort((a, b) => a.id.localeCompare(b.id));
+  }
+
+  /**
+   * 解析一个 server 的凭证引用。
+   *
+   * 没有引用返回 `null` 而不是 `{}`：`{}` 会被合并逻辑当成「解析出了一组空
+   * header」，语义上等于「这个 server 有凭证但凭证是空的」。两者必须能区分 ——
+   * 前者是「不动 headers」，后者是真的一无所有。
+   */
+  private async resolveSecretHeaders(server: {
+    id: string;
+    secretRef?: string;
+  }): Promise<Record<string, string> | null> {
+    if (!server.secretRef) return null;
+    if (!this.secrets) {
+      throw new Error(
+        `MCP Server ${server.id} 配了 secretRef=${server.secretRef}，但本进程没有 SecretProvider，` +
+          '无法取到凭证：请在装配处传入（见 app.ts）',
+      );
+    }
+    return this.secrets.get(server.secretRef);
   }
 }
 

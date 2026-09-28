@@ -2,6 +2,15 @@ import type { ToolRisk } from '../capabilities/types.js';
 
 export type McpServerType = 'local' | 'http' | 'sse';
 
+/**
+ * 这个 server 用哪种认证。
+ *
+ * 它**不参与运行时拼装** —— 真正写哪个 header 由密钥库那一侧决定（见
+ * secret-provider.ts）。留着它是为了让编辑器能显示「配的是哪种认证」，
+ * 而不必从一组不含凭证的 header 里猜。
+ */
+export type McpAuthType = 'none' | 'bearer' | 'apiKey';
+
 export interface McpToolPolicy {
   risk: ToolRisk;
 }
@@ -24,13 +33,29 @@ export interface McpServerDefinition {
   type: McpServerType;
   /** remote（http / sse）必填，支持 ${ENV} 引用（token 只放环境变量）。 */
   url?: string;
+  /**
+   * **非敏感**的自定义 header（Accept、X-Tenant 之类）。
+   *
+   * 凭证不在这里，也不在 `env` 里 —— 它们只以引用形式存在于 `secretRef`，
+   * 值在执行时从密钥库取（见 secret-provider.ts）。这条纪律靠 review 维持，
+   * 因为「这个 header 算不算敏感」只有写的人知道；表结构能做的只是不再提供
+   * 一个「存 token」的入口。
+   */
   headers?: Record<string, string>;
   /** local 必填：SDK 在服务机器上起子进程，默认关闭（见 MCP_LOCAL_ENABLED）。 */
   command?: string;
   args?: string[];
+  /** 同 headers：只放非敏感配置。 */
   env?: Record<string, string>;
   cwd?: string;
   timeout?: number;
+  /**
+   * 密钥库里的引用名（`prod/jira/copilot`）。解析后得到的是一组 header，
+   * 与上面的 `headers` 合并（同名时以密钥库为准）。
+   */
+  secretRef?: string;
+  /** 认证方式提示，见 McpAuthType。不参与运行时拼装。 */
+  authType?: McpAuthType;
   /**
    * 允许暴露的工具（显式 allowlist）。不支持 `*`：多给一个工具就是多一次
    * 外部调用，默认全开等于把授权判断外包给远端 server。

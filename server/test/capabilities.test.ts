@@ -37,7 +37,7 @@ const { DefaultToolPolicy } = await import('../tool-policy.js');
 const { CapabilityResolver } = await import('../capabilities/resolver.js');
 const { CopilotCapabilityAdapter } = await import('../capabilities/copilot-adapter.js');
 const { PERSONAL_SELECTOR } = await import('../capabilities/providers/filesystem-knowledge.js');
-const { createTestStack, capabilityContext, StubCopilot } =
+const { createTestStack, capabilityContext, permissiveEntitlement, StubCopilot } =
   await import('./support.js');
 
 import type { MemberCapabilities } from '../domain.js';
@@ -47,7 +47,10 @@ import type { ToolExecutionContext } from '../capabilities/types.js';
 
 /** 高风险拒绝桩：与生产 DenyHighRiskPolicyService 同语义，理由可断言。 */
 function denyHighRisk(): PolicyService {
-  return { decide: (input) => ({ allowed: false, reason: `risk=${input.tool.risk} 需要独立 Policy 决策` }) };
+  return {
+    revision: () => 'test-policy',
+    decide: (input) => ({ allowed: false, reason: `risk=${input.tool.risk} 需要独立 Policy 决策` }),
+  };
 }
 import type {
   KnowledgeProvider,
@@ -560,7 +563,7 @@ describe('Capability scope layering', () => {
 // ═══════════════════════════════════════════════ 5. Adapter
 
 describe('Adapter：声明与授权同源', () => {
-  const policy = new DefaultToolPolicy({ allowHostTools: false }, denyHighRisk());
+  const policy = new DefaultToolPolicy({ allowHostTools: false }, denyHighRisk(), permissiveEntitlement());
   const adapter = new CopilotCapabilityAdapter(policy);
   const context = capabilityContext('adapter-member');
 

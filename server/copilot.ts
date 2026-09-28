@@ -5,11 +5,14 @@ import {
   type SessionHooks,
 } from '@github/copilot-sdk';
 import { config } from './config.js';
+import { db } from './db.js';
 import type { Member, MemberRuntime } from './domain.js';
 import { CopilotCapabilityAdapter, type CopilotCapabilities } from './capabilities/copilot-adapter.js';
 import type { CapabilityContext, RuntimeCapabilities } from './capabilities/types.js';
 import { DefaultToolPolicy, type ToolPolicy } from './tool-policy.js';
 import { DenyHighRiskPolicyService } from './policy.js';
+import { EntitlementService } from './entitlement-service.js';
+import type { AuditService } from './audit-service.js';
 
 /**
  * SDK 顶层没有导出 `PreToolUseHookInput` / `PreToolUseHookOutput`（它们在
@@ -125,6 +128,14 @@ export interface CopilotServiceOptions {
    * 回调。这里只回答「这一轮用了哪个 MCP」，展示层据此打标，不做审计与计费。
    */
   onMcpToolUse?: (info: McpToolCallInfo) => void;
+  /**
+   * 审计链。不传 = 不写审计（判定行为完全不变）。
+   *
+   * 它是**旁路**：审计写失败不该让一轮正常的工作失败，所以调用点都容错；
+   * 但它也不该是「可选的能力」—— 生产装配永远传（见 app.ts），
+   * 因为「事后能证明发生了什么」是这套系统对外承诺的一部分。
+   */
+  audit?: AuditService;
 }
 
 /**
@@ -198,8 +209,11 @@ export class CopilotService {
       new DefaultToolPolicy(
         { allowHostTools: config.allowHostCodingTools },
         new DenyHighRiskPolicyService(),
+        // 兜底路径自己建一个：它只在「调用方没给 policy」时生效（app.ts 与测试
+        // 都显式传），所以这里用进程全局 db 是安全的。
+        new EntitlementService(db),
       );
-    this.capabilityAdapter = new CopilotCapabilityAdapter(this.toolPolicy);
+    this.capabilityAdapter = new CopilotCapabilityAdapter(this.toolPolicy, this.options.audit);
   }
 
   async getClient(): Promise<CopilotClient> {
@@ -551,6 +565,22 @@ export class CopilotService {
    *
    * 所以直接给出「没有用户可确认」。注意这**不是**默认放行：一个装出来的放宽
    * 会让权限层变成比策略层更弱的一条旁路，那正是策略层想避免的事。
+   *
+   * ── 它将来会变成什么（现在刻意不做） ─────────────────────────────────
+   *
+   * 最终这条链应该是：
+   *
+   *   PermissionRequest → Policy → Approval → Human → ApprovalDecision
+   *
+   * 但**不是** `permissionRequest → allow`。今天不做的原因不是「以后再说」，
+   * 而是这条链需要一个「人在哪里批」的答案：Approval 表现在有（见 command-service），
+   * 但没有能把请求推给人、再把决定送回来的通道。在那条通道存在之前，任何
+   * 「先放行再说」的实现都会把一个待批准的外部动作变成一次已执行的外部动作。
+   *
+   * 同样刻意的是：`onPermissionRequest` **不是** Policy Service 的一部分。
+   * 它只处理「不是由工具调用引起」的请求（url / mcp / memory / 扩展管理），
+   * 工具调用那一路已经被 onPreToolUse + PolicyService 收口了。把两者混为一谈，
+   * 会让「Policy 决策」和「权限提示」这两件不同粒度的事共用一个出口。
    */
   private answerPermissionRequest(
     request: PermissionRequest,

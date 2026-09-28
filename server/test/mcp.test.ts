@@ -25,7 +25,7 @@ const { DenyHighRiskPolicyService } = await import('../policy.js');
 const { db } = await import('../db.js');
 const { MemberService } = await import('../member-service.js');
 const { SkillService } = await import('../skill-service.js');
-const { createTestStack, capabilityContext, StubCopilot } = await import('./support.js');
+const { createTestStack, capabilityContext, permissiveEntitlement, StubCopilot } = await import('./support.js');
 const { McpServerService, seedMcpServersOnBoot } = await import('../mcp/service.js');
 import type { CopilotService } from '../copilot.js';
 import type { McpServerDefinition } from '../mcp/types.js';
@@ -206,7 +206,7 @@ describe('MCP 注册与解析：引用 + 名单 + manifest', () => {
 // ---------------------------------------------------------- 可见性与策略回退
 
 describe('MCP 可见性与策略：SDK 配置 + 同一套 Policy', () => {
-  const policy = new DefaultToolPolicy({ allowHostTools: false }, new DenyHighRiskPolicyService());
+  const policy = new DefaultToolPolicy({ allowHostTools: false }, new DenyHighRiskPolicyService(), permissiveEntitlement());
   const adapter = new CopilotCapabilityAdapter(policy);
 
   function githubRuntimeServer() {
@@ -338,7 +338,7 @@ describe('MCP 目录：展示 + 选择 → 绑定', () => {
     };
   }
 
-  it('secret 进 DB 但读接口永远脱敏', async () => {
+  it('目录只回答「有哪些 server」：定义里的 header 值不进目录输出', async () => {
     stack.registry.registerMcpServer({
       id: 'vault',
       displayName: 'Vault',
@@ -361,7 +361,7 @@ describe('MCP 目录：展示 + 选择 → 绑定', () => {
       { scope: 'member', teamId: defaultTeam.id, memberId: member.id },
     );
     const dumped = JSON.stringify(catalog);
-    assert.ok(!dumped.includes('real-secret'), 'secret 值不能出现在目录输出里');
+    assert.ok(!dumped.includes('real-secret'), 'header 值不能出现在目录输出里');
   });
 
   it('目录列出 server 与逐工具开关；选择落成显式名单绑定', async () => {
@@ -416,7 +416,7 @@ describe('MCP Server 管理：增删改查 + 可达性 + seed', () => {
     };
   }
 
-  it('增删改查：secret 只进不出，改动同步 registry', () => {
+  it('增删改查：凭证只留引用（secretRef），DB 里没有值可泄露', () => {
     const { registry, servers } = service(db);
     const created = servers.create({
       id: 'gh',
@@ -424,18 +424,25 @@ describe('MCP Server 管理：增删改查 + 可达性 + seed', () => {
       type: 'http',
       url: 'https://mcp.github.example/mcp',
       authType: 'bearer',
-      secret: 'token-123',
+      secretRef: 'prod/github/copilot',
       tools: [{ name: 'search_code', risk: 'external-read' }],
       enabled: true,
     });
     assert.equal(created.authType, 'bearer');
     assert.equal(created.secretConfigured, true);
+    // 引用名不是秘密（它只说「去哪找」），所以可以回显 —— 否则管理员改完
+    // 配置无法确认自己指的是哪一条。
+    assert.equal(created.secretRef, 'prod/github/copilot');
 
-    // 读不到 secret，只能看到配没配
-    assert.ok(!JSON.stringify(servers.get('gh')).includes('token-123'));
-    assert.ok(!JSON.stringify(servers.list()).includes('token-123'));
+    // 关键断言：DB 行里**根本没有**凭证值。不是「读接口脱敏」，是「没存」。
+    const row = db
+      .prepare(`SELECT headers_json, env_json, secret_ref FROM mcp_server WHERE id = 'gh'`)
+      .get() as unknown as { headers_json: string; env_json: string; secret_ref: string | null };
+    assert.equal(row.secret_ref, 'prod/github/copilot');
+    assert.equal(row.headers_json, '{}', 'headers 里不该出现任何东西');
+    assert.equal(row.env_json, '{}');
 
-    // 不碰认证的编辑保持 secret；registry 实时同步
+    // 不碰认证的编辑保持引用；registry 实时同步
     const updated = servers.update('gh', {
       displayName: 'GitHub EE',
       type: 'http',
@@ -444,18 +451,33 @@ describe('MCP Server 管理：增删改查 + 可达性 + seed', () => {
       enabled: true,
     });
     assert.equal(updated.name, 'GitHub EE');
-    assert.equal(updated.secretConfigured, true, '没重填 secret 就该保持');
+    assert.equal(updated.secretConfigured, true, '没传 secretRef 就该保持');
     assert.equal(registry.mcpServer('mcp.gh').displayName, 'GitHub EE');
 
-    // 换认证方式必须给新 secret（旧 secret 不能跨类型复用）
-    assert.throws(
-      () => servers.update('gh', { displayName: 'GitHub', type: 'http', url: 'https://x', authType: 'apiKey', tools: [{ name: 'search_code', risk: 'external-read' }] }),
-      /必须提供新的 secret/,
-    );
-    // 切到 none 清掉认证
+    // 空串 = 显式清掉引用（这是唯一能取消凭证的方式，所以必须能表达）
     assert.equal(
-      servers.update('gh', { displayName: 'GitHub', type: 'http', url: 'https://x', authType: 'none', tools: [{ name: 'search_code', risk: 'external-read' }] }).secretConfigured,
+      servers.update('gh', {
+        displayName: 'GitHub',
+        type: 'http',
+        url: 'https://x',
+        secretRef: '',
+        tools: [{ name: 'search_code', risk: 'external-read' }],
+      }).secretConfigured,
       false,
+    );
+
+    // 认证头写进 headers 直接被拒 —— 那只是把凭证换个字段名存进数据库
+    assert.throws(
+      () =>
+        servers.create({
+          id: 'bad',
+          displayName: 'Bad',
+          type: 'http',
+          url: 'https://x',
+          headers: { Authorization: 'Bearer leaked' },
+          tools: [{ name: 'a', risk: 'read' }],
+        }),
+      /认证头不能写在 headers 里/,
     );
 
     // 重复 id 409，不存在的 404
@@ -570,7 +592,7 @@ describe('MCP Server 管理：增删改查 + 可达性 + seed', () => {
 });
 
 describe('MCP 管理 API：读写分离 + admin 门禁', () => {
-  it('读放行；写无 token 拒绝；secret 进去就拿不出来', async () => {
+  it('读放行；写无 token 拒绝；凭证只以引用形式存在', async () => {
     const express = (await import('express')).default;
     const { mcpRouter } = await import('../routes/mcp.js');
     const { config } = await import('../config.js');
@@ -605,18 +627,38 @@ describe('MCP 管理 API：读写分离 + admin 门禁', () => {
           type: 'http',
           url: 'https://x.example/mcp',
           authType: 'bearer',
-          secret: 'super-secret-value',
+          secretRef: 'test/api/copilot',
           tools: [{ name: 'a', risk: 'read' }],
         }),
       });
       assert.equal(created.status, 201);
-      const createdBody = (await created.json()) as { server: { secretConfigured: boolean } };
+      const createdBody = (await created.json()) as {
+        server: { secretConfigured: boolean; secretRef: string | null };
+      };
       assert.equal(createdBody.server.secretConfigured, true);
+      assert.equal(createdBody.server.secretRef, 'test/api/copilot');
 
-      // GET 列表里翻不到 secret
+      // 读接口里没有凭证值 —— 因为 DB 里根本没有它，不是因为被脱敏了
       const listed = await fetch(`${base}/api/mcp/servers`);
       assert.equal(listed.status, 200);
-      assert.ok(!(await listed.text()).includes('super-secret-value'), 'secret 值不能出现在读接口里');
+      const listedText = await listed.text();
+      assert.ok(listedText.includes('test/api/copilot'), '引用名要能回显，否则管理员无法确认指向');
+      assert.ok(!listedText.includes('super-secret-value'));
+
+      // 把凭证塞进 headers 的写法必须被拒（400），否则「DB 不存凭证」只靠自觉
+      const leaked = await fetch(`${base}/api/mcp/servers`, {
+        method: 'POST',
+        headers: authed,
+        body: JSON.stringify({
+          id: 'leaky',
+          displayName: 'Leaky',
+          type: 'http',
+          url: 'https://x',
+          headers: { Authorization: 'Bearer super-secret-value' },
+          tools: [{ name: 'a', risk: 'read' }],
+        }),
+      });
+      assert.equal(leaked.status, 400);
 
       // 非法 id / 拼错工具 400
       const badId = await fetch(`${base}/api/mcp/servers`, {

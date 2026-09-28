@@ -1,7 +1,8 @@
 import { z } from 'zod';
 import type { CapabilityBinding } from '../../domain.js';
 import type { RuntimeTool, ToolProvider, ToolProviderContext } from '../types.js';
-import type { WorkManagementProvider } from '../../work-management/types.js';
+import type { ExternalWorkRef, WorkManagementProvider } from '../../work-management/types.js';
+import type { CommandService } from '../../command-service.js';
 
 /**
  * 外部工作系统的读写工具（当前接的是 Jira）。
@@ -31,6 +32,18 @@ import type { WorkManagementProvider } from '../../work-management/types.js';
  * 当前部署没有配置放行通道，这两个工具在 Policy 层被拒 —— 这是刻意的。
  * 「能列出工具」和「能执行动作」是两件事，前者由 binding 决定，后者由 Policy 决定。
  *
+ * ── 写操作为什么不直接调 Provider ────────────────────────────────────
+ *
+ * 读走 `this.work.search/get`，写走 `this.commands.request(...)`。差别不是风格，
+ * 是**审计链**：
+ *
+ *   Agent → Jira REST                  没有任何一处能回答「它刚才想干什么」
+ *   Agent → Command → Executor → Jira  谁批的、批的什么、执行没执行，全有落点
+ *
+ * 而且 Command 是幂等的：同一轮重试拿回同一条记录，不会在 Jira 上留两条一样的
+ * 评论。这一点在「HTTP 超时但服务端已经处理」时才是真正救命的 —— 那种情况下
+ * 重试是唯一合理的动作，而没有幂等键的重试就是重复副作用。
+ *
  * ── 为什么没有 jira_assign_issue ─────────────────────────────────────
  *
  * Provider 上**有** `assign`（控制面将来要用），但刻意不暴露成工具。理由不是
@@ -44,9 +57,12 @@ import type { WorkManagementProvider } from '../../work-management/types.js';
  */
 export class JiraToolProvider implements ToolProvider {
   readonly id = 'atlassian.jira-tools';
-  readonly version = '2';
+  readonly version = '3';
 
-  constructor(private readonly work: WorkManagementProvider) {}
+  constructor(
+    private readonly work: WorkManagementProvider,
+    private readonly commands: CommandService,
+  ) {}
 
   async resolve(
     _context: ToolProviderContext,
@@ -116,10 +132,45 @@ export class JiraToolProvider implements ToolProvider {
           issueKey: z.string().min(3).max(30),
           body: z.string().min(1).max(8000),
         }),
-        execute: async (_context, args) => {
+        execute: async (context, args) => {
           const ref = this.ref(String(args.issueKey));
-          await this.work.addComment(ref, String(args.body));
-          return `Comment added to ${ref.key}.`;
+          const body = String(args.body);
+
+          // TOCTOU：把「这一刻看到的工单版本」记在 Command 上，执行时由 Jira 端
+          // 比对（`If-Unmodified-Since`）。不这么做的话，一笔基于旧状态批准的
+          // 评论会被写到已经变了的新状态上，而记录看起来是一次正常执行。
+          //
+          // 这次读不是白花：它只在**真的走到执行**时发生（Policy 拒绝的路径根本
+          // 到不了这里），而它换来的是「服务端比对」而不是「客户端读一下再写」——
+          // 后者只是把窗口缩小，没有关掉。
+          const resourceVersion = await this.currentVersion(ref);
+
+          // idempotencyKey 里刻意**不含** body：同一轮对同一张单的「加评论」只该
+          // 发生一次，改了措辞重试仍算同一次动作。带上 body 会让「模型换了个说法
+          // 重试」变成第二条评论 —— 而那恰恰是最常见的重试形态。
+          const { command, result, reused, approvalRequired } = await this.commands.request({
+            executionId: context.executionId,
+            conversationId: context.conversationId,
+            memberId: context.memberId,
+            actorType: 'agent',
+            actorId: context.memberId,
+            action: 'jira.add_comment',
+            target: ref.key,
+            args: { issueKey: ref.key, body },
+            resourceVersion,
+            idempotencyKey: `${context.executionId}:jira.add_comment:${ref.key}`,
+          });
+
+          if (approvalRequired) {
+            return (
+              `评论没有写入 ${ref.key}：这笔外部写入需要人工审批（Command ${command.id} 已停在待审批）。` +
+              '请让有权限的人审批后再试。'
+            );
+          }
+          if (reused) {
+            return `这次评论已经执行过（Command ${command.id}），没有重复写入 ${ref.key}。`;
+          }
+          return result ?? `Comment added to ${ref.key}.`;
         },
       },
       {
@@ -136,9 +187,11 @@ export class JiraToolProvider implements ToolProvider {
           /** 不确定可用 transition 时先调本工具不带 transitionId，会返回可选项。 */
           transitionId: z.string().max(30).optional().describe('Transition id; omit to list available transitions'),
         }),
-        execute: async (_context, args) => {
+        execute: async (context, args) => {
           const ref = this.ref(String(args.issueKey));
 
+          // 不带 transitionId 是**读**：列出可用流转。走 Provider 直连 ——
+          // 读没有副作用，不需要 Command 的幂等与审批。
           if (args.transitionId === undefined) {
             if (!this.work.listTransitions) {
               return `Provider ${this.work.providerId} 不支持列出可用流转，请直接给出 transitionId。`;
@@ -146,8 +199,33 @@ export class JiraToolProvider implements ToolProvider {
             return JSON.stringify(await this.work.listTransitions(ref));
           }
 
-          await this.work.transition(ref, String(args.transitionId));
-          return `Issue ${ref.key} transitioned.`;
+          const transitionId = String(args.transitionId);
+          const resourceVersion = await this.currentVersion(ref);
+          const { command, result, reused, approvalRequired } = await this.commands.request({
+            executionId: context.executionId,
+            conversationId: context.conversationId,
+            memberId: context.memberId,
+            actorType: 'agent',
+            actorId: context.memberId,
+            action: 'jira.transition_issue',
+            target: ref.key,
+            args: { issueKey: ref.key, transitionId },
+            resourceVersion,
+            // 流转带上 transitionId：换一个目标状态是**另一笔**业务动作，
+            // 不该被上一笔的幂等键挡住。
+            idempotencyKey: `${context.executionId}:jira.transition_issue:${ref.key}:${transitionId}`,
+          });
+
+          if (approvalRequired) {
+            return (
+              `流转没有执行 ${ref.key}：这笔外部写入需要人工审批（Command ${command.id} 已停在待审批）。` +
+              '请让有权限的人审批后再试。'
+            );
+          }
+          if (reused) {
+            return `这次流转已经执行过（Command ${command.id}），没有重复执行 ${ref.key}。`;
+          }
+          return result ?? `Issue ${ref.key} transitioned.`;
         },
       },
     ];
@@ -159,5 +237,17 @@ export class JiraToolProvider implements ToolProvider {
    */
   private ref(key: string) {
     return this.work.ref({ key: key.trim() });
+  }
+
+  /**
+   * 这条工单此刻的并发版本。Provider 不提供版本概念时返回 null ——
+   * 于是 Command 上不留版本，执行器走无条件写入（Provider 自己决定怎么保证）。
+   *
+   * 不把「读不到版本」当成失败：不是每家外部系统都有版本号，而「没有版本」
+   * 应当表现为「这一层保护不适用」，不是「这次写入不能做」。
+   */
+  private async currentVersion(ref: ExternalWorkRef): Promise<string | null> {
+    if (!this.work.versionOf) return null;
+    return this.work.versionOf(ref);
   }
 }

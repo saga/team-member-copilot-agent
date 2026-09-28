@@ -4,7 +4,7 @@ import { DeleteOutlined, PlusOutlined } from '@ant-design/icons';
 import type { McpServer, McpServerInput } from '../../lib/api';
 
 interface McpServerEditorProps {
-  /** null = 新建；否则编辑（secret 与 env 值不回显，只能重填或保持）。 */
+  /** null = 新建；否则编辑（env 值不回显，只能重填或保持）。 */
   initial: McpServer | null;
   onSubmit: (input: McpServerInput) => Promise<void>;
   onCancel: () => void;
@@ -33,9 +33,10 @@ function nextKey(): number {
 /**
  * MCP Server 定义编辑器。
  *
- * 只管「连接形状 + 工具名单」：secret 只进不出（编辑时留空=保持），env 只增
- * 不删（值不回显，老变量删不掉 —— 要删直接改 DB 或定义文件，这里会说清楚）。
- * 工具列表是手工维护的：没有在线 discovery，保存时也不探测（Test 按钮另做）。
+ * 只管「连接形状 + 工具名单」：**凭证只填引用名**（密钥库里的条目名），值本身
+ * 永远不经过这里 —— 那正是这条改动的目的。env 只增不删（值不回显，老变量删不掉
+ * ——要删直接改 DB 或定义文件，这里会说清楚）。工具列表是手工维护的：没有在线
+ * discovery，保存时也不探测（Test 按钮另做）。
  */
 export function McpServerEditor({ initial, onSubmit, onCancel }: McpServerEditorProps) {
   const [form] = Form.useForm();
@@ -59,6 +60,7 @@ export function McpServerEditor({ initial, onSubmit, onCancel }: McpServerEditor
       argsText: initial?.args.join('\n') ?? '',
       cwd: initial?.cwd ?? '',
       timeout: initial?.timeout ?? undefined,
+      secretRef: initial?.secretRef ?? '',
     });
     setServerType(initial?.type ?? 'http');
     setAuthType(initial?.authType ?? 'none');
@@ -80,7 +82,9 @@ export function McpServerEditor({ initial, onSubmit, onCancel }: McpServerEditor
         setError('工具名不能为空');
         return;
       }
-      const secret = String(values.secret ?? '').trim();
+      // 空串是**有意义的输入**：它是唯一能取消凭证引用的方式，所以不能像
+      // 其它可选字段那样「空了就不传」（那样会让「清掉引用」变得无法表达）。
+      const secretRef = String(values.secretRef ?? '').trim();
       const input: McpServerInput = {
         id: initial ? initial.id : String(values.id).trim(),
         displayName: String(values.displayName).trim(),
@@ -100,7 +104,7 @@ export function McpServerEditor({ initial, onSubmit, onCancel }: McpServerEditor
             }),
         ...(values.timeout ? { timeout: Number(values.timeout) } : {}),
         authType,
-        ...(secret ? { secret } : {}),
+        secretRef,
         ...(envRows.length > 0
           ? { env: Object.fromEntries(envRows.filter((row) => row.name.trim()).map((row) => [row.name.trim(), row.value])) }
           : {}),
@@ -200,15 +204,15 @@ export function McpServerEditor({ initial, onSubmit, onCancel }: McpServerEditor
         </Form.Item>
         {authType !== 'none' && (
           <Form.Item
-            name="secret"
-            label="Secret"
+            name="secretRef"
+            label="Secret Reference"
             extra={
               initial?.secretConfigured
-                ? '已配过 secret。留空=保持不变，填了=替换；切换认证方式必须重填。值永远不回显。'
-                : '只存服务端，永远不回显。Bearer 只填 token 本体，不要带 Bearer 前缀；API Key 走 X-Api-Key 头。'
+                ? '已配过引用。留空=保持不变，填别的=改指向，清空=取消凭证。值只活在密钥库里，本系统存不到也读不到它。'
+                : '密钥库里的条目名（例如 prod/github/copilot），不是凭证本身。留空=清掉引用。'
             }
           >
-            <Input.Password placeholder={initial?.secretConfigured ? '留空保持不变' : '粘贴 secret'} />
+            <Input placeholder="prod/github/copilot" />
           </Form.Item>
         )}
 

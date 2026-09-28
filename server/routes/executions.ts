@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import type { TeamService } from '../team-service.js';
 import { sendError } from '../middleware/errorHandler.js';
+import { requireResourceConversationAccess } from '../middleware/conversationAccess.js';
 
 /**
  * Execution API。
@@ -11,10 +12,21 @@ import { sendError } from '../middleware/errorHandler.js';
  * 刻意不做 `/executions/:id/tree`：客户端按 `parentExecutionId` 自己组树就够了，
  * 服务端算一次树只是在缓存一个随时会变的视图。
  *
+ * ── 授权 ─────────────────────────────────────────────────────────────
+ *
+ * 整段挂在「execution 归属的那个 Conversation」上。Execution 是**房间里的东西**，
+ * 而执行记录里有 prompt、工具调用、文件引用 —— 只校验「你是这个 Team 的人」
+ * 会让同一个 Team 的成员按 id 遍历别人的执行记录。
+ *
  * 挂载点：`/api/executions`
  */
 export function executionsRouter(team: TeamService) {
   const router = Router();
+
+  router.use(
+    '/:id',
+    requireResourceConversationAccess(team, (id) => team.getExecution(id).conversationId, 'id', 'execution'),
+  );
 
   /** 单条 execution。 */
   router.get('/:id', (req, res) => {

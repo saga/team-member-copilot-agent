@@ -134,6 +134,36 @@ export interface WorkManagementProvider extends WorkRefFactory {
   addComment(ref: ExternalWorkRef, body: string): Promise<void>;
 
   /**
+   * 可选：条件加评论 —— 只在工单仍处于 `expectedVersion` 时写。
+   *
+   * ── 为什么需要它 ────────────────────────────────────────────────────
+   *
+   * Command 是在「看到某个版本的工单」时被批准的，而批准到执行之间工单可能
+   * 已经被人改了。无条件写入等于把一条基于旧状态的决策施加到新状态上，
+   * 表现是「评论内容和当前状态对不上」，而排查时看到的只是一条正常执行的命令。
+   *
+   * 这是典型的 TOCTOU：检查与写入之间有时间窗口。所以实现**必须**把判定放到
+   * 服务端（Jira：`If-Unmodified-Since`），只做一次「读一下比一比再写」是不够的
+   * —— 那只是把窗口缩小了，没有关掉它。
+   *
+   * 版本不匹配时**抛**，不静默跳过：一次被放弃的外部写入必须让调用方知道，
+   * 否则 Command 会被记成成功。
+   */
+  addCommentIfVersion?(
+    ref: ExternalWorkRef,
+    body: string,
+    expectedVersion: string,
+  ): Promise<void>;
+
+  /**
+   * 可选：这条工单当前的并发版本号。
+   *
+   * 由 Provider 定义「什么算变化」—— Jira 是 `fields.updated`。上层不解释它，
+   * 只负责原样取回来再原样传回 `addCommentIfVersion`。
+   */
+  versionOf?(ref: ExternalWorkRef): Promise<string | null>;
+
+  /**
    * 流转。`transitionId` 必须由 Provider 侧的状态机认账 ——
    * 本地不复制 workflow，所以「这个流转合不合法」永远问 Provider。
    */

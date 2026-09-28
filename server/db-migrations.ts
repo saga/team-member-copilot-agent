@@ -20,7 +20,7 @@ import type { DatabaseSync } from 'node:sqlite';
  *
  * 程序不认识任何别的编号 —— 没有升级代码，认出来也无从下手。
  */
-export const SCHEMA_VERSION = 23;
+export const SCHEMA_VERSION = 27;
 
 /**
  * 当前 schema 的完整定义，按最终形状写。
@@ -179,8 +179,17 @@ CREATE INDEX idx_team_event_team_sequence
 --
 -- config/mcp-servers.json 只是新库的 provisioning baseline：空库启动时读一次，
 -- 之后增删改只走 /api/mcp（McpServerService），文件改了不会回头覆盖 ——
--- 和 capability templates 同一套「只读一次」纪律。credential（headers / env 的值）
--- 和定义存在同一行：读接口永远脱敏，只返回「配没配」，不返回值。
+-- 和 capability templates 同一套「只读一次」纪律。
+--
+-- ── 凭证不进这张表 ────────────────────────────────────────────────────
+--
+-- headers_json / env_json 只允许**非敏感**配置（Accept 头、LOG_LEVEL 之类）。
+-- 真正的 credential 只留一个指针 secret_ref（例如 "prod/jira/copilot"），
+-- 值由 SecretProvider 在执行时从外部密钥库取（见 mcp/secret-provider.ts）。
+--
+-- 为什么不是「存了但读接口脱敏」：脱敏只挡住 API 这一条路。备份、WAL 副本、
+-- 崩溃转储、sqlite3 file.db .dump 都不经过 API，一次 DB 泄露就等于一次凭证
+-- 泄露。凭证留在进程外的密钥库里，DB 被完整拿走也换不到它。
 CREATE TABLE mcp_server (
   id TEXT PRIMARY KEY,
   display_name TEXT NOT NULL,
@@ -198,6 +207,13 @@ CREATE TABLE mcp_server (
   version TEXT NOT NULL DEFAULT '1',
   enabled INTEGER NOT NULL DEFAULT 1
     CHECK (enabled IN (0, 1)),
+  -- 密钥库里的引用名。NULL = 这个 server 不需要凭证。
+  secret_ref TEXT,
+  -- 界面提示：这个引用喂的是哪种认证（bearer / apiKey）。**不参与运行时拼装**
+  -- —— 真正写哪个 header 由密钥库那一侧决定（见 mcp/secret-provider.ts）。
+  -- 留着它是为了让编辑器能显示「配的是哪种认证」而不必去猜。
+  auth_type TEXT
+    CHECK (auth_type IN ('none', 'bearer', 'apiKey')),
   last_test_at TEXT,
   last_test_ok INTEGER
     CHECK (last_test_ok IN (0, 1)),
@@ -842,6 +858,237 @@ CREATE INDEX idx_message_file_file
 -- 它们只作为原文件 attachment 交给模型）。
 CREATE VIRTUAL TABLE conversation_file_fts
   USING fts5(file_id UNINDEXED, title, content);
+
+-- ============================================================ 授权与审计链
+--
+-- 下面五组表补的是「能力 ≠ 授权」这半边：Capability 只回答「能不能调 jira_search」，
+-- 不回答「能看哪些 issue」（Data Entitlement）、「这笔外部写入该不该发生」
+-- （Policy → Approval → Command）、「事后能不能证明发生过」（Audit）、
+-- 「多副本下谁在跑这一轮」（Worker Lease）。
+--
+-- 它们全部是**只增不改**的旁路：没有它们服务照跑（默认拒绝），有了它们才
+-- 谈得上授权链与合规证据。
+
+-- ------------------------------------------------------ Data Entitlement
+--
+-- 一条记录 = 「某个 Team（可选某个 Member）在某类资源上被允许做哪些动作」。
+-- 查询时按 (team_id, provider_id, resource_type) 取候选，再按 member_id 收窄：
+-- member_id IS NULL 的行是 Team 级基线，所有 Member 都吃到。
+--
+-- resource_pattern 保留给「按前缀授权」（repo:team-*）这种将来才需要的能力，
+-- 当前 check() 只按 resource_type 判，pattern 不参与 —— 留着它是因为补列比
+-- 补表便宜，而这一层一旦上线就会有存量数据。
+CREATE TABLE data_entitlement (
+  id TEXT PRIMARY KEY,
+  team_id TEXT NOT NULL,
+  member_id TEXT,
+  provider_id TEXT NOT NULL,
+  resource_type TEXT NOT NULL,
+  resource_pattern TEXT NOT NULL,
+  actions_json TEXT NOT NULL DEFAULT '[]',
+  active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+
+  FOREIGN KEY (team_id)
+    REFERENCES team(id)
+    ON DELETE CASCADE,
+
+  FOREIGN KEY (member_id)
+    REFERENCES member(id)
+    ON DELETE CASCADE
+);
+
+CREATE INDEX idx_data_entitlement_lookup
+  ON data_entitlement(
+    team_id,
+    member_id,
+    provider_id,
+    resource_type,
+    active
+  );
+
+-- ------------------------------------------------------------ Audit chain
+--
+-- policy_decision_audit 是「谁批的」，tool_execution_audit 是「批了之后真的
+-- 调了什么」。两张表刻意分开：一次拒绝（deny）只有前者，一次放行两者都有，
+-- 而「拒绝了什么」恰恰是合规审计里最常被问的那一类。
+--
+-- 两者都不是 ConversationEvent 的替代品：事件流是 UI / SSE / replay，
+-- 这两张表是**事后证据**，不参与任何读路径的展示。
+CREATE TABLE policy_decision_audit (
+  id TEXT PRIMARY KEY,
+  execution_id TEXT NOT NULL,
+  tool_name TEXT NOT NULL,
+  policy_revision TEXT NOT NULL,
+  decision TEXT NOT NULL
+    CHECK (
+      decision IN (
+        'allow',
+        'deny',
+        'approval_required'
+      )
+    ),
+  reason TEXT NOT NULL,
+  input_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+
+  FOREIGN KEY (execution_id)
+    REFERENCES execution(id)
+    ON DELETE CASCADE
+);
+
+CREATE INDEX idx_policy_decision_execution
+  ON policy_decision_audit(execution_id);
+
+-- args_redacted_json 存的是**脱敏后**的参数（token / password 等替换成
+-- [REDACTED]），args_hash 存原文的 sha256。两者都要：前者让人看得懂这次调用
+-- 想干什么，后者让「参数有没有被改过」可验证 —— 只存 hash 没法排查，
+-- 只存明文等于把凭证又写进了一张新表。
+CREATE TABLE tool_execution_audit (
+  id TEXT PRIMARY KEY,
+  execution_id TEXT NOT NULL,
+  conversation_id TEXT NOT NULL,
+  member_id TEXT NOT NULL,
+
+  tool_name TEXT NOT NULL,
+  provider_id TEXT NOT NULL,
+  implementation TEXT NOT NULL,
+
+  args_hash TEXT NOT NULL,
+  args_redacted_json TEXT,
+
+  allowed INTEGER NOT NULL CHECK (allowed IN (0,1)),
+
+  policy_decision_id TEXT,
+  entitlement_id TEXT,
+
+  started_at TEXT NOT NULL,
+  ended_at TEXT,
+
+  result_hash TEXT,
+  error TEXT,
+
+  FOREIGN KEY (execution_id)
+    REFERENCES execution(id)
+    ON DELETE CASCADE,
+
+  FOREIGN KEY (policy_decision_id)
+    REFERENCES policy_decision_audit(id)
+);
+
+CREATE INDEX idx_tool_execution_audit_execution
+  ON tool_execution_audit(execution_id, started_at);
+
+-- ------------------------------------------------------- Command / Approval
+--
+-- Command 是「真正要执行的业务动作」的唯一落点：Agent 不再直接打外部 REST，
+-- 而是先落一条 Command，再由 CommandService 走 Entitlement → Policy →
+-- Approval → Executor。这样「模型想干什么」和「系统真的干了什么」之间有
+-- 一条可回放、可幂等的记录。
+--
+-- idempotency_key 唯一：同一轮 execution 里重试同一次评论，拿回的是同一条
+-- Command，不会在 Jira 上留两条一样的评论。
+CREATE TABLE command (
+  id TEXT PRIMARY KEY,
+  execution_id TEXT NOT NULL,
+  conversation_id TEXT NOT NULL,
+  member_id TEXT NOT NULL,
+
+  actor_type TEXT NOT NULL
+    CHECK (actor_type IN ('agent', 'human')),
+  actor_id TEXT NOT NULL,
+
+  action TEXT NOT NULL,
+  target TEXT NOT NULL,
+
+  args_hash TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL UNIQUE,
+
+  resource_version TEXT,
+
+  policy_decision_id TEXT,
+  approval_id TEXT,
+
+  status TEXT NOT NULL
+    CHECK (
+      status IN (
+        'requested',
+        'policy_pending',
+        'approved',
+        'ready',
+        'executing',
+        'completed',
+        'failed',
+        'rejected',
+        'cancelled',
+        'expired'
+      )
+    ),
+
+  created_at TEXT NOT NULL,
+  executed_at TEXT,
+  result_hash TEXT,
+
+  FOREIGN KEY (execution_id)
+    REFERENCES execution(id)
+    ON DELETE CASCADE,
+
+  FOREIGN KEY (conversation_id)
+    REFERENCES conversation(id)
+    ON DELETE CASCADE,
+
+  FOREIGN KEY (member_id)
+    REFERENCES member(id)
+);
+
+CREATE INDEX idx_command_execution
+  ON command(execution_id, created_at);
+
+CREATE TABLE approval (
+  id TEXT PRIMARY KEY,
+  command_id TEXT NOT NULL,
+  requested_by_type TEXT NOT NULL,
+  requested_by_id TEXT NOT NULL,
+  decision TEXT NOT NULL
+    CHECK (
+      decision IN (
+        'pending',
+        'approved',
+        'rejected',
+        'expired'
+      )
+    ),
+  decided_by TEXT,
+  created_at TEXT NOT NULL,
+  decided_at TEXT,
+
+  FOREIGN KEY (command_id)
+    REFERENCES command(id)
+    ON DELETE CASCADE
+);
+
+-- ------------------------------------------------------------ Worker Lease
+--
+-- 多副本部署下「谁在跑这一轮」的唯一仲裁点。单进程时这张表是空的，
+-- 不影响任何现有路径。
+--
+-- 语义是**租约**不是锁：lease_expires_at 过了就自动可抢，所以进程崩溃
+-- 不需要任何人来解锁 —— 这正是它比「进程内 inFlight Set」强的地方，
+-- 后者在进程消失时连「曾经有人在跑」都留不下来。
+CREATE TABLE worker_lease (
+  resource_type TEXT NOT NULL,
+  resource_id TEXT NOT NULL,
+
+  lease_owner TEXT NOT NULL,
+  lease_expires_at TEXT NOT NULL,
+  heartbeat_at TEXT NOT NULL,
+
+  PRIMARY KEY (
+    resource_type,
+    resource_id
+  )
+);
 `;
 
 export function getUserVersion(db: DatabaseSync): number {

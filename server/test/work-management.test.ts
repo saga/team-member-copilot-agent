@@ -284,7 +284,10 @@ describe('JiraProvider：把五个动作翻译成 REST，不做本地建模', ()
 });
 
 describe('Jira tools：description 进出', () => {
-  const tools = new JiraToolProvider({
+  // 这一组只走读路径（jira_search / jira_get_issue），读不经 Command，
+  // 所以 CommandService 传一个空壳即可 —— 写路径的幂等与审批另有归属。
+  const tools = new JiraToolProvider(
+    {
     providerId: 'jira',
     ref: ({ key }: { key: string }) => ({
       provider: 'jira',
@@ -313,7 +316,9 @@ describe('Jira tools：description 进出', () => {
       assignee: 'Ada',
       description: 'y'.repeat(13000),
     }),
-  } as unknown as import('../work-management/types.js').WorkManagementProvider);
+  } as unknown as import('../work-management/types.js').WorkManagementProvider,
+    {} as unknown as import('../command-service.js').CommandService,
+  );
 
   async function run(name: string, args: Record<string, unknown>): Promise<unknown> {
     const context = {

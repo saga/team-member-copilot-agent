@@ -23,6 +23,7 @@ import { HostCodingToolProvider } from '../capabilities/providers/host-tools.js'
 import type { MemberService } from '../member-service.js';
 import { TeamStructureService } from '../team-structure-service.js';
 import type { WorkManagementRegistry } from '../work-management/types.js';
+import type { EntitlementChecker, EntitlementContext } from '../entitlement-service.js';
 
 /**
  * 测试用的能力装配。
@@ -175,6 +176,37 @@ export function capabilityContext(memberId: string, teamId = 'test-team'): Capab
     conversationId: 'test-conversation',
     executionId: 'test-execution',
     userId: 'test-user',
+  };
+}
+
+/**
+ * 授权层替身：Data Entitlement 一律放行。
+ *
+ * ── 为什么用例需要它 ─────────────────────────────────────────────────
+ *
+ * `DefaultToolPolicy` 现在有三个判定阶段（Capability → Entitlement → Policy），
+ * 而 Entitlement 的真实现要读库。绝大多数用例关心的不是数据授权（它们造的工具
+ * 也不碰 Jira），为它们各起一个库只会让用例变慢、变脆。
+ *
+ * ── 为什么是「放行」而不是「拒绝」 ───────────────────────────────────
+ *
+ * 这些用例断言的是「host 开关 / guard / risk 三分」的结论，Entitlement 拒绝会
+ * 把结论盖掉，于是用例不再测它想测的东西。Entitlement 自己的默认拒绝由
+ * `entitlement-service` 的实现保证，不靠这里。
+ *
+ * 刻意写成**会记账**的替身而不是纯常量：`check` 被调用过多少次本身是有意义的
+ * 信号 —— 一个不碰外部资源的工具本不该走到这一层（`resolveToolResource` 返回
+ * null 时整层跳过），用例可以据此断言「这一层没有被误触发」。
+ */
+export function permissiveEntitlement(): EntitlementChecker & { calls: EntitlementContext[] } {
+  const calls: EntitlementContext[] = [];
+  return {
+    calls,
+    revision: () => '',
+    check: (input: EntitlementContext) => {
+      calls.push(input);
+      return { allowed: true, reason: 'test entitlement（用例替身，一律放行）', revision: '' };
+    },
   };
 }
 

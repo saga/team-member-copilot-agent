@@ -25,6 +25,11 @@ import { JiraProvider } from './work-management/jira-provider.js';
 import { WorkManagementRegistry } from './work-management/types.js';
 import { DefaultToolPolicy } from './tool-policy.js';
 import { DenyHighRiskPolicyService } from './policy.js';
+import { EntitlementService } from './entitlement-service.js';
+import { AuditService } from './audit-service.js';
+import { CommandService } from './command-service.js';
+import { WorkerLeaseService } from './worker-lease.js';
+import { EnvSecretProvider } from './mcp/secret-provider.js';
 import { McpServerService, seedMcpServersOnBoot } from './mcp/service.js';
 import { TeamStructureService } from './team-structure-service.js';
 import { SchedulerService } from './scheduler-service.js';
@@ -67,6 +72,26 @@ let conversationFileProcessor!: ConversationFileProcessor;
 
 const memberService = new MemberService(db);
 const capabilityService = new CapabilityService(db);
+
+// ── 授权与证据层 ────────────────────────────────────────────────────────
+//
+// 这三样都只是 DB 的包装，谁都不认识任何 Provider，所以它们可以在最前面构造。
+// 顺序上它们**必须早于** CopilotService / CommandService —— 后两者要在构造时
+// 拿到它们，而不是在执行时才去全局找一个。
+//
+//   EntitlementService  能碰什么数据（静态、按 Team/Member 配）
+//   AuditService        事后证明发生了什么（两张表，见 audit-service.ts）
+//
+// Policy 是有状态无关的（进程内实现），所以直接 new 一个单例给所有调用方共用：
+// 两处各 new 一个会让「同一版政策」这句话失去意义。
+const entitlementService = new EntitlementService(db);
+const auditService = new AuditService(db);
+const policyService = new DenyHighRiskPolicyService();
+
+// Worker 租约：多副本部署下「谁在跑这一轮」的唯一仲裁点。单进程时它仍然存在，
+// 只是永远能抢到 —— 让两条路径共用同一份代码，而不是让「单机模式」走一条
+// 从来没被测试过的分支。
+const workerLease = new WorkerLeaseService(db, config.workerLeaseTtlMs);
 
 // Team SSE 的事件源。结构服务的每次业务变更都会回调到这里：append 与业务行
 // 同事务落库，广播由 commit hook 保证在 COMMIT 之后 —— 先落库、后广播的纪律
@@ -144,6 +169,18 @@ for (const server of mcpServerService.listDefinitions()) {
 // 同一份业务语义，这是刻意的：否则「Agent 看到的工单」和「平台看到的工单」
 // 会漂移成两套。
 const workManagement = new WorkManagementRegistry();
+
+// ── Command 层 ──────────────────────────────────────────────────────────
+//
+// 「真正要执行的业务动作」的唯一落点。它**不认识任何 Provider** —— 出口由
+// 下面按 action 注册进来（见 registerExecutor 的调用）。这是刻意的：Command
+// 的职责是「谁批的、执行没执行、结果是什么」，不是「怎么打 Jira」。
+//
+// Policy 单独传进来（而不是复用工具层那份判定）：Command 自己再过一遍 Policy，
+// 是因为**平台也会发起 Command**（控制面回写、webhook），那条路径不经过工具
+// 授权，只有把闸放在 Command 上两条路径才共用同一道。
+const commandService = new CommandService(db, entitlementService, policyService);
+
 const jiraConfigured = config.jira.baseUrl && config.jira.email && config.jira.apiToken;
 if (jiraConfigured) {
   const jiraProvider = new JiraProvider(
@@ -155,10 +192,39 @@ if (jiraConfigured) {
     config.jira.baseUrl,
   );
   workManagement.register(jiraProvider);
-  registry.registerToolProvider(new JiraToolProvider(jiraProvider));
+
+  // 写动作的出口。工具层把「加评论 / 流转」转成 Command，真正打 Jira 的是这里
+  // —— 两者分开之后，「它想干什么」和「它干了什么」才各有落点。
+  //
+  // 幂等由 CommandService 的 idempotency_key 保证：同一个 key 第二次进来拿到
+  // 的是同一条记录，不会在 Jira 上留第二条评论。
+  //
+  // 版本比对是**服务端**的（If-Unmodified-Since）：Command 上记着「批准时看到的
+  // 版本」，执行时 Jira 在事务里比。客户端读一下再写只缩小窗口，关不掉它。
+  commandService.registerExecutor('jira.add_comment', async ({ command, args }) => {
+    const ref = jiraProvider.ref({ key: String(args.issueKey) });
+    const body = String(args.body);
+    if (command.resourceVersion && jiraProvider.addCommentIfVersion) {
+      await jiraProvider.addCommentIfVersion(ref, body, command.resourceVersion);
+    } else {
+      await jiraProvider.addComment(ref, body);
+    }
+    return { commented: ref.key };
+  });
+  commandService.registerExecutor('jira.transition_issue', async ({ args }) => {
+    const ref = jiraProvider.ref({ key: String(args.issueKey) });
+    const transitionId = String(args.transitionId);
+    // 流转不做条件写：Jira 的 workflow 服务端状态机本来就会拒绝非法流转，
+    // 而「这条流转合不合法」的权威判定在它那边，不在一个版本号上。
+    // `resourceVersion` 仍然记在 Command 上，供将来需要条件流转时使用。
+    await jiraProvider.transition(ref, transitionId);
+    return { transitioned: ref.key, transitionId };
+  });
+
+  registry.registerToolProvider(new JiraToolProvider(jiraProvider, commandService));
 }
 
-const capabilityResolver = new CapabilityResolver(registry);
+const capabilityResolver = new CapabilityResolver(registry, new EnvSecretProvider());
 
 /**
  * 会话文件（聊天附件）。
@@ -194,10 +260,16 @@ registry.registerToolProvider(
 const skillService = new SkillService(db);
 
 const copilotService = new CopilotService({
+  // 三层判定的顺序在 DefaultToolPolicy 里：Capability → Entitlement → Policy。
+  // 传进去的两个实现都是**唯一实例**（同一个 policyService 也给了 CommandService）：
+  // 两处各 new 一个会让「同一版政策」这句话失去意义。
   toolPolicy: new DefaultToolPolicy(
     { allowHostTools: config.allowHostCodingTools },
-    new DenyHighRiskPolicyService(),
+    policyService,
+    entitlementService,
   ),
+  // 工具调用的审计口。不传时整条审计链静默关闭 —— 生产装配永远传。
+  audit: auditService,
   // MCP 调用展示：放行即通知，执行完成没有回调（见 notifyMcpToolUse）。
   onMcpToolUse: (info) => teamService.notifyMcpToolUse(info),
 });
@@ -213,9 +285,22 @@ teamService = new TeamService(
   (teamId, type, payload) => teamEvents.append(teamId, type, payload),
   workManagement,
   conversationFiles,
+  // 授权层的版本进 execution 快照：事后才能回答「当时按哪版政策 / 哪版数据
+  // 授权放的行」。传回调而不是常量 —— 版本会变，常量记的是装配那一刻的值。
+  {
+    policy: () => policyService.revision(),
+    entitlement: () => entitlementService.revision(),
+  },
 );
 
-schedulerService = new SchedulerService(structureService, () => teamService);
+// Scheduler 也拿同一份租约：多副本时它是「同一条 schedule 被两个副本各跑一遍」
+// 的唯一防线（scheduled_wake_run 的 UNIQUE 只保证一行，不保证只有一个进程去执行）。
+// 不启用租约时传 undefined —— 单进程语义，和 RecoveryService 同一套约定。
+schedulerService = new SchedulerService(
+  structureService,
+  () => teamService,
+  config.workerLeaseEnabled ? workerLease : undefined,
+);
 
 // teamScope 的默认 Team 在 index 启动时 ensure 后再 init（库尚未就位时无 id 可用）。
 // 这里先给一个占位，index 会用真实 teamId 重新 init。
@@ -302,6 +387,10 @@ export {
   conversationFileProcessor,
   teamEvents,
   workManagement,
+  entitlementService,
+  auditService,
+  commandService,
+  workerLease,
   describeWebhookBoundary,
 };
 

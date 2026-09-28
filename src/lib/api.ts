@@ -145,8 +145,9 @@ export type CatalogScope = 'global' | 'team' | 'member';
 /**
  * MCP Server（管理面读到的形状）。
  *
- * secret 的值永远拿不到：`secretConfigured` 只回答配没配，`envKeys` 只给
- * 变量名；编辑时重新输入。tools 是定义里声明的工具（手工维护），不是在线发现的。
+ * 凭证的值永远拿不到，而且**根本不在这个系统里**：`secretRef` 是密钥库里的
+ * 条目名（不是秘密，可以回显），`secretConfigured` 只回答配没配，`envKeys`
+ * 只给变量名。tools 是定义里声明的工具（手工维护），不是在线发现的。
  */
 export interface McpServer {
   id: string;
@@ -161,6 +162,8 @@ export interface McpServer {
   version: string;
   authType: 'none' | 'bearer' | 'apiKey';
   secretConfigured: boolean;
+  /** 密钥库里的引用名。回显它才能确认「指的是哪一条」；值在服务端解析。 */
+  secretRef: string | null;
   envKeys: string[];
   tools: Array<{ name: string; risk: string }>;
   enabled: boolean;
@@ -175,9 +178,14 @@ export interface McpServerInput {
   description?: string;
   type: 'http' | 'sse' | 'local';
   url?: string;
-  /** Bearer token 或 API Key 的值。省略 = 保持现状（编辑时不回显，只能重填）。 */
-  secret?: string;
-  /** secret 的种类。不传 secret 时忽略。 */
+  /**
+   * 密钥库里的引用名（例如 `prod/jira/copilot`）。**不是**凭证值本身。
+   *
+   * 省略 = 保持现状；空串 = 显式清掉引用（这是唯一能取消凭证的方式）。
+   * 值只活在密钥库里，本系统任何接口都不接受它 —— 那正是这条改动的目的。
+   */
+  secretRef?: string;
+  /** 认证方式提示（界面用）。不参与服务端的 header 拼装。 */
   authType?: 'none' | 'bearer' | 'apiKey';
   command?: string;
   args?: string[];

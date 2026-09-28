@@ -7,6 +7,8 @@ import {
   type Tool,
 } from '@github/copilot-sdk';
 import type { ToolPolicy } from '../tool-policy.js';
+import type { AuditService } from '../audit-service.js';
+import { hashJson } from '../content-hash.js';
 import type {
   CapabilityContext,
   RuntimeCapabilities,
@@ -58,7 +60,17 @@ export interface CopilotCapabilities {
 }
 
 export class CopilotCapabilityAdapter {
-  constructor(private readonly policy: ToolPolicy) {}
+  /**
+   * `audit` 可选：不传时整条审计链静默关闭。
+   *
+   * 做成可选而不是必填，是因为它不该成为「装配顺序」的又一道约束 —— 适配器在
+   * CopilotService 里构造，而 AuditService 只是个 DB 包装，两者没有真正的依赖。
+   * 生产装配永远传（见 app.ts）；测试可以只关心判定结果。
+   */
+  constructor(
+    private readonly policy: ToolPolicy,
+    private readonly audit?: AuditService,
+  ) {}
 
   build(capabilities: RuntimeCapabilities, context: CapabilityContext): CopilotCapabilities {
     // isolated built-in 恒可用：SDK 契约保证它们只在 session 边界内活动，
@@ -117,10 +129,49 @@ export class CopilotCapabilityAdapter {
         const current: ToolExecutionContext = { ...context, toolName: tool.name };
         const normalized = normalizeArgs(args);
         const decision = await this.evaluateToolUse(tool, context, normalized);
+
+        // 先落 Policy 决策，再落工具调用。顺序不能反：tool_execution_audit
+        // 的外键指向 policy_decision_audit，反了会直接违反约束 —— 而那个约束
+        // 正是「每一条调用都能回指到一次判定」这句话的实现。
+        const policyDecisionId = this.recordPolicyDecision(tool, context, normalized, decision);
+
+        // 审计在**判定之后、执行之前**开始：一条只有「想调」没有「调没调成」的
+        // 记录没法用，所以 start 与 finish 成对出现，两条路径（放行/拒绝）
+        // 都必须收口。
+        const auditId = this.audit?.startToolExecution({
+          executionId: context.executionId,
+          conversationId: context.conversationId,
+          memberId: context.memberId,
+          toolName: tool.name,
+          providerId: tool.providerId,
+          implementation: tool.implementation,
+          args: normalized,
+          allowed: decision.allowed,
+          policyDecisionId,
+          entitlementId: decision.entitlementId ?? null,
+        });
+
         if (!decision.allowed) {
+          if (auditId) {
+            this.audit!.finishToolExecution(auditId, { error: decision.reason });
+          }
           throw new Error(`Tool ${tool.name} 被拒绝：${decision.reason}`);
         }
-        return tool.execute!(current, normalized);
+
+        try {
+          const result = await tool.execute!(current, normalized);
+          if (auditId) {
+            this.audit!.finishToolExecution(auditId, { result });
+          }
+          return result;
+        } catch (error) {
+          if (auditId) {
+            this.audit!.finishToolExecution(auditId, {
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+          throw error;
+        }
       },
     });
   }
@@ -169,7 +220,14 @@ export class CopilotCapabilityAdapter {
 
     const tool = capabilities.toolIndex.get(toolName);
     if (tool) {
-      return this.evaluateToolUse(tool, context, normalizeArgs(args));
+      const normalized = normalizeArgs(args);
+      const decision = await this.evaluateToolUse(tool, context, normalized);
+      // 被拒的调用**没有 handler**（引擎不会去执行它），所以审计必须在这里补。
+      // 放行的那条不在这一层写 —— handler 会写，两处都写就是一次调用两条记录。
+      if (!decision.allowed) {
+        this.auditDecisionWithoutHandler(tool, context, normalized, decision);
+      }
+      return decision;
     }
 
     // MCP 工具走同一套 Policy：先按别名反查是哪个 server 的哪个工具，
@@ -178,6 +236,9 @@ export class CopilotCapabilityAdapter {
     if (candidates.length === 0) {
       // 声明之外的任何名字 —— 引擎的其它 built-in、skill 带来的工具、拼错的名字。
       // 全部拒绝：放行一个来历不明的工具，等于授权层不存在。
+      //
+      // 这一条**不写审计**：没有 Provider 就没有 providerId / implementation，
+      // 硬写一行会把「不知道是谁」记成一条看起来正常的记录。它只在日志里出现。
       return { allowed: false, reason: `未为该工具定义策略（${toolName}），授权层默认拒绝` };
     }
     if (candidates.length > 1) {
@@ -189,7 +250,13 @@ export class CopilotCapabilityAdapter {
           '请收窄授权绑定的 selector，让这个名字只剩一个来源',
       };
     }
-    const decision = await this.evaluateToolUse(candidates[0], context, normalizeArgs(args));
+    const normalizedMcp = normalizeArgs(args);
+    const decision = await this.evaluateToolUse(candidates[0], context, normalizedMcp);
+    // MCP 工具由 SDK 原生执行，本服务没有「执行完成」回调 —— 所以这一行只能记
+    // 到判定为止。放行时 `ended_at` 留空，语义是「已授权、结果不由本服务观察」，
+    // 不是「还在跑」也不是「崩了」。这正是 §29 的要点：`notifyMcpToolUse` 是给
+    // UI 的展示事件，它替代不了审计；而审计在这里也确实只能记一半，不能编。
+    this.auditDecisionWithoutHandler(candidates[0], context, normalizedMcp, decision);
     if (!decision.allowed) return decision;
     // wire 名是本适配器构造的 `${serverId}-${toolName}`：用已知前缀剥离，
     // 工具名里即使有 `-` 也不会切错。
@@ -197,6 +264,83 @@ export class CopilotCapabilityAdapter {
     const wireName: string = candidates[0].name;
     const rawName = wireName.startsWith(`${serverId}-`) ? wireName.slice(serverId.length + 1) : wireName;
     return { ...decision, mcp: { serverId, toolName: rawName } };
+  }
+
+  /**
+   * 记一次「没有 handler 兜底」的判定。
+   *
+   * 两类调用走这里，理由不同但结论一样 —— 本服务看不到它的执行结果：
+   *
+   *   被拒的 custom tool   引擎根本不会去执行，所以永远不会进 handler
+   *   MCP 工具             执行在 SDK 里，没有完成回调
+   *
+   * 拒绝时立刻收口（错误就是结论）；放行时**故意不收口** —— 收口需要一个结果，
+   * 而编一个 `result: null` 会让「执行成功但没有返回值」和「结果未知」在审计上
+   * 长得一模一样。留着 `ended_at` 空，语义是明确的「已授权、结果不由本服务观察」。
+   */
+  private auditDecisionWithoutHandler(
+    tool: RuntimeTool,
+    context: CapabilityContext,
+    args: Record<string, unknown>,
+    decision: ToolDecision,
+  ): void {
+    if (!this.audit) return;
+
+    const policyDecisionId = this.recordPolicyDecision(tool, context, args, decision);
+
+    const auditId = this.audit.startToolExecution({
+      executionId: context.executionId,
+      conversationId: context.conversationId,
+      memberId: context.memberId,
+      toolName: tool.name,
+      providerId: tool.providerId,
+      implementation: tool.implementation,
+      args,
+      allowed: decision.allowed,
+      policyDecisionId,
+      entitlementId: decision.entitlementId ?? null,
+    });
+
+    if (!decision.allowed) {
+      this.audit.finishToolExecution(auditId, { error: decision.reason });
+    }
+  }
+
+  /**
+   * 落一次 Policy 判定，返回它在 `policy_decision_audit` 里的 id。
+   *
+   * ── 为什么每一次判定都要落，不只是拒绝 ──────────────────────────────
+   *
+   * 「这一笔为什么被放行」和「为什么被拒」是同一类问题，而只有拒绝记录时，
+   * 一次「本该被拦却放过了」的事故在审计上完全看不出来 —— 那恰恰是最需要
+   * 回看的那一类。
+   *
+   * ── 为什么复用 decisionId ───────────────────────────────────────────
+   *
+   * PolicyService 自己产出的 `decisionId` 是那条决策的身份。换一个新的会让
+   * 「谁批的」和「批了什么」对不上：工具审计里的 policy_decision_id 指向一条
+   * 内容相同、id 不同的行，等于同一件事被记了两遍且互不相认。
+   *
+   * `approvalRequired` 映射成 `approval_required` 而不是 `deny`：前者指向一条
+   * 可行的操作路径（把批准出口接上），后者看起来像配置错误。
+   */
+  private recordPolicyDecision(
+    tool: RuntimeTool,
+    context: CapabilityContext,
+    args: Record<string, unknown>,
+    decision: ToolDecision,
+  ): string | null {
+    if (!this.audit) return null;
+
+    return this.audit.recordPolicyDecision({
+      id: decision.policyDecisionId,
+      executionId: context.executionId,
+      toolName: tool.name,
+      policyRevision: decision.policyRevision ?? '',
+      decision: decision.allowed ? 'allow' : decision.approvalRequired ? 'approval_required' : 'deny',
+      reason: decision.reason,
+      inputHash: hashJson(args),
+    });
   }
 }
 

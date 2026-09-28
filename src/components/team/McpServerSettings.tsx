@@ -4,18 +4,19 @@ import { PlusOutlined } from '@ant-design/icons';
 import { api, type McpServer, type McpServerInput } from '../../lib/api';
 import { McpServerEditor } from './McpServerEditor';
 
-/** 认证展示行：只说类型和配没配，值永远不出现。 */
+/** 认证展示行：只说类型和「引用指向哪条」，凭证的值根本不在本系统里。 */
 function authLabel(server: McpServer): string {
   if (server.authType === 'none') return 'Authentication: None';
   const kind = server.authType === 'bearer' ? 'Bearer token' : 'API Key';
-  return server.secretConfigured ? `Authentication: ${kind}` : `Authentication: ${kind}（未配置）`;
+  if (!server.secretConfigured) return `Authentication: ${kind}（未配置引用）`;
+  return `Authentication: ${kind} · ${server.secretRef ?? '（引用已配置）'}`;
 }
 
 /**
  * MCP Servers 管理页：系统里有哪些连接。
  *
  * 和 Capabilities/MCP 页签的分工：
- *   这里   怎么连（URL / 认证 / 开关），secret 只进不出
+ *   这里   怎么连（URL / 认证 / 开关），凭证只留一个密钥库引用名
  *   那里   谁可以用其中哪些工具（授权）
  *
  * status 是上次 Test 的结论，不是实时探针 —— “Connected” 不代表现在还通，
@@ -167,7 +168,7 @@ export function McpServerSettings() {
           <div style={{ color: '#999', fontSize: 12 }}>
             {server.authType === 'none' || !server.secretConfigured
               ? null
-              : 'Secret: ************（值不显示，编辑时重填）'}
+              : '凭证值在密钥库里，本系统不存也不回显 —— 这里显示的只是「去哪找」。'}
           </div>
 
           {testResult?.id === server.id && (

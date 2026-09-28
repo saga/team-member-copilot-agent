@@ -94,9 +94,35 @@ export const config = {
    * 启动时做一次恢复：把上次进程留下的 running / waiting_for_member 标成
    * interrupted，并把从未真正跑过的 root execution 重新提交。
    *
-   * 单进程独占 DB 的前提下才安全；多副本部署必须换成 DB lease（见 recovery-service）。
+   * 单进程独占 DB 的前提下才安全；多副本部署必须启用 Worker Lease，
+   * 否则第二个进程的恢复会误伤第一个进程正在跑的 execution（见 index.ts 启动检查）。
    */
   recoverOnStartup: env('RECOVER_ON_STARTUP', 'true') === 'true',
+  /**
+   * 本服务同时跑几个副本。
+   *
+   * 这个值本身不改行为 —— 它是**声明**，用来在启动时拦下「多副本 + 没开租约」
+   * 这种一定会双跑的配置（见 index.ts）。真正的互斥靠 WORKER_LEASE_ENABLED。
+   */
+  workerReplicas: intEnv('WORKER_REPLICAS', 1),
+  /**
+   * 是否启用 DB 层 Worker Lease。
+   *
+   * 单进程时可以不开（租约只是多一次写库）；`WORKER_REPLICAS > 1` 时必须开 ——
+   * 进程内的 pending / inFlight 集合跨进程不成立，两个副本会各自认为自己是
+   * 唯一 owner，同一轮 execution 跑两遍，而外部副作用不可撤销。
+   */
+  workerLeaseEnabled: env('WORKER_LEASE_ENABLED', 'false') === 'true',
+  /**
+   * 本副本的名字，只用于日志与租约归属的可读性。
+   *
+   * 空 = 用进程启动时生成的随机 UUID（WorkerLeaseService.owner）。
+   * 刻意不拿它当租约身份：手填的名字会在「两个副本填了同一个 WORKER_ID」时
+   * 让租约静默失效，而随机 UUID 不可能撞。
+   */
+  workerId: env('WORKER_ID', ''),
+  /** 租约 TTL（毫秒）。必须显著大于一次 heartbeat 间隔，否则会频繁出现双跑。 */
+  workerLeaseTtlMs: intEnv('WORKER_LEASE_TTL_MS', 30_000),
   /**
    * 单次 Member turn 的等待上限（毫秒）。
    * Copilot SDK 的 sendAndWait 默认 60s，对带工具调用的真实 agent 工作太短，

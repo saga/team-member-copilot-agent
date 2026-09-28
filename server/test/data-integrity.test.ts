@@ -378,7 +378,9 @@ describe('execution 记录当时用的配置', () => {
     // 这一轮是无 Task 的 Lead 首轮（planning）：快照记的必须是 Strong，不是回落值
     assert.equal(firstSnapshot.model, modelPolicy.lead.strong.id);
     assert.equal(firstSnapshot.modelPurpose, 'lead:planning');
-    assert.equal(firstSnapshot.policyRevision, 'builtin-deny-high-risk-v1');
+    // 版本号来自 policy.ts 的 BUILTIN_POLICY_REVISION，不是这里编的字符串：
+    // 改判定逻辑必须同时改那个常量，否则审计里的版本号会撒谎。
+    assert.equal(firstSnapshot.policyRevision, 'deny-high-risk-v2');
     assert.equal(firstSnapshot.hostToolsEnabled, config.allowHostCodingTools);
     assert.match(firstSnapshot.systemPromptHash, /^[\da-f]{64}$/);
     assert.match(firstSnapshot.memoryHash, /^[\da-f]{64}$/);

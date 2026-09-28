@@ -504,6 +504,52 @@ export interface ExecutionConfigSnapshot {
    * 换成真正的 Policy Service 时这里记它的版本。
    */
   policyRevision?: string;
+
+  /**
+   * 这一轮 Data Entitlement 的版本（`MAX(updated_at)`）。
+   *
+   * 和 policyRevision 同一个理由，但它记的是**另一件事**：policy 回答「这一笔
+   * 该不该发生」，entitlement 回答「这类数据它有没有资格碰」。只记前者的话，
+   * 一次数据授权变更会让历史 execution 变成无法解释的 —— 同一次调用昨天放行
+   * 今天拒绝，而记录上看不出是哪一层变的。
+   */
+  entitlementRevision?: string;
+
+  /**
+   * 这一轮**实际生效**的配置明细（不只是指纹）。
+   *
+   * ── 为什么光有 hash 不够 ─────────────────────────────────────────────
+   *
+   * `capabilityManifestHash` 能证明「和上次不一样」，但证明不了「这次是什么」。
+   * 要回答「这一轮它到底能调哪些工具」，得把 Provider 注册顺序、模板、默认值
+   * 全都复现一遍才可能重算出同一个哈希 —— 那等于要求排查的人重建整个装配。
+   *
+   * 所以留一份**可读的**明细：名字清单是解析结果，不是配置原文（原文会漂移，
+   * 解析结果就是当时生效的那一份）。它和上面的指纹互为补充：指纹负责「可验证」，
+   * 明细负责「看得懂」。
+   *
+   * 老数据没有它，读出来是 undefined。
+   */
+  effectiveConfig?: {
+    memberId: string;
+    teamId: string;
+    toolNames: string[];
+    skillNames: string[];
+    knowledgeNames: string[];
+    mcpServers: string[];
+    turnMode: TurnMode;
+    policyRevision?: string;
+    entitlementRevision?: string;
+  };
+
+  /**
+   * `effectiveConfig` 的规范化 sha256。
+   *
+   * 单独存而不是让读的人自己算：JSON 的键序、数组顺序都会影响哈希，而
+   * 「谁算的」不统一时同一个配置会得出两个值。写入时算一次、原样存下来，
+   * 于是「这两轮配置是不是同一份」可以直接比字符串。
+   */
+  canonicalHash?: string;
 }
 
 export interface ExecutionRecord {

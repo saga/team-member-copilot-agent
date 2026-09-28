@@ -22,7 +22,10 @@ export class JiraClient {
     return `Basic ${Buffer.from(`${this.cfg.email}:${this.cfg.apiToken}`).toString('base64')}`;
   }
 
-  private async request<T>(path: string, init?: { method?: string; body?: unknown }): Promise<T> {
+  private async request<T>(
+    path: string,
+    init?: { method?: string; body?: unknown; ifUnmodifiedSince?: string },
+  ): Promise<T> {
     const url = `${this.cfg.baseUrl.replace(/\/$/, '')}/rest/api/3${path}`;
     const response = await fetch(url, {
       method: init?.method ?? 'GET',
@@ -30,9 +33,19 @@ export class JiraClient {
         Authorization: this.auth(),
         Accept: 'application/json',
         ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
+        // 乐观并发的**服务端**那一半。只在客户端比对 `updated` 是挡不住竞态的：
+        // 「读到 updated」与「发写请求」之间还有一段时间，对手正好能塞进去一次
+        // 修改。带上这个头，Jira 会在事务里比对，不一致时返回 412 —— 判定与
+        // 写入在同一个地方发生。
+        ...(init?.ifUnmodifiedSince ? { 'If-Unmodified-Since': init.ifUnmodifiedSince } : {}),
       },
       ...(init?.body ? { body: JSON.stringify(init.body) } : {}),
     });
+    if (response.status === 412) {
+      throw new Error(
+        `Jira 拒绝写入 ${path}：资源自读取之后已被修改（If-Unmodified-Since 不匹配），本次操作作废`,
+      );
+    }
     if (!response.ok) {
       const detail = await response.text().catch(() => '');
       throw new Error(`Jira API ${response.status} ${init?.method ?? 'GET'} ${path}: ${detail.slice(0, 500)}`);
@@ -45,17 +58,24 @@ export class JiraClient {
   search(jql: string, limit = 10): Promise<JiraSearchResult> {
     return this.request<JiraSearchResult>(
       `/search/jql?jql=${encodeURIComponent(jql)}&maxResults=${Math.min(limit, 50)}` +
-        `&fields=key,summary,status,assignee,description`,
+        `&fields=key,summary,status,assignee,description,updated`,
     );
   }
 
   getIssue(key: string): Promise<JiraIssue> {
     return this.request<JiraIssue>(
-      `/issue/${encodeURIComponent(key)}?fields=key,summary,status,assignee,description`,
+      `/issue/${encodeURIComponent(key)}?fields=key,summary,status,assignee,description,updated`,
     );
   }
 
-  addComment(key: string, body: string): Promise<void> {
+  /**
+   * 加评论。`ifUnmodifiedSince` = 期望的 `fields.updated`，传了就走条件写入。
+   *
+   * 这是 TOCTOU 的正解：Command 是在「看到某个版本的工单」时被批准的，而批准
+   * 到执行之间工单可能已经被人改了。不比对就写，等于把一条基于旧状态的决策
+   * 施加到新状态上 —— 表现是「评论内容和当前状态对不上」，且没人知道为什么。
+   */
+  addComment(key: string, body: string, ifUnmodifiedSince?: string): Promise<void> {
     return this.request(`/issue/${encodeURIComponent(key)}/comment`, {
       method: 'POST',
       body: {
@@ -64,13 +84,15 @@ export class JiraClient {
         version: 1,
         content: [{ type: 'paragraph', content: [{ type: 'text', text: body }] }],
       },
+      ...(ifUnmodifiedSince ? { ifUnmodifiedSince } : {}),
     });
   }
 
-  transition(key: string, transitionId: string): Promise<void> {
+  transition(key: string, transitionId: string, ifUnmodifiedSince?: string): Promise<void> {
     return this.request(`/issue/${encodeURIComponent(key)}/transitions`, {
       method: 'POST',
       body: { transition: transitionId },
+      ...(ifUnmodifiedSince ? { ifUnmodifiedSince } : {}),
     });
   }
 
@@ -109,5 +131,14 @@ export interface JiraIssue {
     description: unknown;
     status: { name: string };
     assignee: { displayName: string } | null;
+    /**
+     * 最后一次修改时间。**这就是这条工单的并发版本号**。
+     *
+     * Jira 没有单独的 `version` / ETag 字段，但它自己的乐观并发机制就是
+     * `If-Unmodified-Since` + 这个时间戳（见 addComment 的第三个参数）。
+     * 用别的字段（status / assignee）当版本号是不够的：改标题、改描述、
+     * 加评论都会变，而它们一个都不改 status。
+     */
+    updated: string;
   };
 }

@@ -2,6 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { DefaultToolPolicy } from '../tool-policy.js';
 import type { PolicyService } from '../policy.js';
+import type { EntitlementChecker } from '../entitlement-service.js';
 import { HOST_BUILTIN_NAMES } from '../capabilities/providers/host-tools.js';
 import type {
   RuntimeTool,
@@ -36,16 +37,34 @@ import type {
  * `() => ({ allowed: true })` 把自己升级成无限制工具。
  */
 
+/**
+ * Entitlement 替身：一律放行。
+ *
+ * 刻意**不**从 support.ts 取（那里有共享版本）：这个文件是纯单元测试，不碰
+ * 数据库、不读 .data —— 一旦 import 了 support.ts，整个模块图会被拉进来，
+ * 于是「跑这个文件」会变成「先有一个 schema 正确的本地库」。
+ *
+ * 放行而不是拒绝：这组用例断言的是 host 开关 / guard / risk 三分，Entitlement
+ * 拒绝会把结论盖掉。而且它们造的工具都不碰外部资源 ——
+ * `resolveToolResource` 返回 null 时这一层整段跳过，替身根本不会被调用。
+ */
+const PERMISSIVE_ENTITLEMENT: EntitlementChecker = {
+  revision: () => '',
+  check: () => ({ allowed: true, reason: 'test entitlement', revision: '' }),
+};
+
 const DENY_HIGH_RISK: PolicyService = {
+  revision: () => 'test-policy',
   decide: (input) => ({ allowed: false, reason: `policy deny: risk=${input.tool.risk}` }),
 };
 
 const ALLOW_HIGH_RISK: PolicyService = {
+  revision: () => 'test-policy',
   decide: (input) => ({ allowed: true, reason: `policy allow: ${input.tool.name}` }),
 };
 
 function policy(allowHostTools: boolean, highRisk: PolicyService = DENY_HIGH_RISK): DefaultToolPolicy {
-  return new DefaultToolPolicy({ allowHostTools }, highRisk);
+  return new DefaultToolPolicy({ allowHostTools }, highRisk, PERMISSIVE_ENTITLEMENT);
 }
 
 const ALLOW_HOST = true;

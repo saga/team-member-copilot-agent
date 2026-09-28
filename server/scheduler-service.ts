@@ -2,6 +2,8 @@ import { config } from './config.js';
 import type { ScheduledWakeRun } from './domain.js';
 import type { TeamService } from './team-service.js';
 import type { TeamStructureService } from './team-structure-service.js';
+import type { WorkerLeaseService } from './worker-lease.js';
+import { LEASE_RESOURCE_EXECUTION } from './recovery-service.js';
 
 /**
  * Scheduled Wake：只做 once + interval，不做 Calendar/RRULE。
@@ -9,6 +11,20 @@ import type { TeamStructureService } from './team-structure-service.js';
  * 执行链：tick → 到期 active schedule → INSERT run（UNIQUE 幂等）→
  * TeamService.enqueueScheduledWork（建 execution 并绑定 run）→
  * 更新 next_run_at。周期任务不补历史，只执行一次并跳到下一个 future slot。
+ *
+ * ── 多副本：启动 execution 前先抢租约 ────────────────────────────────
+ *
+ * 传入 `leases` 时，每个 execution 在真正开跑前先 `claim` 一次，抢不到就跳过。
+ * 这是 §25 的 worker loop，也是「两个副本各自 tick 一次、同一条 schedule 被
+ * 跑两遍」的唯一防线 —— `scheduled_wake_run` 的 UNIQUE 只保证**一行**，
+ * 不保证只有一个进程去执行它。
+ *
+ * 租约而不是「进程内 running 标记」：后者的前提是只有一个进程，多副本时
+ * 两边各自成立、合起来失效，而这里最不能接受的就是同一个 schedule 跑两遍。
+ *
+ * `leases` 不传 = 单进程语义（照常执行，不抢）。用「传没传」而不是一个
+ * 布尔开关，是为了让「单机模式」和「多副本模式」共用同一条代码路径 ——
+ * 分叉出一条从来没被跑过的单机分支是更糟的选择。
  */
 export class SchedulerService {
   private timer: NodeJS.Timeout | null = null;
@@ -17,6 +33,7 @@ export class SchedulerService {
   constructor(
     private readonly structure: TeamStructureService,
     private readonly team: () => TeamService,
+    private readonly leases?: WorkerLeaseService,
   ) {}
 
   start(): void {
@@ -71,17 +88,15 @@ export class SchedulerService {
           this.structure.updateScheduleRun(run.id, { status: 'running', executionId });
           this.structure.markFired(schedule, scheduledFor);
           fired += 1;
-          void this.team()
-            .runScheduledExecution(executionId)
-            .catch((error: unknown) => {
-              // runScheduledExecution 自己会收口 run（settleScheduleRun），
-              // 这里只是别让拒绝变成 unhandled rejection。
-              // eslint-disable-next-line no-console
-              console.error(
-                `[scheduler] scheduled execution ${executionId} failed:`,
-                error instanceof Error ? error.message : error,
-              );
-            });
+          this.startExecution(executionId, (error) => {
+            // runScheduledExecution 自己会收口 run（settleScheduleRun），
+            // 这里只是别让拒绝变成 unhandled rejection。
+            // eslint-disable-next-line no-console
+            console.error(
+              `[scheduler] scheduled execution ${executionId} failed:`,
+              error instanceof Error ? error.message : error,
+            );
+          });
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           this.structure.updateScheduleRun(run.id, { status: 'failed', error: message });
@@ -122,14 +137,12 @@ export class SchedulerService {
           continue;
         }
         if (execution.status === 'queued') {
-          void this.team()
-            .runScheduledExecution(execution.id)
-            .catch((error: unknown) => {
-              this.structure.updateScheduleRun(run.id, {
-                status: 'failed',
-                error: error instanceof Error ? error.message : String(error),
-              });
+          this.startExecution(execution.id, (error) => {
+            this.structure.updateScheduleRun(run.id, {
+              status: 'failed',
+              error: error instanceof Error ? error.message : String(error),
             });
+          });
           continue;
         }
         // running / waiting_for_member：引擎侧由 RecoveryService 收口，这里不动。
@@ -147,7 +160,12 @@ export class SchedulerService {
         })
         .then((executionId) => {
           this.structure.updateScheduleRun(run.id, { status: 'running', executionId });
-          return this.team().runScheduledExecution(executionId);
+          this.startExecution(executionId, (error) => {
+            this.structure.updateScheduleRun(run.id, {
+              status: 'failed',
+              error: error instanceof Error ? error.message : String(error),
+            });
+          });
         })
         .catch((error: unknown) => {
           this.structure.updateScheduleRun(run.id, {
@@ -156,6 +174,40 @@ export class SchedulerService {
           });
         });
     }
+  }
+
+  /**
+   * 启动一条 execution，并按需持有租约。
+   *
+   * 抢不到 = 另一个副本正在跑它，**直接跳过**（不等待、不重试）：等待会让这个
+   * tick 卡住，而重试在 TTL 内也不会成功。跳过是对的 —— 持有者跑完会自己释放，
+   * 下一轮 tick 再看。
+   *
+   * 心跳间隔取 TTL 的三分之一：留出两次重试的余量，一次抖动不会让租约在自己
+   * 手里过期。TTL 显著大于心跳间隔是租约语义成立的前提（见 worker-lease.ts）。
+   *
+   * 释放只在 finally 里做：中途抛异常时租约必须回到可用状态，否则这条
+   * execution 会被自己的失败卡住，直到 TTL 到期才有人能接手。
+   */
+  private startExecution(executionId: string, onError: (error: unknown) => void): void {
+    if (this.leases && !this.leases.claim(LEASE_RESOURCE_EXECUTION, executionId)) {
+      return;
+    }
+
+    const heartbeat = this.leases
+      ? setInterval(() => {
+          this.leases!.heartbeat(LEASE_RESOURCE_EXECUTION, executionId);
+        }, Math.max(1_000, Math.floor(config.workerLeaseTtlMs / 3)))
+      : null;
+    if (heartbeat && typeof heartbeat.unref === 'function') heartbeat.unref();
+
+    void this.team()
+      .runScheduledExecution(executionId)
+      .catch(onError)
+      .finally(() => {
+        if (heartbeat) clearInterval(heartbeat);
+        this.leases?.release(LEASE_RESOURCE_EXECUTION, executionId);
+      });
   }
 }
 

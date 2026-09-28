@@ -398,7 +398,31 @@ export class ConversationMemberService {
   }
 
   /** 恢复时把所有非 idle 的唤醒状态清回 idle，连同 pending 的元数据。 */
-  resetWakeStatuses(): number {
+  /**
+   * 把所有非 idle 的唤醒状态复位。
+   *
+   * ── 为什么要能保护租约 ──────────────────────────────────────────────
+   *
+   * 多副本时，另一个副本正在处理的那个唤醒也是 `wake_status = 'running'`。
+   * 无条件复位会把它的在途状态清掉，于是那个副本跑完之后写回的是一个
+   * 「本来就不该存在」的状态 —— 表现是这一轮的回答丢失，或者被重复派发。
+   *
+   * `leaseProtected` 打开时只复位**没有活跃租约**的行。单进程不传这个参数，
+   * 行为与以前完全一致。
+   *
+   * 唤醒的租约键是 `conversation_id || ':' || member_id`：唤醒是「某个 Member
+   * 在某个房间里的状态」，单独一个 member_id 表达不出它在哪个房间。
+   */
+  resetWakeStatuses(options: { leaseProtected?: boolean; nowIso?: string } = {}): number {
+    const timestamp = options.nowIso ?? now();
+    const leaseGuard = options.leaseProtected
+      ? `AND NOT EXISTS (
+           SELECT 1 FROM worker_lease l
+           WHERE l.resource_type = 'wake'
+             AND l.resource_id = conversation_member_state.conversation_id || ':' || conversation_member_state.member_id
+             AND l.lease_expires_at >= ?
+         )`
+      : '';
     const result = this.db
       .prepare(
         `
@@ -410,11 +434,12 @@ export class ConversationMemberService {
           pending_wake_reason = NULL,
           pending_wake_task_id = NULL,
           updated_at = ?
-        WHERE wake_status <> 'idle'
-           OR pending_wake = 1
+        WHERE (wake_status <> 'idle'
+           OR pending_wake = 1)
+          ${leaseGuard}
         `,
       )
-      .run(now());
+      .run(...(options.leaseProtected ? [timestamp, timestamp] : [timestamp]));
     return Number(result.changes ?? 0);
   }
 }

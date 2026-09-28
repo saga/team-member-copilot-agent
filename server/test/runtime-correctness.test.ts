@@ -29,7 +29,7 @@ const { CopilotService, isTurnTimeout } = await import('../copilot.js');
 const { DefaultToolPolicy } = await import('../tool-policy.js');
 import type { PolicyService } from '../policy.js';
 import type { MemberCapabilities } from '../domain.js';
-const { createTestStack, capabilityContext, singleExecutionId } = await import(
+const { createTestStack, capabilityContext, permissiveEntitlement, singleExecutionId } = await import(
   './support.js'
 );
 
@@ -40,7 +40,10 @@ after(() => {
 
 /** 本文件只练低风险与宿主开关路径，PolicyService 不参与 —— 放行桩即可。 */
 function allowHighRisk(): PolicyService {
-  return { decide: (input) => ({ allowed: true, reason: `policy allow: ${input.tool.name}` }) };
+  return {
+    revision: () => 'test-policy',
+    decide: (input) => ({ allowed: true, reason: `policy allow: ${input.tool.name}` }),
+  };
 }
 
 // ═══════════════════════════════════════════ 0. 共享装配
@@ -449,7 +452,7 @@ describe('工具授权层真的接到了引擎上', () => {
 
     const { config } = await runTurnCapturing({
       capabilities: hostCapabilities,
-      toolPolicy: new DefaultToolPolicy({ allowHostTools: true }, allowHighRisk()),
+      toolPolicy: new DefaultToolPolicy({ allowHostTools: true }, allowHighRisk(), permissiveEntitlement()),
       during: async (captured) => {
         decision = (await captured.hooks?.onPreToolUse?.({
           sessionId: 'sess-1',
@@ -471,7 +474,7 @@ describe('工具授权层真的接到了引擎上', () => {
 
     const { config } = await runTurnCapturing({
       capabilities: hostCapabilities,
-      toolPolicy: new DefaultToolPolicy({ allowHostTools: false }, allowHighRisk()),
+      toolPolicy: new DefaultToolPolicy({ allowHostTools: false }, allowHighRisk(), permissiveEntitlement()),
       during: async (captured) => {
         decision = (await captured.hooks?.onPreToolUse?.({
           sessionId: 'sess-1',
@@ -510,7 +513,7 @@ describe('工具授权层真的接到了引擎上', () => {
     // 「有宿主工具」的那份 —— 模拟解析在别处重算了一次。
     await runTurnCapturing({
       capabilities: defaultCapabilities,
-      toolPolicy: new DefaultToolPolicy({ allowHostTools: true }, allowHighRisk()),
+      toolPolicy: new DefaultToolPolicy({ allowHostTools: true }, allowHighRisk(), permissiveEntitlement()),
       during: async (captured, input) => {
         input.capabilities = hostCapabilities;
         decision = (await captured.hooks?.onPreToolUse?.({
