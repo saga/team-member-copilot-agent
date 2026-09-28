@@ -33,6 +33,11 @@ import type {
  * 授权。两者共用同一份解析结果（toolIndex），所以不会出现「声明了却被自己拒掉」
  * 的漂移。
  */
+export interface McpToolUse {
+  serverId: string;
+  toolName: string;
+}
+
 export interface CopilotCapabilities {
   /** custom tool 的 SDK 定义，交给 session 的 `tools`。 */
   tools: Tool<unknown>[];
@@ -42,8 +47,14 @@ export interface CopilotCapabilities {
   mcpServers: Record<string, MCPServerConfig>;
   /**
    * 逐次授权。返回 `null` = 找不到这个工具的来历（从未声明过），调用方必须拒绝。
+   *
+   * 放行的是 MCP 工具时顺带报出是哪个 server 的哪个工具：调用方（copilot.ts）
+   * 据此发一条「用过什么」的展示事件。授权判定本身不受影响。
    */
-  checkToolUse(toolName: string, args: unknown): Promise<{ allowed: boolean; reason: string }>;
+  checkToolUse(
+    toolName: string,
+    args: unknown,
+  ): Promise<{ allowed: boolean; reason: string; mcp?: McpToolUse }>;
 }
 
 export class CopilotCapabilityAdapter {
@@ -151,7 +162,7 @@ export class CopilotCapabilityAdapter {
     args: unknown,
     capabilities: RuntimeCapabilities,
     context: CapabilityContext,
-  ): Promise<{ allowed: boolean; reason: string }> {
+  ): Promise<{ allowed: boolean; reason: string; mcp?: McpToolUse }> {
     if ((BuiltInTools.Isolated as readonly string[]).includes(toolName)) {
       return { allowed: true, reason: 'SDK isolated built-in' };
     }
@@ -178,7 +189,14 @@ export class CopilotCapabilityAdapter {
           '请收窄授权绑定的 selector，让这个名字只剩一个来源',
       };
     }
-    return this.evaluateToolUse(candidates[0], context, normalizeArgs(args));
+    const decision = await this.evaluateToolUse(candidates[0], context, normalizeArgs(args));
+    if (!decision.allowed) return decision;
+    // wire 名是本适配器构造的 `${serverId}-${toolName}`：用已知前缀剥离，
+    // 工具名里即使有 `-` 也不会切错。
+    const serverId = candidates[0].providerId.slice('mcp.'.length);
+    const wireName: string = candidates[0].name;
+    const rawName = wireName.startsWith(`${serverId}-`) ? wireName.slice(serverId.length + 1) : wireName;
+    return { ...decision, mcp: { serverId, toolName: rawName } };
   }
 }
 

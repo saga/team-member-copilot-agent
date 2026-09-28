@@ -65,6 +65,8 @@ export interface CatalogMcpServer {
   id: string;
   name: string;
   description: string;
+  /** 开关（MCP Servers 页的状态）。关掉时下面工具不可选，本轮也解析不到。 */
+  serverEnabled: boolean;
   tools: Array<{
     /** `mcp.<serverId>.<toolName>`，配置与执行用同一个名字。 */
     id: string;
@@ -407,12 +409,14 @@ function buildMcpCatalog(deps: CatalogDeps, own: MemberCapabilities): CatalogMcp
         needsApproval: server.tools[toolName].risk === 'external-write' || server.tools[toolName].risk === 'privileged',
         enabled: selected === undefined ? false : selected === null ? true : selected.has(toolName),
       }));
+    const serverEnabled = server.enabled ?? true;
     return {
       id: providerId,
       name: server.displayName,
       description: server.description ?? '',
+      serverEnabled,
       tools,
-      enabled: tools.some((tool) => tool.enabled),
+      enabled: serverEnabled && tools.some((tool) => tool.enabled),
     };
   });
 }

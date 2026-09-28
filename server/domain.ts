@@ -651,7 +651,15 @@ export type ConversationEventType =
   | 'file.updated'
   | 'file.deleted'
   | 'delegation.started'
-  | 'delegation.finished';
+  | 'delegation.finished'
+  /**
+   * 某次 MCP 工具调用被放行（注意是「放行」，不是「执行完成」：引擎没有
+   * 跑完回调，这里的语义是「授权层允许了这一次调用」）。
+   *
+   * 只用于 Activity 的「用过什么」展示，不做计费、不做审计 —— 审计看
+   * execution 快照里的 capabilityManifestHash。
+   */
+  | 'mcp.tool.called';
 
 /** 内部广播用的轻量事件（尚未落库）。 */
 export interface ConversationEvent {

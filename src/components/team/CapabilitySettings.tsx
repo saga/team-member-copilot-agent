@@ -3,8 +3,10 @@ import {
   Alert,
   Badge,
   Button,
+  Card,
   Checkbox,
   Collapse,
+  Empty,
   Modal,
   Popover,
   Select,
@@ -56,10 +58,11 @@ const SCOPE_HINT: Record<Scope, ReactNode> = {
 const LAYER_ORDER: Scope[] = ['global', 'team', 'member'];
 
 /**
- * 一个 MCP Server 的工具开关组：server 名 + 逐个工具的 checkbox。
+ * 一个 MCP Server 的工具开关组：按 server 分卡，每行一个工具。
  *
  * 显示 risk 与审批标记 —— 管理员必须看得出「开这个工具意味着什么」，
- * 尤其是 external-write（每次调用要过 Policy 审批）。
+ * 尤其是 external-write（每次调用要过 Policy 审批）。server 被停用时
+ * 整组不可选：选了也解析不到，去 MCP Servers 页重新启用。
  */
 function McpServerBlock({
   server,
@@ -71,25 +74,55 @@ function McpServerBlock({
   onToggle: (id: string) => void;
 }) {
   return (
-    <div>
-      <strong>{server.name}</strong>
+    <Card
+      size="small"
+      title={
+        <Space>
+          <strong>{server.name}</strong>
+          <Tag style={{ marginInlineEnd: 0 }}>{server.id.replace(/^mcp\./, '')}</Tag>
+          {server.serverEnabled ? (
+            <Tag color="green" style={{ marginInlineEnd: 0 }}>
+              Available
+            </Tag>
+          ) : (
+            <Tag color="red" style={{ marginInlineEnd: 0 }}>
+              Unavailable
+            </Tag>
+          )}
+        </Space>
+      }
+    >
       {server.description ? (
-        <div style={{ color: '#666', fontSize: 12 }}>{server.description}</div>
+        <div style={{ color: '#666', fontSize: 12, marginBottom: 4 }}>{server.description}</div>
       ) : null}
-      <div style={{ marginTop: 4 }}>
+      {!server.serverEnabled && (
+        <div style={{ color: '#a00', fontSize: 12, marginBottom: 4 }}>
+          这个 Server 已在 MCP Servers 页停用：这里勾了也不会生效，先去那边启用。
+        </div>
+      )}
+      <Space direction="vertical" style={{ width: '100%' }}>
         {server.tools.map((tool) => (
-          <div key={tool.id} style={{ marginBottom: 6 }}>
-            <Checkbox checked={selected.includes(tool.id)} onChange={() => onToggle(tool.id)}>
-              <strong>{tool.name}</strong>{' '}
-              <Tag style={{ marginInlineEnd: 0 }}>{tool.risk}</Tag>{' '}
-              {tool.needsApproval ? <Tag color="orange">Needs approval</Tag> : null}
-            </Checkbox>
-          </div>
+          <Checkbox
+            key={tool.id}
+            checked={selected.includes(tool.id)}
+            disabled={!server.serverEnabled}
+            onChange={() => onToggle(tool.id)}
+          >
+            <strong>{tool.name}</strong> <Tag style={{ marginInlineEnd: 0 }}>{tool.risk}</Tag>{' '}
+            {tool.needsApproval ? <Tag color="orange">Needs approval</Tag> : null}
+          </Checkbox>
         ))}
-      </div>
-    </div>
+      </Space>
+    </Card>
   );
 }
+
+/** 每个 scope 的 MCP 授权提示：和 Skills/Knowledge/Actions 不同的只有一句话。 */
+const MCP_HINT: Record<Scope, string> = {
+  global: '这里配置整个系统默认允许使用的 MCP。所有 Team / Member 默认继承。',
+  team: '这里配置本 Team 默认允许使用的 MCP。所有成员自动继承。',
+  member: '这里配置这个 Member 额外允许使用的 MCP。不会覆盖 Company / Team 的配置。',
+};
 
 interface CapabilitySettingsProps {
   onClose: () => void;
@@ -548,14 +581,16 @@ export function CapabilitySettings({
 
     if (catalog.mcp.length === 0) {
       return (
-        <div style={{ color: '#999', fontSize: 12 }}>
-          还没有配置 MCP Server。在服务端 `config/mcp-servers.json` 里定义后，这里会出现可勾选的工具。
-        </div>
+        <Empty
+          image={Empty.PRESENTED_IMAGE_SIMPLE}
+          description="还没有配置 MCP Server：先去 Settings → MCP Servers 里定义连接，再回来授权给谁用。"
+        />
       );
     }
 
     return (
       <Space direction="vertical" style={{ width: '100%' }} size="middle">
+        <div style={{ color: '#999', fontSize: 12 }}>{MCP_HINT[target]}</div>
         {catalog.mcp.map((server) => (
           <McpServerBlock
             key={server.id}
@@ -700,7 +735,7 @@ export function CapabilitySettings({
                   key: 'mcp',
                   label: (
                     <Space size={6}>
-                      <span>MCP Servers</span>
+                      <span>MCP</span>
                       <Tag style={{ marginInlineEnd: 0 }}>{draft?.mcp.length ?? 0} enabled</Tag>
                     </Space>
                   ),

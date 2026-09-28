@@ -156,6 +156,12 @@ export class CapabilityResolver {
     const servers: RuntimeMcpServer[] = [];
     for (const binding of capabilities.mcp ?? []) {
       const server = this.registry.mcpServer(binding.providerId);
+      if (server.enabled === false) {
+        // 停用 ≠ 删除：binding 留着（管理员可能只是在维护 server），本轮跳过。
+        // 每个 server 每个进程只警告一次，不然每个 turn 刷一行。
+        warnDisabledOnce(server.id);
+        continue;
+      }
       const selected = parseSelectorList(binding.selector);
       const toolNames = selected ? [...selected] : Object.keys(server.tools);
       for (const toolName of toolNames) {
@@ -171,6 +177,8 @@ export class CapabilityResolver {
       servers.push({
         id: server.id,
         displayName: server.displayName,
+        // 能进这个数组的都是 enabled 的：停用的在上面已经跳过。
+        enabled: true,
         type: server.type,
         ...(server.url === undefined ? {} : { url: server.url }),
         ...(server.headers === undefined ? {} : { headers: server.headers }),
@@ -193,6 +201,15 @@ export class CapabilityResolver {
  * 管理界面不展示、配置里不出现 —— 由上面的自注入逻辑负责。
  */
 const KNOWLEDGE_TOOLS_ID = 'knowledge.tools';
+
+const warnedDisabledMcp = new Set<string>();
+
+function warnDisabledOnce(serverId: string): void {
+  if (warnedDisabledMcp.has(serverId)) return;
+  warnedDisabledMcp.add(serverId);
+  // eslint-disable-next-line no-console
+  console.warn(`[capabilities] MCP Server ${serverId} 已停用，本轮跳过（binding 保留，可随时重新启用）`);
+}
 
 /**
  * MCP 工具在引擎侧可能出现的名字形态。

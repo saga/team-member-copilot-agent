@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Alert, Input, Modal, Select, Space, Typography } from 'antd';
+import { Alert, Input, Modal, Select, Space, Tag, Typography } from 'antd';
 import type { Member } from '../../lib/api';
 
 /**
@@ -105,12 +105,21 @@ export function TaskCreator({ open, members, leadModels, onCreate, onCancel }: T
             }}
             placeholder="选 1~20 个成员"
             style={{ width: '100%', marginTop: 4 }}
-            maxTagCount="responsive"
             allowClear
             options={activeMembers.map((member) => ({
               value: member.id,
               label: `${member.name} · ${member.role}`,
             }))}
+            // 选中项全部展开，不折成「+ N ...」：建工作区前必须一眼看得出选了谁。
+            // tag 里只放名字（下拉里才需要名字 + role 区分）。
+            tagRender={(props) => {
+              const member = activeMembers.find((item) => item.id === props.value);
+              return (
+                <Tag closable={props.closable} onClose={props.onClose} style={{ marginInlineEnd: 4 }}>
+                  {member ? member.name : props.label}
+                </Tag>
+              );
+            }}
           />
         </div>
 

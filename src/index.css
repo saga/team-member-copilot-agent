@@ -247,6 +247,51 @@ body {
   border-top: 1px solid #f0f0f0;
 }
 
+/* @ 成员补全：在输入框上方弹出，点选插入 @handle。 */
+.mention-popup {
+  position: absolute;
+  left: 18px;
+  right: 18px;
+  bottom: 100%;
+  margin-bottom: 6px;
+  z-index: 20;
+  background: #fff;
+  border: 1px solid #e8e8e8;
+  border-radius: 8px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.12);
+  padding: 4px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.mention-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.mention-item:hover {
+  background: #f5f5f5;
+}
+
+.mention-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: rgba(0, 0, 0, 0.88);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mention-handle {
+  font-size: 12px;
+  color: #999;
+  flex-shrink: 0;
+}
+
 /* ── 会话列表 ──────────────────────────────────────────────────────── */
 
 /*

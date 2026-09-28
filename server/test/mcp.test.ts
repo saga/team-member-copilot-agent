@@ -26,6 +26,7 @@ const { db } = await import('../db.js');
 const { MemberService } = await import('../member-service.js');
 const { SkillService } = await import('../skill-service.js');
 const { createTestStack, capabilityContext, StubCopilot } = await import('./support.js');
+const { McpServerService, seedMcpServersOnBoot } = await import('../mcp/service.js');
 import type { CopilotService } from '../copilot.js';
 import type { McpServerDefinition } from '../mcp/types.js';
 
@@ -212,6 +213,7 @@ describe('MCP 可见性与策略：SDK 配置 + 同一套 Policy', () => {
     return {
       id: 'github',
       displayName: 'GitHub',
+      enabled: true,
       type: 'http' as const,
       url: 'https://mcp.github.example/mcp',
       tools: ['issue_write', 'search_code'],
@@ -230,6 +232,7 @@ describe('MCP 可见性与策略：SDK 配置 + 同一套 Policy', () => {
         {
           id: 'devtools',
           displayName: 'Dev',
+          enabled: true,
           type: 'local' as const,
           command: 'node',
           args: ['./x.js'],
@@ -281,6 +284,7 @@ describe('MCP 可见性与策略：SDK 配置 + 同一套 Policy', () => {
         {
           id: 'a',
           displayName: 'A',
+          enabled: true,
           type: 'http' as const,
           url: 'https://a.example/mcp',
           tools: ['search'],
@@ -290,6 +294,7 @@ describe('MCP 可见性与策略：SDK 配置 + 同一套 Policy', () => {
         {
           id: 'b',
           displayName: 'B',
+          enabled: true,
           type: 'http' as const,
           url: 'https://b.example/mcp',
           tools: ['search'],
@@ -333,6 +338,32 @@ describe('MCP 目录：展示 + 选择 → 绑定', () => {
     };
   }
 
+  it('secret 进 DB 但读接口永远脱敏', async () => {
+    stack.registry.registerMcpServer({
+      id: 'vault',
+      displayName: 'Vault',
+      type: 'http',
+      url: 'https://vault.example/mcp',
+      headers: { Authorization: 'Bearer real-secret' },
+      tools: { read_secret: { risk: 'external-read' } },
+      version: '1',
+    });
+    const { buildCatalog } = await import('../capabilities/catalog.js');
+    const member = stack.team.createMember({ name: 'McpSecret', role: 'T' });
+    const catalog = await buildCatalog(
+      {
+        capabilities: stack.capabilities,
+        skills: skillService,
+        knowledge: stack.knowledge,
+        registry: stack.registry,
+        hostToolsEnabled: false,
+      },
+      { scope: 'member', teamId: defaultTeam.id, memberId: member.id },
+    );
+    const dumped = JSON.stringify(catalog);
+    assert.ok(!dumped.includes('real-secret'), 'secret 值不能出现在目录输出里');
+  });
+
   it('目录列出 server 与逐工具开关；选择落成显式名单绑定', async () => {
     stack.registry.registerMcpServer(githubServer());
 
@@ -341,9 +372,10 @@ describe('MCP 目录：展示 + 选择 → 绑定', () => {
 
     const { buildCatalog, assignmentsToBindings } = await import('../capabilities/catalog.js');
     const empty = await buildCatalog(deps(), query);
-    assert.equal(empty.mcp.length, 1);
-    assert.equal(empty.mcp[0].id, 'mcp.github');
-    assert.ok(empty.mcp[0].tools.every((tool) => tool.enabled === false));
+    // 同一文件里前面的用例注册过别的 server：按 id 找，不数总数。
+    const github = empty.mcp.find((item) => item.id === 'mcp.github')!;
+    assert.ok(github, '目录里必须有刚注册的 github');
+    assert.ok(github.tools.every((tool) => tool.enabled === false));
 
     const bindings = await assignmentsToBindings(deps(), query, {
       skills: [],
@@ -370,3 +402,267 @@ describe('MCP 目录：展示 + 选择 → 绑定', () => {
     );
   });
 });
+
+describe('MCP Server 管理：增删改查 + 可达性 + seed', () => {
+  function service(dbHandle: unknown, allowLocal = false) {
+    const registry = new CapabilityRegistry();
+    return {
+      registry,
+      servers: new McpServerService(
+        dbHandle as import('node:sqlite').DatabaseSync,
+        registry,
+        allowLocal,
+      ),
+    };
+  }
+
+  it('增删改查：secret 只进不出，改动同步 registry', () => {
+    const { registry, servers } = service(db);
+    const created = servers.create({
+      id: 'gh',
+      displayName: 'GitHub',
+      type: 'http',
+      url: 'https://mcp.github.example/mcp',
+      authType: 'bearer',
+      secret: 'token-123',
+      tools: [{ name: 'search_code', risk: 'external-read' }],
+      enabled: true,
+    });
+    assert.equal(created.authType, 'bearer');
+    assert.equal(created.secretConfigured, true);
+
+    // 读不到 secret，只能看到配没配
+    assert.ok(!JSON.stringify(servers.get('gh')).includes('token-123'));
+    assert.ok(!JSON.stringify(servers.list()).includes('token-123'));
+
+    // 不碰认证的编辑保持 secret；registry 实时同步
+    const updated = servers.update('gh', {
+      displayName: 'GitHub EE',
+      type: 'http',
+      url: 'https://mcp.github.example/mcp',
+      tools: [{ name: 'search_code', risk: 'external-read' }],
+      enabled: true,
+    });
+    assert.equal(updated.name, 'GitHub EE');
+    assert.equal(updated.secretConfigured, true, '没重填 secret 就该保持');
+    assert.equal(registry.mcpServer('mcp.gh').displayName, 'GitHub EE');
+
+    // 换认证方式必须给新 secret（旧 secret 不能跨类型复用）
+    assert.throws(
+      () => servers.update('gh', { displayName: 'GitHub', type: 'http', url: 'https://x', authType: 'apiKey', tools: [{ name: 'search_code', risk: 'external-read' }] }),
+      /必须提供新的 secret/,
+    );
+    // 切到 none 清掉认证
+    assert.equal(
+      servers.update('gh', { displayName: 'GitHub', type: 'http', url: 'https://x', authType: 'none', tools: [{ name: 'search_code', risk: 'external-read' }] }).secretConfigured,
+      false,
+    );
+
+    // 重复 id 409，不存在的 404
+    assert.throws(
+      () => servers.create({ id: 'gh', displayName: 'G', type: 'http', url: 'https://x', tools: [{ name: 'a', risk: 'read' }] }),
+      /已存在/,
+    );
+    assert.throws(() => servers.get('ghost'), /不存在/);
+    assert.throws(() => servers.remove('ghost'), /不存在/);
+
+    servers.remove('gh');
+    assert.throws(() => registry.mcpServer('mcp.gh'), /未注册/);
+    assert.deepEqual(
+      servers.list().filter((item) => item.id === 'gh'),
+      [],
+    );
+  });
+
+  it('空库才从文件 seed 一次：删光后重启不复活', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tmca-mcp-seed-'));
+    try {
+      const file = path.join(dir, 'mcp.json');
+      fs.writeFileSync(
+        file,
+        JSON.stringify({
+          servers: [{ id: 'seeded', displayName: 'Seeded', type: 'http', url: 'https://seed.example/mcp', tools: { a: { risk: 'read' } }, version: '1' }],
+        }),
+        'utf8',
+      );
+      const first = service(db);
+      assert.equal(first.servers.seedFromFileIfEmpty(file), true);
+      // seed 只写 DB 不管 registry：和 app.ts 一样，调用方负责补注册。
+      for (const definition of first.servers.listDefinitions()) {
+        first.registry.registerMcpServer(definition);
+      }
+      assert.ok(first.servers.list().some((item) => item.id === 'seeded'));
+
+      // 第二次（非空库）不再读文件：文件里加东西也不会进来
+      fs.writeFileSync(
+        file,
+        JSON.stringify({
+          servers: [
+            { id: 'seeded', displayName: 'Seeded', type: 'http', url: 'https://seed.example/mcp', tools: { a: { risk: 'read' } }, version: '1' },
+            { id: 'late', displayName: 'Late', type: 'http', url: 'https://late.example/mcp', tools: { b: { risk: 'read' } }, version: '1' },
+          ],
+        }),
+        'utf8',
+      );
+      assert.equal(first.servers.seedFromFileIfEmpty(file), false);
+      assert.equal(first.servers.list().filter((item) => item.id === 'late').length, 0);
+
+      // 删光也不复活：启动门只看 freshInstall，不看“表空不空”
+      for (const item of first.servers.list()) first.servers.remove(item.id);
+      assert.equal(seedMcpServersOnBoot({ freshInstall: false, service: first.servers, filePath: file }), false);
+      assert.equal(first.servers.list().length, 0);
+      assert.equal(seedMcpServersOnBoot({ freshInstall: true, service: first.servers, filePath: file }), true);
+      assert.ok(first.servers.list().some((item) => item.id === 'seeded'));
+      // 和 app.ts 同构：seed 之后补注册，否则 remove 会因 registry 里没有而失败
+      for (const definition of first.servers.listDefinitions()) {
+        try {
+          first.registry.registerMcpServer(definition);
+        } catch {
+          // 已经注册过的跳过（seeded 在前面注册过）
+        }
+      }
+      for (const item of first.servers.list()) first.servers.remove(item.id);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('可达性检查不断言协议、不执行命令', async () => {
+    const { servers } = service(db, true);
+    servers.create({
+      id: 'unreachable',
+      displayName: 'Down',
+      type: 'http',
+      url: 'http://127.0.0.1:1/mcp',
+      tools: [{ name: 'a', risk: 'read' }],
+    });
+    const down = await servers.test('unreachable');
+    assert.equal(down.ok, false);
+    assert.match(down.detail, /连接失败/);
+    assert.equal(servers.get('unreachable').status, 'error');
+
+    servers.create({
+      id: 'localbin',
+      displayName: 'Bin',
+      type: 'local',
+      command: 'definitely-not-a-real-binary-xyz',
+      tools: [{ name: 'a', risk: 'read' }],
+    });
+    const missing = await servers.test('localbin');
+    assert.equal(missing.ok, false);
+    assert.match(missing.detail, /找不到/);
+
+    // node 本体一定存在：只确认存在，不执行
+    servers.create({
+      id: 'localnode',
+      displayName: 'Node',
+      type: 'local',
+      command: process.execPath,
+      tools: [{ name: 'a', risk: 'read' }],
+    });
+    const found = await servers.test('localnode');
+    assert.equal(found.ok, true);
+    assert.match(found.detail, /只确认存在，没有执行/);
+    assert.equal(servers.get('localnode').status, 'connected');
+
+    for (const id of ['unreachable', 'localbin', 'localnode']) servers.remove(id);
+  });
+});
+
+describe('MCP 管理 API：读写分离 + admin 门禁', () => {
+  it('读放行；写无 token 拒绝；secret 进去就拿不出来', async () => {
+    const express = (await import('express')).default;
+    const { mcpRouter } = await import('../routes/mcp.js');
+    const { config } = await import('../config.js');
+    const { once } = await import('node:events');
+
+    const registry = new CapabilityRegistry();
+    const servers = new McpServerService(db, registry, false);
+    const app = express();
+    app.use(express.json({ limit: '1mb' }));
+    app.use('/api/mcp', mcpRouter(servers));
+    const server = app.listen(0);
+    await once(server, 'listening');
+    const base = `http://127.0.0.1:${(server.address() as import('node:net').AddressInfo).port}`;
+    const originalToken = config.adminApiToken;
+    try {
+      config.adminApiToken = 'mcp-admin-secret';
+      const authed = { Authorization: 'Bearer mcp-admin-secret', 'Content-Type': 'application/json' };
+
+      const denied = await fetch(`${base}/api/mcp/servers`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: 'api', displayName: 'API', type: 'http', url: 'https://x', tools: [{ name: 'a', risk: 'read' }] }),
+      });
+      assert.ok(denied.status === 401 || denied.status === 403, `期望 401/403，实际 ${denied.status}`);
+
+      const created = await fetch(`${base}/api/mcp/servers`, {
+        method: 'POST',
+        headers: authed,
+        body: JSON.stringify({
+          id: 'api',
+          displayName: 'API',
+          type: 'http',
+          url: 'https://x.example/mcp',
+          authType: 'bearer',
+          secret: 'super-secret-value',
+          tools: [{ name: 'a', risk: 'read' }],
+        }),
+      });
+      assert.equal(created.status, 201);
+      const createdBody = (await created.json()) as { server: { secretConfigured: boolean } };
+      assert.equal(createdBody.server.secretConfigured, true);
+
+      // GET 列表里翻不到 secret
+      const listed = await fetch(`${base}/api/mcp/servers`);
+      assert.equal(listed.status, 200);
+      assert.ok(!(await listed.text()).includes('super-secret-value'), 'secret 值不能出现在读接口里');
+
+      // 非法 id / 拼错工具 400
+      const badId = await fetch(`${base}/api/mcp/servers`, {
+        method: 'POST',
+        headers: authed,
+        body: JSON.stringify({ id: 'BAD ID!', displayName: 'X', type: 'http', url: 'https://x', tools: [{ name: 'a', risk: 'read' }] }),
+      });
+      assert.equal(badId.status, 400);
+
+      const deleted = await fetch(`${base}/api/mcp/servers/api`, { method: 'DELETE', headers: authed });
+      assert.equal(deleted.status, 200);
+      assert.throws(() => registry.mcpServer('mcp.api'), /未注册/);
+    } finally {
+      config.adminApiToken = originalToken;
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+});
+
+describe('MCP 调用展示：放行即记一条，用过什么看得见', () => {
+  it('notifyMcpToolUse 落 durable 事件，SSE 能补发', async () => {
+    const stub = new StubCopilot();
+    const memberService = new MemberService(db);
+    const { team } = createTestStack(db, memberService, stub.asCopilot as unknown as CopilotService);
+    stub.reset();
+    const lead = team.createMember({ name: 'Mcp Loop', role: 'Lead' });
+    const room = team.createConversation({ kind: 'task', title: 'McpLoop', memberIds: [lead.id], leadMemberId: lead.id });
+
+    const seen: Array<{ type: string; data: unknown }> = [];
+    const off = team.subscribe(room.id, (event) => seen.push({ type: event.type, data: event.data }));
+    try {
+      team.notifyMcpToolUse({
+        executionId: 'exec-1',
+        conversationId: room.id,
+        memberId: lead.id,
+        serverId: 'github',
+        toolName: 'search_code',
+      });
+      const replayed = team.listEventsSince(room.id, 0).filter((event) => event.type === 'mcp.tool.called');
+      assert.equal(replayed.length, 1);
+      assert.deepEqual((replayed[0].data as Record<string, unknown>).serverId, 'github');
+      assert.ok(seen.some((event) => event.type === 'mcp.tool.called'), '实时订阅同样收到');
+    } finally {
+      off();
+    }
+  });
+});
+
+

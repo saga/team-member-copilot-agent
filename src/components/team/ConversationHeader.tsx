@@ -43,6 +43,10 @@ export function ConversationHeader({
   const leadName = conversation.leadMemberId ? memberLabel(conversation.leadMemberId) : null;
   const { total, completed } = conversation.taskProgress;
   const progress = total > 0 ? `${completed}/${total}` : null;
+  // 头像上的小圆点太隐蔽：谁在干活必须一眼看出来，不用 hover 才知道。
+  const workingMembers = isDm
+    ? []
+    : conversation.members.filter((member) => memberStatus(member.id).className === 'working');
 
   const meta = isDm
     ? conversation.members.map((member) => member.name).join(' ↔ ')
@@ -65,6 +69,11 @@ export function ConversationHeader({
             {conversation.externalWorkRef?.key && (
               <Tag color="cyan">{conversation.externalWorkRef.key}</Tag>
             )}
+            {workingMembers.map((member) => (
+              <Tag key={member.id} color="processing">
+                {member.name} 处理中…
+              </Tag>
+            ))}
           </Space>
           {!isDm && (
             <Tooltip title={describeConversationStatus(conversation)}>

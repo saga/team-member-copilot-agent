@@ -912,6 +912,61 @@ MUTATIONS = [
             )
         ],
     },
+    {
+        "name": "编辑元数据时清空已存 secret（读不回显就别碰）",
+        "test": "server/test/mcp.test.ts",
+        "steps": [
+            (
+                "server/mcp/service.ts",
+                "  if (input.authType === undefined) {\n    return { ...(current ?? {}) };\n  }\n",
+                "  if (input.authType === undefined) {\n    return {};\n  }\n",
+            )
+        ],
+    },
+    {
+        "name": "旧 secret 跨认证类型复用（换个头继续用）",
+        "test": "server/test/mcp.test.ts",
+        "steps": [
+            (
+                "server/mcp/service.ts",
+                "    throw badRequest(`MCP Server ${serverId} 切换认证方式必须提供新的 secret`);\n",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "重复 id 直接覆盖（已有连接被悄悄替换）",
+        "test": "server/test/mcp.test.ts",
+        "steps": [
+            (
+                "server/mcp/service.ts",
+                "    if (this.findRow(parsed.data.id)) {\n      throw conflict(`MCP Server 已存在：${parsed.data.id}`);\n    }\n",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "MCP 写入不要 admin（谁都能改所有 Agent 的连接）",
+        "test": "server/test/mcp.test.ts",
+        "steps": [
+            (
+                "server/routes/mcp.ts",
+                "  router.post('/servers', (req, res) => {\n    if (!canAdmin(req)) {\n      res.status(403).json({ error: '需要 Team owner 或 admin 权限' });\n      return;\n    }\n",
+                "  router.post('/servers', (req, res) => {\n",
+            )
+        ],
+    },
+    {
+        "name": "删光后重启复活已删 server（删除变成功能开关）",
+        "test": "server/test/mcp.test.ts",
+        "steps": [
+            (
+                "server/mcp/service.ts",
+                "  if (!input.freshInstall) return false;\n",
+                "",
+            )
+        ],
+    },
 ]
 
 

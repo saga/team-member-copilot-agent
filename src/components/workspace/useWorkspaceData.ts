@@ -11,6 +11,7 @@ import {
   type DeltaEvent,
   type ExecutionRecord,
   type ExecutionStatus,
+  type McpToolCallEvent,
   type Member,
 } from '../../lib/api';
 import type { DelegationLog, StreamState } from '../team/ActivityFeed';
@@ -77,6 +78,11 @@ export interface WorkspaceData {
   messages: ConversationMessage[];
   streaming: Record<string, StreamState>;
   delegations: DelegationLog[];
+  /**
+   * executionId → 这一轮放行过的 MCP 工具（展示用“用过什么”，不做审计）。
+   * 同一个 (server, tool) 只记一次：授权求值可能跑多次，展示不重复。
+   */
+  mcpUsage: Record<string, Array<{ serverId: string; toolName: string }>>;
   executions: Record<string, ExecutionRecord>;
   conversationStates: Record<string, ConversationMemberState>;
   /** 当前会话共享的文件（不含已删除的）。 */
@@ -123,6 +129,7 @@ export function useWorkspaceData({ onError }: { onError: (message: string | null
   const [messages, setMessages] = useState<ConversationMessage[]>([]);
   const [streaming, setStreaming] = useState<Record<string, StreamState>>({});
   const [delegations, setDelegations] = useState<DelegationLog[]>([]);
+  const [mcpUsage, setMcpUsage] = useState<Record<string, Array<{ serverId: string; toolName: string }>>>({});
   /** executionId → 最近一次 execution.updated，用来渲染 runtime 实时状态。 */
   const [executions, setExecutions] = useState<Record<string, ExecutionRecord>>({});
   const [tasks, setTasks] = useState<ConversationTask[]>([]);
@@ -410,6 +417,18 @@ export function useWorkspaceData({ onError }: { onError: (message: string | null
       );
     });
 
+    source.addEventListener('mcp.tool.called', (event) => {
+      const data = parseEvent<McpToolCallEvent>(event as MessageEvent);
+      if (!data || !data.executionId) return;
+      setMcpUsage((current) => {
+        const list = current[data.executionId] ?? [];
+        if (list.some((item) => item.serverId === data.serverId && item.toolName === data.toolName)) {
+          return current;
+        }
+        return { ...current, [data.executionId]: [...list, { serverId: data.serverId, toolName: data.toolName }] };
+      });
+    });
+
     source.onerror = () => {
       // EventSource 会自动重连；不把它当成业务错误弹给用户
     };
@@ -603,6 +622,7 @@ export function useWorkspaceData({ onError }: { onError: (message: string | null
     messages,
     streaming,
     delegations,
+    mcpUsage,
     executions,
     conversationStates,
     conversationFiles,

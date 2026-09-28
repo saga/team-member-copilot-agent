@@ -20,7 +20,7 @@ import type { DatabaseSync } from 'node:sqlite';
  *
  * 程序不认识任何别的编号 —— 没有升级代码，认出来也无从下手。
  */
-export const SCHEMA_VERSION = 21;
+export const SCHEMA_VERSION = 22;
 
 /**
  * 当前 schema 的完整定义，按最终形状写。
@@ -174,6 +174,37 @@ CREATE TABLE team_event (
 
 CREATE INDEX idx_team_event_team_sequence
   ON team_event(team_id, sequence);
+
+-- MCP Server 定义（运行时 source of truth）。
+--
+-- config/mcp-servers.json 只是新库的 provisioning baseline：空库启动时读一次，
+-- 之后增删改只走 /api/mcp（McpServerService），文件改了不会回头覆盖 ——
+-- 和 capability templates 同一套「只读一次」纪律。credential（headers / env 的值）
+-- 和定义存在同一行：读接口永远脱敏，只返回「配没配」，不返回值。
+CREATE TABLE mcp_server (
+  id TEXT PRIMARY KEY,
+  display_name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  type TEXT NOT NULL
+    CHECK (type IN ('local', 'http', 'sse')),
+  url TEXT,
+  headers_json TEXT NOT NULL DEFAULT '{}',
+  command TEXT,
+  args_json TEXT NOT NULL DEFAULT '[]',
+  env_json TEXT NOT NULL DEFAULT '{}',
+  cwd TEXT,
+  timeout INTEGER,
+  tools_json TEXT NOT NULL DEFAULT '{}',
+  version TEXT NOT NULL DEFAULT '1',
+  enabled INTEGER NOT NULL DEFAULT 1
+    CHECK (enabled IN (0, 1)),
+  last_test_at TEXT,
+  last_test_ok INTEGER
+    CHECK (last_test_ok IN (0, 1)),
+  last_test_error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 
 CREATE TABLE team_membership (
   team_id TEXT NOT NULL,

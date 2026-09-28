@@ -68,6 +68,14 @@ export class CapabilityRegistry {
     return server;
   }
 
+  /**
+   * 下掉一个 MCP Server 定义。调用方（McpServerService）先保证 DB 行已删，
+   * 这里只动内存 —— 顺序反过来会留下一段时间「DB 有、解析不到」的窗口。
+   */
+  removeMcpServer(id: string): void {
+    if (!this.mcp.delete(id)) throw new Error(`未注册 MCP Server：${id}`);
+  }
+
   listMcpServers(): McpServerDefinition[] {
     return [...this.mcp.values()].sort((a, b) => a.id.localeCompare(b.id));
   }

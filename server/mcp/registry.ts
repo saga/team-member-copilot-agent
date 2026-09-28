@@ -40,6 +40,16 @@ const fileSchema = z
   })
   .strict();
 
+/**
+ * API 输入形状（create / update 共用）：文件形状 + enabled 开关，
+ * version 缺省为 1（文件里 version 必填：vendored 配置必须显式声明版本）。
+ * loader 与 service / routes 共用这一份校验，两处各写一套只会漂移。
+ */
+export const mcpServerInputSchema = serverSchema.extend({
+  enabled: z.boolean().default(true),
+  version: z.string().trim().min(1).max(100).default('1'),
+});
+
 export interface McpLoadOptions {
   /** local/stdio server 需要在服务机器上起子进程，默认关闭。 */
   allowLocal: boolean;

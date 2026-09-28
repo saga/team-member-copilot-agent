@@ -99,6 +99,15 @@ export interface CancelTurnResult {
   idle: boolean;
 }
 
+/** MCP 工具调用被放行时的通知（给 Activity 的「用过什么」展示用）。 */
+export interface McpToolCallInfo {
+  executionId: string;
+  conversationId: string;
+  memberId: string;
+  serverId: string;
+  toolName: string;
+}
+
 export interface CopilotServiceOptions {
   /**
    * 替换 CopilotClient 的构造，仅用于测试 —— 让 resume/create/abort 这套
@@ -111,6 +120,11 @@ export interface CopilotServiceOptions {
    * 可替换是为了让测试能直接验证「某次调用被拒」而不必真的跑引擎。
    */
   toolPolicy?: ToolPolicy;
+  /**
+   * MCP 工具放行回调。注意语义是「放行」，不是「执行完成」—— 引擎没有跑完
+   * 回调。这里只回答「这一轮用了哪个 MCP」，展示层据此打标，不做审计与计费。
+   */
+  onMcpToolUse?: (info: McpToolCallInfo) => void;
 }
 
 /**
@@ -298,7 +312,11 @@ export class CopilotService {
         mcpServers: copilotCapabilities.mcpServers,
         hooks: {
           onPreToolUse: (hookInput: PreToolUseInput) =>
-            this.checkToolUse(hookInput, copilotCapabilities),
+            this.checkToolUse(hookInput, copilotCapabilities, {
+              executionId: input.executionId,
+              conversationId: input.conversationId,
+              memberId: input.member.id,
+            }),
         },
         // 不是由工具调用引起的权限请求（url / mcp / 扩展管理……），见 answerPermissionRequest。
         onPermissionRequest: (request: PermissionRequest, invocation: PermissionInvocation) =>
@@ -503,10 +521,18 @@ export class CopilotService {
   private async checkToolUse(
     hookInput: PreToolUseInput,
     capabilities: CopilotCapabilities,
+    execution: { executionId: string; conversationId: string; memberId: string },
   ): Promise<PreToolUseOutput> {
     const decision = await capabilities.checkToolUse(hookInput.toolName, hookInput.toolArgs);
 
     if (decision.allowed) {
+      if (decision.mcp) {
+        this.options.onMcpToolUse?.({
+          ...execution,
+          serverId: decision.mcp.serverId,
+          toolName: decision.mcp.toolName,
+        });
+      }
       return { permissionDecision: 'allow', permissionDecisionReason: decision.reason };
     }
 

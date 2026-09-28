@@ -3,7 +3,7 @@ import cors from 'cors';
 import path from 'node:path';
 import fs from 'node:fs';
 import { config } from './config.js';
-import { db } from './db.js';
+import { db, migration } from './db.js';
 import { MemberService } from './member-service.js';
 import { CopilotService } from './copilot.js';
 import { TeamService } from './team-service.js';
@@ -25,7 +25,7 @@ import { JiraProvider } from './work-management/jira-provider.js';
 import { WorkManagementRegistry } from './work-management/types.js';
 import { DefaultToolPolicy } from './tool-policy.js';
 import { DenyHighRiskPolicyService } from './policy.js';
-import { loadMcpServerDefinitions } from './mcp/registry.js';
+import { McpServerService, seedMcpServersOnBoot } from './mcp/service.js';
 import { TeamStructureService } from './team-structure-service.js';
 import { SchedulerService } from './scheduler-service.js';
 import { TeamEventService } from './team-event-service.js';
@@ -41,6 +41,7 @@ import { executionsRouter } from './routes/executions.js';
 import { tasksRouter } from './routes/tasks.js';
 import { teamRouter } from './routes/team.js';
 import { workManagementRouter, describeWebhookBoundary } from './routes/work-management.js';
+import { mcpRouter } from './routes/mcp.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { initTeamScope } from './middleware/teamScope.js';
 
@@ -113,12 +114,19 @@ registry.registerToolProvider(
 registry.registerToolProvider(new KnowledgeToolProvider());
 registry.registerToolProvider(new HostCodingToolProvider());
 
-// MCP Server 定义：只注册，不运行。运行与工具调用是 Copilot SDK 的事
-// （sessionConfig.mcpServers），这里只决定「有哪些 server 实现可用」。
-// 谁能用哪个 server 的哪些工具，是各层 capability binding 的事，见 resolver。
-for (const server of loadMcpServerDefinitions(config.mcpServersFile, {
-  allowLocal: config.mcpLocalEnabled,
-})) {
+// MCP Server 定义：DB（mcp_server 表）是运行时 source of truth，
+// 文件只在空库启动时读一次（和 capability templates 同一套 baseline 纪律）。
+// 运行与工具调用是 Copilot SDK 的事（sessionConfig.mcpServers），这里只决定
+// 「有哪些 server 实现可用」。谁能用哪个 server 的哪些工具，是各层
+// capability binding 的事，见 resolver。
+const mcpServerService = new McpServerService(db, registry, config.mcpLocalEnabled);
+if (seedMcpServersOnBoot({ freshInstall: migration.created, service: mcpServerService, filePath: config.mcpServersFile })) {
+  // eslint-disable-next-line no-console
+  console.log(`[server] mcp servers seeded from ${config.mcpServersFile}`);
+}
+// registry 是进程内 map，每次启动都是空的：DB 里已有的定义在这里补注册
+// （seed 只管空库，不管这个）。
+for (const server of mcpServerService.listDefinitions()) {
   registry.registerMcpServer(server);
 }
 
@@ -187,6 +195,8 @@ const copilotService = new CopilotService({
     { allowHostTools: config.allowHostCodingTools },
     new DenyHighRiskPolicyService(),
   ),
+  // MCP 调用展示：放行即通知，执行完成没有回调（见 notifyMcpToolUse）。
+  onMcpToolUse: (info) => teamService.notifyMcpToolUse(info),
 });
 
 teamService = new TeamService(
@@ -242,6 +252,7 @@ app.use('/api/executions', executionsRouter(teamService));
 app.use('/api/tasks', tasksRouter(teamService));
 // 以某个 Member 的身份说话 —— 独立的命名空间 + token 门禁，见 middleware/apiScope.ts
 app.use('/api/internal', internalRouter(teamService));
+app.use('/api/mcp', mcpRouter(mcpServerService));
 
 // 未匹配的 /api/* 返回 JSON 404，不要掉进下面的 SPA fallback 拿到一份 HTML
 app.use('/api', (_req, res) => {
@@ -269,6 +280,7 @@ export {
   memberService,
   capabilityService,
   capabilityResolver,
+  mcpServerService,
   localKnowledgeProvider,
   registry,
   skillService,

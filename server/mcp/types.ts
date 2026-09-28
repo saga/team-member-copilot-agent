@@ -38,4 +38,9 @@ export interface McpServerDefinition {
   tools: Record<string, McpToolPolicy>;
   /** 进 capability manifest：换了定义（增删工具、改 risk）必须能被审计出来。 */
   version: string;
+  /**
+   * 开关。文件里不写（缺省=开）：开关是运行时状态，只活在 DB 行里。
+   * 关掉后 resolver 直接跳过这个 server，本轮用不到它（会有一次警告）。
+   */
+  enabled?: boolean;
 }

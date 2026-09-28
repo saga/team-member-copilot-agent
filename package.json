@@ -1,7 +1,7 @@
 {
   "name": "team-member-copilot-agent",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
   "description": "Copilot SDK + Vite + TypeScript + Express 基础框架（参考 ai-interview-questions 的前后端同源结构）",
   "scripts": {

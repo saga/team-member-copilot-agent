@@ -106,6 +106,8 @@ export interface CatalogMcpServer {
   id: string;
   name: string;
   description: string;
+  /** 开关（MCP Servers 页的状态）。关掉时下面工具不可选，本轮也解析不到。 */
+  serverEnabled: boolean;
   tools: Array<{
     /** `mcp.<serverId>.<toolName>`。 */
     id: string;
@@ -139,6 +141,52 @@ export interface ScopeCatalog {
 
 /** 三个目录层，对应公司 / 团队 / 个人。 */
 export type CatalogScope = 'global' | 'team' | 'member';
+
+/**
+ * MCP Server（管理面读到的形状）。
+ *
+ * secret 的值永远拿不到：`secretConfigured` 只回答配没配，`envKeys` 只给
+ * 变量名；编辑时重新输入。tools 是定义里声明的工具（手工维护），不是在线发现的。
+ */
+export interface McpServer {
+  id: string;
+  name: string;
+  description: string;
+  type: 'http' | 'sse' | 'local';
+  url: string | null;
+  command: string | null;
+  args: string[];
+  cwd: string | null;
+  timeout: number | null;
+  version: string;
+  authType: 'none' | 'bearer' | 'apiKey';
+  secretConfigured: boolean;
+  envKeys: string[];
+  tools: Array<{ name: string; risk: string }>;
+  enabled: boolean;
+  /** 上次可达性检查的结论：unknown = 没测过，connected / error 都是当时那一刻。 */
+  status: 'unknown' | 'connected' | 'error';
+  updatedAt: string;
+}
+
+export interface McpServerInput {
+  id: string;
+  displayName: string;
+  description?: string;
+  type: 'http' | 'sse' | 'local';
+  url?: string;
+  /** Bearer token 或 API Key 的值。省略 = 保持现状（编辑时不回显，只能重填）。 */
+  secret?: string;
+  /** secret 的种类。不传 secret 时忽略。 */
+  authType?: 'none' | 'bearer' | 'apiKey';
+  command?: string;
+  args?: string[];
+  cwd?: string;
+  timeout?: number;
+  tools: Array<{ name: string; risk: string }>;
+  version?: string;
+  enabled?: boolean;
+}
 
 /** skill 内容投放的三个 scope。 */
 export type SkillScope = 'global' | 'team' | 'member';
@@ -589,6 +637,17 @@ export interface DeltaEvent {
   executionId: string;
   memberId: string;
   delta: string;
+}
+
+/**
+ * 某次 MCP 工具调用被放行。语义是「放行」，不是「执行完成」
+ * （引擎没有跑完回调）—— 只回答「这一轮用了哪个 MCP」，不做审计与计费。
+ */
+export interface McpToolCallEvent {
+  executionId: string;
+  memberId: string;
+  serverId: string;
+  toolName: string;
 }
 
 /**
@@ -1044,6 +1103,48 @@ export const api = {
     return fetch(`${API_BASE}/api/executions/${encodeURIComponent(executionId)}/cancel`, {
       method: 'POST',
     }).then(json<{ execution: ExecutionRecord }>);
+  },
+
+  /**
+   * MCP Server 定义的增删改查 + 可达性检查。
+   *
+   * 这是「系统里有哪些 MCP」（连接层）。「谁可以用其中哪些工具」在
+   * Capabilities 里配（授权层），Task 里不需要选 —— 自动用已授权的。
+   */
+  listMcpServers(): Promise<{ servers: McpServer[] }> {
+    return fetch(`${API_BASE}/api/mcp/servers`).then(json<{ servers: McpServer[] }>);
+  },
+
+  createMcpServer(input: McpServerInput): Promise<{ server: McpServer }> {
+    return fetch(`${API_BASE}/api/mcp/servers`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    }).then(json<{ server: McpServer }>);
+  },
+
+  updateMcpServer(id: string, input: McpServerInput): Promise<{ server: McpServer }> {
+    return fetch(`${API_BASE}/api/mcp/servers/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    }).then(json<{ server: McpServer }>);
+  },
+
+  deleteMcpServer(id: string): Promise<{ deleted: string }> {
+    return fetch(`${API_BASE}/api/mcp/servers/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }).then(json<{ deleted: string }>);
+  },
+
+  /**
+   * 可达性检查，不是 MCP 握手、不发现工具。
+   * http/sse 只确认有 HTTP 响应；local 只确认 command 找得到，不执行。
+   */
+  testMcpServer(id: string): Promise<{ ok: boolean; detail: string; server: McpServer }> {
+    return fetch(`${API_BASE}/api/mcp/servers/${encodeURIComponent(id)}/test`, {
+      method: 'POST',
+    }).then(json<{ ok: boolean; detail: string; server: McpServer }>);
   },
 
   /**

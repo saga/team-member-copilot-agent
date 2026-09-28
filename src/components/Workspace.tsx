@@ -10,7 +10,7 @@ import { ConversationFilePicker } from './team/ConversationFilePicker';
 import { MessageComposer } from './team/MessageComposer';
 import { MemberProfile } from './team/MemberProfile';
 import { TeamManagement } from './team/TeamManagement';
-import { CapabilitySettings } from './team/CapabilitySettings';
+import { SettingsPage } from './team/SettingsPage';
 import { TaskSidebar } from './tasks/TaskSidebar';
 import { WorkspaceNav } from './workspace/WorkspaceNav';
 import { TaskCreator } from './team/TaskCreator';
@@ -91,6 +91,7 @@ export function Workspace() {
     messages,
     streaming,
     delegations,
+    mcpUsage,
     conversationStates,
     conversationFiles,
     tasks,
@@ -166,7 +167,7 @@ export function Workspace() {
    * Settings 是 Admin 面，入口在管理面和小菜单，不在工作区顶栏。
    */
   function manageMemberCapabilities(member: Member) {
-    navigate({ view: 'settings', scope: 'member', memberId: member.id });
+    navigate({ view: 'settings', section: 'capabilities', scope: 'member', memberId: member.id });
   }
 
   return (
@@ -179,7 +180,7 @@ export function Workspace() {
           } else if (next === 'team') {
             navigate({ view: 'team' });
           } else {
-            navigate({ view: 'settings', scope: 'global', memberId: null });
+            navigate({ view: 'settings', section: 'capabilities', scope: 'global', memberId: null });
           }
         }}
       />
@@ -229,20 +230,7 @@ export function Workspace() {
           />
         )}
 
-        {view === 'settings' && (
-          <div style={{ padding: '12px 18px', overflowY: 'auto', height: '100%' }}>
-            <CapabilitySettings
-              key={`${route.scope}:${route.memberId ?? ''}`}
-              inline
-              initialScope={route.scope}
-              initialMemberId={route.memberId}
-              onTargetChange={(scope, memberId) =>
-                navigate({ view: 'settings', scope, memberId }, { replace: true })
-              }
-              onClose={() => navigate({ view: 'tasks', conversationId })}
-            />
-          </div>
-        )}
+        {view === 'settings' && <SettingsPage route={route} navigate={navigate} />}
 
         {view === 'tasks' && !selectedConversation && (
           <Content style={{ display: 'grid', placeItems: 'center', color: '#999' }}>
@@ -277,6 +265,7 @@ export function Workspace() {
                       messages={messages}
                       streaming={streaming}
                       delegations={delegations}
+                      mcpUsage={mcpUsage}
                       memberLabel={memberLabel}
                       taskLabel={(taskId) =>
                         taskId

@@ -1090,6 +1090,31 @@ export class TeamService {
   }
 
   /**
+   * MCP 工具调用被放行（引擎 hook 回调）。
+   *
+   * 只记「用过什么」供 Activity 展示：放行 ≠ 执行完成（引擎没有跑完回调），
+   * 所以不做审计、不做计费。重复求值可能带来重复事件，前端按
+   * (executionId, serverId, toolName) 去重展示。
+   */
+  notifyMcpToolUse(input: {
+    executionId: string;
+    conversationId: string;
+    memberId: string;
+    serverId: string;
+    toolName: string;
+  }): void {
+    this.emit(input.conversationId, {
+      type: 'mcp.tool.called',
+      data: {
+        executionId: input.executionId,
+        memberId: input.memberId,
+        serverId: input.serverId,
+        toolName: input.toolName,
+      },
+    });
+  }
+
+  /**
    * 以某个 Member 的身份发一条消息 —— Member ↔ Member 私聊的写入路径。
    *
    * 私聊直接唤醒对端，不经过任何 dispatcher。

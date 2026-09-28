@@ -13,23 +13,36 @@ import { useCallback, useEffect, useState } from 'react';
  *   /settings               能力配置，公司默认
  *   /settings/team          能力配置，团队默认
  *   /settings/member/:id    能力配置，指定成员的增量
+ *   /settings/mcp           MCP Server 连接配置（与能力授权分开）
  *
  * 旧的 /chat/:id 继续解析到工作面（兼容已有链接），但新生成的地址一律用 /tasks。
  */
+export type SettingsSection = 'capabilities' | 'mcp';
+
 export type Route =
   | { view: 'tasks'; conversationId: string | null }
   | { view: 'team' }
-  | { view: 'settings'; scope: 'global' | 'team' | 'member'; memberId: string | null };
+  | {
+      view: 'settings';
+      section: SettingsSection;
+      scope: 'global' | 'team' | 'member';
+      memberId: string | null;
+    };
 
 export function parseRoute(pathname: string): Route {
   const parts = pathname.split('/').filter(Boolean);
   if (parts[0] === 'team') return { view: 'team' };
   if (parts[0] === 'settings') {
-    if (parts[1] === 'member') {
-      return { view: 'settings', scope: 'member', memberId: parts[2] ?? null };
+    if (parts[1] === 'mcp') {
+      return { view: 'settings', section: 'mcp', scope: 'global', memberId: null };
     }
-    if (parts[1] === 'team') return { view: 'settings', scope: 'team', memberId: null };
-    return { view: 'settings', scope: 'global', memberId: null };
+    if (parts[1] === 'member') {
+      return { view: 'settings', section: 'capabilities', scope: 'member', memberId: parts[2] ?? null };
+    }
+    if (parts[1] === 'team') {
+      return { view: 'settings', section: 'capabilities', scope: 'team', memberId: null };
+    }
+    return { view: 'settings', section: 'capabilities', scope: 'global', memberId: null };
   }
   // /tasks/:id 之外的任何路径（含 / 和打错的）都落回 tasks，不做硬 404：
   // 这是单页工具，不是内容站点，把人送回工作面比给他一张 404 页有用。
@@ -45,6 +58,9 @@ export function routeToPath(route: Route): string {
     case 'team':
       return '/team';
     case 'settings':
+      if (route.section === 'mcp') {
+        return '/settings/mcp';
+      }
       if (route.scope === 'member') {
         return route.memberId ? `/settings/member/${route.memberId}` : '/settings/member';
       }

@@ -1,5 +1,5 @@
 import type { RefObject } from 'react';
-import { Avatar, Empty, Timeline } from 'antd';
+import { Avatar, Empty, Tag, Timeline } from 'antd';
 import { Bubble } from '@ant-design/x';
 import type { Conversation, ConversationMessage } from '../../lib/api';
 import { FileAttachmentCard } from './FileAttachmentCard';
@@ -24,6 +24,8 @@ interface ActivityFeedProps {
   /** executionId → 正在流式产出的半截内容。 */
   streaming: Record<string, StreamState>;
   delegations: DelegationLog[];
+  /** executionId → 这一轮放行过的 MCP 工具（只展示“用过什么”）。 */
+  mcpUsage: Record<string, Array<{ serverId: string; toolName: string }>>;
   /** 把 memberId 显示成名字。 */
   memberLabel: (memberId: string) => string;
   /** 把 taskId 显示成任务标题（Task 进展消息用）。 */
@@ -48,10 +50,25 @@ export function ActivityFeed({
   messages,
   streaming,
   delegations,
+  mcpUsage,
   memberLabel,
   taskLabel,
   scrollRef,
 }: ActivityFeedProps) {
+  const mcpTags = (executionId: string | null) => {
+    if (!executionId) return null;
+    const used = mcpUsage[executionId] ?? [];
+    if (used.length === 0) return null;
+    return (
+      <div style={{ marginTop: 6, display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+        {used.map((item) => (
+          <Tag key={`${item.serverId}:${item.toolName}`} color="blue" style={{ marginInlineEnd: 0 }}>
+            MCP · {item.serverId}/{item.toolName}
+          </Tag>
+        ))}
+      </div>
+    );
+  };
   void conversation;
   if (messages.length === 0 && Object.keys(streaming).length === 0) {
     return (
@@ -76,6 +93,7 @@ export function ActivityFeed({
               ))}
             </div>
           )}
+          {mcpTags(message.executionId)}
         </>
       ),
       header:
@@ -99,7 +117,12 @@ export function ActivityFeed({
       key: stream.executionId,
       role: 'ai' as const,
       placement: 'start' as const,
-      content: stream.content || '▍',
+      content: (
+        <>
+          {stream.content || '▍'}
+          {mcpTags(stream.executionId)}
+        </>
+      ),
       typing: { effect: 'typing' as const, step: 2, interval: 50 },
       header: memberLabel(stream.memberId),
       avatar: <Avatar size="small">{memberLabel(stream.memberId).slice(0, 1).toUpperCase()}</Avatar>,

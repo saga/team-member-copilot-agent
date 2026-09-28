@@ -288,6 +288,11 @@ export interface RuntimeMcpServer {
   tools: string[];
   toolPolicies: Record<string, ToolRisk>;
   version: string;
+  /**
+   * 开关。停用的 server 不会出现在解析结果里（resolver 直接跳过并警告一次），
+   * 所以 manifest 里永远只有实际生效的 —— 关掉它不需要改每一层的 binding。
+   */
+  enabled: boolean;
 }
 
 export interface RuntimeCapabilities {
