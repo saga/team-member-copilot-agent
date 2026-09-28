@@ -41,7 +41,7 @@ export function TeamManagement({
         items={[
           {
             key: 'members',
-            label: `Members (${members.length})`,
+            label: 'Members',
             children: (
               <MemberList
                 members={members}

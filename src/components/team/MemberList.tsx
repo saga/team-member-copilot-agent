@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
-import { Avatar, Badge, Button, Dropdown, Modal, Tag, Typography } from 'antd';
-import { EllipsisOutlined, MessageOutlined, UserAddOutlined } from '@ant-design/icons';
+import { Avatar, Badge, Button, Modal, Tag, Typography } from 'antd';
+import { MessageOutlined, UserAddOutlined } from '@ant-design/icons';
 import { api, type Member, type TeamPresence } from '../../lib/api';
 import { NewMemberForm } from './NewMemberForm';
 
@@ -27,8 +27,9 @@ const AVAILABILITY_DOT: Record<string, 'success' | 'warning' | 'default' | 'erro
 /**
  * Team 管理面的 Members 页。
  *
- * 每一行只有一个主动作 —— New task（以这个 Member 为 Lead 开一个工作区）。
- * 管理类动作（看档案、配能力、归档）收进 `...` 菜单：使用与管理是两个层次。
+ * 一行的四个动作全部平铺在同一行：New task（以这个 Member 为 Lead 开一个
+ * 工作区）、View profile、Manage capabilities、Archive。管理页本来就是操作
+ * 入口，不再用 `...` 菜单藏第二层。
  *
  * 布局不用 antd List：它的 actions 与 Meta 在窄侧栏里互相挤压，
  * 长名字/长 role 会被折成一行一个词。这里用显式 flex + minWidth:0 + ellipsis，
@@ -117,7 +118,7 @@ export function MemberList({
                   @{member.handle} · {member.role}
                 </Typography.Text>
 
-                <div style={{ marginTop: 2, display: 'flex', gap: 4 }}>
+                <div style={{ marginTop: 2, display: 'flex', gap: 4, flexWrap: 'wrap' }}>
                   <Button
                     type="link"
                     size="small"
@@ -126,32 +127,30 @@ export function MemberList({
                   >
                     New task
                   </Button>
-                  <Dropdown
-                    menu={{
-                      items: [
-                        { key: 'profile', label: 'View profile' },
-                        { key: 'capabilities', label: 'Manage capabilities' },
-                        { key: 'archive', label: 'Archive', danger: true },
-                      ],
-                      onClick: ({ key }) => {
-                        if (key === 'profile') onViewProfile(member);
-                        else if (key === 'capabilities') onManageCapabilities(member);
-                        else if (key === 'archive') {
-                          Modal.confirm({
-                            title: `归档 ${member.name}？`,
-                            content:
-                              '归档后它不再接活，但保留在历史会话里。需要时可以恢复。',
-                            okText: 'Archive',
-                            okButtonProps: { danger: true },
-                            cancelText: 'Cancel',
-                            onOk: () => onArchive(member),
-                          });
-                        }
-                      },
-                    }}
+                  <Button type="link" size="small" onClick={() => onViewProfile(member)}>
+                    View profile
+                  </Button>
+                  <Button type="link" size="small" onClick={() => onManageCapabilities(member)}>
+                    Manage capabilities
+                  </Button>
+                  <Button
+                    type="link"
+                    size="small"
+                    danger
+                    onClick={() =>
+                      Modal.confirm({
+                        title: `归档 ${member.name}？`,
+                        content:
+                          '归档后它不再接活，但保留在历史会话里。需要时可以恢复。',
+                        okText: 'Archive',
+                        okButtonProps: { danger: true },
+                        cancelText: 'Cancel',
+                        onOk: () => onArchive(member),
+                      })
+                    }
                   >
-                    <Button type="link" size="small" icon={<EllipsisOutlined />} aria-label="更多操作" />
-                  </Dropdown>
+                    Archive
+                  </Button>
                 </div>
               </div>
             </div>
