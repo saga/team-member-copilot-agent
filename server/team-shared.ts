@@ -58,6 +58,8 @@ export interface ExecutionRow {
   external_work_ref: string | null;
   external_work_snapshot: string | null;
   runtime_id: string | null;
+  /** 这一轮由哪个租约代次跑（见 worker-lease.ts）。单进程时为 NULL。 */
+  worker_fencing_token: number | null;
   parent_execution_id: string | null;
   delegation_path: string;
   kind: ExecutionKind;
@@ -140,6 +142,7 @@ export function mapExecution(row: ExecutionRow): ExecutionRecord {
     externalWorkRef: parseExternalWorkRef(row.external_work_ref),
     externalWorkSnapshot: parseExternalWorkSnapshot(row.external_work_snapshot),
     runtimeId: row.runtime_id,
+    workerFencingToken: row.worker_fencing_token ?? null,
     parentExecutionId: row.parent_execution_id,
     delegationPath: JSON.parse(row.delegation_path) as string[],
     kind: row.kind,

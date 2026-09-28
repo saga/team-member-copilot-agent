@@ -34,7 +34,7 @@ import { sendError } from '../middleware/errorHandler.js';
 export function commandsRouter(team: TeamService, commands: CommandService, audit?: AuditService) {
   const router = Router();
 
-  /** 单条 Command 的形状：连同审批与生命周期一起返回。 */
+  /** 单条 Command 的形状：连同审批、生命周期与尝试一起返回。 */
   const detail = (commandId: string) => {
     const command = commands.get(commandId);
     return {
@@ -43,6 +43,10 @@ export function commandsRouter(team: TeamService, commands: CommandService, audi
       // 生命周期是 Command 的**过程**，command 行上只有当前状态。
       // 审批界面要回答「谁批的、什么时候开始执行」，只有事件行说得清。
       audit: audit ? audit.listCommandAudit(commandId) : [],
+      // 每一次真正打出去的尝试。`unknown` 时它是唯一能回答「到底试了几次、
+      // 哪一次结果不明」的地方 —— 少了它，界面只能显示一句「结果未知」，
+      // 而运维要的恰恰是「第 1 次超时、第 2 次才对账确认」这个过程。
+      attempts: commands.listAttempts(commandId),
     };
   };
 
@@ -149,16 +153,45 @@ export function commandsRouter(team: TeamService, commands: CommandService, audi
   });
 
   /**
-   * 显式执行一条已经放行的 Command（`ready` / `approved`）。
+   * 显式执行一条已经放行的 Command（`ready` / `approved` / `failed`）。
    *
    * 单独暴露是为了「先批后跑」和「Policy 直接放行的 ready 命令」两条路径 ——
    * 执行本身是 CAS 的（见 CommandService.markExecuting），所以并发点两次不会
    * 打两次外部系统，第二次会拿到 409。
+   *
+   * `failed` 也在可执行集合里：它的语义是「确认外部没有发生」，重试是安全的。
+   * 这让「失败 → 点一下重试」成为一条真实可走的路径，而不是一个报错。
    */
   router.post('/:id/execute', async (req, res) => {
     try {
       await commands.execute(req.params.id);
       res.json(detail(req.params.id));
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  /**
+   * 对账一条**结果未知**的 Command。
+   *
+   * ── 为什么必须有这个入口 ─────────────────────────────────────────────
+   *
+   * `unknown` 是唯一一个既不能重试（可能已经生效）、也不能批准（早就执行过）
+   * 的状态。没有对账入口的话，它会是一个**死胡同**：收件箱里永远挂着一句
+   * 「结果未知」，而没有人能做任何事。这正是这一整条链要消除的那种状态 ——
+   * 不是「出错了」，而是「卡住了且没人知道该做什么」。
+   *
+   * ── 结论可能是 unknown ──────────────────────────────────────────────
+   *
+   * 对账自己也会读不到（网络又断了、没权限读评论）。那时返回的 `outcome.status`
+   * 是 `unknown`，而 Command **状态不变** —— 这是刻意的，也是正常的返回，不是
+   * 错误。把它当成失败会让这次写入落到 `failed`，而 `failed` 的下一个动作是
+   * 重试。
+   */
+  router.post('/:id/reconcile', async (req, res) => {
+    try {
+      const outcome = await commands.reconcile(req.params.id);
+      res.json({ ...detail(req.params.id), outcome });
     } catch (error) {
       sendError(res, error);
     }
@@ -183,6 +216,10 @@ const decisionSchema = z.object({
  *
  * 这里枚举而不是直接透传字符串：状态是 SQL 参数，而未知值会让 `listByStatus`
  * 静默返回空数组 —— 调用方看到的是「没有待审批」，而不是「你查错了」。
+ *
+ * 这个列表必须跟着 `CommandStatus` 走。少了 `unknown` 时，审批收件箱查
+ * `?status=unknown` 会拿到「未知的 Command 状态：unknown」—— 而它**是**一个
+ * 已知状态，只是这里漏了一行。那种错误信息会把人引到完全错误的方向。
  */
 const commandStatusSchema = z.enum([
   'requested',
@@ -192,6 +229,9 @@ const commandStatusSchema = z.enum([
   'executing',
   'completed',
   'failed',
+  // 外部结果未知，等对账收敛。它**不是**终态，但同样需要出现在收件箱里 ——
+  // 「有一笔写入我们不知道做没做」是必须有人看一眼的那类状态。
+  'unknown',
   'rejected',
   'cancelled',
   'expired',

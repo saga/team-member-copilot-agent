@@ -21,13 +21,16 @@ import { KnowledgeToolProvider } from './capabilities/providers/knowledge-tools.
 import { HostCodingToolProvider } from './capabilities/providers/host-tools.js';
 import { JiraToolProvider } from './capabilities/providers/jira-tools.js';
 import { JiraClient } from './jira/client.js';
-import { JiraProvider } from './work-management/jira-provider.js';
+import { JiraProvider, operationMarker } from './work-management/jira-provider.js';
 import { WorkManagementRegistry } from './work-management/types.js';
+import type { WorkManagementProvider } from './work-management/types.js';
 import { DefaultToolPolicy } from './tool-policy.js';
 import { DenyHighRiskPolicyService } from './policy.js';
 import { EntitlementService } from './entitlement-service.js';
 import { AuditService } from './audit-service.js';
 import { CommandService } from './command-service.js';
+import type { CommandExecutionInput, CommandExecutor } from './command-service.js';
+import type { ExternalOperationOutcome } from './work-management/outcome.js';
 import { WorkerLeaseService } from './worker-lease.js';
 import { EnvSecretProvider } from './mcp/secret-provider.js';
 import { McpServerService, seedMcpServersOnBoot } from './mcp/service.js';
@@ -203,21 +206,33 @@ if (jiraConfigured) {
   // —— 两者分开之后，「它想干什么」和「它干了什么」才各有落点。
   //
   // 幂等由 CommandService 的 idempotency_key 保证：同一个 key 第二次进来拿到
-  // 的是同一条记录，不会在 Jira 上留第二条评论。
+  // 的是同一条记录，不会在 Jira 上留第二条评论。跨 execution 的 retry 由
+  // CommandService 的 retry 链复用保证（见 findRetryableCommand）。
   //
   // 版本比对是**服务端**的（If-Unmodified-Since）：Command 上记着「批准时看到的
   // 版本」，执行时 Jira 在事务里比。客户端读一下再写只缩小窗口，关不掉它。
-  commandService.registerExecutor('jira.add_comment', async ({ command, args }) => {
+  const addComment: CommandExecutor = async ({ command, args }) => {
     const ref = jiraProvider.ref({ key: String(args.issueKey) });
-    const body = String(args.body);
+    // 把这一笔的 operationId 打进评论正文。没有它的话，一次超时之后我们
+    // **没有任何办法**知道那条评论到底发出去了没有 —— 而对账是唯一的出路，
+    // 对账又需要一个能在 Jira 侧认人的标记。
+    //
+    // 标记是 HTML 注释的样子，人一眼能看出它是机器写的；代价是它在渲染出来的
+    // 评论里也会占一行（ADF 没有不可见节点，见 operationMarker 的说明）。
+    const body = `${String(args.body)}\n\n${operationMarker(command.operationId)}`;
+
     if (command.resourceVersion && jiraProvider.addCommentIfVersion) {
       await jiraProvider.addCommentIfVersion(ref, body, command.resourceVersion);
     } else {
       await jiraProvider.addComment(ref, body);
     }
     return { commented: ref.key };
-  });
-  commandService.registerExecutor('jira.transition_issue', async ({ command, args }) => {
+  };
+  addComment.reconcile = (input) => reconcileJiraOperation(jiraProvider, input);
+
+  commandService.registerExecutor('jira.add_comment', addComment);
+
+  const transitionIssue: CommandExecutor = async ({ command, args }) => {
     const ref = jiraProvider.ref({ key: String(args.issueKey) });
     const transitionId = String(args.transitionId);
     // 版本比对和加评论同源：Command 上记着「批准时看到的版本」，执行时 Jira
@@ -232,7 +247,12 @@ if (jiraConfigured) {
       await jiraProvider.transition(ref, transitionId);
     }
     return { transitioned: ref.key, transitionId };
-  });
+  };
+  // 流转没有可打的标记（transition 接口不吃），所以对账只能读变更历史 ——
+  // 见 JiraProvider.reconcileTransition 的说明。
+  transitionIssue.reconcile = (input) => reconcileJiraOperation(jiraProvider, input);
+
+  commandService.registerExecutor('jira.transition_issue', transitionIssue);
 
   registry.registerToolProvider(new JiraToolProvider(jiraProvider, commandService));
 }
@@ -417,3 +437,40 @@ export {
 };
 
 export { initTeamScope };
+
+/**
+ * 把「对账一条 Command」翻译成「问 Provider 这一笔做了没有」。
+ *
+ * 两个 Jira executor 共用它：形状完全一样，差别全在 Provider 的
+ * `reconcileOperation` 里（评论找正文标记、流转读变更历史）。
+ *
+ * ── `attemptStartedAt` 为什么不是 `command.executedAt` ────────────────
+ *
+ * `executed_at` 是「我们放弃等待、判定结果未知」的时刻，而真正的外部写入发生
+ * 在尝试**开始**和它之间。拿后者当时间窗下界，会把自己的那次写入排除在窗口外
+ * —— 于是对账把一次**已经发生**的写入报成 failed，而 failed 的下一个动作是
+ * 重试。方向恰好是反的。
+ *
+ * 取不到 attempt 时退回 `createdAt`：那比任何尝试都**更早**，窗口更宽 →
+ * 更可能落到 `unknown`。在「可能报错结论」和「可能漏掉证据」之间，这里选后者
+ * —— `unknown` 会继续挡住重试，而一个错的 failed 会把它放出去。
+ */
+function reconcileJiraOperation(
+  provider: WorkManagementProvider,
+  input: CommandExecutionInput,
+): Promise<ExternalOperationOutcome> {
+  const { command, args, attempt } = input;
+  if (!provider.reconcileOperation) {
+    return Promise.resolve({
+      status: 'unknown',
+      detail: `Provider ${provider.providerId} 不支持对账`,
+    });
+  }
+  return provider.reconcileOperation({
+    operationId: command.operationId,
+    action: command.action,
+    target: command.target,
+    args,
+    attemptStartedAt: attempt?.startedAt ?? command.createdAt,
+  });
+}

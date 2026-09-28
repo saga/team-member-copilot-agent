@@ -87,7 +87,33 @@ export type CommandAuditEvent =
   | 'rejected'
   | 'executing'
   | 'completed'
-  | 'failed';
+  | 'failed'
+  /**
+   * 外部结果**未知**：请求发出去了，但没能确认对方有没有处理。
+   *
+   * 与 `failed` 分开是必须的，因为它们在审计上是两个不同的结论，而下一步动作
+   * 相反：`failed` = 「确认没发生」→ 可以重试；`unknown` = 「可能已发生」→
+   * 必须先对账，直接重试会产生第二次副作用。
+   *
+   * 它也不是终态 —— 对账会把它收敛成 `completed` 或 `failed`，届时再补一条事件。
+   */
+  | 'unknown'
+  /**
+   * 对账（reconcile）走了一趟，带回了结论。
+   *
+   * 单独一条事件而不是复用 `unknown`：`unknown` 记的是「我们不知道」，这一条
+   * 记的是「我们去查了，查到了什么」—— 包括**还是不知道**。审计要能回答
+   * 「谁在什么时候为了这笔动作多花了一次外部查询」，那正是这条事件。
+   */
+  | 'reconciled'
+  /**
+   * 这条 Command 被一次 retry 复用，没有新建第二笔。
+   *
+   * 没有它的话，审计里会出现「一条 Command 的 attempt 来自两条不同的 execution」
+   * 而没有任何解释 —— 看起来像数据串了。它是「为什么 retry 没有产生第二条
+   * Jira 评论」这个问题的答案。
+   */
+  | 'inherited';
 
 export interface CommandAuditRecord {
   id: string;

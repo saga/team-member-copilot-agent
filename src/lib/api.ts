@@ -538,6 +538,14 @@ export type CommandStatus =
   | 'executing'
   | 'completed'
   | 'failed'
+  /**
+   * 外部结果**未知**：请求发出去了，但没能确认对方有没有处理（超时 / 连接重置
+   * / 5xx）。它**不是**终态，对账会把它收敛成 completed 或 failed。
+   *
+   * 和 failed 分开是必须的 —— failed 的意思是「确认没发生」（可以重试），
+   * 而 unknown 的意思是「可能已经发生」（重试就是重复副作用）。
+   */
+  | 'unknown'
   | 'rejected'
   | 'cancelled'
   | 'expired';
@@ -559,6 +567,12 @@ export interface CommandRecord {
    */
   args: Record<string, unknown>;
   idempotencyKey: string;
+  /**
+   * 这一笔**外部业务动作**的身份（UNIQUE）。它刻意不是 executionId：retry 会
+   * 铸出一条新的 execution，而「同一笔 Jira 评论」不能因此变成两笔。
+   * 对账拿它去外部系统问「这笔到底做了没有」。
+   */
+  operationId: string;
   resourceVersion: string | null;
   policyDecisionId: string | null;
   approvalId: string | null;
@@ -587,7 +601,9 @@ export type CommandAuditEvent =
   | 'rejected'
   | 'executing'
   | 'completed'
-  | 'failed';
+  | 'failed'
+  /** 外部结果未知。与 failed 是两个结论，动作相反（见 CommandStatus）。 */
+  | 'unknown';
 
 export interface CommandAuditRecord {
   id: string;
@@ -600,11 +616,51 @@ export interface CommandAuditRecord {
   createdAt: string;
 }
 
+/** 一次**尝试**的结果。这里记的是「这次调用怎么了」，不是业务决策。 */
+export type CommandAttemptStatus = 'running' | 'succeeded' | 'failed' | 'unknown';
+
+/**
+ * Command 的一次执行尝试。
+ *
+ * 单独一张表而不是在 command 上加几列：「一笔业务动作」和「一次尝试」不是同一个
+ * 东西。Command 可以先 timeout（unknown，可能已写）再被对账确认（succeeded）——
+ * 只留一行的话，第一段的「我们不知道发生过什么」会被第二段覆盖掉，而它恰恰
+ * 解释了为什么这里多了一次外部查询、以及为什么当时不能简单地重试。
+ */
+export interface CommandAttemptRecord {
+  id: string;
+  commandId: string;
+  /** 从 1 开始，同一 Command 内单调递增。 */
+  attemptNo: number;
+  operationId: string;
+  status: CommandAttemptStatus;
+  startedAt: string;
+  endedAt: string | null;
+  error: string | null;
+  resultHash: string | null;
+}
+
+/** 对账的结论。`unknown` 是**合法**结论：对账也可能问不出来。 */
+export interface ExternalOperationOutcome {
+  status: 'completed' | 'failed' | 'unknown';
+  detail?: string | null;
+}
+
 export interface CommandDetail {
   command: CommandRecord;
   approval: ApprovalRecord | null;
   /** 生命周期事件。command 行上只有**当前**状态，过程在这里。 */
   audit: CommandAuditRecord[];
+  /**
+   * 每一次真正打出去的尝试。`unknown` 时它是唯一能回答「试了几次、哪一次
+   * 结果不明」的地方 —— 只显示一句「结果未知」是没法排查的。
+   */
+  attempts: CommandAttemptRecord[];
+}
+
+/** 对账返回：新的 Command 详情 + 这一次对账的结论。 */
+export interface CommandReconcileResult extends CommandDetail {
+  outcome: ExternalOperationOutcome;
 }
 
 export interface PolicyDecisionAuditRecord {
@@ -1550,6 +1606,19 @@ export const api = {
     return fetch(`${API_BASE}/api/commands/${encodeURIComponent(id)}/execute`, {
       method: 'POST',
     }).then(json<CommandDetail>);
+  },
+
+  /**
+   * 对账一条**结果未知**的 Command。
+   *
+   * 这是 `unknown` 唯一的出路：它不能重试（可能已经生效），也不能批准（早就
+   * 执行过）。返回的 `outcome.status` 可能是 `unknown` —— 那说明对账自己也没
+   * 读到，Command 状态不变，这是正常结果而不是错误。
+   */
+  reconcileCommand(id: string): Promise<CommandReconcileResult> {
+    return fetch(`${API_BASE}/api/commands/${encodeURIComponent(id)}/reconcile`, {
+      method: 'POST',
+    }).then(json<CommandReconcileResult>);
   },
 
   // ---------------------------------------------------------------- 审计

@@ -1,9 +1,32 @@
-import type { JiraClient, JiraIssue } from '../jira/client.js';
+import type { JiraChangelogResponse, JiraClient, JiraComment, JiraIssue } from '../jira/client.js';
 import type {
+  ExternalOperationQuery,
   ExternalWorkRef,
   ExternalWorkSummary,
   WorkManagementProvider,
 } from './types.js';
+import type { ExternalOperationOutcome } from './outcome.js';
+
+/**
+ * 打在 Jira 评论正文里的操作标记。
+ *
+ * ── 为什么是正文里的一行文本 ────────────────────────────────────────
+ *
+ * Jira v3 的评论正文是 ADF，而 ADF **没有**「不可见节点」这种东西。理论上的
+ * 替代是 comment properties（`POST /comment` 的 `properties` 字段），但读它要
+ * 再走一次 `GET /comment/{id}/properties` —— 而那要求你**已经知道是哪条评论**。
+ * 对账要回答的恰恰是「哪一条是我发的」，这是个先有鸡还是先有蛋的问题。
+ *
+ * 所以标记写在正文里。代价是它在渲染出来的评论里也会显示一行；换来的是
+ * 「哪条评论来自平台」在**原始文本里永远查得到**，不依赖额外接口，也不依赖
+ * 任何只有我们才知道的本地状态。
+ *
+ * 格式固定成 `<!-- copilot-operation:<id> -->`：HTML 注释的样子让人一眼看出
+ * 它是机器写的，不是人写的正文。
+ */
+export function operationMarker(operationId: string): string {
+  return `<!-- copilot-operation:${operationId} -->`;
+}
 
 /**
  * Jira 的 WorkManagementProvider 实现（REST 传输）。
@@ -144,6 +167,172 @@ export class JiraProvider implements WorkManagementProvider {
     }));
   }
 
+  /**
+   * 对账 —— 「这一笔到底做了没有」。
+   *
+   * 两类动作的痕迹不同，所以分开处理：评论在正文里留了标记（可以直接找），
+   * 流转只在变更历史里留了一行（要按时间和目标状态推断）。
+   *
+   * 两个分支都遵守同一条纪律：**`completed` 只能来自找到痕迹**，读失败一律
+   * 报 `unknown`（而不是「查不到 = 没发生」）—— 后者的下一步是重试，而重试
+   * 的代价是重复副作用。
+   */
+  async reconcileOperation(query: ExternalOperationQuery): Promise<ExternalOperationOutcome> {
+    switch (query.action) {
+      case 'jira.add_comment':
+        return this.reconcileComment(query);
+      case 'jira.transition_issue':
+        return this.reconcileTransition(query);
+      default:
+        return {
+          status: 'unknown',
+          detail: `Jira Provider 不知道怎么对账 action=${query.action}`,
+        };
+    }
+  }
+
+  /**
+   * 评论对账：在一张工单的全部评论里找这一笔的操作标记。
+   *
+   * ── 为什么「找不到」可以判 failed ────────────────────────────────────
+   *
+   * 因为这次读是**穷尽**的（`listComments` 翻完所有页），而 Jira 的评论读对
+   * 同一个账号是读己之写一致的。所以「全部评论都读过，没有这个标记」是一条
+   * 关于外部世界的直接观测，不是推断。
+   *
+   * 反过来说，如果这里只读第一页，结论就会反过来变成灾难：一张评论很多的
+   * 工单上，我们那条排在后面 → 报 failed → 人去重试 → 第二条评论。
+   */
+  private async reconcileComment(
+    query: ExternalOperationQuery,
+  ): Promise<ExternalOperationOutcome> {
+    const marker = operationMarker(query.operationId);
+
+    let comments: JiraComment[];
+    try {
+      comments = await this.client.listComments(query.target);
+    } catch (error) {
+      return {
+        status: 'unknown',
+        detail: `读 ${query.target} 的评论失败，无法对账：${describeError(error)}`,
+      };
+    }
+
+    const hit = comments.find((comment) => (jiraDescriptionText(comment.body) ?? '').includes(marker));
+    if (hit) {
+      return {
+        status: 'completed',
+        detail: `在 ${query.target} 的评论 ${hit.id} 里找到本次操作标记`,
+      };
+    }
+
+    return {
+      status: 'failed',
+      detail: `读过 ${query.target} 的全部 ${comments.length} 条评论，没有本次操作标记（${query.operationId}）`,
+    };
+  }
+
+  /**
+   * 流转对账：在变更历史里找时间窗内的状态变更。
+   *
+   * ── 为什么不能只看「当前状态是不是目标状态」 ─────────────────────────
+   *
+   * 因为那张单**本来就可能**处在目标状态 —— 别人在我们之前刚把它流转过去，
+   * 或者它一直就在那里。只看当前状态会把这两种情况都报成「我们成功了」，而
+   * 我们的那次写入其实被 Jira 拒绝了（transition 不合法）。
+   *
+   * ── 为什么目标状态可能解析不出来 ────────────────────────────────────
+   *
+   * `GET /transitions` 返回的是**当前可用**的流转。一次成功的流转之后，我们用
+   * 的那个 transition 通常就不在可用列表里了 —— 也就是说「解析不出来」恰恰是
+   * 成功之后最常见的样子。所以解析不出来时退回「时间窗内任何一次状态变更」，
+   * 并在说明里带上观察到的 from → to，让人能自己核。
+   */
+  private async reconcileTransition(
+    query: ExternalOperationQuery,
+  ): Promise<ExternalOperationOutcome> {
+    const transitionId =
+      typeof query.args.transitionId === 'string' ? query.args.transitionId : null;
+    if (!transitionId) {
+      return {
+        status: 'unknown',
+        detail: 'Command 上没有 transitionId，无法确定这次流转的目标状态',
+      };
+    }
+
+    // 目标状态是**尽力**解析，解析不出来不算失败（见上面的说明）。
+    let targetStatus: string | null = null;
+    try {
+      const transitions = await this.listTransitions(this.ref({ key: query.target }));
+      targetStatus = transitions.find((item) => item.id === transitionId)?.to ?? null;
+    } catch {
+      targetStatus = null;
+    }
+
+    let changelog: JiraChangelogResponse;
+    try {
+      changelog = await this.client.getIssueChangelog(query.target);
+    } catch (error) {
+      return {
+        status: 'unknown',
+        detail: `读 ${query.target} 的变更历史失败，无法对账：${describeError(error)}`,
+      };
+    }
+
+    const histories = changelog.changelog?.histories ?? [];
+    const since = Date.parse(query.attemptStartedAt);
+
+    /** 变更历史里所有「把状态改到某个值」的条目，且发生在时间窗内。 */
+    const statusChanges = histories
+      .map((history) => {
+        const item = (history.items ?? []).find((candidate) => candidate.field === 'status');
+        if (!item) return null;
+        // 时间戳解析不出来时**不**排除这条 —— 宁可多一条候选（可能落到
+        // unknown）也不要因为一个格式问题把证据丢掉。
+        if (Number.isFinite(since) && Number.isFinite(Date.parse(history.created))) {
+          if (Date.parse(history.created) < since) return null;
+        }
+        return { history, to: item.toString ?? null, from: item.fromString ?? null };
+      })
+      .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
+
+    const matches = targetStatus
+      ? statusChanges.filter((entry) => entry.to === targetStatus)
+      : statusChanges;
+
+    if (matches.length === 1) {
+      const [match] = matches;
+      return {
+        status: 'completed',
+        detail:
+          `变更历史 ${match.history.id}（${match.history.created}）把 ${query.target} ` +
+          `从 ${match.from ?? '?'} 转到 ${match.to ?? '?'}` +
+          (targetStatus ? '' : `（transitionId=${transitionId} 当前不可用，目标状态未能独立核对）`),
+      };
+    }
+
+    if (matches.length === 0) {
+      return {
+        status: 'failed',
+        detail:
+          `读过 ${query.target} 的变更历史（${histories.length} 条），` +
+          `${query.attemptStartedAt} 之后没有` +
+          (targetStatus ? `到 ${targetStatus} 的` : '任何') +
+          '状态变更',
+      };
+    }
+
+    // 多于一條：无法确定哪一次是我们做的。如实说不知道 —— 猜一个方向都比
+    // unknown 更糟（猜成功没人去查，猜失败会重试）。
+    return {
+      status: 'unknown',
+      detail:
+        `时间窗内有 ${matches.length} 次状态变更` +
+        (targetStatus ? `到 ${targetStatus}` : '') +
+        '，无法确定哪一次是本次操作，需要人工核对',
+    };
+  }
+
   private browseUrl(key: string): string {
     return `${this.baseUrl.replace(/\/$/, '')}/browse/${encodeURIComponent(key)}`;
   }
@@ -250,4 +439,9 @@ function normalizeJiraText(value: string): string | null {
     .replace(/\n{3,}/g, '\n\n')
     .trim();
   return text || null;
+}
+
+/** 对账的说明里带上错误原文 —— 这一层不解释错误，只保证它不丢。 */
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

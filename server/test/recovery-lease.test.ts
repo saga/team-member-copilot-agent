@@ -19,12 +19,23 @@ import path from 'node:path';
  *
  * 第二个容易写错的地方是**静默失败**：SQLite 的 upsert 在 WHERE 不成立时是
  * 静默不更新（不抛异常），只看异常会把「没抢到」当成「抢到了」。所以 claim
- * 必须返回 `changes === 1`，这里逐条验证。
+ * 返回的是 `LeaseGrant | null`，null 才是「没抢到」。
+ *
+ * ── fencing token：这一组用例的重心 ─────────────────────────────────
+ *
+ * 「租约」只回答「**现在**谁可以跑」，回答不了「刚才那个以为自己还在跑的进程
+ * 能不能把结果写回来」。后者才是真正会造成伤害的那件事：
+ *
+ *   A 拿到租约 → 假死 → TTL 到期 → B 接手 → A 醒来，继续写回
+ *
+ * 只按 id 做条件更新挡不住它（id 没变，A 眼里 lease_owner 还是自己）。所以
+ * 每次重新夺取时 `fencing_token` 递增，所有写回都带上它。下面逐条验证：
+ * 递增、旧代次的 heartbeat 失效、旧代次不能 release 掉新代次。
  *
  * ── 为什么还要测 RecoveryService ─────────────────────────────────────
  *
- * 租约只在恢复流程里才有意义。单进程时「running 的 execution」必然属于刚崩掉
- * 的自己，全部标 interrupted 是对的；多副本时那个前提不成立 —— 一起打掉等于
+ * 租约只在恢复流程里才有意义。单进程时「running 的 execution」必然属于刚崩掉的
+ * 自己，全部标 interrupted 是对的；多副本时那个前提不成立 —— 一起打掉等于
  * 把别人的活干掉，而它自己还不知道，会继续跑完然后写进一条已经中断的记录里。
  */
 
@@ -39,6 +50,7 @@ const { RecoveryService, LEASE_RESOURCE_EXECUTION } = await import('../recovery-
 const { ConversationMemberService } = await import('../conversation-member-service.js');
 const { createTestStack, StubCopilot } = await import('./support.js');
 import type { CopilotService } from '../copilot.js';
+import type { LeaseGrant } from '../worker-lease.js';
 
 after(() => {
   db.close();
@@ -50,6 +62,17 @@ function worker(ttlMs = 30_000): InstanceType<typeof WorkerLeaseService> {
   return new WorkerLeaseService(db, ttlMs);
 }
 
+/** 抢到，抢不到就 fail。大多数用例只关心「抢到之后的凭证」。 */
+function mustClaim(
+  service: InstanceType<typeof WorkerLeaseService>,
+  resourceType: string,
+  resourceId: string,
+): LeaseGrant {
+  const grant = service.claim(resourceType, resourceId);
+  assert.ok(grant, `必须抢到 ${resourceType}/${resourceId}`);
+  return grant;
+}
+
 /** 把租约行直接写成「已过期」——比 sleep 一个 TTL 稳定得多。 */
 function forceExpire(resourceType: string, resourceId: string): void {
   db.prepare(
@@ -57,13 +80,22 @@ function forceExpire(resourceType: string, resourceId: string): void {
   ).run(new Date(Date.now() - 60_000).toISOString(), resourceType, resourceId);
 }
 
+/** 读库里的当前代次 —— 用来验证 fencing_token 的单调递增。 */
+function tokenOf(resourceType: string, resourceId: string): number {
+  const row = db
+    .prepare(`SELECT fencing_token FROM worker_lease WHERE resource_type = ? AND resource_id = ?`)
+    .get(resourceType, resourceId) as { fencing_token: number } | undefined;
+  assert.ok(row, `租约行必须存在：${resourceType}/${resourceId}`);
+  return row.fencing_token;
+}
+
 describe('Worker Lease：同一资源上只有一个 owner', () => {
   it('A 拿到之后 B 抢不到（未过期）', () => {
     const a = worker();
     const b = worker();
 
-    assert.equal(a.claim('execution', 'exec-1'), true, '第一个必须拿到');
-    assert.equal(b.claim('execution', 'exec-1'), false, '未过期时第二个必须抢不到');
+    assert.ok(a.claim('execution', 'exec-1'), '第一个必须拿到');
+    assert.equal(b.claim('execution', 'exec-1'), null, '未过期时第二个必须抢不到');
     assert.equal(a.isHeld('execution', 'exec-1'), true);
     assert.equal(a.owner === b.owner, false, '两个实例必须是两个身份');
   });
@@ -76,38 +108,41 @@ describe('Worker Lease：同一资源上只有一个 owner', () => {
     forceExpire('execution', 'exec-2');
 
     assert.equal(b.isHeld('execution', 'exec-2'), false, '过期就不再算持有');
-    assert.equal(b.claim('execution', 'exec-2'), true, '过期租约必须能被抢');
+    assert.ok(b.claim('execution', 'exec-2'), '过期租约必须能被抢');
   });
 
   it('A 续租之后 B 抢不到（heartbeat 只续自己的）', () => {
     const a = worker();
     const b = worker();
 
-    a.claim('execution', 'exec-3');
+    const grant = mustClaim(a, 'execution', 'exec-3');
     // 先让它接近过期，再续租 —— 否则「续租生效」和「本来就没过期」分不开。
     forceExpire('execution', 'exec-3');
-    a.heartbeat('execution', 'exec-3');
+    assert.equal(a.heartbeat(grant), true, '自己的这一代必须续得上');
 
     assert.equal(a.isHeld('execution', 'exec-3'), true, '续租之后必须重新有效');
-    assert.equal(b.claim('execution', 'exec-3'), false, '续过租的不能被抢');
+    assert.equal(b.claim('execution', 'exec-3'), null, '续过租的不能被抢');
   });
 
   it('A 释放之后 B 能接手', () => {
     const a = worker();
     const b = worker();
 
-    a.claim('execution', 'exec-4');
-    a.release('execution', 'exec-4');
+    const grant = mustClaim(a, 'execution', 'exec-4');
+    a.release(grant);
 
-    assert.equal(b.claim('execution', 'exec-4'), true);
+    assert.ok(b.claim('execution', 'exec-4'));
   });
 
-  it('B 释放不掉 A 的租约（release 只删自己的）', () => {
+  it('B 释放不掉 A 的租约（release 只删自己的那一代）', () => {
     const a = worker();
     const b = worker();
 
-    a.claim('execution', 'exec-5');
-    b.release('execution', 'exec-5');
+    const aGrant = mustClaim(a, 'execution', 'exec-5');
+    // B 手里没有 A 的凭证。退一步说，就算它拿一个「资源键对得上、owner 是自己」
+    // 的凭证去删，SQL 里的 owner 条件也会让它命中 0 行 —— 替别人解锁会让两个
+    // 进程都以为自己在跑。
+    b.release({ ...aGrant, owner: b.owner });
 
     assert.equal(a.isHeld('execution', 'exec-5'), true, '替别人解锁会让两个进程都以为自己在跑');
   });
@@ -116,31 +151,119 @@ describe('Worker Lease：同一资源上只有一个 owner', () => {
     const a = worker();
     const b = worker();
 
-    a.claim('execution', 'exec-6');
+    const aGrant = mustClaim(a, 'execution', 'exec-6');
     forceExpire('execution', 'exec-6');
-    b.heartbeat('execution', 'exec-6');
 
+    // B 手里根本没有 A 的凭证（`myGrant` 是 null）。退一步说，就算它拿一个
+    // 「资源键对得上、owner 是自己的」的凭证去续，SQL 里的 owner 条件也会让
+    // 它命中 0 行 —— 这正是 owner 条件不能省的理由。
+    assert.equal(b.heldByMe('execution', 'exec-6'), false, 'B 没有这一代');
+    assert.equal(
+      b.heartbeat({ ...aGrant, owner: b.owner }),
+      false,
+      'owner 对不上就不能续',
+    );
     assert.equal(a.isHeld('execution', 'exec-6'), false, 'B 的 heartbeat 不该让 A 的租约复活');
   });
 
   it('sweepExpired 只打扫，不影响正确性', () => {
     const a = worker();
-    a.claim('execution', 'exec-7');
+    mustClaim(a, 'execution', 'exec-7');
     forceExpire('execution', 'exec-7');
 
     assert.equal(a.sweepExpired() >= 1, true);
     // 打扫完照样能被抢 —— 过期的租约本来就能被覆盖，清理只是别让表无限长大。
-    assert.equal(worker().claim('execution', 'exec-7'), true);
+    assert.ok(worker().claim('execution', 'exec-7'));
   });
 });
 
 /**
- * `heldByMe` / `runWithLease` —— 嵌套调用不能把自己当成别人。
+ * fencing token —— 重新夺取时代次必须 +1，且旧代次再也写不进去。
+ *
+ * 这是「租约」和「授权」分开的那一半：租约决定谁能跑，fencing 决定旧 worker
+ * 还能不能写。少了它，TTL 内双跑就会从「最多多打一次外部请求」升级成
+ * 「两条记录互相覆盖」。
+ */
+describe('fencing token：重新夺取递增，旧代次失效', () => {
+  it('第一次取得是 1，重新夺取 +1，代次严格单调', () => {
+    const a = worker();
+
+    const first = mustClaim(a, 'execution', 'fence-1');
+    assert.equal(first.fencingToken, 1, '第一次取得必须是 1');
+
+    // 同一个进程重新 claim 自己的**过期**租约 —— 同样是「重新夺取」。
+    forceExpire('execution', 'fence-1');
+    const second = mustClaim(a, 'execution', 'fence-1');
+    assert.equal(second.fencingToken, 2, '重新夺取必须 +1');
+    assert.equal(tokenOf('execution', 'fence-1'), 2);
+
+    // 另一个进程接手 —— 继续 +1。
+    forceExpire('execution', 'fence-1');
+    const third = mustClaim(worker(), 'execution', 'fence-1');
+    assert.equal(third.fencingToken, 3, '换一个 owner 接手也要 +1');
+  });
+
+  it('旧代次的 heartbeat 命中 0 行（返回值必须是 false，不是抛异常）', () => {
+    const a = worker();
+    const oldGrant = mustClaim(a, 'execution', 'fence-2');
+
+    forceExpire('execution', 'fence-2');
+    const newGrant = mustClaim(worker(), 'execution', 'fence-2');
+    assert.equal(newGrant.fencingToken, oldGrant.fencingToken + 1);
+
+    // 旧持有者醒来，继续心跳 —— 必须失败。它不失败的话会把新持有者的 TTL
+    // 往后推，两边都不过期。
+    assert.equal(a.heartbeat(oldGrant), false, '旧代次必须续不上');
+    assert.equal(worker().heartbeat(newGrant), true, '新代次必须续得上');
+  });
+
+  it('assertHeld：代次被替换后抛 LeaseLostError', async () => {
+    const a = worker();
+    const staleGrant = mustClaim(a, 'execution', 'fence-3');
+
+    assert.doesNotThrow(() => a.assertHeld(staleGrant), '还在手里时必须通过');
+
+    forceExpire('execution', 'fence-3');
+    const freshGrant = mustClaim(worker(), 'execution', 'fence-3');
+
+    const { LeaseLostError } = await import('../worker-lease.js');
+    assert.throws(() => a.assertHeld(staleGrant), LeaseLostError, '被夺走之后必须抛');
+    assert.doesNotThrow(() => worker().assertHeld(freshGrant), '新持有者必须通过');
+  });
+
+  it('assertHeld：租约还在自己名下但**已经过期**同样抛', () => {
+    const a = worker();
+    const grant = mustClaim(a, 'execution', 'fence-4');
+    forceExpire('execution', 'fence-4');
+
+    // 「过期」和「被抢」都要挡：过期意味着别人随时会接手，此时继续写就是在
+    // 制造双写。判据比 heartbeat 更严，正是这一点。
+    assert.throws(() => a.assertHeld(grant), /租约已失效/);
+  });
+
+  it('旧代次 release 不掉新代次（否则新持有者的锁会被别人解掉）', () => {
+    const a = worker();
+    const staleGrant = mustClaim(a, 'execution', 'fence-5');
+
+    forceExpire('execution', 'fence-5');
+    const freshGrant = mustClaim(worker(), 'execution', 'fence-5');
+
+    a.release(staleGrant);
+    assert.equal(worker().isHeld('execution', 'fence-5'), true, '新代次必须还在');
+    assert.equal(worker().heldByMe('execution', 'fence-5'), false, '但它不属于 a');
+    // 新持有者自己释放 —— 这时才真的空出来。
+    new WorkerLeaseService(db).release(freshGrant);
+    assert.equal(worker().isHeld('execution', 'fence-5'), false);
+  });
+});
+
+/**
+ * `heldByMe` / `myGrant` / `runWithLease` —— 嵌套调用不能把自己当成别人。
  *
  * ── 这一组在锁的东西 ─────────────────────────────────────────────────
  *
  * `claim()` 的 WHERE 是 `lease_expires_at < ?`，所以它对**自己**未过期的租约
- * 同样返回 false。这不是 bug，是「抢」这个动作的定义：已经归我了就没有可抢的。
+ * 同样返回 null。这不是 bug，是「抢」这个动作的定义：已经归我了就没有可抢的。
  *
  * 但调用链是嵌套的：SchedulerService 在启动 execution 前抢一次，它调用的
  * runScheduledExecution → executeMemberTurn 里还会再抢一次。没有 `heldByMe`
@@ -151,10 +274,10 @@ describe('Worker Lease：同一资源上只有一个 owner', () => {
  * 内层如果在 finally 里 release，等于外层还在跑就把资源让出去了。
  */
 describe('runWithLease：嵌套调用与自己抢占', () => {
-  it('claim 对自己的未过期租约返回 false —— 这正是 heldByMe 存在的理由', () => {
+  it('claim 对自己的未过期租约返回 null —— 这正是 heldByMe 存在的理由', () => {
     const a = worker();
-    assert.equal(a.claim('execution', 'nest-0'), true);
-    assert.equal(a.claim('execution', 'nest-0'), false, '已经归我了，没有可抢的');
+    assert.ok(a.claim('execution', 'nest-0'));
+    assert.equal(a.claim('execution', 'nest-0'), null, '已经归我了，没有可抢的');
     assert.equal(a.heldByMe('execution', 'nest-0'), true, '但它确实是我的');
   });
 
@@ -174,12 +297,15 @@ describe('runWithLease：嵌套调用与自己抢占', () => {
     assert.equal(a.heldByMe('execution', 'nest-2'), false);
   });
 
-  it('嵌套 runWithLease：内层照跑，且不释放外层的租约', async () => {
+  it('嵌套 runWithLease：内层照跑，拿到**同一个** grant，且不释放外层', async () => {
     const a = worker();
     let innerRan = false;
+    const seen: number[] = [];
 
-    const outer = await a.runWithLease('execution', 'nest-3', async () => {
-      const inner = await a.runWithLease('execution', 'nest-3', async () => {
+    const outer = await a.runWithLease('execution', 'nest-3', async (grant) => {
+      seen.push(grant.fencingToken);
+      const inner = await a.runWithLease('execution', 'nest-3', async (g) => {
+        seen.push(g.fencingToken);
         innerRan = true;
         return 'inner';
       });
@@ -194,6 +320,9 @@ describe('runWithLease：嵌套调用与自己抢占', () => {
 
     assert.equal(outer.ran, true);
     assert.equal(innerRan, true);
+    // 同一个代次：内层的写回也因此被同一把 fencing 保护。
+    assert.equal(seen.length, 2, '外层与内层各拿一次 grant');
+    assert.equal(seen[0], seen[1], '内层必须拿到外层的同一代次');
     assert.equal(a.heldByMe('execution', 'nest-3'), false, '最外层退出后才释放');
   });
 
@@ -238,7 +367,45 @@ describe('runWithLease：嵌套调用与自己抢占', () => {
     );
 
     assert.equal(a.heldByMe('execution', 'nest-5'), false, '异常路径同样走 finally');
-    assert.equal(worker().claim('execution', 'nest-5'), true);
+    assert.ok(worker().claim('execution', 'nest-5'));
+  });
+
+  it('心跳失败时 onLeaseLost 只触发一次', async () => {
+    // TTL 1s、心跳间隔下限也是 1s —— 让心跳尽快跑到。
+    const a = new WorkerLeaseService(db, 1_000);
+    let lostCount = 0;
+    let releaseFn!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseFn = resolve;
+    });
+
+    const running = a.runWithLease(
+      'execution',
+      'nest-6',
+      async () => {
+        await gate;
+      },
+      {
+        onLeaseLost: () => {
+          lostCount += 1;
+        },
+      },
+    );
+
+    // 模拟「假死之后被别人接手」：代次 +1、owner 换掉。之后每一次心跳都会
+    // 命中 0 行 —— 而且会**一直**失败，正是这里要验的重复触发。
+    db.prepare(
+      `UPDATE worker_lease SET fencing_token = fencing_token + 1, lease_owner = 'other'
+       WHERE resource_type = ? AND resource_id = ?`,
+    ).run('execution', 'nest-6');
+
+    await new Promise((resolve) => setTimeout(resolve, 1_600)); // 第一次心跳
+    await new Promise((resolve) => setTimeout(resolve, 1_200)); // 第二次心跳
+
+    assert.equal(lostCount, 1, '重复触发只会把日志淹没在一堆同样的告警里');
+
+    releaseFn();
+    await running;
   });
 
   it('心跳间隔默认取 TTL 的三分之一，且不低于 1s', () => {

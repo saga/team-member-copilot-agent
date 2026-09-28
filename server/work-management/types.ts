@@ -45,6 +45,8 @@
  * 恢复、审计。这些必须确定性、可复现、不依赖模型愿不愿意调工具。
  */
 
+import type { ExternalOperationOutcome } from './outcome.js';
+
 /** 已接入的外部工作系统。加一家就加一个取值 + 一个 Provider 实现。 */
 export type WorkProviderId = 'jira';
 
@@ -98,6 +100,44 @@ export interface ExternalWorkSummary {
    * Jira 会填充；其它 Provider 可以不填。
    */
   description?: string | null;
+}
+
+/**
+ * 一次**对账**的输入：拿这些去外部系统问「这一笔动作到底做了没有」。
+ *
+ * ── 为什么需要「问外部系统」而不是本地猜 ──────────────────────────────
+ *
+ * 一次外部写入的结果有三种，而不是两种：
+ *
+ *   completed  确认发生了
+ *   failed     确认没发生
+ *   unknown    请求发出去了，但没能确认对方有没有处理（超时 / reset / 5xx）
+ *
+ * `unknown` 只能靠**读外部系统的真实状态**来收敛。本地没有任何办法区分
+ * 「服务端没收到」和「服务端收到了但回包丢了」—— 那正是 5xx 的定义。
+ * 猜一个方向都比 `unknown` 更糟：猜成功 → 没人去查；猜失败 → 重试产生
+ * 第二次副作用。
+ */
+export interface ExternalOperationQuery {
+  /**
+   * 这一笔外部业务动作的身份。执行器把它**打在外部系统上**（Jira 评论正文里的
+   * 操作标记），对账靠它在一堆同类记录里认出「哪一条是我发的」。
+   */
+  operationId: string;
+  /** 哪一类动作（`jira.add_comment` / `jira.transition_issue`）。 */
+  action: string;
+  /** 资源 id（Jira：issue key）。 */
+  target: string;
+  /** 执行时用的**冻结**参数 —— 对账要复现「当时想做的是哪一笔」。 */
+  args: Record<string, unknown>;
+  /**
+   * 那次尝试是什么时候开始的（ISO）。
+   *
+   * 只用于**时间窗**：外部系统的变更历史里可能有更早的、同一个人做的同类动作
+   * （昨天也把这张单流转到 In Review 过）。没有下界就会把旧的那次认成这一笔，
+   * 于是报告「已完成」，而这次的写入其实根本没发生。
+   */
+  attemptStartedAt: string;
 }
 
 /**
@@ -204,6 +244,27 @@ export interface WorkManagementProvider extends WorkRefFactory {
    * 试错就能挑对 id，本地仍然不持有状态机。
    */
   listTransitions?(ref: ExternalWorkRef): Promise<Array<{ id: string; name: string; to: string | null }>>;
+
+  /**
+   * 可选：**对账** —— 去外部系统查「这一笔动作到底做了没有」。
+   *
+   * ── 为什么它是 Provider 的职责 ──────────────────────────────────────
+   *
+   * 只有 Provider 知道「一笔写入在它的世界里留下什么痕迹」：Jira 的评论正文、
+   * 变更历史、字段版本；换成别的系统可能是别的形状。把这件事放在 Provider
+   * 之外，等于让上层去猜每种外部系统的痕迹长什么样。
+   *
+   * ── 返回 unknown 是**合法且常见**的结论 ─────────────────────────────
+   *
+   * 对账本身也可能失败（网络又断了、没有权限读评论）。这时必须如实说
+   * `unknown`，而不是「查不到就当没发生」—— 后者的下一步是重试，而重试的
+   * 代价是重复副作用。`completed` 只能来自「在外部系统里找到了这一笔的痕迹」，
+   * 永远不能靠推断。
+   *
+   * 不实现这个方法时，上层把该动作的对账结论记成「无法对账」（仍然是
+   * `unknown`），而不是「失败」。
+   */
+  reconcileOperation?(query: ExternalOperationQuery): Promise<ExternalOperationOutcome>;
 }
 
 /**

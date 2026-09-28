@@ -18,6 +18,7 @@ import {
 import type { ColumnsType } from 'antd/es/table';
 import { api } from '../../lib/api';
 import type {
+  CommandAttemptStatus,
   CommandAuditEvent,
   CommandDetail,
   CommandRecord,
@@ -53,6 +54,9 @@ const STATUS_META: Record<CommandStatus, { label: string; color: string }> = {
   executing: { label: '执行中', color: 'processing' },
   completed: { label: '已完成', color: 'green' },
   failed: { label: '失败', color: 'red' },
+  // 不是 failed：failed 是「确认没发生」，可以重试；unknown 是「可能已经发生」，
+  // 重试就是重复副作用。用橙色而不是红色，是因为它需要的是**看一眼**，不是「出事了」。
+  unknown: { label: '结果未知', color: 'orange' },
   rejected: { label: '已驳回', color: 'red' },
   cancelled: { label: '已取消', color: 'default' },
   expired: { label: '已过期', color: 'default' },
@@ -67,14 +71,31 @@ const EVENT_LABEL: Record<CommandAuditEvent, string> = {
   executing: '开始执行',
   completed: '执行完成',
   failed: '执行失败',
+  unknown: '结果未知',
 };
 
 /** 生命周期里「不是好事」的事件，时间轴上用红点。 */
-const BAD_EVENTS = new Set<CommandAuditEvent>(['rejected', 'failed']);
+const BAD_EVENTS = new Set<CommandAuditEvent>(['rejected', 'failed', 'unknown']);
 
-/** 收件箱的三个分页。按状态查，不按 execution 查 —— 见 api.ts 的注释。 */
+/** 一次尝试的结果 → 展示。 */
+const ATTEMPT_META: Record<CommandAttemptStatus, { label: string; color: string }> = {
+  running: { label: '执行中', color: 'processing' },
+  succeeded: { label: '成功', color: 'green' },
+  failed: { label: '失败', color: 'red' },
+  // 「未知」不是「失败」：失败能重试，未知不能。
+  unknown: { label: '未知', color: 'orange' },
+};
+
+/**
+ * 收件箱的分页。按状态查，不按 execution 查 —— 见 api.ts 的注释。
+ *
+ * `unknown` 单独一页是刻意的：它是一条**必须有人看一眼**的状态（有一笔外部写入
+ * 我们不知道做没做），而它既不属于「已完成」也不属于「已驳回」。塞进任何一页
+ * 都会让人以为事情已经了结。
+ */
 const INBOX_TABS: Array<{ key: CommandStatus; label: string }> = [
   { key: 'policy_pending', label: '待审批' },
+  { key: 'unknown', label: '结果未知' },
   { key: 'completed', label: '已完成' },
   { key: 'rejected', label: '已驳回' },
 ];
@@ -116,7 +137,7 @@ export function ApprovalsPage() {
    * （approve 默认连执行一起做），本地改一个 status 字段会显示出一个服务端
    * 从没承认过的中间态。抽屉里的详情也一并刷新，因为它的 audit 数组变了。
    */
-  async function act(id: string, action: 'approve' | 'reject' | 'execute') {
+  async function act(id: string, action: 'approve' | 'reject' | 'execute' | 'reconcile') {
     setBusyId(id);
     try {
       const updated =
@@ -124,12 +145,26 @@ export function ApprovalsPage() {
           ? await api.approveCommand(id)
           : action === 'reject'
             ? await api.rejectCommand(id)
-            : await api.executeCommand(id);
+            : action === 'reconcile'
+              ? await api.reconcileCommand(id)
+              : await api.executeCommand(id);
       setDetail(updated);
       await load(status);
-      message.success(
-        action === 'approve' ? '已批准' : action === 'reject' ? '已驳回' : '已执行',
-      );
+      // 对账的提示要说结论，不能说「成功」：`unknown` 是**合法**结论（对账自己
+      // 也没读到），而把它显示成成功会让人以为事情已经了结。
+      if (action === 'reconcile') {
+        const outcome = (updated as { outcome?: { status: string; detail?: string | null } })
+          .outcome;
+        message.info(
+          outcome
+            ? `对账结论：${outcome.status}${outcome.detail ? ` —— ${outcome.detail}` : ''}`
+            : '对账完成',
+        );
+      } else {
+        message.success(
+          action === 'approve' ? '已批准' : action === 'reject' ? '已驳回' : '已执行',
+        );
+      }
     } catch (err) {
       // 冲突（409）在这里是**预期**的：另一个人先批了 / 执行者已经接手。
       // 所以不弹「失败」，而是把服务端的原话显示出来并刷新列表 ——
@@ -276,7 +311,11 @@ export function ApprovalsPage() {
                 <Empty
                   image={Empty.PRESENTED_IMAGE_SIMPLE}
                   description={
-                    status === 'policy_pending' ? '没有待审批的外部写入' : '这里还是空的'
+                    status === 'policy_pending'
+                      ? '没有待审批的外部写入'
+                      : status === 'unknown'
+                        ? '没有结果未知的外部写入'
+                        : '这里还是空的'
                   }
                 />
               ),
@@ -305,9 +344,9 @@ function CommandDetailView({
 }: {
   detail: CommandDetail;
   busyId: string | null;
-  onAct: (id: string, action: 'approve' | 'reject' | 'execute') => Promise<void>;
+  onAct: (id: string, action: 'approve' | 'reject' | 'execute' | 'reconcile') => Promise<void>;
 }) {
-  const { command, approval, audit } = detail;
+  const { command, approval, audit, attempts } = detail;
 
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
@@ -334,6 +373,25 @@ function CommandDetailView({
           </Typography.Text>
         </Descriptions.Item>
       </Descriptions>
+
+      {/*
+        `unknown` 不给任何操作按钮 —— 这是刻意的。它不是「失败」，所以没有
+        「重试」；它也不是「待审批」，所以没有「批准」。这里唯一正确的下一步是
+        对账（确认外部系统到底做没做），而那一步还没有入口。给一个看起来能解决
+        问题的按钮，只会让人用它去做那个恰恰会产生重复副作用的动作。
+      */}
+      {command.status === 'unknown' && (
+        <Alert
+          type="warning"
+          showIcon
+          message="这笔外部写入的结果未知"
+          description={
+            '请求已经发出，但没能确认外部系统是否处理了它（超时 / 连接重置 / 5xx）。' +
+            '它和「失败」不是一回事：失败是确认没发生、可以直接重试；这里是**可能已经发生**，' +
+            '重试会产生第二次副作用。需要先对账确认它到底做没做。'
+          }
+        />
+      )}
 
       {/* 参数是审批的核心：人批的就是这一份。 */}
       <div>
@@ -406,6 +464,51 @@ function CommandDetailView({
             导出这一轮 execution 的审计（JSON）
           </Button>
         </Space>
+      </div>
+
+      <div>
+        <Typography.Title level={5}>执行尝试</Typography.Title>
+        {attempts.length === 0 ? (
+          <Typography.Text type="secondary">
+            还没有真正打出去过 —— 它停在审批，或者在碰外部系统之前就被挡下了。
+          </Typography.Text>
+        ) : (
+          <Table
+            rowKey="id"
+            size="small"
+            pagination={false}
+            dataSource={attempts}
+            columns={[
+              { title: '第几次', dataIndex: 'attemptNo', width: 72 },
+              {
+                title: '结果',
+                dataIndex: 'status',
+                width: 96,
+                render: (value: CommandAttemptStatus) => (
+                  <Tag color={ATTEMPT_META[value].color}>{ATTEMPT_META[value].label}</Tag>
+                ),
+              },
+              {
+                title: '开始',
+                dataIndex: 'startedAt',
+                width: 170,
+                render: (value: string) => formatTime(value),
+              },
+              {
+                title: '说明',
+                dataIndex: 'error',
+                render: (value: string | null) =>
+                  value ? (
+                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                      {value}
+                    </Typography.Text>
+                  ) : (
+                    '—'
+                  ),
+              },
+            ]}
+          />
+        )}
       </div>
 
       {(command.status === 'policy_pending' ||

@@ -256,6 +256,8 @@ describe('schema 就位（PRAGMA user_version）', () => {
         // executing / completed|failed）—— command 行上只有**当前**状态，
         // 过程在这里。
         'command_audit',
+        // 每一次真正打出去的尝试。「外部结果未知」靠它 + 对账收敛。
+        'command_attempt',
         'worker_lease',
         // 谁可以进这间房（human ACL）。conversation_member 只装 Agent。
         'conversation_participant',
@@ -450,6 +452,9 @@ describe('schema 就位（PRAGMA user_version）', () => {
             'external_work_ref',
             'external_work_snapshot',
             'runtime_id',
+            // 跑这一轮的租约代次（fencing token）。旧 worker 的写回带上它之后
+            // 会命中 0 行 —— 「租约」管谁能跑，「代次」管谁还能写。
+            'worker_fencing_token',
             'parent_execution_id',
             'delegation_path',
             'kind',
@@ -569,6 +574,10 @@ describe('schema 就位（PRAGMA user_version）', () => {
           // 否则「批准时看到的」和「真正执行的」可以是两份。
           'args_json',
           'idempotency_key',
+          // 这一笔**外部业务动作**的身份。它刻意不是 execution_id：retry 会铸出
+          // 一条新的 execution，而「同一笔 Jira 评论」不能因此变成两笔。
+          // UNIQUE + 对账时拿它去外部系统查，见 command-service.ts。
+          'operation_id',
           'resource_version',
           'policy_decision_id',
           'approval_id',
@@ -591,8 +600,24 @@ describe('schema 就位（PRAGMA user_version）', () => {
           'resource_type',
           'resource_id',
           'lease_owner',
+          // 每次重新夺取 +1。持有者拿到它之后，所有写回都带这个条件。
+          'fencing_token',
           'lease_expires_at',
           'heartbeat_at',
+        ],
+        // 每一次真正打出去的尝试。`command` 行上只有**当前**状态，而
+        // 「同一笔动作被尝试了几次、每次结果是什么」必须能查 —— 外部结果
+        // 未知（unknown）时，对账靠的就是这张表。
+        command_attempt: [
+          'id',
+          'command_id',
+          'attempt_no',
+          'operation_id',
+          'status',
+          'started_at',
+          'ended_at',
+          'error',
+          'result_hash',
         ],
         command_audit: [
           'id',
@@ -625,6 +650,8 @@ describe('schema 就位（PRAGMA user_version）', () => {
       assert.deepEqual(indexes, [
         'idx_capability_binding_provider',
         'idx_capability_binding_scope',
+        'idx_command_attempt_command',
+        'idx_command_attempt_operation',
         'idx_command_audit_command',
         'idx_command_execution',
         'idx_conversation_event_replay',

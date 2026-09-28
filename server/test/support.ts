@@ -24,6 +24,7 @@ import type { MemberService } from '../member-service.js';
 import { TeamStructureService } from '../team-structure-service.js';
 import type { WorkManagementRegistry } from '../work-management/types.js';
 import type { EntitlementChecker, EntitlementContext } from '../entitlement-service.js';
+import type { WorkerLeaseService } from '../worker-lease.js';
 
 /**
  * 测试用的能力装配。
@@ -139,6 +140,14 @@ export function createTestStack(
    * 取证安静地拿不到东西，而不是抛错）。
    */
   workManagement?: WorkManagementRegistry,
+  /**
+   * Worker 租约。默认不传 = 单进程语义（照常执行、不抢、不 fence）。
+   *
+   * 传了才进入多副本语义：唤醒按 (conversation, member) 抢租约、execution 按
+   * id 抢租约、每一笔写回带 fencing token。需要验「旧 worker 写不进去」的用例
+   * 必须传 —— 不传的话那条路径根本不会被走到，测试会全绿而保护并不存在。
+   */
+  leases?: WorkerLeaseService,
 ): TestStack {
   let team!: TeamService;
   const stack = createCapabilityStack(db, members, () => team);
@@ -157,6 +166,8 @@ export function createTestStack(
     undefined,
     workManagement,
     stack.conversationFiles,
+    undefined,
+    leases,
   );
   return { ...stack, team, structure, processor };
 }

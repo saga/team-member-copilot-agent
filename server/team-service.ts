@@ -68,7 +68,7 @@ import { ConversationService } from './conversation-service.js';
 import { ExecutionService } from './execution-service.js';
 import { TaskApplicationService } from './task-application-service.js';
 import type { TeamInternals } from './team-internals.js';
-import type { WorkerLeaseService } from './worker-lease.js';
+import type { LeaseGrant, WorkerLeaseService } from './worker-lease.js';
 import { ExecutionCancelledError, mapExecution, mapMessage } from './team-shared.js';
 import type { ConversationRow, ExecutionRow, MessageRow } from './team-shared.js';
 export { ExecutionCancelledError } from './team-shared.js';
@@ -397,7 +397,7 @@ export class TeamService {
     this.tasks = new TaskService(db);
     this.scheduler = new MemberTurnScheduler(
       this.states,
-      (wake, markStarted) => this.runWake(wake, markStarted),
+      (wake, markStarted, grant) => this.runWake(wake, markStarted, grant),
       (wake, error) => {
         // 一轮唤醒失败已经被 runTurn 记进 execution 并广播了，这里只是别让它
         // 变成 unhandled rejection，也不要让调度器的循环静默吞掉。
@@ -1290,8 +1290,12 @@ export class TeamService {
     return this.conversations.setMemberMuted(conversationId, memberId, muted);
   }
 
-  private async runWake(wake: PendingWake, markStarted: () => void): Promise<void> {
-    return this.executions.runWake(wake, markStarted);
+  private async runWake(
+    wake: PendingWake,
+    markStarted: () => void,
+    lease: LeaseGrant | null,
+  ): Promise<void> {
+    return this.executions.runWake(wake, markStarted, lease);
   }
 
   /** conversation 当前 Goal 版本号（单字段快读，给 turn 收尾判新旧用）。 */
@@ -1627,7 +1631,7 @@ export class TeamService {
     const execution = this.findExecution(executionId);
     if (!execution || execution.status !== 'queued') return;
 
-    const outcome = await this.executions.withExecutionLease(executionId, async () => {
+    const outcome = await this.executions.withExecutionLease(executionId, async (grant) => {
       // 抢到租约之后**再确认一次状态**：从上面那次读到这一刻之间，另一个副本
       // 可能已经跑完并释放了租约。不重查就会在一条已经 completed 的记录上再跑
       // 一遍 —— 而「重跑」正是这里最不能发生的事。
@@ -1641,11 +1645,18 @@ export class TeamService {
         // 归档的 Member 不再接活：这条 queued 直接判 interrupted 并说明原因
         member = this.requireActiveMember(conversation, current.memberId);
       } catch (error) {
-        this.updateExecution(executionId, {
-          status: 'interrupted',
-          error: `无法恢复：${error instanceof Error ? error.message : String(error)}`,
-          endedAt: now(),
-        });
+        // 放弃写：带 fencing 提交 —— 若租约在这中间被夺走（另一副本已经接手并
+        // 让这条 execution 跑起来了），这一笔放弃不该把对方的状态顶掉。
+        // 被挡下也不抛：另一副本会自己收口。
+        this.updateExecution(
+          executionId,
+          {
+            status: 'interrupted',
+            error: `无法恢复：${error instanceof Error ? error.message : String(error)}`,
+            endedAt: now(),
+          },
+          grant?.fencingToken ?? null,
+        );
         return;
       }
 
@@ -1658,6 +1669,7 @@ export class TeamService {
           triggerMessageSequence: current.triggerMessageSequence,
           turnMode: this.turnModeFor(conversation, current),
           wakeReason: current.wakeReason,
+          lease: grant,
         });
       } catch (error) {
         // executeMemberTurn 已经把 execution 置为 failed 并广播过，这里只是收口。
@@ -1712,6 +1724,7 @@ export class TeamService {
       externalWorkRef: conversation.externalWorkRef,
       externalWorkSnapshot: null,
       runtimeId: null,
+      workerFencingToken: null,
       parentExecutionId: null,
       delegationPath: [member.id],
       kind: 'member_work',
@@ -1762,13 +1775,31 @@ export class TeamService {
     return execution.id;
   }
 
-  async runScheduledExecution(executionId: string): Promise<void> {
+  /**
+   * 跑一条 scheduled execution。
+   *
+   * `lease` 是调用方（SchedulerService.startExecution）已经抢到并正在心跳的
+   * **execution** 租约凭证。这里刻意**不**再抢一次（不再走 withExecutionLease）：
+   * 租约的心跳必须只有一处 —— 两处心跳各自续期，任何一处失败都不会让这一轮停
+   * 下来，「租约丢了却还在跑」就变成不可观测的了。
+   *
+   * 代次由这里钉到 execution 行上（bindExecutionFencingToken），之后这一轮所有
+   * 写回都带它 —— 旧副本即便复活也写不进去。
+   */
+  async runScheduledExecution(
+    executionId: string,
+    lease: LeaseGrant | null = null,
+  ): Promise<void> {
     const execution = this.getExecution(executionId);
     if (execution.kind !== 'member_work' || execution.wakeReason !== 'schedule') {
       throw badRequest(`不是 scheduled execution：${executionId}`);
     }
     if (execution.status !== 'queued') return;
+    const fencingToken = lease?.fencingToken ?? null;
     try {
+      if (fencingToken !== null) {
+        this.executions.bindExecutionFencingToken(executionId, fencingToken);
+      }
       const conversation = this.getConversation(execution.conversationId);
       const member = this.requireActiveMember(conversation, execution.memberId);
       await this.executeMemberTurn({
@@ -1779,18 +1810,26 @@ export class TeamService {
         triggerMessageSequence: null,
         turnMode: 'lead',
         wakeReason: 'schedule',
+        lease,
       });
     } catch (error) {
       // executeMemberTurn 已经收口 execution 状态，这里不再重写终态，避免二次终态。
       // 开跑前的校验失败（房间没了 / Member 归档）会让 execution 停在 queued，
       // 恢复逻辑每个 tick 都会重派这条注定失败的执行 —— 把它标成 interrupted 断掉重试。
+      //
+      // 带 fencing：若租约已被夺走（另一副本接手并已推进），这一笔「放弃」不该
+      // 把对方的状态顶掉。被挡下不抛 —— 对方会自己收口。
       const current = this.findExecution(executionId);
       if (current && current.status === 'queued') {
-        this.updateExecution(executionId, {
-          status: 'interrupted',
-          error: error instanceof Error ? error.message : String(error),
-          endedAt: now(),
-        });
+        this.updateExecution(
+          executionId,
+          {
+            status: 'interrupted',
+            error: error instanceof Error ? error.message : String(error),
+            endedAt: now(),
+          },
+          fencingToken,
+        );
       }
       // eslint-disable-next-line no-console
       console.error(
@@ -1970,6 +2009,7 @@ export class TeamService {
     triggerMessageSequence: number | null;
     turnMode: TurnMode;
     wakeReason: WakeReason | null;
+    lease?: LeaseGrant | null;
   }): Promise<string> {
     return this.executions.executeMemberTurn(input);
   }
@@ -2022,6 +2062,34 @@ export class TeamService {
     return chooseLeadModel(modelPolicy, leadPurpose);
   }
 
+  /**
+   * 本轮租约的「此刻还属于我吗」断言。租约丢失时抛 `LeaseLostError`。
+   *
+   * 工具路径用它做两道闸（执行前 / 执行后）。它拦不住已经发出去的 HTTP 请求 ——
+   * 那要靠 Command 的 unknown + 对账。这里做的是「不再产生新的副作用」和
+   * 「不再使用可能已经过期的结果」。
+   *
+   * 单进程（lease 为 null）或没有租约服务时返回 undefined：这一层不适用，
+   * 与 `updateExecution` 的 fencingToken 语义一致（null = 不适用，不是「代次 0」）。
+   */
+  private executionGuard(lease: LeaseGrant | null): (() => void) | undefined {
+    if (!lease) return undefined;
+    const leases = this.leases;
+    if (!leases) return undefined;
+    return () => {
+      try {
+        leases.assertHeld(lease);
+      } catch (error) {
+        // 文案要明确：它会被引擎当作工具错误交回模型。含糊的措辞会让模型以为
+        // 是参数问题，换个写法再试一次 —— 而每次重试都可能是一次新的副作用。
+        throw new Error(
+          '本轮执行的租约已失效（另一个 worker 已接手这条 execution），' +
+            `本次调用不再继续，也不要重试：${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    };
+  }
+
   private async runTurn(input: {
     conversation: Conversation;
     member: Member;
@@ -2033,10 +2101,15 @@ export class TeamService {
     turnMode: TurnMode;
     wakeReason: WakeReason | null;
     runtime: MemberRuntime;
+    lease?: LeaseGrant | null;
   }): Promise<string> {
     const runtime = input.runtime;
     const executionId = input.execution.id;
     const startedAt = now();
+    // 本轮的租约代次：null = 单进程（没有租约服务），此时不 fence，与以前一致。
+    // 它只影响**写回条件**，不参与「该不该跑」的判定。
+    const lease = input.lease ?? null;
+    const fencingToken = lease?.fencingToken ?? null;
 
     // 排队期间状态可能被改掉（cancel 直接落库 cancelled；recovery 可能标 interrupted）。
     // 开跑前必须重新确认这条 execution 还该跑 —— 否则一条已取消的 execution 会在
@@ -2048,18 +2121,52 @@ export class TeamService {
       );
     }
 
+    // ── 进 Agent 之前验证租约仍然在手 ────────────────────────────────
+    //
+    // 「抢到租约」和「开始跑 Agent」之间隔着排队 + runtime 锁。等待期间租约可能
+    // 已经过期被别人接手 —— 那时另一个副本正在跑同一件事，本进程必须就地停下，
+    // 而不是把整轮跑完再发现写不回去（写不回去是 fencing 的功劳，但那时外部
+    // 副作用已经发出去了）。
+    //
+    // 用整张凭证断言（而不是「用 executionId 再查一次」）：凭证里带着它自己的
+    // 资源键与代次，wake 租约和 execution 租约因此共用同一条检查。
+    // 没有 lease = 单进程，这一层不适用。
+    if (lease) {
+      const leases = this.leases;
+      if (leases) {
+        try {
+          leases.assertHeld(lease);
+        } catch (error) {
+          throw new ExecutionCancelledError(
+            `execution 租约已失效，不再执行：${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+    }
+
     this.updateRuntime(runtime.id, {
       status: 'running',
       activeExecutionId: executionId,
       lastUsedAt: startedAt,
     });
-    this.updateExecution(executionId, {
-      runtimeId: runtime.id,
-      status: 'running',
-      startedAt,
-      endedAt: null,
-      error: null,
-    });
+    const runningWrite = this.updateExecution(
+      executionId,
+      {
+        runtimeId: runtime.id,
+        status: 'running',
+        startedAt,
+        endedAt: null,
+        error: null,
+      },
+      fencingToken,
+    );
+    // 写回被 fencing 挡下 = 租约在我们开跑前就被夺走了。此时**绝不能继续**：
+    // 下面就是 Agent 与外部副作用，而另一个副本正在跑同一轮。
+    if (!runningWrite) {
+      throw new ExecutionCancelledError(
+        'execution 的租约代次已被替换（fencing 拒绝了本次写回），不再执行',
+      );
+    }
     this.emitExecution(this.getExecution(executionId));
     // Presence：开跑即 lastSeen 前进（有效 busy 由 hasActiveExecution 计算，不落库）。
     // paused 不会被覆盖：touch 只动 lastSeen，不动 availability。
@@ -2082,7 +2189,7 @@ export class TeamService {
     // 模型愿不愿意调工具。失败不阻断这一轮（见 captureWorkSnapshot）。
     const workSnapshot = await this.captureWorkSnapshot(input.execution.externalWorkRef);
     if (workSnapshot) {
-      this.updateExecution(executionId, { externalWorkSnapshot: workSnapshot });
+      this.updateExecution(executionId, { externalWorkSnapshot: workSnapshot }, fencingToken);
     }
 
     // 只注入「自该 runtime 上次成功 turn 以来新增的 shared messages」。
@@ -2167,6 +2274,7 @@ export class TeamService {
         input.turnMode,
         modelSelection.model,
         modelSelection.purpose,
+        fencingToken,
       );
 
       const result = await this.copilot.runMemberTurn({
@@ -2180,6 +2288,10 @@ export class TeamService {
         conversationId: input.conversation.id,
         teamId: input.conversation.teamId,
         capabilities: runtimeCapabilities,
+        // 工具路径上的 fencing：租约代次 + 「此刻还属于我吗」的断言。
+        // 单进程（lease 为 null）时两者都是 null / undefined，判定完全不变。
+        fencingToken,
+        assertExecutionActive: this.executionGuard(lease),
         // 原文件交给引擎（它能读 PDF / 图片），提取出的文本另走 FTS 供搜索 ——
         // 两条路并存：一条让模型「看见」内容，一条让它「找得到」内容。
         attachments: referencedFiles.map((file) => ({
@@ -2258,12 +2370,26 @@ export class TeamService {
         this.states.markReplied(input.conversation.id, input.member.id, message.messageSequence);
       }
 
-      this.updateExecution(executionId, {
-        status: 'completed',
-        decision: 'reply',
-        response: content || null,
-        endedAt: now(),
-      });
+      const completedWrite = this.updateExecution(
+        executionId,
+        {
+          status: 'completed',
+          decision: 'reply',
+          response: content || null,
+          endedAt: now(),
+        },
+        fencingToken,
+      );
+      // 被 fencing 挡下 = 这一轮的租约在跑的过程中被别人接手了。**必须留痕**：
+      // 否则「旧 worker 悄悄什么都没写」看起来和「写成功了」一模一样，而它的
+      // 表现是「这条 execution 永远停在 running」—— 一条极难联想到租约的现象。
+      if (!completedWrite) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[team] execution ${executionId}: completed 写回被 fencing 拒绝` +
+            `（本进程 token=${fencingToken}，租约已被其他 worker 接手），这一轮的结果不落库`,
+        );
+      }
 
       if (message) this.emit(input.conversation.id, { type: 'message.created', data: message });
       this.emitExecution(this.getExecution(executionId));
@@ -2317,13 +2443,27 @@ export class TeamService {
         activeExecutionId: null,
         lastUsedAt: now(),
       });
-      this.updateExecution(executionId, {
-        status: cancelled ? 'cancelled' : 'failed',
-        // 引擎自己返回的那半截更完整（流式可能只到一半），优先用它。
-        response: cancelled ? (partial || streamed || null) : undefined,
-        error: message,
-        endedAt: now(),
-      });
+      const terminalWrite = this.updateExecution(
+        executionId,
+        {
+          status: cancelled ? 'cancelled' : 'failed',
+          // 引擎自己返回的那半截更完整（流式可能只到一半），优先用它。
+          response: cancelled ? (partial || streamed || null) : undefined,
+          error: message,
+          endedAt: now(),
+        },
+        fencingToken,
+      );
+      // 终态写回同样带 fencing：租约被夺走后旧进程不能再改这条记录。
+      // 被挡下时**不抛**：这里已经在 catch 里，原始错误更有诊断价值；另一副本
+      // 正在收尾，它会写自己的终态。只留一条日志 —— 否则「旧 worker 悄悄什么都
+      // 没写」会看起来和「写成功了」一模一样。
+      if (!terminalWrite) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[team] execution ${executionId}: 终态写回被 fencing 拒绝（租约已被其他 worker 接手），本进程不再修改这条记录`,
+        );
+      }
       this.emitExecution(this.getExecution(executionId));
       this.touchAgentPresence(input.member.id);
 
@@ -2521,19 +2661,24 @@ export class TeamService {
     turnMode: TurnMode,
     model: string,
     modelPurpose: ExecutionConfigSnapshot['modelPurpose'],
+    fencingToken?: number | null,
   ): void {
     try {
-      this.updateExecution(executionId, {
-        configSnapshot: this.buildConfigSnapshot(
-          member,
-          teamId,
-          systemPrompt,
-          capabilities,
-          turnMode,
-          model,
-          modelPurpose,
-        ),
-      });
+      this.updateExecution(
+        executionId,
+        {
+          configSnapshot: this.buildConfigSnapshot(
+            member,
+            teamId,
+            systemPrompt,
+            capabilities,
+            turnMode,
+            model,
+            modelPurpose,
+          ),
+        },
+        fencingToken,
+      );
     } catch (error) {
       // eslint-disable-next-line no-console
       console.warn(
@@ -3046,6 +3191,7 @@ export class TeamService {
           external_work_ref,
           external_work_snapshot,
           runtime_id,
+          worker_fencing_token,
           parent_execution_id,
           delegation_path,
           kind,
@@ -3063,7 +3209,7 @@ export class TeamService {
           ended_at,
           created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `,
       )
       .run(
@@ -3075,6 +3221,7 @@ export class TeamService {
         serializeExternalWorkRef(execution.externalWorkRef),
         serializeExternalWorkSnapshot(execution.externalWorkSnapshot),
         execution.runtimeId,
+        execution.workerFencingToken,
         execution.parentExecutionId,
         JSON.stringify(execution.delegationPath),
         execution.kind,
@@ -3105,6 +3252,19 @@ export class TeamService {
    * 用 `!== undefined` 而不是 `??`：这两个语义不同。
    * `??` 会让「显式清空为 null」失效，而 waiting_for_runtime_id /
    * active_execution_id 恰恰需要能被显式清空。
+   *
+   * ── fencingToken：Agent 工作路径必须传 ───────────────────────────────
+   *
+   * 传了它就会变成 SQL 的 `AND worker_fencing_token = ?`：租约被重新夺取过
+   * （代次 +1）时，旧持有者的写回命中 0 行，而不是把新持有者的结果覆盖掉。
+   *
+   * 不传 = 无 fencing，适用于**控制面**写入（cancel / recovery 标 interrupted）。
+   * 那些写入不来自「某一轮 Agent 工作」，没有代次可言，也不该被代次挡住 ——
+   * 用户取消一条 execution 不能被「租约属于谁」影响。
+   *
+   * 返回 `changes === 1`：SQLite 的 UPDATE 在 WHERE 不成立时是**静默 0 行**
+   * （不抛异常）。调用方必须能区分「写成功」和「被 fencing 挡下」，否则
+   * 「旧 worker 悄悄什么都没写」会看起来和「写成功了」一模一样。
    */
   private updateExecution(
     id: string,
@@ -3120,9 +3280,10 @@ export class TeamService {
       startedAt: string | null;
       endedAt: string | null;
     }>,
-  ): void {
+    fencingToken?: number | null,
+  ): boolean {
     const current = this.getExecution(id);
-    this.db
+    const result = this.db
       .prepare(
         `
         UPDATE execution
@@ -3138,6 +3299,7 @@ export class TeamService {
           started_at = ?,
           ended_at = ?
         WHERE id = ?
+          AND (? IS NULL OR worker_fencing_token = ?)
         `,
       )
       .run(
@@ -3164,7 +3326,10 @@ export class TeamService {
         patch.startedAt !== undefined ? patch.startedAt : current.startedAt,
         patch.endedAt !== undefined ? patch.endedAt : current.endedAt,
         id,
+        fencingToken ?? null,
+        fencingToken ?? null,
       );
+    return Number(result.changes) === 1;
   }
 
   private emitExecution(execution: ExecutionRecord): void {

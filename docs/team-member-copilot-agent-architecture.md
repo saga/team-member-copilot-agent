@@ -1622,10 +1622,36 @@ approved
 ready
    ↓
 executing
- ┌─┴─────────┐
- ▼           ▼
-completed   failed
+ ┌─┴──────────────┬──────────────┐
+ ▼                ▼              ▼
+completed      failed         unknown
+                               │
+                               └─ 对账收敛 → completed / failed
 ```
+
+`completed` ≠ HTTP 200。执行器抛出的错误必须被分成两类：
+
+```text
+definite  确认没发生（4xx / 412 / 连接没建起来）  → failed   可以重试
+unknown   可能已经发生（超时 / reset / 5xx / 崩溃）→ unknown  必须先对账
+```
+
+把 `unknown` 记成 `failed` 会让人去重试，于是**可能已经生效的那次写入**再来一遍
+—— 这正是重复副作用最常见的来源。所以 `unknown` 不是终态，而是等对账收敛的
+中间态；`UnknownCommandOutcomeError` 是它的程序化表达。
+
+判据来自传输层的结构化错误（`ExternalOperationError.kind`），不是对错误文案做
+匹配：文案会随实现漂移，而这里判错的代价不可撤销。
+
+每次真正打出去的调用单独落一行 `command_attempt`：
+
+```text
+Command #1  attempt#1 → unknown（超时，可能已写）
+            attempt#2 → succeeded（对账确认已写）
+```
+
+只留 `command` 上的当前状态的话，attempt#1 的 `unknown` 会被 attempt#2 的
+`succeeded` 覆盖 —— 而那段「我们曾经不知道发生过什么」正是审计最需要的一段。
 
 也可能：
 

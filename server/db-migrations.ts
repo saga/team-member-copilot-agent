@@ -20,7 +20,7 @@ import type { DatabaseSync } from 'node:sqlite';
  *
  * 程序不认识任何别的编号 —— 没有升级代码，认出来也无从下手。
  */
-export const SCHEMA_VERSION = 28;
+export const SCHEMA_VERSION = 29;
 
 /**
  * 当前 schema 的完整定义，按最终形状写。
@@ -631,6 +631,20 @@ CREATE TABLE execution (
   -- **它不是缓存**：没有任何读路径拿它当业务事实用。要看现在的状态，问 Jira。
   external_work_snapshot TEXT,
   runtime_id TEXT,
+  -- 这一轮是由**哪个租约代次**在跑的。
+  --
+  -- 为什么需要它：租约只决定「谁可以跑」，回答不了「刚才那个以为自己还在跑的
+  -- 进程能不能写回来」。进程 A 拿到租约 → 卡住（GC / 网络分区 / 假死）→ TTL 到期
+  -- → 进程 B 接手并推进了这条 execution → A 恢复后继续把它的结果写回来。
+  -- 只按 id 做条件更新挡不住这件事，因为 id 自始至终没变。
+  --
+  -- 每次重新夺取租约 fencing_token 递增，于是 A 手里永远是旧值，它的写回会
+  -- 命中 0 行。见 worker-lease.ts 的 claim()/assertHeld() 与
+  -- TeamService.updateExecution 的 fencing 条件。
+  --
+  -- 刻意可空：单进程（不启用租约）时永远是 NULL，语义是「这一层保护不适用」，
+  -- 而不是「fencing token = 0」。
+  worker_fencing_token INTEGER,
   parent_execution_id TEXT,
   delegation_path TEXT NOT NULL DEFAULT '[]',
   kind TEXT NOT NULL
@@ -1015,6 +1029,20 @@ CREATE TABLE command (
   args_json TEXT NOT NULL,
   idempotency_key TEXT NOT NULL UNIQUE,
 
+  -- 这一次**外部业务动作**的身份，稳定且全局唯一。
+  --
+  -- 为什么不复用 id：id 是平台内部记录的身份，operation_id 是「外部世界这一次
+  -- 动作」的身份。两者在正常路径下一起产生，但在**重试**与**对账**时分开用：
+  -- 重试会产生新的 attempt（新 execution），而外部世界要能凭 operation_id
+  -- 回答「这个动作做过没有」—— 那个标识必须跨 attempt 不变。
+  --
+  -- 刻意不用 executionId：execution retry 会生成新 id，而「同一笔业务动作」
+  -- 不该因为平台重跑了一次就变成另一笔。
+  --
+  -- UNIQUE：同一个 operation_id 只可能对应一次外部写入。它是对账的查询键，
+  -- 也是「这条 Command 是不是同一笔动作」的判据。
+  operation_id TEXT NOT NULL UNIQUE,
+
   resource_version TEXT,
 
   policy_decision_id TEXT,
@@ -1030,6 +1058,16 @@ CREATE TABLE command (
         'executing',
         'completed',
         'failed',
+        -- 外部结果**未知**：请求发出去了，但没能确认对方有没有处理。
+        --
+        -- 单独一个状态而不是并进 failed：「failed」的语义是「确认没有发生」，
+        -- 而 timeout / connection reset / 5xx 都属于「可能已经发生了」。
+        -- 把后者记成 failed 会带来两个后果：人会去重试（于是重复副作用），
+        -- 审计上留下一条「确定失败」的假结论。
+        --
+        -- 它**不是终态**：对账（reconcile）之后会收敛到 completed / failed，
+        -- 或者一直停在 unknown 等人处理。
+        'unknown',
         'rejected',
         'cancelled',
         'expired'
@@ -1054,6 +1092,67 @@ CREATE TABLE command (
 
 CREATE INDEX idx_command_execution
   ON command(execution_id, created_at);
+
+-- ------------------------------------------------------- Command Attempt
+--
+-- 一次 Command 的**每一次执行尝试**。
+--
+-- ── 为什么不把 attempt 状态塞在 command 一行里 ────────────────────────
+--
+-- 因为「一笔业务动作」和「一次尝试」不是同一个东西，而它们的失败语义不同：
+--
+--   Command  #1  attempt#1 → unknown（超时，可能已写）
+--                attempt#2 → succeeded（对账确认已写，或重试后确认写入）
+--
+-- 只留一行的话，attempt#1 的 unknown 会被 attempt#2 的 succeeded 覆盖 ——
+-- 而那段「我们曾经不知道发生过什么」正是审计最需要的一段。它解释了两件事：
+-- 为什么这里有一次额外的外部查询，以及为什么不能简单地「再试一次」。
+--
+-- status 刻意只有四个取值：这里记的是**尝试**的结果，不是业务决策
+-- （policy / approval 那一层在 command 与 command_audit 上）。
+CREATE TABLE command_attempt (
+  id TEXT PRIMARY KEY,
+
+  command_id TEXT NOT NULL,
+
+  -- 从 1 开始，同一 Command 内单调递增。和 UNIQUE(command_id, attempt_no)
+  -- 一起保证「第几次尝试」是确定事实，而不是按 created_at 猜出来的顺序。
+  attempt_no INTEGER NOT NULL,
+
+  -- 冗余存一份：对账时要按 operation_id 反查「这个动作做过没有」，
+  -- 而从 attempt 直接查到比回表 command 少一次 join。
+  operation_id TEXT NOT NULL,
+
+  status TEXT NOT NULL
+    CHECK (
+      status IN (
+        'running',
+        'succeeded',
+        'failed',
+        -- 这次尝试的结果无法确定（见 command.status 的 unknown）。
+        'unknown'
+      )
+    ),
+
+  started_at TEXT NOT NULL,
+  ended_at TEXT,
+
+  error TEXT,
+  result_hash TEXT,
+
+  UNIQUE(command_id, attempt_no),
+
+  FOREIGN KEY(command_id)
+    REFERENCES command(id)
+    ON DELETE CASCADE
+);
+
+CREATE INDEX idx_command_attempt_command
+  ON command_attempt(command_id, attempt_no);
+
+-- 对账入口：给定 operation_id，找到它属于哪条 Command / 哪几次尝试。
+CREATE INDEX idx_command_attempt_operation
+  ON command_attempt(operation_id);
 
 CREATE TABLE approval (
   id TEXT PRIMARY KEY,
@@ -1111,7 +1210,14 @@ CREATE TABLE command_audit (
         'rejected',
         'executing',
         'completed',
-        'failed'
+        'failed',
+        -- 外部结果未知（见 command.status 的 unknown）：请求发出去了，但没能
+        -- 确认对方有没有处理。它和 failed 是两个不同的结论，下一步动作相反。
+        'unknown',
+        -- 对账走了一趟带回了结论（包括「还是不知道」）。
+        'reconciled',
+        -- 这条 Command 被一次 retry 复用，没有新建第二笔。
+        'inherited'
       )
     ),
 
@@ -1190,6 +1296,23 @@ CREATE TABLE worker_lease (
   resource_id TEXT NOT NULL,
 
   lease_owner TEXT NOT NULL,
+
+  -- 租约的**代次**。第一次取得时为 1，之后每次被别人重新夺取就 +1。
+  --
+  -- ── 为什么只有 owner 不够 ────────────────────────────────────────────
+  --
+  -- 「租约过期 → 别人接手」这件事对**旧持有者**是不可见的：它只是卡住了
+  -- 一会儿，醒来后仍然以为自己在跑。而 lease_owner 在它看来「还是我」——
+  -- 因为它手里那份是过期的快照。
+  --
+  -- fencing_token 给了这件事一个单调递增的判据：旧持有者手里永远是旧值，
+  -- 于是它的任何写回都能被一眼认出并拒绝。见 worker-lease.ts 的 assertHeld()
+  -- 与 TeamService.updateExecution 的 fencing 条件。
+  --
+  -- 用 INTEGER 而不是随机串：需要的性质是「可比较的新旧」，不是「不可猜」。
+  -- 每次 claim 一定 +1（见 claim() 的 upsert），所以只要带上它就能判定新旧。
+  fencing_token INTEGER NOT NULL,
+
   lease_expires_at TEXT NOT NULL,
   heartbeat_at TEXT NOT NULL,
 

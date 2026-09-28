@@ -189,25 +189,53 @@ export class SchedulerService {
    *
    * 释放只在 finally 里做：中途抛异常时租约必须回到可用状态，否则这条
    * execution 会被自己的失败卡住，直到 TTL 到期才有人能接手。
+   *
+   * ── 心跳失败 = 立刻停掉这一轮 ────────────────────────────────────────
+   *
+   * 心跳返回 false 说明租约已经不在自己手里（过期被别人接手，或代次变了）。
+   * 此时**不能**让这一轮继续跑下去：另一个副本已经在跑同一件事，两边同时产出
+   * 结果就是双写。所以这里主动 cancel 掉这条 execution（abort 引擎 + 等它收尾），
+   * 让「我们不再产出结果」成为可观测事实，而不是指望它自然结束。
    */
   private startExecution(executionId: string, onError: (error: unknown) => void): void {
-    if (this.leases && !this.leases.claim(LEASE_RESOURCE_EXECUTION, executionId)) {
-      return;
-    }
+    const grant = this.leases?.claim(LEASE_RESOURCE_EXECUTION, executionId) ?? null;
+    if (this.leases && !grant) return;
 
-    const heartbeat = this.leases
+    let lost = false;
+    const heartbeat = grant
       ? setInterval(() => {
-          this.leases!.heartbeat(LEASE_RESOURCE_EXECUTION, executionId);
-        }, this.leases.heartbeatIntervalMs)
+          if (lost) return;
+          let ok = false;
+          try {
+            ok = this.leases!.heartbeat(grant);
+          } catch {
+            ok = false;
+          }
+          if (ok) return;
+          // 只触发一次：心跳是周期性的，租约丢了之后每一次都会失败，重复
+          // abort 只会把日志淹没在一堆同样的告警里。
+          lost = true;
+          // eslint-disable-next-line no-console
+          console.warn(
+            `[scheduler] execution ${executionId} 的租约已丢失（token=${grant.fencingToken}），` +
+              '停止这一轮：另一个副本已经接手',
+          );
+          void this.team()
+            .cancelExecution(executionId)
+            .catch(() => {
+              // 引擎可能已经收尾 / 状态已不允许取消 —— 那说明它已经停了，
+              // 正是我们想要的结果。
+            });
+        }, this.leases!.heartbeatIntervalMs)
       : null;
     if (heartbeat && typeof heartbeat.unref === 'function') heartbeat.unref();
 
     void this.team()
-      .runScheduledExecution(executionId)
+      .runScheduledExecution(executionId, grant)
       .catch(onError)
       .finally(() => {
         if (heartbeat) clearInterval(heartbeat);
-        this.leases?.release(LEASE_RESOURCE_EXECUTION, executionId);
+        if (grant) this.leases?.release(grant);
       });
   }
 }

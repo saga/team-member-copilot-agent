@@ -1,6 +1,6 @@
 import type { PendingWake, WakeReason } from './domain.js';
 import type { ConversationMemberService } from './conversation-member-service.js';
-import { LEASE_RESOURCE_WAKE, wakeLeaseId, type WorkerLeaseService } from './worker-lease.js';
+import { LEASE_RESOURCE_WAKE, wakeLeaseId, type LeaseGrant, type WorkerLeaseService } from './worker-lease.js';
 
 /**
  * 把「消息到了」和「Agent 开始跑」分成两个阶段。
@@ -47,8 +47,17 @@ export class MemberTurnScheduler {
      * 真正跑一轮。第二个参数 `markStarted` 必须在 **execution 落库之后** 调用一次，
      * 它告诉调度器「这条 wake 不再是可以安全重派的排队项了」。
      * 不调 = 这一轮压根没进引擎，可以放心把 durable 的 pending 标记丢掉。
+     *
+     * 第三个参数是本轮 **wake 租约的凭证**（没传 leases 时为 null）。它必须一路
+     * 传下去：runWake 会把它钉到新建的 execution 上，于是这一轮所有的写回都带
+     * 上这一代 —— 租约被别的副本接手之后，本进程的写回会命中 0 行。只传一个
+     * 布尔「抢到了」是不够的，凭证里才有代次。
      */
-    private readonly run: (wake: PendingWake, markStarted: () => void) => Promise<void>,
+    private readonly run: (
+      wake: PendingWake,
+      markStarted: () => void,
+      grant: LeaseGrant | null,
+    ) => Promise<void>,
     private readonly onError: (wake: PendingWake, error: unknown) => void,
     /**
      * 不传 = 单进程语义（照常执行，不抢）。用「传没传」而不是一个布尔开关，
@@ -164,10 +173,10 @@ export class MemberTurnScheduler {
           try {
             // 「排队 → 在跑」的 durable 翻转由 run() 负责，因为它必须与
             // execution 的落库同一个事务。这里只记录它有没有发生。
-            const task = () =>
+            const task = (grant: LeaseGrant | null) =>
               this.run(wake, () => {
                 started = true;
-              });
+              }, grant);
 
             if (this.leases) {
               const outcome = await this.leases.runWithLease(
@@ -177,7 +186,7 @@ export class MemberTurnScheduler {
               );
               skipped = !outcome.ran;
             } else {
-              await task();
+              await task(null);
             }
           } catch (error) {
             if (!started) {

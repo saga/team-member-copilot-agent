@@ -109,6 +109,7 @@ export class CollaborationService {
       externalWorkRef: parent.externalWorkRef,
       externalWorkSnapshot: null,
       runtimeId: null,
+      workerFencingToken: null,
       parentExecutionId: parent.id,
       delegationPath: [...parent.delegationPath, targetMember.id],
       kind: 'member_delegate',

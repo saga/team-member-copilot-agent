@@ -168,7 +168,7 @@ export class JiraToolProvider implements ToolProvider {
             );
           }
           if (reused) {
-            return `这次评论已经执行过（Command ${command.id}），没有重复写入 ${ref.key}。`;
+            return reusedNote(command, '评论', ref.key, '写入');
           }
           return result ?? `Comment added to ${ref.key}.`;
         },
@@ -223,7 +223,7 @@ export class JiraToolProvider implements ToolProvider {
             );
           }
           if (reused) {
-            return `这次流转已经执行过（Command ${command.id}），没有重复执行 ${ref.key}。`;
+            return reusedNote(command, '流转', ref.key, '执行');
           }
           return result ?? `Issue ${ref.key} transitioned.`;
         },
@@ -250,4 +250,37 @@ export class JiraToolProvider implements ToolProvider {
     if (!this.work.versionOf) return null;
     return this.work.versionOf(ref);
   }
+}
+
+/**
+ * 幂等命中时给模型的话。
+ *
+ * ── 为什么不能一律说「已经执行过」 ────────────────────────────────────
+ *
+ * `reused` 的准确含义是「这次没有重新执行」，而**原因**有好几种，它们的下一步
+ * 动作完全不同：
+ *
+ *   completed           确实做过了        → 什么都不用做
+ *   rejected            被 Entitlement / Policy / 审批否掉了
+ *                                        → 需要人重新授权，不是「办完了」
+ *   cancelled / expired 作废了            → 需要重新发起
+ *   policy_pending      还在等审批        → 需要人去批
+ *
+ * 把它们都说成「已经执行过」会让模型认为事情办完了 —— 于是一次被驳回的外部
+ * 写入，在对话里表现为「已经处理好了」。这是最坏的一类错误信息：它让**没人**
+ * 去处理那件其实没做的事。
+ */
+function reusedNote(
+  command: { id: string; status: string },
+  noun: string,
+  target: string,
+  verb: string,
+): string {
+  if (command.status === 'completed') {
+    return `这次${noun}已经执行过（Command ${command.id}），没有重复${verb} ${target}。`;
+  }
+  return (
+    `这次${noun}没有${verb} ${target}：Command ${command.id} 当前状态是 ${command.status}，` +
+    '不会重新执行。请先确认这笔动作的状态再决定下一步。'
+  );
 }

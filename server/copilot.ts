@@ -80,6 +80,23 @@ export interface RunMemberTurnInput {
   /** 这一轮生效的能力。冻结在这里而不是在 hook 里现查 Member，见下。 */
   capabilities: RuntimeCapabilities;
   /**
+   * 本轮的租约代次（fencing token，见 worker-lease.ts）。null / 不传 = 单进程。
+   *
+   * 它只进 `CapabilityContext` 供审计与排查读取，**不参与判定** ——
+   * 判定用下面的 `assertExecutionActive`。
+   */
+  fencingToken?: number | null;
+  /**
+   * 断言「这条 execution 的租约此刻仍然属于我们这一代」，不成立就抛。
+   *
+   * 工具路径用它做两道闸（执行前 / 执行后）：租约已经丢了就不再产生新的外部
+   * 副作用，也不再把手里的结果交回模型。见 CapabilityContext 的注释。
+   *
+   * 由 TeamService 构造（它持有 WorkerLeaseService 和本轮的 LeaseGrant）；
+   * 不传 = 单进程，这一层不适用。
+   */
+  assertExecutionActive?: () => void;
+  /**
    * 触发这一轮的消息带上的文件。
    *
    * 交给 SDK 作为 attachment（引擎自己知道怎么读 PDF / 图片），而不是把内容
@@ -280,12 +297,20 @@ export class CopilotService {
       // 一轮 turn 用的是**开始那一刻**的能力：中途有人改了 Member 的绑定，
       // 不该让正在跑的这一轮突然多出（或少掉）一个工具。解析在 team-service
       // 里完成，这里只消费结果。
+      //
+      // fencing 的两个字段也在这里进上下文：它们随这一轮冻结，和工具集合同一
+      // 生命周期。工具执行时读到的是同一份 —— 不会出现「工具用的是新的租约、
+      // 判定用的是旧的」这种漂移。
       const runtimeContext: CapabilityContext = {
         teamId: input.teamId,
         memberId: input.member.id,
         conversationId: input.conversationId,
         executionId: input.executionId,
         userId: config.localUserId,
+        fencingToken: input.fencingToken ?? null,
+        ...(input.assertExecutionActive
+          ? { assertExecutionActive: input.assertExecutionActive }
+          : {}),
       };
       const copilotCapabilities = this.capabilityAdapter.build(
         input.capabilities,

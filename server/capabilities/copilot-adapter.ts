@@ -128,6 +128,14 @@ export class CopilotCapabilityAdapter {
       handler: async (args: unknown, _invocation: ToolInvocation) => {
         const current: ToolExecutionContext = { ...context, toolName: tool.name };
         const normalized = normalizeArgs(args);
+
+        // ── 执行前断言租约 ──────────────────────────────────────────────
+        //
+        // 租约已经丢了（另一个副本接手了这一轮）时，这一次外部写入连发都不该发
+        // 出去。放在授权之前：被 fencing 挡下的调用不该在审计里长得像一次
+        // 「策略拒绝」—— 两者的原因和处置完全不同。
+        this.assertLease(current);
+
         const decision = await this.evaluateToolUse(tool, context, normalized);
 
         // 先落 Policy 决策，再落工具调用。顺序不能反：tool_execution_audit
@@ -160,6 +168,16 @@ export class CopilotCapabilityAdapter {
 
         try {
           const result = await tool.execute!(current, normalized);
+          // ── 执行后再断言一次 ──────────────────────────────────────────
+          //
+          // 工具可能跑了很久（外部 HTTP、长查询）。这段时间里租约可能已经过期
+          // 被别人接手 —— 那时另一个副本正在跑同一件事，把这里的结果交回模型
+          // 就会变成双写。断言失败时**不返回结果**（走下面的 catch，记成错误），
+          // 这一轮由心跳那条路径 abort 掉。
+          //
+          // 注意它拦不住「已经发出去的 HTTP 请求」。那正是 Command 层要做
+          // unknown + 对账的原因（见 command-service.ts）。
+          this.assertLease(current);
           if (auditId) {
             this.audit!.finishToolExecution(auditId, { result });
           }
@@ -174,6 +192,15 @@ export class CopilotCapabilityAdapter {
         }
       },
     });
+  }
+
+  /**
+   * 租约断言。不成立时抛出的错误文案要**明确**，因为它会被引擎当作工具错误
+   * 交回模型 —— 含糊的措辞会让模型以为是参数问题，然后换个写法再试一次，
+   * 而每一次重试都可能是一次新的外部副作用。
+   */
+  private assertLease(context: CapabilityContext): void {
+    context.assertExecutionActive?.();
   }
 
   /**
@@ -216,6 +243,21 @@ export class CopilotCapabilityAdapter {
   ): Promise<{ allowed: boolean; reason: string; mcp?: McpToolUse }> {
     if ((BuiltInTools.Isolated as readonly string[]).includes(toolName)) {
       return { allowed: true, reason: 'SDK isolated built-in' };
+    }
+
+    // ── 所有非 isolated 工具的入口断言 ─────────────────────────────────
+    //
+    // MCP 工具由 SDK **原生**执行，本服务没有「执行完成」回调 —— 所以对它们
+    // 只能在放行之前拦一次。custom tool 的 handler 里还会再断言前后各一次。
+    //
+    // 放在这里（而不是只在 handler 里）是必须的：MCP 那条路径根本不进 handler。
+    try {
+      this.assertLease(context);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      // eslint-disable-next-line no-console
+      console.warn(`[copilot] 拒绝工具调用 ${toolName}（租约已失效）：${reason}`);
+      return { allowed: false, reason };
     }
 
     const tool = capabilities.toolIndex.get(toolName);

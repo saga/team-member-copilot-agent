@@ -14,7 +14,7 @@ import { TaskService } from './task-service.js';
 import type { AuthorizationRevisions } from './team-service.js';
 import type { ConversationRow } from './team-shared.js';
 import { TeamStructureService } from './team-structure-service.js';
-import type { WorkerLeaseService } from './worker-lease.js';
+import type { LeaseGrant, WorkerLeaseService } from './worker-lease.js';
 import type { ExternalWorkRef, ExternalWorkSnapshot } from './work-management/types.js';
 
 /**
@@ -66,6 +66,14 @@ export interface TeamInternals {
     triggerMessageSequence: number | null;
     turnMode: TurnMode;
     wakeReason: WakeReason | null;
+    /**
+     * 本轮的租约凭证（见 worker-lease.ts）。可能是 execution 租约（retry /
+     * 恢复 / scheduler）或 wake 租约（聊天唤醒）—— `runTurn` 用它做 assertHeld，
+     * 所以必须是整张凭证而不是一个裸 token：两者的资源键不同。
+     *
+     * null / 不传 = 单进程部署，这一层保护不适用。
+     */
+    lease?: LeaseGrant | null;
   }): Promise<string>;
   readonly experiences: ExperienceStore;
   findExecution(id: string): ExecutionRecord | null;
@@ -116,6 +124,7 @@ export interface TeamInternals {
     turnMode: TurnMode;
     wakeReason: WakeReason | null;
     runtime: MemberRuntime;
+    lease?: LeaseGrant | null;
   }): Promise<string>;
   readonly scheduler: MemberTurnScheduler;
   readonly states: ConversationMemberService;
@@ -135,7 +144,7 @@ export interface TeamInternals {
       externalWorkSnapshot: ExternalWorkSnapshot | null;
       startedAt: string | null;
       endedAt: string | null;
-    }>): void;
+    }>, fencingToken?: number | null): boolean;
   waitForRuntimeIdle(runtimeId: string): Promise<void>;
   withMessageFiles(messages: ConversationMessage[]): ConversationMessage[];
   withRuntimeLock<T>(runtimeId: string, fn: () => Promise<T>): Promise<T>;

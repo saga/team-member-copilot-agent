@@ -597,6 +597,14 @@ export interface ExecutionRecord {
    */
   externalWorkSnapshot: ExternalWorkSnapshot | null;
   runtimeId: string | null;
+  /**
+   * 这一轮是由**哪个租约代次**跑的（见 worker-lease.ts 的 fencing token）。
+   *
+   * null = 单进程部署（不启用租约），这一层保护不适用。非 null 时，所有写回
+   * 都必须带上它做条件更新 —— 旧持有者手里的代次已经被换掉，它的写回会命中
+   * 0 行，而不是把新持有者的结果覆盖掉。
+   */
+  workerFencingToken: number | null;
   parentExecutionId: string | null;
   /** 从根到当前的 Member 链，用来防 A→B→C→A 和无限深链。 */
   delegationPath: string[];

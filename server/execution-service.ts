@@ -11,6 +11,7 @@ import type { TeamInternals } from './team-internals.js';
 import { ACTIVE_STATUSES, CANCEL_REASON, ExecutionCancelledError, TERMINAL_STATUSES, mapExecution } from './team-shared.js';
 import type { ExecutionRow } from './team-shared.js';
 import { LEASE_RESOURCE_EXECUTION } from './worker-lease.js';
+import type { LeaseGrant } from './worker-lease.js';
 
 /**
  * ExecutionService
@@ -43,7 +44,15 @@ export class ExecutionService {
    * 才有人能接手」—— 一条几乎不可能被联想到是租约的 bug。
    *
    * 不传 leases（单进程）时直接跑，与以前完全一致：单机模式下「running」必然
-   * 属于自己，抢租约只是多一次写库。
+   * 属于自己，抢租约只是多一次写库。此时 `fn` 收到 null，语义是
+   * **「这一层保护不适用」**，而不是「代次是 0」—— 条件写入据此跳过 fencing。
+   *
+   * ── 为什么把代次钉在 execution 上 ────────────────────────────────────
+   *
+   * 租约回答「现在谁可以跑」，回答不了「刚才那个以为自己还在跑的进程能不能
+   * 把结果写回来」。把 `fencing_token` 落到 `execution.worker_fencing_token`
+   * 之后，所有写回都能带上它做条件更新：旧持有者手里永远是旧值，它的写回
+   * 命中 0 行。这同时留下了一条审计事实 —— 「这一轮由哪一代跑过」。
    *
    * ── 为什么是 public ────────────────────────────────────────────────
    *
@@ -54,11 +63,57 @@ export class ExecutionService {
    */
   async withExecutionLease<T>(
     executionId: string,
-    fn: () => Promise<T>,
+    fn: (grant: LeaseGrant | null) => Promise<T>,
   ): Promise<{ ran: false } | { ran: true; value: T }> {
     const leases = this.internals.leases;
-    if (!leases) return { ran: true, value: await fn() };
-    return leases.runWithLease(LEASE_RESOURCE_EXECUTION, executionId, fn);
+    if (!leases) return { ran: true, value: await fn(null) };
+
+    return leases.runWithLease(
+      LEASE_RESOURCE_EXECUTION,
+      executionId,
+      async (grant) => {
+        this.bindExecutionFencingToken(executionId, grant.fencingToken);
+        return fn(grant);
+      },
+      {
+        /**
+         * 心跳失败 = 租约已经不在自己手里（过期被别人接手，或代次变了）。
+         * 此时**必须把这一轮停掉**：另一个副本已经在跑同一件事，两边同时
+         * 产出结果就是双写。日志不能阻止双写，abort 才能。
+         *
+         * 刻意 fire-and-forget：这是心跳定时器的回调，不能阻塞它（下一次
+         * 心跳还要跑），也不能让它的异常冒出来把定时器打挂。
+         */
+        onLeaseLost: () => {
+          void this.internals.copilot.cancelTurn(executionId).catch(() => {
+            // 引擎可能已经收尾 —— 那正是我们想要的结果。
+          });
+        },
+      },
+    );
+  }
+
+  /**
+   * 把本轮的租约代次钉在 execution 行上。
+   *
+   * 无条件覆盖（而不是「只在为空时写」）：重新夺取会产生**新的一代**，而
+   * 旧持有者必须看到自己那一代已经被换掉。只在为空时写会让第二代永远钉不上，
+   * 于是 fencing 形同虚设。
+   *
+   * 不带 `status = 'queued'` 条件：这条执行能不能跑由 runTurn 开跑前统一判定
+   * （它已经有那道检查）。在这里再判一次会出现两个判据，而它们迟早会漂移。
+   *
+   * ── 为什么是 public ─────────────────────────────────────────────────
+   *
+   * `SchedulerService.startExecution` 自己抢租约（它的心跳是唯一真相源，
+   * 见 scheduler-service.ts），不走 `withExecutionLease`。但「抢到」和「钉代次」
+   * 是两件事，钉代次这段逻辑必须只有一份 —— 否则漏钉的那条路径上所有带 fencing
+   * 的写入都会被自己的条件挡下（`worker_fencing_token` 还是 NULL）。
+   */
+  bindExecutionFencingToken(executionId: string, token: number): void {
+    this.internals.db
+      .prepare(`UPDATE execution SET worker_fencing_token = ? WHERE id = ?`)
+      .run(token, executionId);
   }
 
   getExecution(id: string): ExecutionRecord {
@@ -119,6 +174,7 @@ export class ExecutionService {
       externalWorkRef: original.externalWorkRef,
       externalWorkSnapshot: null,
       runtimeId: null,
+      workerFencingToken: null,
       parentExecutionId: original.parentExecutionId,
       delegationPath: [...original.delegationPath],
       kind: original.kind,
@@ -148,7 +204,7 @@ export class ExecutionService {
     // 以前这里直接 executeMemberTurn：多副本时两个副本各自 retry 一次，
     // 同一个动作跑两遍，而 retry 的语义恰恰是「把同一轮再跑一次」——
     // 跑两次就是两次副作用。
-    void this.withExecutionLease(retry.id, () =>
+    void this.withExecutionLease(retry.id, (grant) =>
       this.executeMemberTurn({
         conversation,
         member,
@@ -157,6 +213,7 @@ export class ExecutionService {
         triggerMessageSequence: retry.triggerMessageSequence,
         turnMode: this.internals.turnModeFor(conversation, retry),
         wakeReason: retry.wakeReason,
+        lease: grant,
       }),
     ).catch((error: unknown) => {
       // eslint-disable-next-line no-console
@@ -258,8 +315,21 @@ export class ExecutionService {
    *   wake 租约       同一轮唤醒不被两个副本各跑一遍（键与 id 无关）
    *   execution 租约  同一条**已存在**的 execution 不被两个副本各跑一遍
    *                   （retry / 崩溃恢复的重新提交 —— 那里 id 是已知的）
+   *
+   * ── wake 租约的代次也要钉下去 ────────────────────────────────────────
+   *
+   * `lease` 是调用方（MemberTurnScheduler）手里那把 **wake** 租约的凭证。
+   * 它必须被钉到新建的 execution 上：wake 租约一旦丢失（本进程假死、TTL 到期
+   * 被另一个副本接手），本进程手里就永远是一个旧代次，之后所有写回都会命中
+   * 0 行 —— 这正是「旧 worker 不能把结果写回来」要的效果。
+   *
+   * 不传 = 单进程（没有租约服务），此时不钉、不 fence，与以前完全一致。
    */
-  async runWake(wake: PendingWake, markStarted: () => void): Promise<void> {
+  async runWake(
+    wake: PendingWake,
+    markStarted: () => void,
+    lease: LeaseGrant | null = null,
+  ): Promise<void> {
     const conversation = this.internals.getConversation(wake.conversationId);
     const member = this.internals.requireActiveMember(conversation, wake.memberId);
 
@@ -313,6 +383,7 @@ export class ExecutionService {
       externalWorkRef: conversation.externalWorkRef,
       externalWorkSnapshot: null,
       runtimeId: null,
+      workerFencingToken: lease?.fencingToken ?? null,
       parentExecutionId: null,
       delegationPath: [member.id],
       kind: task ? 'member_work' : 'interactive',
@@ -361,6 +432,7 @@ export class ExecutionService {
         triggerMessageSequence: wake.triggerSequence,
         turnMode,
         wakeReason: wake.reason,
+        lease,
       });
     } catch (error) {
       if (task) {
@@ -390,6 +462,14 @@ export class ExecutionService {
     triggerMessageSequence: number | null;
     turnMode: TurnMode;
     wakeReason: WakeReason | null;
+    /**
+     * 本轮的租约凭证。可能是 execution 租约（retry / 恢复 / scheduler）或
+     * wake 租约（聊天唤醒）—— `runTurn` 用它做 assertHeld，所以必须是整张凭证
+     * 而不是一个裸 token：两者的资源键不同。
+     *
+     * null / 不传 = 单进程，这一层保护不适用。
+     */
+    lease?: LeaseGrant | null;
   }): Promise<string> {
     const runtime = this.internals.ensureRuntime(input.conversation, input.member);
     // 整个 turn（含 DB 写入）都在 runtime 锁内，保证单写者。

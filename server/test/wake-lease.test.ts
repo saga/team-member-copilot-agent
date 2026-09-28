@@ -111,7 +111,8 @@ describe('MemberTurnScheduler：wake 租约挡住跨副本的重复执行', () =
     const leaseB = new WorkerLeaseService(db, 30_000);
 
     // A 正在处理这个唤醒。
-    assert.equal(leaseA.claim(LEASE_RESOURCE_WAKE, wakeLeaseId(CONVERSATION, MEMBER)), true);
+    const aGrant = leaseA.claim(LEASE_RESOURCE_WAKE, wakeLeaseId(CONVERSATION, MEMBER));
+    assert.ok(aGrant, 'A 必须抢到');
 
     const b = replica(leaseB);
     b.scheduler.enqueue(wake());
@@ -128,7 +129,7 @@ describe('MemberTurnScheduler：wake 租约挡住跨副本的重复执行', () =
       '把 wake_status 回 idle 等于把对方正在跑的那一轮标成「空闲」，下一个 turn 立刻能挤进来',
     );
 
-    leaseA.release(LEASE_RESOURCE_WAKE, wakeLeaseId(CONVERSATION, MEMBER));
+    leaseA.release(aGrant);
   });
 
   it('持有者跑完释放之后，另一个副本能接手', async () => {
@@ -136,7 +137,8 @@ describe('MemberTurnScheduler：wake 租约挡住跨副本的重复执行', () =
     const leaseB = new WorkerLeaseService(db, 30_000);
     const resourceId = wakeLeaseId(CONVERSATION, MEMBER);
 
-    leaseA.claim(LEASE_RESOURCE_WAKE, resourceId);
+    const aGrant = leaseA.claim(LEASE_RESOURCE_WAKE, resourceId);
+    assert.ok(aGrant);
 
     const b = replica(leaseB);
     b.scheduler.enqueue(wake());
@@ -145,7 +147,7 @@ describe('MemberTurnScheduler：wake 租约挡住跨副本的重复执行', () =
 
     // A 那一轮结束，释放。下一次唤醒 B 必须能接手 —— 否则这个 Member 的
     // 唤醒会被永久卡住。
-    leaseA.release(LEASE_RESOURCE_WAKE, resourceId);
+    leaseA.release(aGrant);
 
     b.scheduler.enqueue(wake());
     await b.scheduler.drain();
