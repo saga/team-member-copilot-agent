@@ -72,6 +72,29 @@ export class MemberTurnScheduler {
   }
 
   /**
+   * 按条件删掉还没开跑的 pending wake（用户消息取消 bootstrap 用）。
+   *
+   * 只动 pending：在跑的轮次碰不得（abort 是 execution 层的事）。
+   * durable 视图一起收回，否则重启恢复会把删掉的轮次重派回来。
+   */
+  cancelPending(
+    conversationId: string,
+    memberId: string,
+    predicate: (wake: PendingWake) => boolean,
+  ): boolean {
+    const key = keyOf(conversationId, memberId);
+    const wake = this.pending.get(key);
+    if (!wake || !predicate(wake)) return false;
+
+    this.pending.delete(key);
+    this.states.abandonPendingWake(conversationId, memberId, wake);
+    if (!this.inFlight.has(key)) {
+      this.states.setWakeStatus(conversationId, memberId, 'idle');
+    }
+    return true;
+  }
+
+  /**
    * 这个 Member 在**任意**房间里有没有待处理 / 进行中的唤醒。
    *
    * 归档是全局动作（一个 Member 可能同时在几个房间里），所以不能用 isBusy。
@@ -152,6 +175,9 @@ const REASON_PRIORITY: Record<Exclude<WakeReason, 'schedule'>, number> = {
   lead_message: 1,
   lead_clarification: 1,
   lead_recovery: 1,
+  // 自动首轮垫底：同一个 Lead 的 pending 里它永远输给真正的用户消息，
+  // bootstrap 和 user message 不会各跑一遍。
+  lead_bootstrap: 0,
 };
 
 /**

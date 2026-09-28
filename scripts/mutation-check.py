@@ -1078,6 +1078,28 @@ MUTATIONS = [
         ],
     },
     {
+        "name": "用户消息不取消 bootstrap（旧 Lead 回复混入）",
+        "test": "server/test/member-mention-routing.test.ts",
+        "steps": [
+            (
+                "server/team-service.ts",
+                "    // 用户真正开始交互时，取消尚未完成的自动 bootstrap。\n    await this.cancelLeadBootstrap(fresh);\n",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "@其他 Member 把 waiting_user 清掉（Lead 的问题丢失）",
+        "test": "server/test/member-mention-routing.test.ts",
+        "steps": [
+            (
+                "server/team-service.ts",
+                "      fresh.status === 'waiting_user' && (mentionedMembers.length === 0 || leadIsMentioned);\n",
+                "      fresh.status === 'waiting_user';\n",
+            )
+        ],
+    },
+    {
         "name": "Goal 唤醒走普通消息通道（不用 Strong 规划）",
         "test": "server/test/goal-revision.test.ts",
         "steps": [

@@ -1195,10 +1195,10 @@ describe('Task 生命周期补严', () => {
     assert.equal(opener.senderType, 'system');
 
     await waitForConversationIdle(room.id);
-    // Lead 被唤醒并说了话
+    // Lead 被唤醒并说了话：自动首轮是 lead_bootstrap，不再伪装成 lead_message。
     const leadRuns = db
       .prepare(
-        `SELECT COUNT(*) AS n FROM execution WHERE conversation_id = ? AND member_id = ? AND wake_reason = 'lead_message'`,
+        `SELECT COUNT(*) AS n FROM execution WHERE conversation_id = ? AND member_id = ? AND wake_reason = 'lead_bootstrap'`,
       )
       .get(room.id, alice.id) as unknown as { n: number };
     assert.ok(leadRuns.n >= 1, 'Lead 建完就该被唤醒');

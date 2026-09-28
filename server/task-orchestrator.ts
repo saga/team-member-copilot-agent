@@ -37,7 +37,11 @@ export class TaskOrchestrator {
     triggerSequence: number,
     reason: Extract<
       WakeReason,
-      'lead_message' | 'lead_clarification' | 'lead_recovery' | 'goal_changed'
+      | 'lead_bootstrap'
+      | 'lead_message'
+      | 'lead_clarification'
+      | 'lead_recovery'
+      | 'goal_changed'
     > = 'lead_message',
   ): boolean {
     if (!leadMemberId) return false;

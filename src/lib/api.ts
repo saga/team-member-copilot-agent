@@ -518,6 +518,7 @@ export interface ExecutionRecord {
 
 /**
  * 为什么唤醒这个 Member。确定性规则的产物，不是 LLM routing：
+ *   lead_bootstrap     新工作区创建后的自动首轮 Lead 唤醒
  *   lead_message       用户发普通消息，唤醒 Lead
  *   lead_clarification 用户回答了澄清问题，唤醒 Lead 继续推进
  *   lead_recovery      Task 失败/阻塞，唤醒 Lead 做整体判断
@@ -527,6 +528,7 @@ export interface ExecutionRecord {
  *   schedule           定时唤醒
  */
 export type WakeReason =
+  | 'lead_bootstrap'
   | 'lead_message'
   | 'lead_clarification'
   | 'lead_recovery'

@@ -409,15 +409,17 @@ export type TurnMode = 'lead' | 'mention' | 'task' | 'delegation';
 /**
  * 为什么唤醒这个 Member。确定性规则产出，不经过 LLM 路由。
  *
- * lead_message       用户给 Task 工作区发普通消息，唤醒 Lead
- * lead_clarification 用户回答了 Lead 的澄清问题，唤醒 Lead
- * lead_recovery      Task 失败/阻塞，唤醒 Lead 做整体判断
- * goal_changed       Goal 发生变化，唤醒 Lead 重新规划
- * user_mention       用户明确 @ 某个 Member，直接唤醒这个 Member
- * task_ready         Task 依赖满足，唤醒执行人
+ * lead_bootstrap     新工作区创建后的自动首轮 Lead 唤醒
+ * lead_message       用户普通消息唤醒 Lead
+ * lead_clarification 用户回答 Lead 的澄清问题
+ * lead_recovery      Task 失败/阻塞后唤醒 Lead
+ * goal_changed       Goal 改变后重新规划
+ * user_mention       用户明确 @Member
+ * task_ready         Task 依赖满足
  * schedule           定时唤醒
  */
 export type WakeReason =
+  | 'lead_bootstrap'
   | 'lead_message'
   | 'lead_clarification'
   | 'lead_recovery'

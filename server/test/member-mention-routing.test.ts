@@ -179,6 +179,126 @@ describe('User @mention routing', () => {
   });
 });
 
+describe('Bootstrap 竞态：用户消息取消自动首轮', () => {
+  it('用户第一次消息到达时，会取消仍在运行的 Lead bootstrap，避免旧 Lead 回复混入', async () => {
+    stub.reset();
+    const lead = team.createMember({ name: 'Bootstrap Lead', role: 'Lead' });
+    const engineer = team.createMember({ name: 'Bootstrap Engineer', role: 'Engineer' });
+    const conversation = team.createConversation(
+      {
+        kind: 'task',
+        title: 'Bootstrap race',
+        memberIds: [lead.id, engineer.id],
+        leadMemberId: lead.id,
+      },
+      { autoStartLead: true },
+    );
+
+    // 把 bootstrap Lead turn 稳定挂住。
+    // 共享 stub 没有 cancelTurn（真引擎才有 abort）：临时补一个「找到但
+    // 停不掉」的实现，cancel 发得出信号，收尾时自己看到信号停下来。
+    let release!: () => void;
+    stub.hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    stub.holdMemberIds = new Set([lead.id]);
+    const stubAny = stub as unknown as { cancelTurn?: unknown };
+    const originalCancelTurn = stubAny.cancelTurn;
+    stubAny.cancelTurn = async () => ({ found: false, aborted: false, idle: false });
+    try {
+      // 等到 bootstrap execution 真正开始。
+      for (let i = 0; i < 300; i += 1) {
+        const row = db
+          .prepare(
+            `SELECT id FROM execution
+             WHERE conversation_id = ? AND member_id = ? AND wake_reason = 'lead_bootstrap'
+             AND status IN ('running', 'queued') LIMIT 1`,
+          )
+          .get(conversation.id, lead.id) as unknown as { id: string } | undefined;
+        if (row) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const bootstrap = db
+        .prepare(
+          `SELECT id, status FROM execution
+           WHERE conversation_id = ? AND member_id = ? AND wake_reason = 'lead_bootstrap'
+           ORDER BY created_at DESC LIMIT 1`,
+        )
+        .get(conversation.id, lead.id) as unknown as { id: string; status: string } | undefined;
+      assert.ok(bootstrap, 'bootstrap execution 必须先跑起来');
+
+      const result = await team.sendMessage({
+        conversationId: conversation.id,
+        content: `@${engineer.handle} 你是谁？`,
+      });
+      assert.equal(result.wakes.length, 1);
+      assert.equal(result.wakes[0].memberId, engineer.id);
+      assert.equal(result.wakes[0].reason, 'user_mention');
+
+      // Lead bootstrap 已经被取消。
+      const cancelledBootstrap = db.prepare(`SELECT status FROM execution WHERE id = ?`).get(
+        bootstrap.id,
+      ) as unknown as { status: string };
+      assert.equal(cancelledBootstrap.status, 'cancelled');
+
+      // 释放 Lead，确保 cancellation race 真正收口。
+      release();
+    } finally {
+      release();
+      stub.hold = null;
+      stub.holdMemberIds = null;
+      if (originalCancelTurn === undefined) delete stubAny.cancelTurn;
+      else stubAny.cancelTurn = originalCancelTurn;
+    }
+    await waitForConversationIdle(conversation.id);
+
+    const executions = db
+      .prepare(
+        `SELECT member_id, wake_reason FROM execution WHERE conversation_id = ? ORDER BY created_at`,
+      )
+      .all(conversation.id) as unknown as Array<{ member_id: string; wake_reason: string }>;
+    // 只允许 cancelled bootstrap + engineer mention，不能再出现第二个 Lead execution。
+    assert.equal(executions.length, 2);
+    assert.deepEqual(
+      executions.map((item) => item.member_id),
+      [lead.id, engineer.id],
+    );
+    assert.equal(executions[0].wake_reason, 'lead_bootstrap');
+    assert.equal(executions[1].wake_reason, 'user_mention');
+  });
+
+  it('@非 Lead Member 时不能把 waiting_user 清掉', async () => {
+    stub.reset();
+    const lead = team.createMember({ name: 'Waiting Lead', role: 'Lead' });
+    const engineer = team.createMember({ name: 'Waiting Engineer', role: 'Engineer' });
+    const conversation = team.createConversation({
+      kind: 'task',
+      title: 'Waiting mention',
+      memberIds: [lead.id, engineer.id],
+      leadMemberId: lead.id,
+    });
+
+    await team.requestClarification({
+      conversationId: conversation.id,
+      memberId: lead.id,
+      questions: ['具体目标是什么？'],
+      assumptions: [],
+      summary: '需要明确目标',
+    });
+    assert.equal(team.getConversation(conversation.id).status, 'waiting_user');
+
+    await team.sendMessage({
+      conversationId: conversation.id,
+      content: `@${engineer.handle} 你是谁？`,
+    });
+    await waitForConversationIdle(conversation.id);
+
+    const after = team.getConversation(conversation.id);
+    assert.equal(after.status, 'waiting_user');
+    assert.deepEqual(after.openQuestions, ['具体目标是什么？']);
+  });
+});
+
 describe('findMentionedMembers：只认 @handle', () => {
   it('邮箱 / 普通文本里的 @ 不算 mention，大小写不敏感，重复去重', async () => {
     const architect = team.createMember({ name: 'Parse Architect', role: 'Architect' });

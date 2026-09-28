@@ -753,7 +753,9 @@ export class TeamService {
       this.insertMessage(opener);
       this.touchConversation(id);
       this.emit(id, { type: 'message.created', data: opener });
-      this.orchestrator.ensureLeadWake(id, leadMemberId, opener.messageSequence);
+      // 自动首轮不再伪装成 lead_message：它是可丢弃的启动动作，用户一旦
+      // 开始交互就会被取消；独立原因才能在竞态里认出它、停掉它。
+      this.orchestrator.ensureLeadWake(id, leadMemberId, opener.messageSequence, 'lead_bootstrap');
     }
 
     return this.getConversation(id);
@@ -905,6 +907,42 @@ export class TeamService {
    * 是澄清、规划还是调整任务。Lead 正在执行时不重复入队 —— 消息已经落库，
    * checkpoint 机制会让下一轮看到它。
    */
+  /**
+   * 用户真正开始交互时，取消尚未完成的自动 bootstrap。
+   *
+   * bootstrap 是可丢弃的启动动作（“房间空着，Lead 先开口”），用户消息才是
+   * 真正的工作输入：旧 Lead 那一轮带着 opener 跑完，只会往 Activity 里多写
+   * 一条没人要的回复。分两步停 —— pending 的直接删，在跑的走正常取消。
+   */
+  private async cancelLeadBootstrap(conversation: Conversation): Promise<void> {
+    const leadMemberId = conversation.leadMemberId;
+    if (!leadMemberId) return;
+
+    this.scheduler.cancelPending(
+      conversation.id,
+      leadMemberId,
+      (wake) => wake.reason === 'lead_bootstrap',
+    );
+
+    const active = this.db
+      .prepare(
+        `SELECT id FROM execution
+         WHERE conversation_id = ?
+           AND member_id = ?
+           AND wake_reason = 'lead_bootstrap'
+           AND status IN ('queued', 'running', 'waiting_for_member')
+         ORDER BY created_at DESC`,
+      )
+      .all(conversation.id, leadMemberId) as Array<{ id: string }>;
+    for (const row of active) {
+      try {
+        await this.cancelExecutionTree(row.id);
+      } catch {
+        // 用户消息已经提交；cancellation race 不应阻塞真正的用户消息。
+      }
+    }
+  }
+
   async sendMessage(input: {
     conversationId: string;
     content: string;
@@ -983,17 +1021,20 @@ export class TeamService {
     const created = { ...message, files };
     this.emit(conversation.id, { type: 'message.created', data: created });
 
-    // Lead 唤醒原因决定模型档位，落库前就要定：回答澄清用 clarification，
-    // 在阻塞里追问用 recovery，其余是普通消息。判据是发送前的工作区状态，
-    // 下面的 waiting_user → running 翻转之后就看不出来了。
-    const leadWakeReason =
-      conversation.status === 'waiting_user'
-        ? 'lead_clarification'
-        : conversation.status === 'blocked'
-          ? 'lead_recovery'
-          : 'lead_message';
+    const wakes: WakePlan[] = [];
+    const fresh = this.getConversation(conversation.id);
+    const mentionedMembers = findMentionedMembers(created.content, fresh.members);
+    const leadIsMentioned =
+      !!fresh.leadMemberId && mentionedMembers.some((member) => member.id === fresh.leadMemberId);
 
-    if (conversation.status === 'waiting_user') {
+    // 用户真正开始交互时，取消尚未完成的自动 bootstrap。
+    await this.cancelLeadBootstrap(fresh);
+
+    // @别的 Member 不是在回答 Lead 的澄清问题：waiting_user 和 openQuestions
+    // 都保留。只有普通消息、或明确 @Lead，才算把 Lead 等的那轮问题接过去。
+    const resolvesLeadWaiting =
+      fresh.status === 'waiting_user' && (mentionedMembers.length === 0 || leadIsMentioned);
+    if (resolvesLeadWaiting) {
       this.db
         .prepare(
           `
@@ -1012,14 +1053,9 @@ export class TeamService {
       });
     }
 
-    const wakes: WakePlan[] = [];
-    const fresh = this.getConversation(conversation.id);
-
-    // 用户明确 @Member（@architect 看一下这个方案）就直接唤醒被点名的 Member，
-    // 而不是 User → Lead → Architect。只有没有明确 mention 时，普通用户消息
-    // 才走 Lead。
-    const mentionedMembers = findMentionedMembers(created.content, fresh.members);
     if (mentionedMembers.length > 0) {
+      // 用户明确 @Member（@architect 看一下这个方案）就直接唤醒被点名的 Member，
+      // 而不是 User → Lead → Architect。
       for (const member of mentionedMembers) {
         // muted 是明确的控制面设置，@mention 也不能绕过。
         if (this.states.get(conversation.id, member.id).muted) continue;
@@ -1039,6 +1075,14 @@ export class TeamService {
       }
     } else if (fresh.leadMemberId) {
       // 没有明确点名：保持原来的 Lead-first 行为。
+      // 唤醒原因按这条消息到达前的状态定：waiting_user 下的普通回答是澄清回复，
+      // 阻塞里追问是恢复，其余是普通消息。翻转之后再看就看不出来了。
+      const leadWakeReason =
+        conversation.status === 'waiting_user'
+          ? 'lead_clarification'
+          : conversation.status === 'blocked'
+            ? 'lead_recovery'
+            : 'lead_message';
       const enqueued = this.orchestrator.ensureLeadWake(
         conversation.id,
         fresh.leadMemberId,
@@ -1792,6 +1836,27 @@ export class TeamService {
   private async runWake(wake: PendingWake, markStarted: () => void): Promise<void> {
     const conversation = this.getConversation(wake.conversationId);
     const member = this.requireActiveMember(conversation, wake.memberId);
+
+    // bootstrap 的最后一道闸：scheduler 把它从 pending 拿走、还没 INSERT
+    // execution 的间隙里，用户消息可能已经到了。触发之后才来的用户消息
+    // 证明这一轮已经没人要 —— 直接丢掉，不建 execution。
+    if (wake.reason === 'lead_bootstrap') {
+      const newerUserMessage = this.db
+        .prepare(
+          `SELECT 1 AS ok FROM conversation_message
+           WHERE conversation_id = ? AND sender_type = 'user' AND message_sequence > ?
+           LIMIT 1`,
+        )
+        .get(wake.conversationId, wake.triggerSequence ?? 0) as unknown as
+        | { ok: number }
+        | undefined;
+      if (newerUserMessage) {
+        // 预期内的丢弃，不走 onError（那会打一条失败日志）：durable 标记要亲手
+        // 收回，否则重启恢复会把这轮已丢弃的 bootstrap 重派回来。
+        this.states.abandonPendingWake(wake.conversationId, wake.memberId, wake);
+        return;
+      }
+    }
 
     const task = wake.taskId ? this.tasks.get(wake.taskId) : null;
     if (wake.taskId && !task) throw new ExecutionCancelledError('Task 已不存在，不再执行');

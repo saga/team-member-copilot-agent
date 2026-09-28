@@ -241,6 +241,11 @@ export function classifyLeadTurn(input: {
   if (input.wakeReason === 'lead_recovery') {
     return 'recovery';
   }
+  // 自动首轮和 Goal 变化 = 理解目标 + 规划，永远走 Strong。
+  // bootstrap 单独列出来：它不再伪装成 lead_message。
+  if (input.wakeReason === 'lead_bootstrap') {
+    return 'planning';
+  }
   // Goal 变化 = 重新理解目标 + 重新规划，永远走 Strong。
   if (input.wakeReason === 'goal_changed') {
     return 'planning';

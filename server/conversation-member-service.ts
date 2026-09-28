@@ -426,6 +426,7 @@ export class ConversationMemberService {
  * 就编译不过。字符串比较不会报错，Record 会。
  */
 const KNOWN_WAKE_REASONS: Record<Exclude<WakeReason, 'schedule'>, true> = {
+  lead_bootstrap: true,
   lead_message: true,
   lead_clarification: true,
   lead_recovery: true,
