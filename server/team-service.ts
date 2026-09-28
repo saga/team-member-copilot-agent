@@ -12,7 +12,7 @@ import { ExperienceStore, type ExperienceKind } from './experience-store.js';
 import { ConversationMemberService } from './conversation-member-service.js';
 import { MemberTurnScheduler } from './member-turn-scheduler.js';
 import { TaskOrchestrator } from './task-orchestrator.js';
-import { TaskService, parseRequirements, parseStringArray } from './task-service.js';
+import { TaskService, parseRequirements, parseStringArray, type TaskPlanInput } from './task-service.js';
 import { badRequest, conflict, notFound } from './http-error.js';
 import { MemberConversationService, isMemberDm, type MemberDirectMessage } from './member-conversation-service.js';
 import type { ConversationFileService } from './conversation-file-service.js';
@@ -52,6 +52,8 @@ import type {
   ExecutionKind,
   ExecutionRecord,
   ExecutionStatus,
+  GoalChangeKind,
+  GoalRevision,
   Member,
   MemberCapabilities,
   MemberRuntime,
@@ -91,6 +93,7 @@ interface ConversationRow {
   title: string;
   kind: 'task' | 'direct';
   objective: string;
+  goal_revision: number;
   lead_member_id: string | null;
   status: ConversationStatus;
   requirements_json: string | null;
@@ -120,6 +123,7 @@ interface ExecutionRow {
   id: string;
   conversation_id: string;
   member_id: string;
+  goal_revision: number;
   task_id: string | null;
   external_work_ref: string | null;
   external_work_snapshot: string | null;
@@ -538,14 +542,17 @@ export class TeamService {
       )
       .all() as unknown as ConversationRow[];
     // 一次聚合拿全列表的任务进度：每个工作区再调一次 Task API 是 N+1。
+    // 只看当前 Goal：v1 的 5/5 不能和 v2 的 1/3 加成 6/8。
     const progressRows = this.db
       .prepare(
         `
-        SELECT conversation_id AS conversation_id,
+        SELECT t.conversation_id AS conversation_id,
                COUNT(*) AS total,
-               SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed
-        FROM conversation_task
-        GROUP BY conversation_id
+               SUM(CASE WHEN t.status = 'completed' THEN 1 ELSE 0 END) AS completed
+        FROM conversation_task t
+        JOIN conversation c ON c.id = t.conversation_id
+        WHERE t.goal_revision = c.goal_revision
+        GROUP BY t.conversation_id
         `,
       )
       .all() as unknown as Array<{ conversation_id: string; total: number; completed: number }>;
@@ -1244,6 +1251,44 @@ export class TeamService {
     return this.tasks.get(taskId);
   }
 
+  /** Goal 版本历史（倒序）：v1 永不修改，只能往前加。 */
+  listGoalRevisions(conversationId: string): GoalRevision[] {
+    this.getConversation(conversationId);
+    const rows = this.db
+      .prepare(
+        `
+        SELECT *
+        FROM conversation_goal_revision
+        WHERE conversation_id = ?
+        ORDER BY revision DESC
+        `,
+      )
+      .all(conversationId) as unknown as Array<{
+        id: string;
+        conversation_id: string;
+        revision: number;
+        objective: string;
+        requirements_json: string;
+        changed_by_type: 'user' | 'member' | 'system';
+        changed_by_id: string;
+        change_kind: GoalChangeKind;
+        reason: string;
+        created_at: string;
+      }>;
+    return rows.map((row) => ({
+      id: row.id,
+      conversationId: row.conversation_id,
+      revision: row.revision,
+      objective: row.objective,
+      requirements: parseRequirements(row.requirements_json),
+      changedByType: row.changed_by_type,
+      changedById: row.changed_by_id,
+      changeKind: row.change_kind,
+      reason: row.reason,
+      createdAt: row.created_at,
+    }));
+  }
+
   retryTask(taskId: string): ConversationTask {
     const task = this.tasks.retry(taskId);
     this.emit(task.conversationId, { type: 'task.updated', data: task });
@@ -1306,6 +1351,89 @@ export class TeamService {
     return `已记录 ${input.questions.length} 个待确认问题，工作区进入 waiting_user`;
   }
 
+  /**
+   * 改 Goal：记一条不可变历史，旧版本未完成的任务全部 cancelled，
+   * 活着的 execution 级联停掉（调用者自己的那轮除外），再唤醒 Lead 重新规划。
+   *
+   * actorType user = 人在 UI / API 上点的；member = Lead 调 update_goal 工具。
+   * Lead 检查只对 member 做：user 走 HTTP 门禁，不走 Member 身份。
+   */
+  async updateGoal(input: {
+    conversationId: string;
+    actorType: 'user' | 'member' | 'system';
+    actorId: string;
+    executionId?: string | null;
+    objective: string;
+    requirements?: TaskRequirements;
+    changeKind:
+      | 'clarification'
+      | 'scope_change'
+      | 'success_criteria_change'
+      | 'correction';
+    reason?: string;
+  }): Promise<{
+    conversation: Conversation;
+    revision: GoalRevision;
+  }> {
+    const conversation = this.getConversation(input.conversationId);
+    if (input.actorType === 'member') {
+      this.requireActiveMember(conversation, input.actorId);
+      if (conversation.leadMemberId !== input.actorId) {
+        throw badRequest('只有 Lead 可以修改 Goal');
+      }
+    }
+
+    const result = this.tasks.reviseGoal({
+      conversationId: conversation.id,
+      objective: input.objective,
+      requirements: input.requirements,
+      changedByType: input.actorType,
+      changedById: input.actorId,
+      changeKind: input.changeKind,
+      reason: input.reason,
+    });
+
+    for (const taskId of result.cancelledTaskIds) {
+      this.emit(conversation.id, {
+        type: 'task.updated',
+        data: this.tasks.get(taskId),
+      });
+    }
+
+    for (const executionId of result.executionIds) {
+      if (executionId === input.executionId) continue;
+      try {
+        await this.cancelExecutionTree(executionId);
+      } catch {
+        // Goal revision 已经提交。如果执行引擎已经收尾或 cancellation race，
+        // 不能回滚 Goal —— 旧任务行已经是 cancelled，引擎侧自己收尾即可。
+      }
+    }
+
+    const latest = this.getConversation(conversation.id);
+    this.emit(conversation.id, {
+      type: 'conversation.updated',
+      data: latest,
+    });
+
+    if (
+      input.actorType === 'user' &&
+      latest.leadMemberId
+    ) {
+      this.orchestrator.ensureLeadWake(
+        latest.id,
+        latest.leadMemberId,
+        latest.messageSequence,
+        'goal_changed',
+      );
+    }
+
+    return {
+      conversation: latest,
+      revision: result.revision,
+    };
+  }
+
   /** CoreToolHost：Lead 制定任务计划。 */
   async planTasks(input: {
     conversationId: string;
@@ -1345,6 +1473,70 @@ export class TeamService {
     // turn 结束时的收口再调一次 startReadyTasks 是幂等的 no-op。
     const started = this.orchestrator.startReadyTasks(conversation.id);
     return `已创建 ${created.length} 个任务，${started.length} 个已开始执行`;
+  }
+
+  /** CoreToolHost：Lead 修改 Goal（update_goal 工具）。 */
+  async updateGoalTool(input: {
+    conversationId: string;
+    memberId: string;
+    executionId: string;
+    objective: string;
+    requirements?: TaskRequirements;
+    changeKind:
+      | 'clarification'
+      | 'scope_change'
+      | 'success_criteria_change'
+      | 'correction';
+    reason?: string;
+  }): Promise<string> {
+    const conversation = this.getConversation(input.conversationId);
+    this.requireActiveMember(conversation, input.memberId);
+    if (conversation.leadMemberId !== input.memberId) {
+      throw badRequest('只有 Lead 可以修改 Goal');
+    }
+    const result = await this.updateGoal({
+      conversationId: conversation.id,
+      actorType: 'member',
+      actorId: input.memberId,
+      executionId: input.executionId,
+      objective: input.objective,
+      requirements: input.requirements,
+      changeKind: input.changeKind,
+      reason: input.reason,
+    });
+    return `Goal 已更新为 v${result.revision.revision}。旧任务计划已失效，请继续调用 replan_tasks 创建新计划。`;
+  }
+
+  /** CoreToolHost：Lead 给当前 Goal 重建任务计划（replan_tasks 工具）。 */
+  async replanTasks(input: {
+    conversationId: string;
+    memberId: string;
+    tasks: TaskPlanInput[];
+  }): Promise<string> {
+    const conversation = this.getConversation(input.conversationId);
+    this.requireActiveMember(conversation, input.memberId);
+    if (conversation.leadMemberId !== input.memberId) {
+      throw badRequest('只有 Lead 可以重新规划任务');
+    }
+    const created = this.tasks.replan({
+      conversationId: conversation.id,
+      memberId: input.memberId,
+      tasks: input.tasks,
+      rosterMemberIds: conversation.members.map((member) => member.id),
+      leadMemberId: conversation.leadMemberId,
+    });
+    for (const task of created) {
+      this.emit(conversation.id, {
+        type: 'task.updated',
+        data: task,
+      });
+    }
+    const started = this.orchestrator.startReadyTasks(conversation.id);
+    this.emit(conversation.id, {
+      type: 'conversation.updated',
+      data: this.getConversation(conversation.id),
+    });
+    return `Goal v${conversation.goalRevision} 已重新规划：创建 ${created.length} 个任务，${started.length} 个已开始执行`;
   }
 
   /** CoreToolHost：Lead 在已有计划中补充一个真正缺失的任务。 */
@@ -1559,6 +1751,13 @@ export class TeamService {
     if (task && task.conversationId !== conversation.id) {
       throw new ExecutionCancelledError('Task 不属于这个工作区，不再执行');
     }
+    // stale wake 保护：Goal 已经往前走了，这个唤醒是对旧计划点的名。
+    // crash / recovery 可能把它重派回来 —— 直接取消，不执行旧 Task。
+    if (task && task.goalRevision !== conversation.goalRevision) {
+      throw new ExecutionCancelledError(
+        `Task 属于 Goal v${task.goalRevision}，当前已经是 Goal v${conversation.goalRevision}`,
+      );
+    }
     const trigger = wake.triggerSequence !== null && wake.triggerSequence !== undefined
       ? this.findMessageBySequence(wake.conversationId, wake.triggerSequence)
       : null;
@@ -1571,6 +1770,7 @@ export class TeamService {
       id: randomUUID(),
       conversationId: conversation.id,
       memberId: member.id,
+      goalRevision: conversation.goalRevision,
       taskId: task?.id ?? null,
       externalWorkRef: conversation.externalWorkRef,
       externalWorkSnapshot: null,
@@ -1619,7 +1819,10 @@ export class TeamService {
       if (task) {
         const message = error instanceof Error ? error.message : String(error);
         const cancelled = error instanceof ExecutionCancelledError;
-        if (!cancelled) {
+        // turn 跑的是旧 Goal（中途 reviseGoal 已经收口）：旧 Task 行不动，
+        // 也不推进 —— 新计划由 replan + 新 wake 驱动。
+        const stale = this.tasks.get(task.id).goalRevision !== this.currentGoalRevision(task.conversationId);
+        if (!cancelled && !stale) {
           this.tasks.markFailed(task.id, message);
           this.orchestrator.onTaskChanged(task.id);
         } else {
@@ -1628,6 +1831,14 @@ export class TeamService {
       }
       throw error;
     }
+  }
+
+  /** conversation 当前 Goal 版本号（单字段快读，给 turn 收尾判新旧用）。 */
+  private currentGoalRevision(conversationId: string): number {
+    const row = this.db
+      .prepare(`SELECT goal_revision FROM conversation WHERE id = ?`)
+      .get(conversationId) as unknown as { goal_revision: number } | undefined;
+    return row?.goal_revision ?? 0;
   }
 
   /**
@@ -1811,6 +2022,7 @@ export class TeamService {
       id: randomUUID(),
       conversationId: conversation.id,
       memberId: targetMember.id,
+      goalRevision: conversation.goalRevision,
       taskId: null,
       // delegation 继承父的外部工作引用：同一项业务工作的审计链不断。
       // 快照**不继承** —— 它是「这一轮开跑时取证的结果」，子轮次会自己取证一次。
@@ -2107,6 +2319,52 @@ export class TeamService {
   }
 
   /**
+   * 级联取消一条 execution 及其等出来的子树：
+   * waiting_for_member 的父先停掉它等的孩子，再停自己。
+   *
+   * visited 防环：等待图理论上无环（delegation 建边时检查过），但取消路径上
+   * 不再假设一次 —— 环了就停，而不是转死。
+   */
+  private async cancelExecutionTree(
+    executionId: string,
+    visited = new Set<string>(),
+  ): Promise<void> {
+    if (visited.has(executionId)) return;
+    visited.add(executionId);
+
+    const execution = this.getExecution(executionId);
+    if (execution.status === 'waiting_for_member') {
+      if (execution.waitingForRuntimeId) {
+        const child = this.db
+          .prepare(
+            `
+            SELECT id
+            FROM execution
+            WHERE runtime_id = ?
+              AND status IN ('queued', 'running', 'waiting_for_member')
+            ORDER BY created_at DESC
+            LIMIT 1
+            `,
+          )
+          .get(execution.waitingForRuntimeId) as
+          | { id: string }
+          | undefined;
+        if (child) {
+          await this.cancelExecutionTree(child.id, visited);
+        }
+      }
+    }
+
+    const current = this.getExecution(executionId);
+    if (
+      current.status === 'queued' ||
+      current.status === 'running'
+    ) {
+      await this.cancelExecution(executionId);
+    }
+  }
+
+  /**
    * 显式 retry。绝不自动重跑被中断的 execution：
    * Copilot session 可能已经执行完工具但没来得及落库，自动重跑会重复执行。
    *
@@ -2127,6 +2385,7 @@ export class TeamService {
       id: randomUUID(),
       conversationId: original.conversationId,
       memberId: original.memberId,
+      goalRevision: original.goalRevision,
       taskId: original.taskId,
       externalWorkRef: original.externalWorkRef,
       externalWorkSnapshot: null,
@@ -2254,6 +2513,7 @@ export class TeamService {
       id: randomUUID(),
       conversationId: conversation.id,
       memberId: member.id,
+      goalRevision: conversation.goalRevision,
       taskId: null,
       externalWorkRef: conversation.externalWorkRef,
       externalWorkSnapshot: null,
@@ -2791,7 +3051,13 @@ export class TeamService {
       this.touchConversation(input.conversation.id);
       this.touchAgentPresence(input.member.id);
 
-      if (taskAfterTurn && taskAfterTurn.status === 'running') {
+      // turn 跑的是旧 Goal（中途 reviseGoal 已经收口）：旧 Task 行不动，
+      // 也不推进 —— 新计划由 replan + 新 wake 驱动。
+      const staleTurn = !!taskAfterTurn && taskAfterTurn.goalRevision !== this.currentGoalRevision(input.conversation.id);
+      if (staleTurn) {
+        // 刻意空着：上面 updateExecution 的 completed 记的是 execution 事实，
+        // Task 行是 reviseGoal 关掉的，两边各管各的。
+      } else if (taskAfterTurn && taskAfterTurn.status === 'running') {
         // turn 结束时 Task 还在 running：Agent 没有调 update_task 报告完成或阻塞。
         // 不能按「输出了文字 = 做完了」自动 completed —— 做一半就输出一段文字的
         // Agent 会把没做完的任务标记成完成。按失败处理，Lead recovery 来决定
@@ -3519,6 +3785,7 @@ export class TeamService {
       title: row.title,
       kind: row.kind,
       objective: row.objective ?? '',
+      goalRevision: row.goal_revision ?? 0,
       leadMemberId: row.lead_member_id,
       status: row.status ?? 'intake',
       requirements,
@@ -3546,7 +3813,7 @@ export class TeamService {
     };
   }
 
-  /** 单个工作区的任务进度：列表页走批量聚合，只有这里走单查。 */
+  /** 单个工作区的任务进度：列表页走批量聚合，只有这里走单查。只看当前 Goal。 */
   private taskProgressOf(conversationId: string): { total: number; completed: number } {
     const row = this.db
       .prepare(
@@ -3555,9 +3822,14 @@ export class TeamService {
                COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0) AS completed
         FROM conversation_task
         WHERE conversation_id = ?
+          AND goal_revision = (
+            SELECT goal_revision
+            FROM conversation
+            WHERE id = ?
+          )
         `,
       )
-      .get(conversationId) as unknown as { total: number; completed: number };
+      .get(conversationId, conversationId) as unknown as { total: number; completed: number };
     return { total: row.total, completed: row.completed };
   }
 
@@ -3569,6 +3841,7 @@ export class TeamService {
           id,
           conversation_id,
           member_id,
+          goal_revision,
           task_id,
           external_work_ref,
           external_work_snapshot,
@@ -3590,13 +3863,14 @@ export class TeamService {
           ended_at,
           created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `,
       )
       .run(
         execution.id,
         execution.conversationId,
         execution.memberId,
+        execution.goalRevision,
         execution.taskId,
         serializeExternalWorkRef(execution.externalWorkRef),
         serializeExternalWorkSnapshot(execution.externalWorkSnapshot),
@@ -3964,6 +4238,7 @@ function mapExecution(row: ExecutionRow): ExecutionRecord {
     id: row.id,
     conversationId: row.conversation_id,
     memberId: row.member_id,
+    goalRevision: row.goal_revision ?? 0,
     taskId: row.task_id,
     externalWorkRef: parseExternalWorkRef(row.external_work_ref),
     externalWorkSnapshot: parseExternalWorkSnapshot(row.external_work_snapshot),

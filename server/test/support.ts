@@ -98,6 +98,8 @@ export function createCapabilityStack(
       addTask: (input) => resolveTeam().addTask(input),
       reassignTask: (input) => resolveTeam().reassignTask(input),
       learnExperience: (input) => resolveTeam().learnExperience(input),
+      updateGoal: (input) => resolveTeam().updateGoalTool(input),
+      replanTasks: (input) => resolveTeam().replanTasks(input),
       updateTask: (input) => resolveTeam().updateTask(input),
     }),
   );

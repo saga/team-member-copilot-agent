@@ -145,6 +145,17 @@ describe('Lead model routing', () => {
     );
   });
 
+  it('goal_changed 使用 Strong 做规划', () => {
+    assert.equal(
+      classifyLeadTurn({ wakeReason: 'goal_changed', taskCount: 0, prompt: '根据新的 Goal 重新规划任务' }),
+      'planning',
+    );
+    assert.deepEqual(
+      chooseLeadModel(policy, classifyLeadTurn({ wakeReason: 'goal_changed', taskCount: 3, prompt: '按新 Goal 来' })),
+      { model: 'gpt-5', purpose: 'lead:planning' },
+    );
+  });
+
   it('明确要求重新规划时使用 Strong', () => {
     assert.deepEqual(
       chooseLeadModel(

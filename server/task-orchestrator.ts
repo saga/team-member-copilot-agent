@@ -34,7 +34,10 @@ export class TaskOrchestrator {
     conversationId: string,
     leadMemberId: string | null,
     triggerSequence: number,
-    reason: Extract<WakeReason, 'lead_message' | 'lead_clarification' | 'lead_recovery'> = 'lead_message',
+    reason: Extract<
+      WakeReason,
+      'lead_message' | 'lead_clarification' | 'lead_recovery' | 'goal_changed'
+    > = 'lead_message',
   ): boolean {
     if (!leadMemberId) return false;
     // 忙也不丢：scheduler 按 (conversation, member) 串行，忙时入队只是排进
@@ -65,6 +68,13 @@ export class TaskOrchestrator {
       // 同一个成员的任务链（A 完成后 B 才能跑）会在 A 的 turn 内外各被跳过一次，
       // 然后永远没人再 kick，B 烂在 ready。重复入队由 scheduler 的 mergeWake
       // 合并（同 taskId 只留一条），不会跑重。
+      //
+      // 跨 Goal 保护：findReady 只读当前版本，这里是双保险 —— 万一读到旧行，
+      // 也不执行它（旧计划已失效，执行旧 Task 等于把上一版工作又跑一遍）。
+      const conversation = this.readConversation(conversationId);
+      if (!conversation || task.goalRevision !== conversation.goalRevision) {
+        continue;
+      }
       if (this.hasActiveExecution(conversationId, task.assigneeMemberId)) continue;
       const state = this.states.get(conversationId, task.assigneeMemberId);
       if (state.muted) continue;
@@ -131,12 +141,13 @@ export class TaskOrchestrator {
   private readConversation(conversationId: string): {
     leadMemberId: string | null;
     messageSequence: number;
+    goalRevision: number;
   } | null {
     const row = this.db
-      .prepare(`SELECT lead_member_id, message_sequence FROM conversation WHERE id = ?`)
-      .get(conversationId) as unknown as { lead_member_id: string | null; message_sequence: number } | undefined;
+      .prepare(`SELECT lead_member_id, message_sequence, goal_revision FROM conversation WHERE id = ?`)
+      .get(conversationId) as unknown as { lead_member_id: string | null; message_sequence: number; goal_revision: number } | undefined;
     if (!row) return null;
-    return { leadMemberId: row.lead_member_id, messageSequence: row.message_sequence };
+    return { leadMemberId: row.lead_member_id, messageSequence: row.message_sequence, goalRevision: row.goal_revision ?? 0 };
   }
 
   touchConversation(conversationId: string): void {

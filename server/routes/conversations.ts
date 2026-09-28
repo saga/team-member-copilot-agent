@@ -76,6 +76,46 @@ const sendMessageSchema = z.object({
   fileIds: z.array(z.string().min(1)).max(50).optional(),
 });
 
+const updateGoalSchema = z.object({
+  objective: z.string().trim().min(1).max(4000),
+  requirements: z
+    .object({
+      facts: z
+        .array(
+          z.object({
+            key: z.string().min(1).max(200),
+            value: z.string().min(1).max(4000),
+            source: z.enum([
+              'user',
+              'jira',
+              'knowledge',
+              'conversation',
+              'agent',
+            ]),
+            confirmed: z.boolean(),
+          }),
+        )
+        .max(50)
+        .optional(),
+      assumptions: z.array(z.string().max(1000)).max(20).optional(),
+      constraints: z.array(z.string().max(1000)).max(20).optional(),
+      successCriteria: z
+        .array(z.string().max(1000))
+        .max(20)
+        .optional(),
+    })
+    .optional(),
+  changeKind: z
+    .enum([
+      'clarification',
+      'scope_change',
+      'success_criteria_change',
+      'correction',
+    ])
+    .default('scope_change'),
+  reason: z.string().trim().max(2000).optional(),
+});
+
 /** promote 的目标知识库：只接受 team KB，个人库不在这个入口的语义里。 */
 export interface PromotionTarget {
   writeDocument(input: {
@@ -221,6 +261,52 @@ export function conversationsRouter(
   router.get('/:id/state', (req, res) => {
     try {
       res.json({ states: team.listConversationState(req.params.id) });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  /**
+   * 用户在 UI 上改 Goal：生成新版本，旧计划失效，Lead 重新规划。
+   * Lead 自己在 turn 里改走 update_goal 工具，两条路汇到同一个
+   * TeamService.updateGoal —— “谁点的”只决定 actorType，不决定语义。
+   */
+  router.patch('/:id/goal', async (req, res) => {
+    const parsed = updateGoalSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({
+        error: parsed.error.issues.map((i) => i.message).join('; '),
+      });
+      return;
+    }
+    try {
+      const result = await team.updateGoal({
+        conversationId: req.params.id,
+        actorType: 'user',
+        actorId: config.localUserId,
+        objective: parsed.data.objective,
+        requirements: parsed.data.requirements
+          ? {
+              facts: parsed.data.requirements.facts ?? [],
+              assumptions: parsed.data.requirements.assumptions ?? [],
+              constraints: parsed.data.requirements.constraints ?? [],
+              successCriteria: parsed.data.requirements.successCriteria ?? [],
+            }
+          : undefined,
+        changeKind: parsed.data.changeKind,
+        reason: parsed.data.reason,
+      });
+      res.json(result);
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  router.get('/:id/goal/history', (req, res) => {
+    try {
+      res.json({
+        revisions: team.listGoalRevisions(req.params.id),
+      });
     } catch (error) {
       sendError(res, error);
     }

@@ -108,7 +108,7 @@ export function Workspace() {
     applyMemberSaved,
   } = data;
   void applyTaskChanged;
-  const { createTask, createMember, archiveMember, send, uploadFile, deleteFile, retryTask, cancelTask } =
+  const { createTask, createMember, archiveMember, send, uploadFile, deleteFile, retryTask, cancelTask, updateGoal } =
     actions;
 
   const editingMember = editingMemberId ? (memberById.get(editingMemberId) ?? null) : null;
@@ -315,6 +315,7 @@ export function Workspace() {
                     memberLabel={memberLabel}
                     onRetryTask={(taskId) => void retryTask(taskId)}
                     onCancelTask={(taskId) => void cancelTask(taskId)}
+                    onUpdateGoal={(objective) => updateGoal(objective)}
                   />
                 </aside>
               )}

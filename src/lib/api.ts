@@ -314,6 +314,8 @@ export interface Conversation {
   kind: 'task' | 'direct';
   /** 这次工作的总体目标。 */
   objective: string;
+  /** 0 = 还没有正式确定 Goal；1+ = 当前 Goal Revision。 */
+  goalRevision: number;
   /** 当前负责澄清需求、维护任务整体状态的 Member。 */
   leadMemberId: string | null;
   status: ConversationStatus;
@@ -345,9 +347,28 @@ export type ConversationTaskStatus =
 /** Task 锁定的模型档位（Lead 在 plan/add 里定）；null = 跟执行人默认。 */
 export type TaskModelTier = 'cheap' | 'standard' | 'strong';
 
+export interface GoalRevision {
+  id: string;
+  conversationId: string;
+  revision: number;
+  objective: string;
+  requirements: TaskRequirements;
+  changedByType: 'user' | 'member' | 'system';
+  changedById: string;
+  changeKind:
+    | 'initial'
+    | 'clarification'
+    | 'scope_change'
+    | 'success_criteria_change'
+    | 'correction';
+  reason: string;
+  createdAt: string;
+}
+
 export interface ConversationTask {
   id: string;
   conversationId: string;
+  goalRevision: number;
   title: string;
   description: string;
   assigneeMemberId: string;
@@ -500,6 +521,7 @@ export interface ExecutionRecord {
  *   lead_message       用户发普通消息，唤醒 Lead
  *   lead_clarification 用户回答了澄清问题，唤醒 Lead 继续推进
  *   lead_recovery      Task 失败/阻塞，唤醒 Lead 做整体判断
+ *   goal_changed       Goal 改版本，唤醒 Lead 重新规划
  *   task_ready         Task 依赖满足，唤醒执行人
  *   schedule           定时唤醒
  */
@@ -507,6 +529,7 @@ export type WakeReason =
   | 'lead_message'
   | 'lead_clarification'
   | 'lead_recovery'
+  | 'goal_changed'
   | 'task_ready'
   | 'schedule';
 
@@ -1145,6 +1168,44 @@ export const api = {
     return fetch(`${API_BASE}/api/mcp/servers/${encodeURIComponent(id)}/test`, {
       method: 'POST',
     }).then(json<{ ok: boolean; detail: string; server: McpServer }>);
+  },
+
+  /**
+   * 用户在 UI 上改 Goal：生成新版本，旧计划失效，Lead 重新规划。
+   * 和 Lead 在 turn 里调 update_goal 工具走同一条服务端链。
+   */
+  updateConversationGoal(
+    conversationId: string,
+    input: {
+      objective: string;
+      reason?: string;
+      changeKind?:
+        | 'clarification'
+        | 'scope_change'
+        | 'success_criteria_change'
+        | 'correction';
+    },
+  ): Promise<{ conversation: Conversation; revision: GoalRevision }> {
+    return fetch(
+      `${API_BASE}/api/conversations/${encodeURIComponent(conversationId)}/goal`,
+      {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(input),
+      },
+    ).then(
+      json<{ conversation: Conversation; revision: GoalRevision }>,
+    );
+  },
+
+  getConversationGoalHistory(
+    conversationId: string,
+  ): Promise<{ revisions: GoalRevision[] }> {
+    return fetch(
+      `${API_BASE}/api/conversations/${encodeURIComponent(
+        conversationId,
+      )}/goal/history`,
+    ).then(json<{ revisions: GoalRevision[] }>);
   },
 
   /**

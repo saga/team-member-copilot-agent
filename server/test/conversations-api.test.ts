@@ -31,11 +31,13 @@ process.env.COPILOT_WARMUP = 'false';
 const { db } = await import('../db.js');
 const { MemberService } = await import('../member-service.js');
 const { conversationsRouter } = await import('../routes/conversations.js');
-const { StubCopilot, createTestStack } = await import('./support.js');
+const { StubCopilot, createTestStack, reportTaskTurns } = await import('./support.js');
 
 const memberService = new MemberService(db);
 const stub = new StubCopilot();
 const stack = createTestStack(db, memberService, stub.asCopilot);
+// Task turn 内调 update_task(completed)，v1 任务能自己跑完，旧版本取消不断言执行细节。
+reportTaskTurns(stack.team, stub);
 
 let alice: Member;
 let bob: Member;
@@ -254,5 +256,116 @@ describe('GET /events：流式增量原样到达客户端', () => {
       controller.abort();
       await pump;
     }
+  });
+});
+
+describe('PATCH /:id/goal + GET /:id/goal/history：Goal 改版本走真实 HTTP', () => {
+  const requirements = { facts: [], assumptions: [], constraints: [], successCriteria: [] };
+
+  async function waitForIdle(conversationId: string): Promise<void> {
+    for (let attempt = 0; attempt < 400; attempt += 1) {
+      const row = db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM execution WHERE conversation_id = ? AND status IN ('queued', 'running', 'waiting_for_member')`,
+        )
+        .get(conversationId) as unknown as { n: number };
+      if (row.n === 0) return;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.fail(`conversation ${conversationId} 仍有未完成的 execution`);
+  }
+
+  function patchGoal(conversationId: string, body: unknown) {
+    return fetch(`${base}/api/conversations/${encodeURIComponent(conversationId)}/goal`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  }
+
+  it('改目标回 200：版本号 +1、旧任务 cancelled、history 有两条', async () => {
+    stub.reset();
+    const conversationId = await makeGroup('Goal Http Room');
+    // 按住 bob 的 turn：任务钉在 running，PATCH 撞上的是活 execution，不是已跑完的行。
+    let release!: () => void;
+    stub.hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    stub.holdMemberIds = new Set([bob.id]);
+    try {
+      await stack.team.planTasks({
+        conversationId,
+        memberId: alice.id,
+        objective: '做 A',
+        requirements,
+        tasks: [{ key: 'a', title: 'A', assigneeMemberId: bob.id }],
+      });
+      for (let attempt = 0; attempt < 400; attempt += 1) {
+        const current = stack.team.listTasks(conversationId)[0];
+        if (current?.status === 'running' && current.currentExecutionId) {
+          const row = db
+            .prepare(`SELECT status FROM execution WHERE id = ?`)
+            .get(current.currentExecutionId) as unknown as { status: string };
+          if (row.status === 'running') break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.equal(stack.team.getConversation(conversationId).goalRevision, 1);
+
+      const response = await patchGoal(conversationId, {
+        objective: '改做 B',
+        changeKind: 'scope_change',
+        reason: '用户改了需求',
+      });
+      assert.equal(response.status, 200);
+      const body = (await response.json()) as {
+        conversation: { goalRevision: number };
+        revision: { revision: number; objective: string };
+      };
+      // schema 把字段吃掉的表现就是「接口 200 但版本号没动」
+      assert.equal(body.revision.revision, 2);
+      assert.equal(body.revision.objective, '改做 B');
+      assert.equal(body.conversation.goalRevision, 2);
+
+      const oldTask = db
+        .prepare(`SELECT status, blocker FROM conversation_task WHERE conversation_id = ?`)
+        .get(conversationId) as unknown as { status: string; blocker: string | null };
+      assert.equal(oldTask.status, 'cancelled');
+      assert.match(oldTask.blocker ?? '', /v2/);
+    } finally {
+      release();
+      stub.hold = null;
+      stub.holdMemberIds = null;
+    }
+    await waitForIdle(conversationId);
+
+    const history = await fetch(
+      `${base}/api/conversations/${encodeURIComponent(conversationId)}/goal/history`,
+    );
+    assert.equal(history.status, 200);
+    const revisions = (
+      (await history.json()) as {
+        revisions: Array<{ revision: number; objective: string }>;
+      }
+    ).revisions;
+    assert.equal(revisions.length, 2);
+    assert.deepEqual(
+      revisions.map((revision) => revision.revision),
+      [2, 1],
+    );
+    assert.equal(revisions[0]?.objective, '改做 B');
+  });
+
+  it('空 objective 回 400，而不是静默 no-op', async () => {
+    const conversationId = await makeGroup('Goal Empty Room');
+    assert.equal((await patchGoal(conversationId, { objective: '  ' })).status, 400);
+  });
+
+  it('不存在的会话：PATCH 与 history 都回 404', async () => {
+    assert.equal((await patchGoal('no-such-room', { objective: 'x' })).status, 404);
+    assert.equal(
+      (await fetch(`${base}/api/conversations/no-such-room/goal/history`)).status,
+      404,
+    );
   });
 });

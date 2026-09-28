@@ -127,6 +127,30 @@ export interface TaskRequirements {
   successCriteria: string[];
 }
 
+export type GoalChangeKind =
+  | 'initial'
+  | 'clarification'
+  | 'scope_change'
+  | 'success_criteria_change'
+  | 'correction';
+
+/**
+ * Goal 的一次版本快照。只增不改：v1 写进去就永远是 v1，
+ * “恢复 v1” 也是生成内容相同的新版本，而不是动指针。
+ */
+export interface GoalRevision {
+  id: string;
+  conversationId: string;
+  revision: number;
+  objective: string;
+  requirements: TaskRequirements;
+  changedByType: 'user' | 'member' | 'system';
+  changedById: string;
+  changeKind: GoalChangeKind;
+  reason: string;
+  createdAt: string;
+}
+
 export type ConversationTaskStatus =
   | 'pending'
   | 'ready'
@@ -142,6 +166,8 @@ export type TaskModelTier = 'cheap' | 'standard' | 'strong';
 export interface ConversationTask {
   id: string;
   conversationId: string;
+  /** 创建时房间的 Goal 版本。旧版本任务只读历史，不再推进不许操作。 */
+  goalRevision: number;
   title: string;
   description: string;
   assigneeMemberId: string;
@@ -274,6 +300,8 @@ export interface Conversation {
   kind: ConversationKind;
   /** 这次工作的总体目标。 */
   objective: string;
+  /** 0 = 还没有正式确定 Goal；1+ = 当前 Goal Revision。 */
+  goalRevision: number;
   /** 当前负责澄清需求、维护任务整体状态的 Member。 */
   leadMemberId: string | null;
   status: ConversationStatus;
@@ -390,6 +418,7 @@ export type WakeReason =
   | 'lead_message'
   | 'lead_clarification'
   | 'lead_recovery'
+  | 'goal_changed'
   | 'task_ready'
   | 'schedule';
 
@@ -470,6 +499,8 @@ export interface ExecutionRecord {
   id: string;
   conversationId: string;
   memberId: string;
+  /** execution 开始时使用的 Goal Revision。 */
+  goalRevision: number;
   /** 这次运行属于哪个 Task，null = Lead 处理用户输入。 */
   taskId: string | null;
   /**

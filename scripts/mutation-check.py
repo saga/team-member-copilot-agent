@@ -967,6 +967,61 @@ MUTATIONS = [
             )
         ],
     },
+    {
+        "name": "plan 不建 Goal v1（版本号永远是 0）",
+        "test": "server/test/goal-revision.test.ts",
+        "steps": [
+            (
+                "server/task-service.ts",
+                "    const goalRevision = 1;\n",
+                "    const goalRevision = 0;\n",
+            )
+        ],
+    },
+    {
+        "name": "reviseGoal 不取消旧任务（旧计划继续跑）",
+        "test": "server/test/goal-revision.test.ts",
+        "steps": [
+            (
+                "server/task-service.ts",
+                "          UPDATE conversation_task\n          SET\n            status = 'cancelled',\n            blocker = ?,\n            current_execution_id = NULL,\n",
+                "          UPDATE conversation_task\n          SET\n            status = 'completed',\n            blocker = ?,\n            current_execution_id = NULL,\n",
+            )
+        ],
+    },
+    {
+        "name": "listTasks 不分版本（旧任务混进当前 UI）",
+        "test": "server/test/goal-revision.test.ts",
+        "steps": [
+            (
+                "server/task-service.ts",
+                "          AND goal_revision = ?\n        ORDER BY sort_order, created_at\n",
+                "          AND goal_revision >= 0\n        ORDER BY sort_order, created_at\n",
+            )
+        ],
+    },
+    {
+        "name": "update_task 不查版本（旧任务能被改写）",
+        "test": "server/test/goal-revision.test.ts",
+        "steps": [
+            (
+                "server/task-service.ts",
+                "    const task = this.get(input.taskId);\n    this.assertCurrentRevision(task);\n    if (task.assigneeMemberId !== input.memberId) {\n",
+                "    const task = this.get(input.taskId);\n    if (task.assigneeMemberId !== input.memberId) {\n",
+            )
+        ],
+    },
+    {
+        "name": "Goal 唤醒走普通消息通道（不用 Strong 规划）",
+        "test": "server/test/goal-revision.test.ts",
+        "steps": [
+            (
+                "server/team-service.ts",
+                "      this.orchestrator.ensureLeadWake(\n        latest.id,\n        latest.leadMemberId,\n        latest.messageSequence,\n        'goal_changed',\n      );\n",
+                "      this.orchestrator.ensureLeadWake(\n        latest.id,\n        latest.leadMemberId,\n        latest.messageSequence,\n        'lead_message',\n      );\n",
+            )
+        ],
+    },
 ]
 
 

@@ -6,6 +6,7 @@ import type {
   ConversationStatus,
   ConversationTask,
   ConversationTaskStatus,
+  GoalRevision,
   TaskModelTier,
   TaskRequirements,
 } from './domain.js';
@@ -42,6 +43,7 @@ export interface DependencyRefreshResult {
 interface TaskRow {
   id: string;
   conversation_id: string;
+  goal_revision: number;
   title: string;
   description: string;
   assignee_member_id: string;
@@ -103,12 +105,26 @@ export function parseStringArray(raw: string | null): string[] {
 export class TaskService {
   constructor(private readonly db: DatabaseSync) {}
 
+  /**
+   * 只返回当前 Goal 的任务：旧版本任务是历史，在 UI 里混进来会让人对着
+   * 已经失效的计划点重试。要看历史走  conversation_goal_revision + 按 id 取。
+   */
   list(conversationId: string): ConversationTask[] {
+    const row = this.db
+      .prepare(`SELECT goal_revision FROM conversation WHERE id = ?`)
+      .get(conversationId) as unknown as { goal_revision: number } | undefined;
+    if (!row) return [];
     const rows = this.db
       .prepare(
-        `SELECT * FROM conversation_task WHERE conversation_id = ? ORDER BY sort_order, created_at`,
+        `
+        SELECT *
+        FROM conversation_task
+        WHERE conversation_id = ?
+          AND goal_revision = ?
+        ORDER BY sort_order, created_at
+        `,
       )
-      .all(conversationId) as unknown as TaskRow[];
+      .all(conversationId, row.goal_revision) as unknown as TaskRow[];
     return rows.map(mapTask);
   }
 
@@ -135,10 +151,20 @@ export class TaskService {
     if (this.list(input.conversationId).length > 0) {
       throw badRequest('这个工作区已经存在任务，不能重新创建任务计划');
     }
-    const convRow = this.db.prepare(`SELECT status FROM conversation WHERE id = ?`).get(input.conversationId) as
-      | { status: ConversationStatus }
+    const convRow = this.db
+      .prepare(
+        `SELECT status, goal_revision FROM conversation WHERE id = ?`,
+      )
+      .get(input.conversationId) as
+      | { status: ConversationStatus; goal_revision: number }
       | undefined;
-    if (convRow && convRow.status !== 'intake' && convRow.status !== 'waiting_user') {
+    if (!convRow) {
+      throw notFound(`Conversation 不存在：${input.conversationId}`);
+    }
+    if (convRow.goal_revision !== 0) {
+      throw badRequest('初始 Goal 已经确定；Goal 发生变化后必须使用 replan_tasks');
+    }
+    if (convRow.status !== 'intake' && convRow.status !== 'waiting_user') {
       throw badRequest('任务已经开始，不能重新创建任务计划');
     }
     const objective = input.objective.trim();
@@ -170,17 +196,48 @@ export class TaskService {
     }
     validateNoCycle(keys, input.tasks.map((task) => task.dependencies ?? []));
 
+    const goalRevision = 1;
+    const requirements = normalizeRequirements(input.requirements);
     const createdAt = now();
     const created: ConversationTask[] = [];
     // 依赖写的是 key，先分配 id 再翻译成 id 落库 —— 执行时只认 id。
     const idByKey = new Map(input.tasks.map((task) => [task.key.trim(), randomUUID()]));
     this.db.exec('BEGIN');
     try {
+      // plan 即 Goal v1 的诞生：先落版本行，任务和 conversation 都指向它。
+      this.db
+        .prepare(
+          `
+          INSERT INTO conversation_goal_revision (
+            id,
+            conversation_id,
+            revision,
+            objective,
+            requirements_json,
+            changed_by_type,
+            changed_by_id,
+            change_kind,
+            reason,
+            created_at
+          )
+          VALUES (?, ?, ?, ?, ?, 'member', ?, 'initial', '', ?)
+          `,
+        )
+        .run(
+          randomUUID(),
+          input.conversationId,
+          goalRevision,
+          objective,
+          JSON.stringify(requirements),
+          input.memberId,
+          createdAt,
+        );
       // plan 只允许一次（入口已拒绝已有任务），这里直接插入，不删旧行。
       input.tasks.forEach((task, index) => {
         const row: TaskRow = {
           id: idByKey.get(task.key.trim())!,
           conversation_id: input.conversationId,
+          goal_revision: goalRevision,
           title: task.title.trim(),
           description: (task.description ?? '').slice(0, 8000),
           assignee_member_id: (task.assigneeMemberId ?? input.leadMemberId ?? '').trim(),
@@ -198,13 +255,13 @@ export class TaskService {
         this.db
           .prepare(
             `INSERT INTO conversation_task (
-              id, conversation_id, title, description, assignee_member_id, status,
+              id, conversation_id, goal_revision, title, description, assignee_member_id, status,
               dependencies_json, acceptance_criteria_json, result, blocker,
               current_execution_id, model_tier, sort_order, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           )
           .run(
-            row.id, row.conversation_id, row.title, row.description, row.assignee_member_id,
+            row.id, row.conversation_id, row.goal_revision, row.title, row.description, row.assignee_member_id,
             row.status, row.dependencies_json, row.acceptance_criteria_json, row.result,
             row.blocker, row.current_execution_id, row.model_tier, row.sort_order, row.created_at, row.updated_at,
           );
@@ -212,10 +269,329 @@ export class TaskService {
       });
       this.db
         .prepare(
-          `UPDATE conversation SET objective = ?, requirements_json = ?, open_questions_json = '[]',
+          `UPDATE conversation SET objective = ?, goal_revision = ?, requirements_json = ?, open_questions_json = '[]',
             status = 'running', updated_at = ? WHERE id = ?`,
         )
-        .run(objective, JSON.stringify(normalizeRequirements(input.requirements)), createdAt, input.conversationId);
+        .run(objective, goalRevision, JSON.stringify(requirements), createdAt, input.conversationId);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+    this.refreshReady(this.db, input.conversationId);
+    return this.list(input.conversationId);
+  }
+
+  /**
+   * Goal 改版本：记一条不可变历史，把旧版本未完成的任务全部 cancelled。
+   *
+   * 旧 completed / failed / blocked 不动 —— 它们是历史事实。返回被取消的
+   * 任务和它们挂着的 execution：调用方（TeamService.updateGoal）负责把
+   * 活着的 execution 停掉，再唤醒 Lead 重新规划。
+   */
+  reviseGoal(input: {
+    conversationId: string;
+    objective: string;
+    requirements?: TaskRequirements;
+    changedByType: 'user' | 'member' | 'system';
+    changedById: string;
+    changeKind: 'clarification' | 'scope_change' | 'success_criteria_change' | 'correction';
+    reason?: string;
+  }): {
+    revision: GoalRevision;
+    cancelledTaskIds: string[];
+    executionIds: string[];
+  } {
+    const conversation = this.db
+      .prepare(
+        `
+        SELECT
+          status,
+          goal_revision,
+          requirements_json
+        FROM conversation
+        WHERE id = ?
+        `,
+      )
+      .get(input.conversationId) as unknown as
+      | {
+          status: ConversationStatus;
+          goal_revision: number;
+          requirements_json: string | null;
+        }
+      | undefined;
+    if (!conversation) {
+      throw notFound(`Conversation 不存在：${input.conversationId}`);
+    }
+    if (conversation.status === 'cancelled') {
+      throw badRequest('已取消的工作区不能修改 Goal');
+    }
+    const objective = input.objective.trim();
+    if (!objective) throw badRequest('Goal 不能为空');
+    if (objective.length > 4000) throw badRequest('Goal 太长');
+    const requirements = normalizeRequirements(
+      input.requirements ?? parseRequirements(conversation.requirements_json),
+    );
+    const reason = (input.reason ?? '').trim().slice(0, 2000);
+    const nextRevision = conversation.goal_revision + 1;
+    const createdAt = now();
+    const revisionId = randomUUID();
+
+    const activeTasks = this.db
+      .prepare(
+        `
+        SELECT
+          id,
+          current_execution_id
+        FROM conversation_task
+        WHERE conversation_id = ?
+          AND goal_revision = ?
+          AND status IN ('pending', 'ready', 'running')
+        `,
+      )
+      .all(input.conversationId, conversation.goal_revision) as unknown as Array<{
+        id: string;
+        current_execution_id: string | null;
+      }>;
+    const cancelledTaskIds = activeTasks.map((row) => row.id);
+    const executionIds = activeTasks
+      .map((row) => row.current_execution_id)
+      .filter((id): id is string => Boolean(id));
+
+    this.db.exec('BEGIN');
+    try {
+      this.db
+        .prepare(
+          `
+          INSERT INTO conversation_goal_revision (
+            id,
+            conversation_id,
+            revision,
+            objective,
+            requirements_json,
+            changed_by_type,
+            changed_by_id,
+            change_kind,
+            reason,
+            created_at
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `,
+        )
+        .run(
+          revisionId,
+          input.conversationId,
+          nextRevision,
+          objective,
+          JSON.stringify(requirements),
+          input.changedByType,
+          input.changedById,
+          input.changeKind,
+          reason,
+          createdAt,
+        );
+      this.db
+        .prepare(
+          `
+          UPDATE conversation_task
+          SET
+            status = 'cancelled',
+            blocker = ?,
+            current_execution_id = NULL,
+            updated_at = ?
+          WHERE conversation_id = ?
+            AND goal_revision = ?
+            AND status IN ('pending', 'ready', 'running')
+          `,
+        )
+        .run(
+          `Goal 已更新为 v${nextRevision}，旧任务不再执行`,
+          createdAt,
+          input.conversationId,
+          conversation.goal_revision,
+        );
+      this.db
+        .prepare(
+          `
+          UPDATE conversation
+          SET
+            objective = ?,
+            goal_revision = ?,
+            requirements_json = ?,
+            open_questions_json = '[]',
+            status = 'running',
+            updated_at = ?
+          WHERE id = ?
+          `,
+        )
+        .run(
+          objective,
+          nextRevision,
+          JSON.stringify(requirements),
+          createdAt,
+          input.conversationId,
+        );
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+
+    return {
+      revision: {
+        id: revisionId,
+        conversationId: input.conversationId,
+        revision: nextRevision,
+        objective,
+        requirements,
+        changedByType: input.changedByType,
+        changedById: input.changedById,
+        changeKind: input.changeKind,
+        reason,
+        createdAt,
+      },
+      cancelledTaskIds,
+      executionIds,
+    };
+  }
+
+  /**
+   * 给当前 Goal 建任务计划：Goal 升级后的“第二次 plan”。
+   *
+   * plan() 只管 goal_revision 0 → v1；这里只管 v1+ → 当前版本的新计划，
+   * 且当前版本必须还没有任务（有就走 add_task）。校验形状与 plan() 同级，
+   * 只是 assignee 必须显式指定 —— 重规划时没有“默认归 Lead”的假设。
+   */
+  replan(input: {
+    conversationId: string;
+    memberId: string;
+    tasks: TaskPlanInput[];
+    rosterMemberIds: string[];
+    leadMemberId: string | null;
+  }): ConversationTask[] {
+    const conversation = this.db
+      .prepare(
+        `
+        SELECT
+          status,
+          goal_revision
+        FROM conversation
+        WHERE id = ?
+        `,
+      )
+      .get(input.conversationId) as unknown as
+      | { status: ConversationStatus; goal_revision: number }
+      | undefined;
+    if (!conversation) {
+      throw notFound(`Conversation 不存在：${input.conversationId}`);
+    }
+    if (conversation.goal_revision <= 0) {
+      throw badRequest('还没有正式 Goal，请使用 plan_tasks');
+    }
+    if (conversation.status === 'cancelled') {
+      throw badRequest('工作已经取消，不能重新规划');
+    }
+    if (this.list(input.conversationId).length > 0) {
+      throw badRequest('当前 Goal 已经有任务，不能重复 replan；请使用 add_task');
+    }
+    if (input.tasks.length === 0) {
+      throw badRequest('任务列表不能为空');
+    }
+    if (input.tasks.length > MAX_TASKS) {
+      throw badRequest(`一次最多规划 ${MAX_TASKS} 个任务`);
+    }
+    if (input.memberId !== input.leadMemberId) {
+      throw badRequest('只有 Lead 可以重新规划任务');
+    }
+
+    const keys = input.tasks.map((task) => task.key.trim());
+    for (const key of keys) {
+      if (!KEY_PATTERN.test(key)) throw badRequest(`任务 key 不合法：${key}`);
+    }
+    if (new Set(keys).size !== keys.length) throw badRequest('任务 key 不能重复');
+
+    const roster = new Set(input.rosterMemberIds);
+    for (const task of input.tasks) {
+      const assignee = (task.assigneeMemberId ?? '').trim();
+      if (!assignee || !roster.has(assignee)) {
+        throw badRequest(`任务 ${task.key} 的执行人不在这个工作区里`);
+      }
+      if (!task.title.trim()) {
+        throw badRequest(`任务 ${task.key} 的标题不能为空`);
+      }
+      if (task.title.trim().length > 300) {
+        throw badRequest(`任务 ${task.key} 的标题太长`);
+      }
+      for (const dep of task.dependencies ?? []) {
+        if (!keys.includes(dep)) {
+          throw badRequest(`任务 ${task.key} 依赖了不存在的任务：${dep}`);
+        }
+        if (dep === task.key) {
+          throw badRequest(`任务 ${task.key} 不能依赖自己`);
+        }
+      }
+    }
+    validateNoCycle(
+      keys,
+      input.tasks.map((task) => task.dependencies ?? []),
+    );
+
+    const createdAt = now();
+    const idByKey = new Map(
+      input.tasks.map((task) => [task.key.trim(), randomUUID()]),
+    );
+    this.db.exec('BEGIN');
+    try {
+      input.tasks.forEach((task, index) => {
+        const id = idByKey.get(task.key.trim())!;
+        this.db
+          .prepare(
+            `
+            INSERT INTO conversation_task (
+              id,
+              conversation_id,
+              goal_revision,
+              title,
+              description,
+              assignee_member_id,
+              status,
+              dependencies_json,
+              acceptance_criteria_json,
+              result,
+              blocker,
+              current_execution_id,
+              model_tier,
+              sort_order,
+              created_at,
+              updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, NULL, NULL, NULL, ?, ?, ?, ?)
+            `,
+          )
+          .run(
+            id,
+            input.conversationId,
+            conversation.goal_revision,
+            task.title.trim(),
+            (task.description ?? '').slice(0, 8000),
+            task.assigneeMemberId!.trim(),
+            JSON.stringify(
+              (task.dependencies ?? []).map(
+                (dep) => idByKey.get(dep) ?? dep,
+              ),
+            ),
+            JSON.stringify((task.acceptanceCriteria ?? []).slice(0, 20)),
+            normalizeModelTier(task.modelTier),
+            index,
+            createdAt,
+            createdAt,
+          );
+      });
+      this.db
+        .prepare(
+          `UPDATE conversation SET status = 'running', updated_at = ? WHERE id = ?`,
+        )
+        .run(createdAt, input.conversationId);
       this.db.exec('COMMIT');
     } catch (error) {
       this.db.exec('ROLLBACK');
@@ -241,7 +617,24 @@ export class TaskService {
     acceptanceCriteria?: string[];
     modelTier?: TaskModelTier | null;
   }): ConversationTask {
-    if (this.list(input.conversationId).length >= MAX_TASKS) {
+    const currentRevision = (
+      this.db
+        .prepare(`SELECT goal_revision FROM conversation WHERE id = ?`)
+        .get(input.conversationId) as { goal_revision: number } | undefined
+    )?.goal_revision;
+    if (currentRevision === undefined) {
+      throw notFound(`Conversation 不存在：${input.conversationId}`);
+    }
+    // 上限只看当前 Goal 未取消的任务：旧版本 + 已取消的不占名额。
+    const activeCount = (
+      this.db
+        .prepare(
+          `SELECT COUNT(*) AS count FROM conversation_task
+           WHERE conversation_id = ? AND goal_revision = ? AND status <> 'cancelled'`,
+        )
+        .get(input.conversationId, currentRevision) as { count: number }
+    ).count;
+    if (activeCount >= MAX_TASKS) {
       throw badRequest(`一个工作区最多 ${MAX_TASKS} 个任务`);
     }
     const conversation = this.db.prepare(`SELECT status FROM conversation WHERE id = ?`).get(input.conversationId) as
@@ -271,14 +664,15 @@ export class TaskService {
     this.db
       .prepare(
         `INSERT INTO conversation_task (
-          id, conversation_id, title, description, assignee_member_id, status,
+          id, conversation_id, goal_revision, title, description, assignee_member_id, status,
           dependencies_json, acceptance_criteria_json, result, blocker,
           current_execution_id, model_tier, sort_order, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, NULL, NULL, NULL, ?, ?, ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, NULL, NULL, NULL, ?, ?, ?, ?)`,
       )
       .run(
         id,
         input.conversationId,
+        currentRevision,
         title,
         (input.description ?? '').slice(0, 8000),
         input.assigneeMemberId,
@@ -300,6 +694,7 @@ export class TaskService {
    */
   reassign(input: { taskId: string; assigneeMemberId: string }): ConversationTask {
     const task = this.get(input.taskId);
+    this.assertCurrentRevision(task);
     if (task.assigneeMemberId === input.assigneeMemberId) {
       return task;
     }
@@ -342,6 +737,24 @@ export class TaskService {
     void input.summary;
   }
 
+  /**
+   * 旧 Goal 的任务一律只读：v1 的任务在 v2 不能 update / retry / reassign。
+   * 进行中的认定只看当前版本 —— 否则对着已失效的计划点重试，只会把旧工作
+   * 又跑一遍，还污染新计划的状态。
+   */
+  private assertCurrentRevision(task: ConversationTask): void {
+    const row = this.db
+      .prepare(`SELECT goal_revision FROM conversation WHERE id = ?`)
+      .get(task.conversationId) as unknown as
+      | { goal_revision: number }
+      | undefined;
+    if (!row || task.goalRevision !== row.goal_revision) {
+      throw conflict(
+        `任务属于旧 Goal v${task.goalRevision}，当前已经是 Goal v${row?.goal_revision ?? '?'}`,
+      );
+    }
+  }
+
   /** Task 执行人上报进展：只能动自己的任务。 */
   update(input: {
     taskId: string;
@@ -351,6 +764,7 @@ export class TaskService {
     blocker?: string;
   }): ConversationTask {
     const task = this.get(input.taskId);
+    this.assertCurrentRevision(task);
     if (task.assigneeMemberId !== input.memberId) {
       throw badRequest('只能更新分给自己的任务');
     }
@@ -399,6 +813,7 @@ export class TaskService {
 
   retry(taskId: string): ConversationTask {
     const task = this.get(taskId);
+    this.assertCurrentRevision(task);
     if (task.status !== 'failed' && task.status !== 'blocked' && task.status !== 'cancelled') {
       throw badRequest(`这个任务当前是 ${task.status}，不需要重试`);
     }
@@ -428,11 +843,26 @@ export class TaskService {
     return this.get(taskId);
   }
 
-  /** 依赖全部 completed 的 pending 任务变成 ready；依赖有失败/阻塞/取消的变成 blocked。 */
+  /**
+   * 依赖全部 completed 的 pending 任务变成 ready；依赖有失败/阻塞/取消的变成 blocked。
+   * 只看当前 Goal：旧版本的 pending 行已经随 reviseGoal 全 cancelled，这里不会再碰到。
+   */
   refreshReady(db: DatabaseSync = this.db, conversationId?: string): DependencyRefreshResult {
     const scope = conversationId ?? '';
     const rows = (scope
-      ? db.prepare(`SELECT * FROM conversation_task WHERE conversation_id = ? AND status = 'pending'`).all(scope)
+      ? db.prepare(
+          `
+          SELECT *
+          FROM conversation_task
+          WHERE conversation_id = ?
+            AND goal_revision = (
+              SELECT goal_revision
+              FROM conversation
+              WHERE id = ?
+            )
+            AND status = 'pending'
+          `,
+        ).all(scope, scope)
       : db.prepare(`SELECT * FROM conversation_task WHERE status = 'pending'`).all()) as unknown as TaskRow[];
     const ready: ConversationTask[] = [];
     const blocked: ConversationTask[] = [];
@@ -462,17 +892,45 @@ export class TaskService {
     this.refreshReady(this.db, conversationId);
     const rows = this.db
       .prepare(
-        `SELECT * FROM conversation_task WHERE conversation_id = ? AND status = 'ready' ORDER BY sort_order`,
+        `
+        SELECT *
+        FROM conversation_task
+        WHERE conversation_id = ?
+          AND goal_revision = (
+            SELECT goal_revision
+            FROM conversation
+            WHERE id = ?
+          )
+          AND status = 'ready'
+        ORDER BY sort_order
+        `,
       )
-      .all(conversationId) as unknown as TaskRow[];
+      .all(conversationId, conversationId) as unknown as TaskRow[];
     return rows.map(mapTask);
   }
 
-  /** 没有未完成的任务（且至少有一个任务）时，工作区自动完成。 */
+  /**
+   * 没有未完成的任务（且至少有一个任务）时，工作区自动完成。
+   * 只看当前 Goal：v1 的 completed 行不能把 v2 提前算成 completed，
+   * v1 的 cancelled 行也不能把“等 replan 的 v2”算成 cancelled。
+   */
   recomputeConversationStatus(conversationId: string): ConversationStatus | null {
     const rows = this.db
-      .prepare(`SELECT status FROM conversation_task WHERE conversation_id = ?`)
-      .all(conversationId) as unknown as Array<{ status: ConversationTaskStatus }>;
+      .prepare(
+        `
+        SELECT status
+        FROM conversation_task
+        WHERE conversation_id = ?
+          AND goal_revision = (
+            SELECT goal_revision
+            FROM conversation
+            WHERE id = ?
+          )
+        `,
+      )
+      .all(conversationId, conversationId) as unknown as Array<{
+        status: ConversationTaskStatus;
+      }>;
     if (rows.length === 0) return null;
     const timestamp = now();
     // failed 也是未解决：把它漏掉会让「全部失败」的工作区变成 completed。
@@ -586,6 +1044,7 @@ export function mapTask(row: TaskRow): ConversationTask {
   return {
     id: row.id,
     conversationId: row.conversation_id,
+    goalRevision: row.goal_revision,
     title: row.title,
     description: row.description,
     assigneeMemberId: row.assignee_member_id,

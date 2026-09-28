@@ -154,8 +154,8 @@ describe('schema 就位（PRAGMA user_version）', () => {
         VALUES ('t1', 'T', 'u', 't', 't');
         INSERT INTO conversation (id, team_id, title, kind, created_by, created_at, updated_at)
         VALUES ('c', 't1', 'C', 'direct', 'u', 't', 't');
-        INSERT INTO execution (id, conversation_id, member_id, kind, status, prompt, created_at)
-        VALUES ('e', 'c', 'm', 'interactive', 'interrupted', 'p', 't');
+        INSERT INTO execution (id, conversation_id, member_id, goal_revision, kind, status, prompt, created_at)
+        VALUES ('e', 'c', 'm', 0, 'interactive', 'interrupted', 'p', 't');
       `);
 
       // 幂等键的唯一性真的落在库里，而不是只活在 service 的判断里。
@@ -192,8 +192,8 @@ describe('schema 就位（PRAGMA user_version）', () => {
       assert.throws(
         () =>
           handle.exec(`
-            INSERT INTO execution (id, conversation_id, member_id, parent_execution_id, kind, status, prompt, created_at)
-            VALUES ('bad', 'c', 'm', 'does-not-exist', 'member_delegate', 'queued', 'p', 't');
+            INSERT INTO execution (id, conversation_id, member_id, goal_revision, parent_execution_id, kind, status, prompt, created_at)
+            VALUES ('bad', 'c', 'm', 0, 'does-not-exist', 'member_delegate', 'queued', 'p', 't');
           `),
         /FOREIGN KEY/i,
       );
@@ -224,6 +224,7 @@ describe('schema 就位（PRAGMA user_version）', () => {
         'scheduled_wake',
         'scheduled_wake_run',
         'conversation',
+        'conversation_goal_revision',
         'conversation_member',
         'conversation_member_state',
         'conversation_message',
@@ -333,6 +334,7 @@ describe('schema 就位（PRAGMA user_version）', () => {
             'title',
             'kind',
             'objective',
+            'goal_revision',
             'lead_member_id',
             'status',
             'requirements_json',
@@ -343,9 +345,22 @@ describe('schema 就位（PRAGMA user_version）', () => {
             'created_at',
             'updated_at',
           ],
+          conversation_goal_revision: [
+            'id',
+            'conversation_id',
+            'revision',
+            'objective',
+            'requirements_json',
+            'changed_by_type',
+            'changed_by_id',
+            'change_kind',
+            'reason',
+            'created_at',
+          ],
           conversation_task: [
             'id',
             'conversation_id',
+            'goal_revision',
             'title',
             'description',
             'assignee_member_id',
@@ -410,6 +425,7 @@ describe('schema 就位（PRAGMA user_version）', () => {
             'id',
             'conversation_id',
             'member_id',
+            'goal_revision',
             'external_work_ref',
             'external_work_snapshot',
             'runtime_id',
@@ -497,13 +513,16 @@ describe('schema 就位（PRAGMA user_version）', () => {
         'idx_conversation_file_conversation',
         'idx_conversation_file_hash',
         'idx_conversation_file_status',
+        'idx_conversation_goal_revision',
         'idx_conversation_member_state_wake',
         'idx_conversation_task_assignee',
         'idx_conversation_task_conversation',
+        'idx_conversation_task_revision',
         'idx_conversation_task_status',
         'idx_conversation_team',
         'idx_execution_conversation_created',
         'idx_execution_external_work_key',
+        'idx_execution_goal_revision',
         'idx_execution_parent',
         'idx_execution_status',
         'idx_execution_task',
@@ -897,12 +916,12 @@ describe('RecoveryService', () => {
       VALUES ('r-running', 'c',  'm', 's1', '/tmp/1', 'running', 'e-running', 3),
              ('r-idle',    'c2', 'm', 's2', '/tmp/2', 'idle',    NULL,        0);
 
-      INSERT INTO execution (id, conversation_id, member_id, runtime_id, parent_execution_id, delegation_path, kind, status, prompt, waiting_for_runtime_id, created_at)
-      VALUES ('e-running', 'c',  'm', 'r-running', NULL,     '["m"]',     'interactive',     'running',            'p', NULL,         '1'),
-             ('e-waiting', 'c2', 'm', 'r-idle',    NULL,     '["m"]',     'interactive',     'waiting_for_member', 'p', 'r-running',  '2'),
-             ('e-qroot',   'c2', 'm', 'r-idle',    NULL,     '["m"]',     'interactive',     'queued',             'p', NULL,         '3'),
-             ('e-qchild',  'c2', 'm', 'r-idle',    'e-qroot','["m","m"]', 'member_delegate', 'queued',             'p', NULL,         '4'),
-             ('e-done',    'c2', 'm', 'r-idle',    NULL,     '["m"]',     'interactive',     'completed',          'p', NULL,         '5');
+      INSERT INTO execution (id, conversation_id, member_id, goal_revision, runtime_id, parent_execution_id, delegation_path, kind, status, prompt, waiting_for_runtime_id, created_at)
+      VALUES ('e-running', 'c',  'm', 0, 'r-running', NULL,     '["m"]',     'interactive',     'running',            'p', NULL,         '1'),
+             ('e-waiting', 'c2', 'm', 0, 'r-idle',    NULL,     '["m"]',     'interactive',     'waiting_for_member', 'p', 'r-running',  '2'),
+             ('e-qroot',   'c2', 'm', 0, 'r-idle',    NULL,     '["m"]',     'interactive',     'queued',             'p', NULL,         '3'),
+             ('e-qchild',  'c2', 'm', 0, 'r-idle',    'e-qroot','["m","m"]', 'member_delegate', 'queued',             'p', NULL,         '4'),
+             ('e-done',    'c2', 'm', 0, 'r-idle',    NULL,     '["m"]',     'interactive',     'completed',          'p', NULL,         '5');
     `);
 
     const report = new RecoveryService(handle, new ConversationMemberService(handle)).recover();

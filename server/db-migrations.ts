@@ -20,7 +20,7 @@ import type { DatabaseSync } from 'node:sqlite';
  *
  * 程序不认识任何别的编号 —— 没有升级代码，认出来也无从下手。
  */
-export const SCHEMA_VERSION = 22;
+export const SCHEMA_VERSION = 23;
 
 /**
  * 当前 schema 的完整定义，按最终形状写。
@@ -341,7 +341,9 @@ CREATE TABLE conversation (
     CHECK (kind IN ('task', 'direct')),
   -- 这次工作的总体目标，由 Lead 通过 plan_tasks 确认。
   objective TEXT NOT NULL DEFAULT '',
-  -- 当前负责澄清需求、维护任务整体状态的 Member。
+  -- 0 = 尚未正式确定 Goal；1+ = 当前 Goal revision
+  goal_revision INTEGER NOT NULL DEFAULT 0,
+  -- 当前负责澄清需求、维护任务整体状态的 Member.
   lead_member_id TEXT,
   status TEXT NOT NULL DEFAULT 'intake'
     CHECK (
@@ -371,6 +373,38 @@ CREATE TABLE conversation (
     REFERENCES member(id)
     ON DELETE SET NULL
 );
+
+-- Goal 版本历史：只增不改。v1 写进去就永远是 v1；
+-- “恢复 v1”也是生成内容相同的新版本，而不是动指针。
+CREATE TABLE conversation_goal_revision (
+  id TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  objective TEXT NOT NULL,
+  requirements_json TEXT NOT NULL,
+  changed_by_type TEXT NOT NULL
+    CHECK (changed_by_type IN ('user', 'member', 'system')),
+  changed_by_id TEXT NOT NULL,
+  change_kind TEXT NOT NULL
+    CHECK (
+      change_kind IN (
+        'initial',
+        'clarification',
+        'scope_change',
+        'success_criteria_change',
+        'correction'
+      )
+    ),
+  reason TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  UNIQUE (conversation_id, revision),
+  FOREIGN KEY (conversation_id)
+    REFERENCES conversation(id)
+    ON DELETE CASCADE
+);
+
+CREATE INDEX idx_conversation_goal_revision
+  ON conversation_goal_revision(conversation_id, revision);
 
 CREATE INDEX idx_conversation_team
   ON conversation(team_id, updated_at);
@@ -469,6 +503,7 @@ CREATE INDEX idx_message_task
 CREATE TABLE conversation_task (
   id TEXT PRIMARY KEY,
   conversation_id TEXT NOT NULL,
+  goal_revision INTEGER NOT NULL,
   title TEXT NOT NULL,
   description TEXT NOT NULL DEFAULT '',
   assignee_member_id TEXT NOT NULL,
@@ -513,6 +548,9 @@ CREATE INDEX idx_conversation_task_status
 
 CREATE INDEX idx_conversation_task_assignee
   ON conversation_task(assignee_member_id, status);
+
+CREATE INDEX idx_conversation_task_revision
+  ON conversation_task(conversation_id, goal_revision, sort_order);
 
 CREATE UNIQUE INDEX idx_message_conversation_sequence
   ON conversation_message(conversation_id, message_sequence);
@@ -563,6 +601,7 @@ CREATE TABLE execution (
   id TEXT PRIMARY KEY,
   conversation_id TEXT NOT NULL,
   member_id TEXT NOT NULL,
+  goal_revision INTEGER NOT NULL,
   -- 开始时快照的**引用**（取自 conversation）。execution 是历史事实：
   -- conversation 后来换了挂钩的工单，这条记录仍然知道当时在干哪条。
   external_work_ref TEXT,
@@ -642,6 +681,9 @@ CREATE INDEX idx_execution_status
 
 CREATE INDEX idx_execution_task
   ON execution(task_id);
+
+CREATE INDEX idx_execution_goal_revision
+  ON execution(conversation_id, goal_revision);
 
 CREATE INDEX idx_execution_external_work_key
   ON execution(json_extract(external_work_ref, '$.key'));

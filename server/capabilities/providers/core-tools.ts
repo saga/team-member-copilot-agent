@@ -108,6 +108,39 @@ export interface CoreToolHost {
     confidence?: number;
   }): Promise<string>;
 
+  updateGoal(input: {
+    conversationId: string;
+    memberId: string;
+    executionId: string;
+    objective: string;
+    requirements?: {
+      facts: Array<{ key: string; value: string; source: 'user' | 'jira' | 'knowledge' | 'conversation' | 'agent'; confirmed: boolean }>;
+      assumptions: string[];
+      constraints: string[];
+      successCriteria: string[];
+    };
+    changeKind:
+      | 'clarification'
+      | 'scope_change'
+      | 'success_criteria_change'
+      | 'correction';
+    reason?: string;
+  }): Promise<string>;
+
+  replanTasks(input: {
+    conversationId: string;
+    memberId: string;
+    tasks: Array<{
+      key: string;
+      title: string;
+      description?: string;
+      assigneeMemberId: string;
+      dependencies?: string[];
+      acceptanceCriteria?: string[];
+      modelTier?: 'cheap' | 'standard' | 'strong';
+    }>;
+  }): Promise<string>;
+
   updateTask(input: {
     conversationId: string;
     memberId: string;
@@ -234,10 +267,92 @@ export class CoreTeamToolProvider implements ToolProvider {
         providerId: this.id,
         implementation: 'app' as const,
         kind: 'custom',
+        name: 'update_goal',
+        description:
+          'Lead only. Change the authoritative goal of the current workspace when the user ' +
+          'explicitly changes scope, requirements, or success criteria. This creates a new Goal revision ' +
+          'and invalidates the current task plan. After this tool succeeds, call replan_tasks to create ' +
+          'the new task plan. Do not use it for a normal progress update.',
+        risk: 'coordination',
+        availableTo: ['lead'],
+        parameters: z.object({
+          objective: z.string().min(1).max(4000),
+          requirements: z
+            .object({
+              facts: z
+                .array(
+                  z.object({
+                    key: z.string().min(1).max(200),
+                    value: z.string().min(1).max(4000),
+                    source: z.enum(['user', 'jira', 'knowledge', 'conversation', 'agent']),
+                    confirmed: z.boolean(),
+                  }),
+                )
+                .max(50)
+                .default([]),
+              assumptions: z.array(z.string().max(1000)).max(20).default([]),
+              constraints: z.array(z.string().max(1000)).max(20).default([]),
+              successCriteria: z.array(z.string().max(1000)).max(20).default([]),
+            })
+            .optional(),
+          changeKind: z.enum(['clarification', 'scope_change', 'success_criteria_change', 'correction']),
+          reason: z.string().max(2000).optional(),
+        }),
+        execute: (context, args) =>
+          this.host.updateGoal({
+            conversationId: context.conversationId,
+            memberId: context.memberId,
+            executionId: context.executionId,
+            objective: String((args as { objective: string }).objective),
+            requirements: (args as { requirements: never }).requirements,
+            changeKind: (args as { changeKind: 'clarification' | 'scope_change' | 'success_criteria_change' | 'correction' }).changeKind,
+            ...((args as { reason?: string }).reason === undefined
+              ? {}
+              : { reason: String((args as { reason?: string }).reason) }),
+          }),
+      },
+      {
+        providerId: this.id,
+        implementation: 'app' as const,
+        kind: 'custom',
+        name: 'replan_tasks',
+        description:
+          'Lead only. Create a new task plan for the current Goal revision after update_goal. ' +
+          'Use this instead of plan_tasks when the workspace already had a previous Goal revision.',
+        risk: 'coordination',
+        availableTo: ['lead'],
+        parameters: z.object({
+          tasks: z
+            .array(
+              z.object({
+                key: z.string().regex(/^[a-zA-Z0-9_-]+$/),
+                title: z.string().min(1).max(300),
+                description: z.string().max(8000).default(''),
+                assigneeMemberId: z.string().min(1),
+                dependencies: z.array(z.string()).max(20).default([]),
+                acceptanceCriteria: z.array(z.string().min(1).max(1000)).max(20).default([]),
+                modelTier: z.enum(['cheap', 'standard', 'strong']).optional(),
+              }),
+            )
+            .min(1)
+            .max(20),
+        }),
+        execute: (context, args) =>
+          this.host.replanTasks({
+            conversationId: context.conversationId,
+            memberId: context.memberId,
+            tasks: (args as { tasks: never }).tasks as never as Parameters<CoreToolHost['replanTasks']>[0]['tasks'],
+          }),
+      },
+      {
+        providerId: this.id,
+        implementation: 'app' as const,
+        kind: 'custom',
         name: 'plan_tasks',
         description:
           'Lead only. Define the initial concrete task list for this workspace. ' +
-          'Use this only when the workspace has no tasks. ' +
+          'Use this only when the workspace has no tasks and no Goal revision yet. ' +
+          'After update_goal, use replan_tasks instead of this tool. ' +
           'For an existing task plan, use add_task for genuinely missing work and ' +
           'reassign_task when an unstarted task has the wrong assignee. ' +
           'Set modelTier to strong for an unusually complex task that needs the strongest model; ' +

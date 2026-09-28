@@ -260,6 +260,7 @@ export class ContextAssembler {
   ): string {
     const lines: string[] = [
       `Current task workspace: ${conversation.title}`,
+      `Goal revision: v${conversation.goalRevision}`,
       `Objective: ${conversation.objective || '(not yet defined)'}`,
       `Status: ${conversation.status}`,
     ];
@@ -356,6 +357,11 @@ const LEAD_INSTRUCTION = [
   'Do not add a duplicate merely because the same work also exists as a Jira subtask.',
   'If an existing unstarted task has the wrong Agent Member, use reassign_task.',
   'Do not reassign a task that is already ready, running, completed or cancelled.',
+  '',
+  'The current Goal revision is authoritative for this workspace.',
+  'If the user materially changes the objective, scope, requirements, or success criteria, use update_goal.',
+  'After update_goal, use replan_tasks to create the new task plan.',
+  'Do not continue executing tasks from an older Goal revision.',
   '',
   'JIRA SUBTASKS ARE NOT AUTOMATIC AGENT TASKS:',
   'An existing Jira subtask is input to planning, not an instruction to create another copy.',

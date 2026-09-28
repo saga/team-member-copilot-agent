@@ -417,8 +417,8 @@ describe('execution 记录当时用的配置', () => {
 
     db.prepare(
       `
-      INSERT INTO execution (id, conversation_id, member_id, delegation_path, kind, status, prompt, created_at)
-      VALUES ('legacy-exec', ?, ?, '[]', 'interactive', 'completed', 'p', 't')
+      INSERT INTO execution (id, conversation_id, member_id, goal_revision, delegation_path, kind, status, prompt, created_at)
+      VALUES ('legacy-exec', ?, ?, 0, '[]', 'interactive', 'completed', 'p', 't')
       `,
     ).run(room.id, alice.id);
 

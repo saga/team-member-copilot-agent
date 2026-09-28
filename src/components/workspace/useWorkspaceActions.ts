@@ -170,6 +170,28 @@ export function useWorkspaceActions(deps: WorkspaceActionDeps) {
     }
   }
 
+  /**
+   * 用户在 Task 面板里改 Goal：旧计划失效、Lead 重新规划。
+   * 和发消息不一样 —— 这不是一次讨论，而是一次版本推进。
+   */
+  async function updateGoal(objective: string): Promise<void> {
+    if (!data.conversationId) return;
+    deps.setError(null);
+    try {
+      const result = await api.updateConversationGoal(
+        data.conversationId,
+        {
+          objective,
+          changeKind: 'scope_change',
+        },
+      );
+      data.applyConversationChanged(result.conversation);
+    } catch (e) {
+      deps.setError(e instanceof Error ? e.message : String(e));
+      throw e;
+    }
+  }
+
   return {
     createTask,
     createMember,
@@ -179,5 +201,6 @@ export function useWorkspaceActions(deps: WorkspaceActionDeps) {
     send,
     retryTask,
     cancelTask,
+    updateGoal,
   };
 }

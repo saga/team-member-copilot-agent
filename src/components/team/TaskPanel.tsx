@@ -1,5 +1,15 @@
-import { Button, Progress, Typography } from 'antd';
-import type { Conversation, ConversationTask } from '../../lib/api';
+import { useState } from 'react';
+import {
+  Button,
+  Modal,
+  Progress,
+  Space,
+  Tag,
+  Typography,
+  Input,
+  List,
+} from 'antd';
+import { api, type Conversation, type ConversationTask, type GoalRevision } from '../../lib/api';
 import { TASK_STATUS_TEXT } from './constants';
 
 interface TaskPanelProps {
@@ -8,6 +18,7 @@ interface TaskPanelProps {
   memberLabel: (id: string) => string;
   onRetryTask: (taskId: string) => void;
   onCancelTask: (taskId: string) => void;
+  onUpdateGoal: (objective: string) => Promise<void>;
 }
 
 const STATUS_ICON: Record<ConversationTask['status'], string> = {
@@ -34,23 +45,98 @@ const sectionLabel: React.CSSProperties = {
  * description 与 acceptance criteria 不在这里展开 —— 它们是执行细节，
  * 去 execution 里看。这里回答「做到哪了、谁在做、卡在哪」就够了。
  *
- * 只读（Retry / Cancel 除外）：Task 的正常变更路径是 Lead 的 plan（仅一次）
- * 和执行人的 update_task。
+ * 只读（Retry / Cancel / Goal 编辑除外）：Task 的正常变更路径是 Lead 的
+ * plan（仅一次）和执行人的 update_task；Goal 改版本走编辑框，旧计划失效、
+ * Lead 重新规划，历史版本在 Goal History 里只读查看。
  */
-export function TaskPanel({ conversation, tasks, memberLabel, onRetryTask, onCancelTask }: TaskPanelProps) {
+export function TaskPanel({
+  conversation,
+  tasks,
+  memberLabel,
+  onRetryTask,
+  onCancelTask,
+  onUpdateGoal,
+}: TaskPanelProps) {
   const done = tasks.filter((task) => task.status === 'completed').length;
+  const [goalEditorOpen, setGoalEditorOpen] = useState(false);
+  const [goalHistoryOpen, setGoalHistoryOpen] = useState(false);
+  const [goalDraft, setGoalDraft] = useState(conversation.objective);
+  const [goalSaving, setGoalSaving] = useState(false);
+  const [goalHistory, setGoalHistory] = useState<GoalRevision[]>([]);
+
+  const openGoalEditor = () => {
+    setGoalDraft(conversation.objective);
+    setGoalEditorOpen(true);
+  };
+
+  const saveGoal = async () => {
+    const value = goalDraft.trim();
+    if (!value) return;
+    setGoalSaving(true);
+    try {
+      await onUpdateGoal(value);
+      setGoalEditorOpen(false);
+    } finally {
+      setGoalSaving(false);
+    }
+  };
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16, minHeight: 0 }}>
       <section>
-        <Typography.Text style={sectionLabel}>Goal</Typography.Text>
-        <Typography.Paragraph style={{ margin: '4px 0 0', fontSize: 13 }}>
-          {conversation.objective || '还没有确定目标 —— 在下方说清楚要做什么，Lead 会先确认目标。'}
+        <Space size={6} align="center">
+          <Typography.Text style={sectionLabel}>
+            Goal
+          </Typography.Text>
+          {conversation.goalRevision > 0 && (
+            <Tag color="blue">
+              v{conversation.goalRevision}
+            </Tag>
+          )}
+          <Button
+            type="link"
+            size="small"
+            style={{ padding: 0 }}
+            onClick={openGoalEditor}
+          >
+            编辑
+          </Button>
+          <Button
+            type="link"
+            size="small"
+            style={{ padding: 0 }}
+            onClick={async () => {
+              const result =
+                await api.getConversationGoalHistory(
+                  conversation.id,
+                );
+              setGoalHistory(result.revisions);
+              setGoalHistoryOpen(true);
+            }}
+          >
+            历史
+          </Button>
+        </Space>
+        <Typography.Paragraph
+          style={{ margin: '4px 0 0', fontSize: 13 }}
+        >
+          {conversation.objective ||
+            '还没有确定目标 —— 在下方说清楚要做什么，Lead 会先确认目标。'}
         </Typography.Paragraph>
         {conversation.openQuestions.length > 0 && (
           <div style={{ marginTop: 8 }}>
-            <Typography.Text style={{ ...sectionLabel, color: '#c7742c' }}>等你回答</Typography.Text>
-            <ul style={{ margin: '4px 0 0', paddingLeft: 18, fontSize: 12 }}>
+            <Typography.Text
+              style={{ ...sectionLabel, color: '#c7742c' }}
+            >
+              等你回答
+            </Typography.Text>
+            <ul
+              style={{
+                margin: '4px 0 0',
+                paddingLeft: 18,
+                fontSize: 12,
+              }}
+            >
               {conversation.openQuestions.map((question) => (
                 <li key={question}>{question}</li>
               ))}
@@ -133,6 +219,68 @@ export function TaskPanel({ conversation, tasks, memberLabel, onRetryTask, onCan
           ))}
         </div>
       </section>
+
+      <Modal
+        title={`修改 Goal${conversation.goalRevision > 0 ? ` v${conversation.goalRevision}` : ''}`}
+        open={goalEditorOpen}
+        okText="更新 Goal"
+        cancelText="取消"
+        confirmLoading={goalSaving}
+        onOk={() => void saveGoal()}
+        onCancel={() => setGoalEditorOpen(false)}
+      >
+        <Input.TextArea
+          value={goalDraft}
+          onChange={(event) => setGoalDraft(event.target.value)}
+          rows={6}
+          maxLength={4000}
+          showCount
+        />
+        <Typography.Text
+          type="warning"
+          style={{
+            display: 'block',
+            marginTop: 12,
+            fontSize: 12,
+          }}
+        >
+          更新后当前 Goal 下的未完成任务会失效，Lead 会根据新 Goal 重新规划。
+        </Typography.Text>
+      </Modal>
+
+      <Modal
+        title="Goal History"
+        open={goalHistoryOpen}
+        footer={null}
+        onCancel={() => setGoalHistoryOpen(false)}
+      >
+        <List
+          dataSource={goalHistory}
+          renderItem={(item) => (
+            <List.Item>
+              <List.Item.Meta
+                title={
+                  <Space>
+                    <Tag color={item.revision === conversation.goalRevision ? 'blue' : undefined}>
+                      v{item.revision}
+                    </Tag>
+                    <span>{item.objective}</span>
+                  </Space>
+                }
+                description={
+                  <>
+                    <div>
+                      {item.changeKind} · {item.changedByType} ·{' '}
+                      {new Date(item.createdAt).toLocaleString()}
+                    </div>
+                    {item.reason && <div>{item.reason}</div>}
+                  </>
+                }
+              />
+            </List.Item>
+          )}
+        />
+      </Modal>
     </div>
   );
 }

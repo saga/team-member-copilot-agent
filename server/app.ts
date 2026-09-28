@@ -108,6 +108,8 @@ registry.registerToolProvider(
     addTask: (input) => teamService.addTask(input),
     reassignTask: (input) => teamService.reassignTask(input),
     learnExperience: (input) => teamService.learnExperience(input),
+    updateGoal: (input) => teamService.updateGoalTool(input),
+    replanTasks: (input) => teamService.replanTasks(input),
     updateTask: (input) => teamService.updateTask(input),
   }),
 );

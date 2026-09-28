@@ -237,6 +237,10 @@ export function classifyLeadTurn(input: {
   if (input.wakeReason === 'lead_recovery') {
     return 'recovery';
   }
+  // Goal 变化 = 重新理解目标 + 重新规划，永远走 Strong。
+  if (input.wakeReason === 'goal_changed') {
+    return 'planning';
+  }
   // 没有 Task 时，Lead 的职责就是理解目标 / 澄清 / 初始规划。
   if (input.taskCount === 0) {
     return 'planning';

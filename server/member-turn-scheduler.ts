@@ -144,6 +144,7 @@ function keyOf(conversationId: string, memberId: string): string {
  * 三种 Lead 原因同级：都是「Lead 要说话」，谁的新消息序号大听谁的。
  */
 const REASON_PRIORITY: Record<Exclude<WakeReason, 'schedule'>, number> = {
+  goal_changed: 3,
   task_ready: 2,
   lead_message: 1,
   lead_clarification: 1,
