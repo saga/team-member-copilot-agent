@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
 import { Avatar, Button, Dropdown, Space } from 'antd';
 import { PaperClipOutlined } from '@ant-design/icons';
-import { Sender } from '@ant-design/x';
+import { FileCard, Sender } from '@ant-design/x';
 import type { SenderRef } from '@ant-design/x/es/sender/interface';
 import type { Conversation, ConversationFile, Member } from '../../lib/api';
 import { isMemberDm } from './constants';
-import { FileChip } from './FileAttachmentCard';
+import { fileCardIcon, formatBytes } from './FileAttachmentCard';
 
 /**
  * 光标前正在输入的 @token：`@` 起始下标 + 后面跟的查询串。
@@ -139,13 +139,13 @@ export function MessageComposer({
       className={`sender-bar${dragging ? ' dragging' : ''}`}
       style={{ position: 'relative' }}
       onDragOver={(event) => {
-        if (readOnly) return;
+        if (!editable) return;
         event.preventDefault();
         setDragging(true);
       }}
       onDragLeave={() => setDragging(false)}
       onDrop={(event) => {
-        if (readOnly) return;
+        if (!editable) return;
         event.preventDefault();
         setDragging(false);
         for (const file of Array.from(event.dataTransfer.files)) onUploadFile(file);
@@ -157,7 +157,27 @@ export function MessageComposer({
       {selectedFiles.length > 0 && (
         <div className="composer-files">
           {selectedFiles.map((file) => (
-            <FileChip key={file.id} file={file} onRemove={() => onRemoveFile(file.id)} />
+            <div key={file.id} className="composer-file-card">
+              <FileCard
+                name={file.originalName}
+                byte={file.sizeBytes}
+                size="small"
+                icon={fileCardIcon(file)}
+                type={file.contentType.startsWith('image/') ? 'image' : 'file'}
+                loading={file.status === 'processing'}
+                description={file.status === 'processing' ? '处理中…' : formatBytes(file.sizeBytes)}
+                style={{ width: '100%' }}
+              />
+              <Button
+                type="text"
+                size="small"
+                className="composer-file-remove"
+                aria-label={`移除 ${file.originalName}`}
+                onClick={() => onRemoveFile(file.id)}
+              >
+                ×
+              </Button>
+            </div>
           ))}
         </div>
       )}
@@ -184,10 +204,15 @@ export function MessageComposer({
         value={value}
         onChange={onChange}
         onSubmit={() => onSend()}
+        // 粘贴文件直接进同一条上传逻辑：拖入 / 粘贴 / 回形针三种入口不再各写一套。
+        onPasteFile={(files) => {
+          for (const file of Array.from(files)) onUploadFile(file);
+        }}
         loading={busy}
         disabled={disabled || readOnly || finished}
         placeholder={placeholder}
         submitType="enter"
+        autoSize={{ minRows: 2, maxRows: 8 }}
         prefix={
           <Space size={2} align="center">
             {!readOnly && (
@@ -203,9 +228,9 @@ export function MessageComposer({
                       onClick: () => {
                         const input = document.createElement('input');
                         input.type = 'file';
+                        input.multiple = true;
                         input.onchange = () => {
-                          const file = input.files?.[0];
-                          if (file) onUploadFile(file);
+                          for (const file of Array.from(input.files ?? [])) onUploadFile(file);
                         };
                         input.click();
                       },

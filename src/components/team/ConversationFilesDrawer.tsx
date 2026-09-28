@@ -1,5 +1,18 @@
 import { useEffect, useState } from 'react';
-import { Button, Drawer, Empty, Modal, Popconfirm, Select, Space, Spin, Tag, Upload } from 'antd';
+import {
+  Alert,
+  Button,
+  Drawer,
+  Empty,
+  Input,
+  Modal,
+  Popconfirm,
+  Select,
+  Space,
+  Spin,
+  Tag,
+  Upload,
+} from 'antd';
 import { UploadOutlined } from '@ant-design/icons';
 import type { ConversationFile } from '../../lib/api';
 import { api } from '../../lib/api';
@@ -78,8 +91,8 @@ export function ConversationFilesDrawer({
       .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)));
   }, [promoteTarget]);
 
-  async function runSearch(): Promise<void> {
-    const trimmed = query.trim();
+  async function runSearch(value = query): Promise<void> {
+    const trimmed = value.trim();
     if (!trimmed) {
       setHits(null);
       return;
@@ -138,28 +151,33 @@ export function ConversationFilesDrawer({
           </Upload>
         }
       >
-        <Space direction="vertical" style={{ width: '100%' }} size="small">
-          {error && <div style={{ color: '#a00', fontSize: 12 }}>{error}</div>}
-          {saved && <div style={{ color: '#389e0d', fontSize: 12 }}>{saved}</div>}
-
-          <Space.Compact style={{ width: '100%' }}>
-            <input
-              className="conversation-file-search"
-              placeholder="搜文件内容（只有文本类文件可搜）"
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter') void runSearch();
-              }}
+        <Space direction="vertical" style={{ width: '100%' }} size="middle">
+          {error && (
+            <Alert type="error" showIcon closable message={error} onClose={() => setError(null)} />
+          )}
+          {saved && (
+            <Alert
+              type="success"
+              showIcon
+              closable
+              message={saved}
+              onClose={() => setSaved(null)}
             />
-            <Button onClick={() => void runSearch()} loading={searching}>
-              搜索
-            </Button>
-          </Space.Compact>
+          )}
+
+          <Input.Search
+            allowClear
+            enterButton="搜索"
+            placeholder="搜文件内容（文本文件）"
+            value={query}
+            loading={searching}
+            onChange={(event) => setQuery(event.target.value)}
+            onSearch={(value) => void runSearch(value)}
+          />
 
           {hits !== null && (
             <div>
-              <div style={{ fontSize: 12, color: '#666', marginBottom: 4 }}>
+              <div className="conversation-file-search-summary">
                 {hits.length === 0 ? '没有搜到内容。' : `搜到 ${hits.length} 处：`}
               </div>
               {hits.map((hit) => (

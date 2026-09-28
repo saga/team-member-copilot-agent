@@ -387,140 +387,154 @@ body {
 
 /* ── 会话文件（聊天附件） ─────────────────────────────────────────── */
 
-/*
- * 一份文件：图标 + 名字 + 大小/状态。附件卡片出现在三个地方（消息气泡、
- * composer 的 chip、Shared Files 抽屉），所以样式必须与容器无关 ——
- * 靠 .compact / .conversation-file-actions 这两个修饰类表达差异。
- */
-.conversation-file-card {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  padding: 8px 10px;
+/* ── Ant Design X 文件卡片 / Markdown ─────────────────────────────── */
+
+.activity-message-content {
+  min-width: 0;
+}
+
+.activity-markdown {
+  min-width: 0;
+  line-height: 1.65;
+}
+
+.activity-markdown p:last-child {
+  margin-bottom: 0;
+}
+
+.activity-markdown ul,
+.activity-markdown ol {
+  padding-left: 22px;
+}
+
+.activity-markdown table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 8px 0;
+  font-size: 13px;
+}
+
+.activity-markdown th,
+.activity-markdown td {
   border: 1px solid #f0f0f0;
-  border-radius: 8px;
+  padding: 6px 8px;
+  text-align: left;
+}
+
+.activity-markdown th {
   background: #fafafa;
-  max-width: 340px;
+  font-weight: 600;
+}
+
+.activity-markdown pre {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.activity-markdown img {
+  max-width: 100%;
+}
+
+/* XMarkdown / Mermaid 在气泡中的宽度控制 */
+.activity-markdown > * {
+  max-width: 100%;
+}
+
+.activity-markdown .ant-x-markdown,
+.activity-markdown .ant-x-markdown-content {
+  max-width: 100%;
+}
+
+.message-sources {
+  margin-top: 8px;
+  padding-top: 4px;
+}
+
+.activity-mcp-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.activity-delegations {
+  margin-top: 16px;
+}
+
+/* ── FileCard wrapper ─────────────────────────────────────────────── */
+
+.conversation-file-card {
+  width: 100%;
+  min-width: 0;
 }
 
 .conversation-file-card.compact {
-  max-width: 100%;
-  padding: 6px 8px;
-  background: #fff;
-}
-
-.conversation-file-icon {
-  font-size: 16px;
-  line-height: 20px;
-  color: #666;
-  flex-shrink: 0;
-}
-
-.conversation-file-body {
-  min-width: 0;
-  flex: 1;
-}
-
-.conversation-file-name {
-  font-size: 13px;
-  font-weight: 600;
-  /* 文件名可能很长，但它是识别这份文件的唯一线索，所以单行省略而不是换行：
-     卡片高度一致，列表才扫得动。全名在预览里。 */
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.conversation-file-meta {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  color: #999;
-  margin-top: 2px;
+  width: 100%;
 }
 
 .conversation-file-actions {
-  flex-shrink: 0;
-}
-
-/* 消息气泡里的附件：与正文之间留一点距离，别糊在一起。 */
-.message-files {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  margin-top: 8px;
+  margin-top: 4px;
 }
 
 .conversation-file-list {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 10px;
 }
 
-.conversation-file-search {
-  flex: 1;
-  min-width: 0;
-  height: 28px;
-  padding: 0 10px;
-  border: 1px solid #d9d9d9;
-  border-radius: 6px;
-  font-size: 13px;
-  outline: none;
-}
-
-.conversation-file-search:focus {
-  border-color: #4096ff;
+.conversation-file-search-summary {
+  color: #666;
+  font-size: 12px;
+  margin-bottom: 6px;
 }
 
 .conversation-file-hit {
-  padding: 6px 8px;
-  border-radius: 6px;
+  padding: 8px 10px;
+  border: 1px solid #f0f0f0;
+  border-radius: 8px;
   background: #fafafa;
   font-size: 12px;
   color: #595959;
-  margin-bottom: 4px;
+  margin-bottom: 6px;
 }
+
+.conversation-file-picker-hint {
+  color: #999;
+  font-size: 12px;
+}
+
+/* ── Composer attachments ────────────────────────────────────────── */
 
 /* composer 上的已选文件：在输入框上方，发送前最后一次「这条消息带什么」。 */
 .composer-files {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 8px;
   margin-bottom: 8px;
 }
 
-.composer-file-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  max-width: 260px;
-  padding: 2px 6px;
-  border: 1px solid #d9d9d9;
-  border-radius: 12px;
-  background: #fafafa;
-  font-size: 12px;
-  color: rgba(0, 0, 0, 0.88);
+.composer-file-card {
+  position: relative;
+  min-width: 0;
 }
 
-.composer-file-chip-name {
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+.composer-file-remove {
+  position: absolute !important;
+  top: -5px;
+  right: -5px;
+  width: 20px;
+  height: 20px;
+  min-width: 20px !important;
+  padding: 0 !important;
+  border-radius: 50% !important;
+  background: #fff !important;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12);
+  z-index: 2;
+  color: #666 !important;
 }
 
-.composer-file-chip-remove {
-  border: none;
-  background: none;
-  padding: 0 2px;
-  cursor: pointer;
-  color: #999;
-  font-size: 14px;
-  line-height: 1;
-}
-
-.composer-file-chip-remove:hover {
-  color: #ff4d4f;
+.composer-file-remove:hover {
+  color: #ff4d4f !important;
 }
 
 /* 拖拽上传的提示：整个输入区描边，告诉用户「松手就传到这里」。 */

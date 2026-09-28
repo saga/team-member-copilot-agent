@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Button, Empty, Modal, Space, Upload } from 'antd';
+import { Button, Empty, Input, Modal, Space, Upload } from 'antd';
 import { PaperClipOutlined, UploadOutlined } from '@ant-design/icons';
 import type { ConversationFile } from '../../lib/api';
 import { FileAttachmentCard } from './FileAttachmentCard';
@@ -38,12 +38,13 @@ export function ConversationFilePicker({
 
   return (
     <Modal open={open} title="引用这个会话里的文件" onCancel={onClose} footer={null} width={560}>
-      <Space direction="vertical" style={{ width: '100%' }} size="small">
-        <input
-          className="conversation-file-search"
+      <Space direction="vertical" style={{ width: '100%' }} size="middle">
+        <Input.Search
+          allowClear
           placeholder="按文件名筛选"
           value={query}
           onChange={(event) => setQuery(event.target.value)}
+          onSearch={(value) => setQuery(value)}
         />
 
         {visible.length === 0 ? (
@@ -91,7 +92,7 @@ export function ConversationFilePicker({
           </Button>
         </Upload>
 
-        <div style={{ color: '#999', fontSize: 12 }}>
+        <div className="conversation-file-picker-hint">
           <PaperClipOutlined /> 只能引用这个会话里的文件。别的会话的文件在这里看不到，也不能带过来。
         </div>
       </Space>

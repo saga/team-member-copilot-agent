@@ -1080,7 +1080,9 @@ src/                          # Vite + React + Ant Design 前端
       TaskCreator.tsx         # 新建 Task 工作区：title + 成员 + Lead + Jira key
       TaskPanel.tsx           # 工作区左侧：目标 + 任务列表 + 进展 + 重试/取消
       ConversationMessages.tsx  # @ant-design/x Bubble.List + Timeline（delegation），显示为动态
-      MessageComposer.tsx     # @ant-design/x Sender（无收件人选择）
+      MessageContent.tsx      # @ant-design/x-markdown XMarkdown（code 拦截 mermaid→Mermaid）+ Sources（附件收进引用来源）
+      MessageComposer.tsx     # @ant-design/x Sender（无收件人选择；onPasteFile + autoSize）+ FileCard（已选文件）
+      FileAttachmentCard.tsx  # @ant-design/x FileCard（抽屉 / 引用窗口共用）
       ConversationHeader.tsx  # 标题 + 状态 + Lead + Jira + 成员
       MemberManager.tsx       # antd Table：加人 / 移人 / 静音（有未完成工作时禁止 Remove）
       MemberEditor.tsx        # antd Form + Popconfirm Archive（能力已移到 Capabilities）

@@ -2,7 +2,7 @@ import type { RefObject } from 'react';
 import { Avatar, Empty, Tag, Timeline } from 'antd';
 import { Bubble } from '@ant-design/x';
 import type { Conversation, ConversationMessage } from '../../lib/api';
-import { FileAttachmentCard } from './FileAttachmentCard';
+import { MessageContent } from './MessageContent';
 
 export interface StreamState {
   executionId: string;
@@ -60,7 +60,7 @@ export function ActivityFeed({
     const used = mcpUsage[executionId] ?? [];
     if (used.length === 0) return null;
     return (
-      <div style={{ marginTop: 6, display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+      <div className="activity-mcp-tags">
         {used.map((item) => (
           <Tag key={`${item.serverId}:${item.toolName}`} color="blue" style={{ marginInlineEnd: 0 }}>
             MCP · {item.serverId}/{item.toolName}
@@ -85,14 +85,7 @@ export function ActivityFeed({
       placement: (message.senderType === 'user' ? 'end' : 'start') as 'end' | 'start',
       content: (
         <>
-          {message.content}
-          {message.files.length > 0 && (
-            <div className="message-files">
-              {message.files.map((file) => (
-                <FileAttachmentCard key={file.id} file={file} compact />
-              ))}
-            </div>
-          )}
+          <MessageContent content={message.content} files={message.files} />
           {mcpTags(message.executionId)}
         </>
       ),
@@ -119,7 +112,7 @@ export function ActivityFeed({
       placement: 'start' as const,
       content: (
         <>
-          {stream.content || '▍'}
+          <MessageContent content={stream.content} streaming />
           {mcpTags(stream.executionId)}
         </>
       ),
@@ -134,7 +127,7 @@ export function ActivityFeed({
       <Bubble.List items={items} />
       {delegations.length > 0 && (
         <Timeline
-          style={{ marginTop: 16 }}
+          className="activity-delegations"
           items={delegations.map((item) => ({
             key: item.executionId,
             color: item.status === 'error' ? 'red' : item.status === 'running' ? 'blue' : 'green',

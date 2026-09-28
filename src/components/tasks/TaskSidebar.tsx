@@ -45,7 +45,7 @@ export function TaskSidebar({
           search={search}
         />
       </div>
-      <Space direction="vertical" style={{ width: '100%', marginTop: 8 }}>
+      <Space direction="vertical" style={{ width: '100%', marginTop: 8 }} size={6}>
         <Button type="primary" block icon={<PlusOutlined />} onClick={onNewTask}>
           新建任务
         </Button>

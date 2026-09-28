@@ -106,12 +106,12 @@ export function ConversationHeader({
             })}
           </Avatar.Group>
 
-          <Button icon={<PaperClipOutlined />} onClick={onOpenFiles}>
+          <Button size="small" icon={<PaperClipOutlined />} onClick={onOpenFiles}>
             Files{fileCount > 0 ? ` ${fileCount}` : ''}
           </Button>
 
           {!isDm && (
-            <Button icon={<TeamOutlined />} onClick={() => setParticipantsOpen(true)}>
+            <Button size="small" icon={<TeamOutlined />} onClick={() => setParticipantsOpen(true)}>
               Participants
             </Button>
           )}
