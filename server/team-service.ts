@@ -1054,20 +1054,23 @@ export class TeamService {
     }
 
     if (mentionedMembers.length > 0) {
-      // 用户明确 @Member（@architect 看一下这个方案）就直接唤醒被点名的 Member，
-      // 而不是 User → Lead → Architect。
-      for (const member of mentionedMembers) {
-        // muted 是明确的控制面设置，@mention 也不能绕过。
-        if (this.states.get(conversation.id, member.id).muted) continue;
+      // 同一条 User message 中的多个 @Member 是一个有序 mention chain：
+      // 第一位立即执行，后面的等前一位完成后再 enqueue（见 advanceMentionChain）。
+      // 全部同时启动的话，后面的 Member 看不到前面的回答，只能各说各的。
+      const firstMentioned = mentionedMembers.find(
+        (member) => !this.states.get(conversation.id, member.id).muted,
+      );
+      // muted 是明确的控制面设置，@mention 也不能绕过。
+      if (firstMentioned) {
         this.scheduler.enqueue({
           conversationId: conversation.id,
-          memberId: member.id,
+          memberId: firstMentioned.id,
           taskId: null,
           reason: 'user_mention',
           triggerSequence: created.messageSequence,
         });
         wakes.push({
-          memberId: member.id,
+          memberId: firstMentioned.id,
           reason: 'user_mention',
           taskId: null,
           triggerSequence: created.messageSequence,
@@ -1100,6 +1103,46 @@ export class TeamService {
     }
 
     return { message: created, wakes, deduplicated: false };
+  }
+
+  /**
+   * mention chain 推进：同一条 User message 点了 @A @B，A 回答完后叫 B。
+   *
+   * B 看到的是 A 已经写进 Conversation 的回答（+ 确定性补充区兜底窗口截断），
+   * 所以只做增量补充。判据是 execution 行：同 trigger + user_mention +
+   * completed 的才算“真正回答过”，光 enqueue 不算。
+   */
+  private advanceMentionChain(conversationId: string, triggerMessageSequence: number): void {
+    const conversation = this.getConversation(conversationId);
+    const trigger = this.findMessageBySequence(conversationId, triggerMessageSequence);
+    if (!trigger) return;
+    if (trigger.senderType !== 'user') return;
+    const mentionedMembers = findMentionedMembers(trigger.content, conversation.members);
+    if (mentionedMembers.length <= 1) return;
+
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT member_id FROM execution
+         WHERE conversation_id = ? AND trigger_message_sequence = ?
+           AND wake_reason = 'user_mention' AND status = 'completed'`,
+      )
+      .all(conversationId, triggerMessageSequence) as Array<{ member_id: string }>;
+    const completed = new Set(rows.map((row) => row.member_id));
+    const next = mentionedMembers.find(
+      (member) =>
+        !completed.has(member.id) && !this.states.get(conversationId, member.id).muted,
+    );
+    if (!next) return;
+
+    // 下一位直接进入 scheduler：如果它此时正在执行自己的 Task，
+    // scheduler 会把 mention 放到它的下一轮，不插队。
+    this.scheduler.enqueue({
+      conversationId,
+      memberId: next.id,
+      taskId: null,
+      reason: 'user_mention',
+      triggerSequence: triggerMessageSequence,
+    });
   }
 
   /**
@@ -3183,6 +3226,16 @@ export class TeamService {
       });
 
       if (message) this.emit(input.conversation.id, { type: 'message.created', data: message });
+
+      if (input.turnMode === 'mention' && message && !goalStale) {
+        if (input.triggerMessageSequence !== null) {
+          this.advanceMentionChain(input.conversation.id, input.triggerMessageSequence);
+        }
+        // mention 可能优先于一个 task_ready wake 进来：完成后重新扫描 ready，
+        // 避免被优先级替换掉的那条 Task 推进永远等不到。
+        this.orchestrator.startReadyTasks(input.conversation.id);
+      }
+
       this.emitExecution(this.getExecution(executionId));
       this.touchConversation(input.conversation.id);
       this.touchAgentPresence(input.member.id);

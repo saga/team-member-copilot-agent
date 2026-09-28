@@ -167,11 +167,10 @@ function keyOf(conversationId: string, memberId: string): string {
  * 三种 Lead 原因同级：都是「Lead 要说话」，谁的新消息序号大听谁的。
  */
 const REASON_PRIORITY: Record<Exclude<WakeReason, 'schedule'>, number> = {
-  goal_changed: 3,
+  goal_changed: 4,
+  // 用户明确点名高于普通自动 Task wake，但低于 Goal 重新规划。
+  user_mention: 3,
   task_ready: 2,
-  // 用户明确点名和 Task 就绪同级：都是「这个 Member 现在有事做」。
-  // 同级拼触发序号，用户的 @ 永远最新，所以点名不会被顶掉。
-  user_mention: 2,
   lead_message: 1,
   lead_clarification: 1,
   lead_recovery: 1,

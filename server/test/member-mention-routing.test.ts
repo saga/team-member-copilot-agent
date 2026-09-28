@@ -86,40 +86,100 @@ describe('User @mention routing', () => {
     );
   });
 
-  it('@多个 Member 时并行唤醒多个 Member', async () => {
+  it('@多个 Member 时按用户输入顺序串行回答，后面的 Member 看到前面的回答', async () => {
     stub.reset();
     const lead = team.createMember({ name: 'Multi Lead', role: 'Lead' });
-    const architect = team.createMember({ name: 'Multi Architect', role: 'Architect' });
-    const reviewer = team.createMember({ name: 'Multi Reviewer', role: 'Reviewer' });
+    const security = team.createMember({ name: 'Multi Security', role: 'Security Reviewer' });
+    const engineer = team.createMember({ name: 'Multi Engineer', role: 'Software Engineer' });
     const conversation = team.createConversation({
       kind: 'task',
-      title: 'Multiple mentions',
-      memberIds: [lead.id, architect.id, reviewer.id],
+      title: 'Ordered mentions',
+      memberIds: [lead.id, security.id, engineer.id],
       leadMemberId: lead.id,
     });
 
     const result = await team.sendMessage({
       conversationId: conversation.id,
-      content: `@${architect.handle} @${reviewer.handle} 请分别看一下这个设计。`,
+      content:
+        `@${security.handle} @${engineer.handle} ` + '分别从安全和工程实现角度看看这个设计。',
     });
-    assert.equal(result.wakes.length, 2);
-    assert.deepEqual(
-      new Set(result.wakes.map((wake) => wake.memberId)),
-      new Set([architect.id, reviewer.id]),
+    // 第一次只启动 Security。
+    assert.equal(result.wakes.length, 1);
+    assert.equal(result.wakes[0].memberId, security.id);
+    assert.equal(result.wakes[0].reason, 'user_mention');
+
+    await waitForConversationIdle(conversation.id);
+
+    const executions = db
+      .prepare(
+        `SELECT id, member_id, wake_reason, status, trigger_message_sequence FROM execution
+         WHERE conversation_id = ? ORDER BY created_at`,
+      )
+      .all(conversation.id) as unknown as Array<{
+      id: string;
+      member_id: string;
+      wake_reason: string;
+      status: string;
+      trigger_message_sequence: number | null;
+    }>;
+    // 不应该有 Lead execution。
+    assert.equal(
+      executions.some((execution) => execution.member_id === lead.id),
+      false,
     );
-    assert.ok(result.wakes.every((wake) => wake.reason === 'user_mention'));
+    assert.equal(executions.length, 2);
+    assert.deepEqual(
+      executions.map((execution) => execution.member_id),
+      [security.id, engineer.id],
+    );
+    assert.ok(executions.every((execution) => execution.wake_reason === 'user_mention'));
+    // 两轮必须属于同一条 User message。
+    assert.equal(executions[0].trigger_message_sequence, executions[1].trigger_message_sequence);
+
+    // 最关键的断言：Engineer 的 prompt 必须看到 Security 已经产生的回答。
+    const engineerExecution = executions.find(
+      (execution) => execution.member_id === engineer.id,
+    );
+    assert.ok(engineerExecution);
+    const engineerTurn = stub.turnFor(engineerExecution.id);
+    assert.match(engineerTurn.prompt, /reply from Multi Security/);
+
+    const messages = team.listMessages(conversation.id);
+    assert.ok(messages.some((message) => message.senderId === security.id));
+    assert.ok(messages.some((message) => message.senderId === engineer.id));
+  });
+
+  it('mention 顺序严格跟随用户输入，而不是 conversation roster 顺序', async () => {
+    stub.reset();
+    const lead = team.createMember({ name: 'Order Lead', role: 'Lead' });
+    const security = team.createMember({ name: 'Order Security', role: 'Security Reviewer' });
+    const engineer = team.createMember({ name: 'Order Engineer', role: 'Software Engineer' });
+    const conversation = team.createConversation({
+      kind: 'task',
+      title: 'Mention order',
+      // roster 故意反过来
+      memberIds: [lead.id, engineer.id, security.id],
+      leadMemberId: lead.id,
+    });
+
+    const result = await team.sendMessage({
+      conversationId: conversation.id,
+      content: `@${security.handle} ` + `@${engineer.handle} 看一下。`,
+    });
+    assert.equal(result.wakes.length, 1);
+    assert.equal(result.wakes[0].memberId, security.id);
 
     await waitForConversationIdle(conversation.id);
 
     const rows = db
       .prepare(
-        `SELECT member_id, wake_reason FROM execution WHERE conversation_id = ? ORDER BY created_at`,
+        `SELECT member_id FROM execution
+         WHERE conversation_id = ? AND wake_reason = 'user_mention' ORDER BY created_at`,
       )
-      .all(conversation.id) as unknown as Array<{ member_id: string; wake_reason: string | null }>;
-    assert.equal(rows.length, 2);
+      .all(conversation.id) as unknown as Array<{ member_id: string }>;
     assert.deepEqual(
-      new Set(rows.map((row) => row.member_id)),
-      new Set([architect.id, reviewer.id]),
+      rows.map((row) => row.member_id),
+      [security.id, engineer.id],
     );
   });
 

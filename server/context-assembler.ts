@@ -163,10 +163,12 @@ export class ContextAssembler {
     input: {
       conversation: Conversation;
       member: Member;
-      turnMode: TurnMode;
-      wakeReason: WakeReason | null;
-      currentPrompt: string;
-      currentTask?: ConversationTask | null;
+    turnMode: TurnMode;
+    wakeReason: WakeReason | null;
+    /** mention chain 绑定到哪条 User message（找前序回答用，其它模式忽略）。 */
+    triggerMessageSequence: number | null;
+    currentPrompt: string;
+    currentTask?: ConversationTask | null;
       tasks?: ConversationTask[];
       experiences?: ExperienceRecord[];
       work?: { provider: string; key: string; url: string | null } | null;
@@ -238,6 +240,33 @@ export class ContextAssembler {
       sections.push(header, [notice, this.transcript(sharedMessages)].filter(Boolean).join('\n\n'));
     }
 
+    // 同一条 mention chain 的前序回答：窗口截断可能把它裁掉，这里确定性补一份。
+    // 只补 sharedMessages 里没有的 —— 重复贴两遍是浪费 token。
+    if (input.turnMode === 'mention' && input.triggerMessageSequence !== null) {
+      const previousMentionResponses = this.findPreviousMentionResponses(
+        input.conversation.id,
+        input.triggerMessageSequence,
+        input.member.id,
+      );
+      if (previousMentionResponses.length > 0) {
+        const alreadyVisible = new Set(sharedMessages.map((message) => message.id));
+        const omittedPreviousResponses = previousMentionResponses.filter(
+          (message) => !alreadyVisible.has(message.id),
+        );
+        if (omittedPreviousResponses.length > 0) {
+          sections.push(
+            [
+              'Previous Member responses to this same user request:',
+              this.transcript(omittedPreviousResponses),
+              '',
+              'These responses were produced earlier in this same mention round.',
+              'Build on them instead of repeating them.',
+            ].join('\n'),
+          );
+        }
+      }
+    }
+
     if (input.turnMode === 'delegation') {
       sections.push('Task:', input.currentPrompt);
       return sections.join('\n\n');
@@ -302,6 +331,35 @@ export class ContextAssembler {
     return lines.filter(Boolean).join('\n');
   }
 
+  /**
+   * 同一条 mention chain 里、当前 Member 之前已经回答完的 Member 回复。
+   *
+   * 判据是 execution 行（同 trigger + user_mention + completed），不是消息时间：
+   * 只有真正跑完的那一轮才有完整回答，进窗口一半的半截内容不算。
+   */
+  private findPreviousMentionResponses(
+    conversationId: string,
+    triggerMessageSequence: number,
+    currentMemberId: string,
+  ): ConversationMessage[] {
+    const rows = this.db
+      .prepare(
+        `SELECT m.* FROM conversation_message m
+         JOIN execution e ON e.id = m.execution_id
+         WHERE m.conversation_id = ?
+           AND m.message_sequence > ?
+           AND m.sender_type = 'member'
+           AND m.sender_id <> ?
+           AND e.trigger_message_sequence = ?
+           AND e.wake_reason = 'user_mention'
+           AND e.status = 'completed'
+         ORDER BY m.message_sequence`,
+      )
+      .all(conversationId, triggerMessageSequence, currentMemberId, triggerMessageSequence) as unknown as
+      MessageRow[];
+    return rows.map(mapMessage);
+  }
+
   private transcript(messages: ConversationMessage[]): string {
     const names = this.memberNames();
     return messages
@@ -332,11 +390,23 @@ export class ContextAssembler {
 const MEMBER_MENTION_INSTRUCTION = [
   'You were directly addressed by the user with an @mention in this task workspace.',
   'Answer the user directly from your own role, expertise, and available capabilities.',
+  '',
+  'MULTI-MEMBER MENTION:',
+  'This may be an ordered multi-member mention round.',
+  'Earlier Members in the same user request may already have answered before you.',
+  'Review those earlier answers before producing your response.',
+  'Treat their responses as working context, not authoritative truth.',
+  'Do not repeat points that have already been adequately explained.',
+  'Focus on what is missing, different, deeper, or more actionable from your own perspective.',
+  'If another Member identified a risk, requirement, or conclusion, build on it instead of restarting the analysis.',
+  'If you disagree with a previous answer, explicitly explain the disagreement.',
+  'If there is no materially new information to add, say so briefly rather than producing another generic answer.',
+  '',
+  'DIRECT RESPONSE:',
   'Do not route the user back through the Lead merely because you are not the Lead.',
   'Do not act as a coordinator unless the user explicitly asks you to coordinate the team.',
   'Do not create or re-plan the workspace task plan.',
   'Use available knowledge and tools when useful.',
-  'If another Member is genuinely needed for a narrow piece of information, you may use the available collaboration capability, but your primary response is still to the user.',
   'Keep the answer focused on the question you were directly asked.',
 ].join('\n');
 

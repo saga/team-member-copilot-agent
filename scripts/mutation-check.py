@@ -1100,6 +1100,28 @@ MUTATIONS = [
         ],
     },
     {
+        "name": "mention chain 不推进（第二位永远等不到）",
+        "test": "server/test/member-mention-routing.test.ts",
+        "steps": [
+            (
+                "server/team-service.ts",
+                "          this.advanceMentionChain(input.conversation.id, input.triggerMessageSequence);\n",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "mention 按 roster 排序（用户输入顺序丢失）",
+        "test": "server/test/member-mention-routing.test.ts",
+        "steps": [
+            (
+                "server/member-mentions.ts",
+                "  const result: Member[] = [];\n  const seen = new Set<string>();\n  for (const match of content.matchAll(MEMBER_MENTION_RE)) {\n    const handle = match[1]?.trim().toLowerCase();\n    if (!handle) continue;\n    const member = memberByHandle.get(handle);\n    if (!member) continue;\n    if (seen.has(member.id)) continue;\n    seen.add(member.id);\n    result.push(member);\n  }\n  return result;\n",
+                "  const result: Member[] = [];\n  const seen = new Set<string>();\n  const requested = new Set<string>();\n  for (const match of content.matchAll(MEMBER_MENTION_RE)) {\n    const handle = match[1]?.trim().toLowerCase();\n    if (handle) requested.add(handle);\n  }\n  for (const member of members) {\n    if (member.status !== 'active') continue;\n    if (!requested.has(member.handle.toLowerCase())) continue;\n    if (seen.has(member.id)) continue;\n    seen.add(member.id);\n    result.push(member);\n  }\n  return result;\n",
+            )
+        ],
+    },
+    {
         "name": "Goal 唤醒走普通消息通道（不用 Strong 规划）",
         "test": "server/test/goal-revision.test.ts",
         "steps": [
