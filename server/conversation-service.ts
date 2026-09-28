@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { config } from './config.js';
 import { now } from './db.js';
-import type { Conversation, ConversationMemberState, ConversationMessage, GoalChangeKind, GoalRevision, TaskRequirements } from './domain.js';
+import type { Conversation, ConversationMemberState, ConversationMessage, ConversationParticipant, ConversationPrincipalType, GoalChangeKind, GoalRevision, TaskRequirements } from './domain.js';
 import { badRequest, conflict, notFound } from './http-error.js';
 import { isMemberDm } from './member-conversation-service.js';
 import { findMentionedMembers } from './member-mentions.js';
@@ -31,16 +31,130 @@ export class ConversationService {
     return this.internals.hydrateConversation(row);
   }
 
-  listConversations(): Conversation[] {
+  // ------------------------------------------------- Conversation Participant
+  //
+  // 谁可以进这间房。和 conversation_member（哪些 Agent 是成员）是两张表，
+  // 理由见 domain.ts 的 ConversationParticipant 注释。
+  //
+  // 这些方法刻意都很薄：ACL 的判定必须只有一处（middleware/conversationAccess.ts），
+  // 这里只提供「读这一行 / 写这一行」。在服务层再包一层「能不能进」的判断，
+  // 就会出现两套判据各自漂移 —— 而漂移的表现是「房间进不去但执行记录看得见」。
+
+  /** 这个 principal 是不是这间房的参与者。 */
+  isConversationParticipant(
+    conversationId: string,
+    principalType: ConversationPrincipalType,
+    principalId: string,
+  ): boolean {
+    const row = this.internals.db
+      .prepare(
+        `SELECT 1 AS ok FROM conversation_participant
+         WHERE conversation_id = ? AND principal_type = ? AND principal_id = ?
+         LIMIT 1`,
+      )
+      .get(conversationId, principalType, principalId);
+    return row !== undefined;
+  }
+
+  /**
+   * 加一个参与者。幂等 —— 重复添加不报错。
+   *
+   * 用 `ON CONFLICT DO NOTHING` 而不是先查后插：并发添加同一个人（两次点击、
+   * 或者建房的自动加入与显式邀请撞在一起）会走成主键冲突异常，而「把已经在
+   * 房里的人再加一次」显然不该是一次失败。
+   */
+  addConversationParticipant(input: {
+    conversationId: string;
+    principalType: ConversationPrincipalType;
+    principalId: string;
+    addedBy?: string | null;
+  }): void {
+    // 房间不存在时直接报 404，而不是靠外键抛一个「FOREIGN KEY constraint failed」：
+    // 后者在日志里看不出是哪个 id 错了。
+    this.getConversation(input.conversationId);
+
+    this.internals.db
+      .prepare(
+        `INSERT INTO conversation_participant (
+           conversation_id, principal_type, principal_id, added_by, added_at
+         ) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(conversation_id, principal_type, principal_id) DO NOTHING`,
+      )
+      .run(
+        input.conversationId,
+        input.principalType,
+        input.principalId,
+        input.addedBy ?? null,
+        now(),
+      );
+  }
+
+  removeConversationParticipant(
+    conversationId: string,
+    principalType: ConversationPrincipalType,
+    principalId: string,
+  ): void {
+    this.internals.db
+      .prepare(
+        `DELETE FROM conversation_participant
+         WHERE conversation_id = ? AND principal_type = ? AND principal_id = ?`,
+      )
+      .run(conversationId, principalType, principalId);
+  }
+
+  listConversationParticipants(conversationId: string): ConversationParticipant[] {
+    this.getConversation(conversationId);
     const rows = this.internals.db
       .prepare(
+        `SELECT * FROM conversation_participant
+         WHERE conversation_id = ?
+         ORDER BY added_at, principal_id`,
+      )
+      .all(conversationId) as unknown as Array<{
+      conversation_id: string;
+      principal_type: ConversationPrincipalType;
+      principal_id: string;
+      added_by: string | null;
+      added_at: string;
+    }>;
+
+    return rows.map((row) => ({
+      conversationId: row.conversation_id,
+      principalType: row.principal_type,
+      principalId: row.principal_id,
+      addedBy: row.added_by,
+      addedAt: row.added_at,
+    }));
+  }
+
+  /**
+   * Conversation 列表。
+   *
+   * 传 `teamId` 时只返回**这个 Team 的**房间。不传 = 全部（单 Team 部署与
+   * 内部工具用）。
+   *
+   * conversation 表上有 team_id，所以过滤是一条 WHERE —— 但以前这里没有它，
+   * 于是多 Team 部署下侧栏会把所有 Team 的房间一起列出来。这是最容易被忽略的
+   * 一类越权：它不报错、不 403，只是**多显示了几行**，而用户会以为那就是
+   * 自己该看到的全部。
+   */
+  listConversations(teamId?: string): Conversation[] {
+    const rows = this.internals.db
+      .prepare(
+        teamId
+          ? `
+        SELECT *
+        FROM conversation
+        WHERE team_id = ?
+        ORDER BY updated_at DESC
         `
+          : `
         SELECT *
         FROM conversation
         ORDER BY updated_at DESC
         `,
       )
-      .all() as unknown as ConversationRow[];
+      .all(...(teamId ? [teamId] : [])) as unknown as ConversationRow[];
     // 一次聚合拿全列表的任务进度：每个工作区再调一次 Task API 是 N+1。
     // 只看当前 Goal：v1 的 5/5 不能和 v2 的 1/3 加成 6/8。
     const progressRows = this.internals.db
@@ -98,12 +212,15 @@ export class ConversationService {
       input.title?.trim() ||
       (kind === 'task' ? `工作-${createdAt.slice(0, 10)}` : members.map((m) => m.name).join(' · '));
 
-    // Team 归属：单 Team 部署取默认 Team；成员不在 Team 里则自动补 membership
-    // （provisioning/旧库路径），已在但 inactive 的仍拒绝。
+    // Team 归属：显式 teamId 优先（多 Team 部署下由请求决定），否则取默认 Team。
+    // 成员不在 Team 里则自动补 membership（provisioning/旧库路径），
+    // 已在但 inactive 的仍拒绝。
     let teamId = '';
     const externalWorkRef = this.internals.resolveExternalWorkRef(input.externalWorkRef);
     try {
-      const team = this.internals.defaultTeam();
+      const team = input.teamId
+        ? this.internals.structure?.getTeam(input.teamId) ?? this.internals.defaultTeam()
+        : this.internals.defaultTeam();
       teamId = team.id;
       for (const memberId of memberIds) {
         try {
@@ -173,6 +290,22 @@ export class ConversationService {
       // 新房间没有历史，房间读游标从 0 开始
       this.internals.states.ensure(id, memberId, 0);
     }
+
+    // 建房者自动成为参与者。
+    //
+    // 这一步是 ACL 收紧之后**必须**有的：human 的访问判据从「你是这个 Team 的
+    // 成员」改成「你是这间房的参与者」，而这张表一开始是空的 —— 不在这里写入，
+    // 建完房的人立刻进不去自己刚建的房间。
+    //
+    // 落的是 `createdBy`（HTTP 层传进来的真实 principalId，即 OIDC 的 sub），
+    // 不是 `config.localUserId`：后者是「本机单用户」的占位，在生产里永远不会
+    // 出现在任何一张 token 上 —— 用它写入等于给一个不存在的人开门。
+    this.addConversationParticipant({
+      conversationId: id,
+      principalType: 'human',
+      principalId: input.createdBy ?? config.localActorId,
+      addedBy: null,
+    });
 
     // Lead 主动先开口：落一条 system 开场（触发消息），再唤醒 Lead。
     // 用户看到的第一条就是 Lead 的回应，而不是一个等他先说话的空房间。

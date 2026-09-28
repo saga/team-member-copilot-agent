@@ -14,6 +14,7 @@ import { TaskService } from './task-service.js';
 import type { AuthorizationRevisions } from './team-service.js';
 import type { ConversationRow } from './team-shared.js';
 import { TeamStructureService } from './team-structure-service.js';
+import type { WorkerLeaseService } from './worker-lease.js';
 import type { ExternalWorkRef, ExternalWorkSnapshot } from './work-management/types.js';
 
 /**
@@ -85,6 +86,14 @@ export interface TeamInternals {
   }): ConversationMessage;
   insertMessage(message: ConversationMessage): void;
   latestExecutionFor(conversationId: string, memberId: string): string | null;
+  /**
+   * Worker 租约。多副本部署下「谁在跑这一轮」的唯一仲裁点。
+   *
+   * undefined = 单进程语义（不抢、不挡）。执行链上的租约保护必须走这里，
+   * 而不是让四个服务各自 new 一个 —— 租约的 owner 是**本进程的身份**，
+   * 换一个实例就等于换一个身份，恢复流程会把自己正在跑的活当成别人的。
+   */
+  readonly leases?: WorkerLeaseService;
   readonly memberConversations: MemberConversationService;
   readonly members: MemberService;
   nextMessageSequence(conversationId: string): number;

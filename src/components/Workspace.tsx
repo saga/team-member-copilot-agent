@@ -11,6 +11,7 @@ import { MessageComposer } from './team/MessageComposer';
 import { MemberProfile } from './team/MemberProfile';
 import { TeamManagement } from './team/TeamManagement';
 import { SettingsPage } from './team/SettingsPage';
+import { ApprovalsPage } from './approvals/ApprovalsPage';
 import { TaskSidebar } from './tasks/TaskSidebar';
 import { WorkspaceNav } from './workspace/WorkspaceNav';
 import { TaskCreator } from './team/TaskCreator';
@@ -179,6 +180,8 @@ export function Workspace() {
             navigate({ view: 'tasks', conversationId });
           } else if (next === 'team') {
             navigate({ view: 'team' });
+          } else if (next === 'approvals') {
+            navigate({ view: 'approvals' });
           } else {
             navigate({ view: 'settings', section: 'capabilities', scope: 'global', memberId: null });
           }
@@ -231,6 +234,8 @@ export function Workspace() {
         )}
 
         {view === 'settings' && <SettingsPage route={route} navigate={navigate} />}
+
+        {view === 'approvals' && <ApprovalsPage />}
 
         {view === 'tasks' && !selectedConversation && (
           <Content style={{ display: 'grid', placeItems: 'center', color: '#999' }}>

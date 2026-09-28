@@ -85,6 +85,28 @@ export class TeamStructureService {
     return this.upsertMembership(teamId, 'agent', memberId, 'member', 'active');
   }
 
+  /**
+   * 这个 Team 有没有 human owner。
+   *
+   * 启动引导用它区分两件事，而这两件事从 team 行上分不出来：
+   *
+   *   1. 全新的部署        → 必须有一个 owner，否则没人能改配置（要拦启动）
+   *   2. 已经在跑的部署    → 已有 owner，不需要再要 OIDC_BOOTSTRAP_OWNER_SUB
+   *
+   * 少了它，要么每次重启都要求配置 bootstrap owner（运维负担），要么干脆不检查
+   * 而让一个「没有 owner」的 Team 静默跑起来（谁都改不了配置，只能改库）。
+   */
+  hasHumanOwner(teamId: string): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS ok FROM team_membership
+         WHERE team_id = ? AND kind = 'human' AND role = 'owner' AND status = 'active'
+         LIMIT 1`,
+      )
+      .get(teamId) as { ok: number } | undefined;
+    return row !== undefined;
+  }
+
   listMemberships(teamId: string): TeamMembership[] {
     const rows = this.db
       .prepare(`SELECT * FROM team_membership WHERE team_id = ? ORDER BY kind, principal_id`)

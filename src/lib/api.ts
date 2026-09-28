@@ -524,6 +524,122 @@ export interface ExecutionRecord {
   createdAt: string;
 }
 
+// -------------------------------------------------------------- Command 层
+//
+// Command 是「真正要执行的业务动作」的唯一落点：Agent 不直接打外部 REST，
+// 而是先落一条 Command，再走 Entitlement → Policy → Approval → Executor。
+// 默认 Policy 对一切 external-write 返回「要人批」，所以界面要能看见并放行它们。
+
+export type CommandStatus =
+  | 'requested'
+  | 'policy_pending'
+  | 'approved'
+  | 'ready'
+  | 'executing'
+  | 'completed'
+  | 'failed'
+  | 'rejected'
+  | 'cancelled'
+  | 'expired';
+
+export interface CommandRecord {
+  id: string;
+  executionId: string;
+  conversationId: string;
+  memberId: string;
+  actorType: 'agent' | 'human';
+  actorId: string;
+  action: string;
+  target: string;
+  /** 参数原文的 sha256 —— 「有没有被改过」可验证。 */
+  argsHash: string;
+  /**
+   * 冻结的规范化参数。执行时用的就是这一份，不是调用方再传一遍的。
+   * 审批界面显示它 —— 人批的必须是他当时看见的东西。
+   */
+  args: Record<string, unknown>;
+  idempotencyKey: string;
+  resourceVersion: string | null;
+  policyDecisionId: string | null;
+  approvalId: string | null;
+  status: CommandStatus;
+  createdAt: string;
+  executedAt: string | null;
+  resultHash: string | null;
+}
+
+export interface ApprovalRecord {
+  id: string;
+  commandId: string;
+  requestedByType: 'agent' | 'human';
+  requestedById: string;
+  decision: 'pending' | 'approved' | 'rejected' | 'expired';
+  decidedBy: string | null;
+  createdAt: string;
+  decidedAt: string | null;
+}
+
+export type CommandAuditEvent =
+  | 'requested'
+  | 'policy_decided'
+  | 'approval_requested'
+  | 'approved'
+  | 'rejected'
+  | 'executing'
+  | 'completed'
+  | 'failed';
+
+export interface CommandAuditRecord {
+  id: string;
+  commandId: string;
+  executionId: string;
+  event: CommandAuditEvent;
+  actorType: 'agent' | 'human' | 'system';
+  actorId: string;
+  detail: string | null;
+  createdAt: string;
+}
+
+export interface CommandDetail {
+  command: CommandRecord;
+  approval: ApprovalRecord | null;
+  /** 生命周期事件。command 行上只有**当前**状态，过程在这里。 */
+  audit: CommandAuditRecord[];
+}
+
+export interface PolicyDecisionAuditRecord {
+  id: string;
+  executionId: string;
+  toolName: string;
+  policyRevision: string;
+  decision: 'allow' | 'deny' | 'approval_required';
+  reason: string;
+  inputHash: string;
+  createdAt: string;
+}
+
+export interface ToolExecutionAuditRecord {
+  id: string;
+  executionId: string;
+  toolName: string;
+  providerId: string;
+  implementation: string;
+  allowed: boolean;
+  policyDecisionId: string | null;
+  entitlementId: string | null;
+  startedAt: string;
+  endedAt: string | null;
+  error: string | null;
+}
+
+/** 一次 execution 的完整证据链（三张表合起来才是完整答案）。 */
+export interface ExecutionAuditBundle {
+  executionId: string;
+  policyDecisions: PolicyDecisionAuditRecord[];
+  toolExecutions: ToolExecutionAuditRecord[];
+  commands: CommandAuditRecord[];
+}
+
 /**
  * 为什么唤醒这个 Member。确定性规则的产物，不是 LLM routing：
  *   lead_bootstrap     新工作区创建后的自动首轮 Lead 唤醒
@@ -1379,5 +1495,79 @@ export const api = {
   teamEventsUrl(since?: number): string {
     const base = `${API_BASE}/api/team/events`;
     return since && since > 0 ? `${base}?since=${since}` : base;
+  },
+
+  // ------------------------------------------------------ Command / Approval
+  //
+  // 外部写入的控制面。默认 Policy 把一切 external-write 停在 policy_pending，
+  // 这几个接口是唯一的放行出口。
+
+  /**
+   * 审批收件箱：待审批的 Command（跨房间，服务端按可见性过滤）。
+   *
+   * 按状态而不是按 execution 列 —— 审批人关心的是「有什么在等我批」，
+   * 不是「某一轮里有什么」。
+   */
+  listCommandsByStatus(status: CommandStatus): Promise<{ commands: CommandRecord[] }> {
+    return fetch(`${API_BASE}/api/commands?status=${encodeURIComponent(status)}`).then(
+      json<{ commands: CommandRecord[] }>,
+    );
+  },
+
+  /** 某一轮 execution 里的全部业务动作。 */
+  listCommandsForExecution(executionId: string): Promise<{ commands: CommandRecord[] }> {
+    return fetch(`${API_BASE}/api/commands?executionId=${encodeURIComponent(executionId)}`).then(
+      json<{ commands: CommandRecord[] }>,
+    );
+  },
+
+  /** 单条 Command：连同审批与生命周期事件。 */
+  getCommand(id: string): Promise<CommandDetail> {
+    return fetch(`${API_BASE}/api/commands/${encodeURIComponent(id)}`).then(json<CommandDetail>);
+  },
+
+  /**
+   * 审批通过。`execute` 默认 true（批准即执行）—— 让它停在 approved 等一个
+   * 不存在的第二个动作，等于批准之后还要再点一次「执行」，而没人会去找那个按钮。
+   */
+  approveCommand(id: string, options?: { execute?: boolean }): Promise<CommandDetail> {
+    return fetch(`${API_BASE}/api/commands/${encodeURIComponent(id)}/approve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ execute: options?.execute ?? true }),
+    }).then(json<CommandDetail>);
+  },
+
+  rejectCommand(id: string): Promise<CommandDetail> {
+    return fetch(`${API_BASE}/api/commands/${encodeURIComponent(id)}/reject`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    }).then(json<CommandDetail>);
+  },
+
+  executeCommand(id: string): Promise<CommandDetail> {
+    return fetch(`${API_BASE}/api/commands/${encodeURIComponent(id)}/execute`, {
+      method: 'POST',
+    }).then(json<CommandDetail>);
+  },
+
+  // ---------------------------------------------------------------- 审计
+  //
+  // 一次 execution 的完整证据链：工具层判定 / 工具层执行 / 业务动作。
+
+  getExecutionAudit(executionId: string): Promise<ExecutionAuditBundle> {
+    return fetch(`${API_BASE}/api/audit/executions/${encodeURIComponent(executionId)}`).then(
+      json<ExecutionAuditBundle>,
+    );
+  },
+
+  /**
+   * 导出地址（不是 fetch）：交给浏览器下载，文件名由服务端给。
+   * 走 <a download> 而不是先 fetch 再造 Blob —— 后者会把整份 JSON 在内存里
+   * 多存一份，而审计导出本来就可能不小。
+   */
+  executionAuditExportUrl(executionId: string): string {
+    return `${API_BASE}/api/audit/executions/${encodeURIComponent(executionId)}/export`;
   },
 };

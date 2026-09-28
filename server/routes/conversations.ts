@@ -8,6 +8,7 @@ import type { ConversationFileService } from '../conversation-file-service.js';
 import type { StoredConversationEvent } from '../domain.js';
 import { config } from '../config.js';
 import { currentPrincipal } from '../middleware/auth.js';
+import { requestTeamId } from '../middleware/teamScope.js';
 import { requireConversationAccess } from '../middleware/conversationAccess.js';
 import { sendError } from '../middleware/errorHandler.js';
 import { canAdmin } from '../middleware/adminAccess.js';
@@ -57,6 +58,23 @@ const createConversationSchema = z.object({
     })
     .nullable()
     .optional(),
+});
+
+/**
+ * 房间参与者（human ACL）。
+ *
+ * `principalType` 允许 'agent' 是为了「把某个 Member 的房间成员关系显式化」这类
+ * 将来的用法，当前 ACL 判定只用 'human' 那一支 —— agent 的访问判据仍然是
+ * conversation_member（见 middleware/conversationAccess.ts 的注释）。
+ */
+const addParticipantSchema = z.object({
+  principalType: z.enum(['human', 'agent']),
+  principalId: z.string().trim().min(1).max(200),
+});
+
+const participantKeySchema = z.object({
+  principalType: z.enum(['human', 'agent']),
+  principalId: z.string().trim().min(1).max(200),
 });
 
 const sendMessageSchema = z.object({
@@ -157,8 +175,10 @@ export function conversationsRouter(
 ) {
   const router = Router();
 
-  router.get('/', (_req, res) => {
-    res.json({ conversations: team.listConversations() });
+  router.get('/', (req, res) => {
+    // 按请求的 Team 过滤。多 Team 部署下这是「别人的房间不出现在我的侧栏里」
+    // 的实现 —— 不过滤不会报错，只会多显示几行，而用户会以为那就是全部。
+    res.json({ conversations: team.listConversations(requestTeamId(req)) });
   });
 
   // :id 之下的所有读写统一先做 Conversation ACL（human 看 Team 归属，
@@ -172,8 +192,67 @@ export function conversationsRouter(
       return;
     }
     try {
+      // 建房者的身份要显式传下去：它决定谁被写进 conversation_participant，
+      // 也就是 ACL 收紧之后谁能进这间房。服务层读不到请求，只能由这里传。
+      const createdBy = currentPrincipal(req).principalId;
       // 线上建工作区 Lead 主动先开口：用户不用先想第一句话。
-      res.status(201).json({ conversation: team.createConversation(parsed.data, { autoStartLead: true }) });
+      res.status(201).json({
+        conversation: team.createConversation(
+          { ...parsed.data, createdBy, teamId: requestTeamId(req) },
+          { autoStartLead: true },
+        ),
+      });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  /**
+   * 房间参与者（human ACL）。
+   *
+   * 挂在 `/:id/participants` 下，因此继承 `/:id` 上的房间 ACL —— 能读写这份
+   * 名单的人，至少是已经能进这间房的人（参与者，或 Team 的 owner/admin）。
+   */
+  router.get('/:id/participants', (req, res) => {
+    try {
+      res.json({ participants: team.listConversationParticipants(req.params.id) });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  router.post('/:id/participants', (req, res) => {
+    const parsed = addParticipantSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues.map((i) => i.message).join('; ') });
+      return;
+    }
+    try {
+      team.addConversationParticipant({
+        conversationId: req.params.id,
+        principalType: parsed.data.principalType,
+        principalId: parsed.data.principalId,
+        addedBy: currentPrincipal(req).principalId,
+      });
+      res.status(201).json({ participants: team.listConversationParticipants(req.params.id) });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  router.delete('/:id/participants/:principalType/:principalId', (req, res) => {
+    const parsed = participantKeySchema.safeParse(req.params);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues.map((i) => i.message).join('; ') });
+      return;
+    }
+    try {
+      team.removeConversationParticipant(
+        req.params.id,
+        parsed.data.principalType,
+        parsed.data.principalId,
+      );
+      res.json({ participants: team.listConversationParticipants(req.params.id) });
     } catch (error) {
       sendError(res, error);
     }

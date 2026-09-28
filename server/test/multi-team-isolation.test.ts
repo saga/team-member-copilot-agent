@@ -1,0 +1,231 @@
+import { after, before, describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+import { once } from 'node:events';
+import { randomUUID } from 'node:crypto';
+import type { AddressInfo } from 'node:net';
+import type { Server } from 'node:http';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import express from 'express';
+
+/**
+ * 多 Team 隔离 —— 「按请求的 Team 取数」而不是「永远取第一个 Team」。
+ *
+ * ── 为什么这是一个独立的失败形态 ─────────────────────────────────────
+ *
+ * 隔离失效**不报错**。`defaultTeam()` 永远返回第一个 Team，所以每个服务的
+ * 默认行为是「把所有请求都当成同一个 Team 的」—— 表现是「另一个 Team 的成员
+ * 出现在列表里」，看起来只是数据多了几行，不像越权。而 `?teamId=` 这个参数
+ * 会被静默忽略：接口 200、返回一份别的 Team 的数据。
+ *
+ * 所以这一组用例的断言都是**「不该出现的东西没出现」**，而不是「该出现的东西
+ * 出现了」—— 后者在 bug 存在时也常常为真。
+ *
+ * ── 为什么第二个 Team 是手工插的 ─────────────────────────────────────
+ *
+ * `ensureDefaultTeam` 是「当前部署的唯一 Team」，不提供新建入口（单 Team 部署
+ * 下多一层管理界面只会多一处可以配错的地方）。但 schema 与各服务的 team_id
+ * 维度是真实的，隔离逻辑必须成立 —— 所以这里直接插一行 team 来造第二个 Team。
+ */
+
+const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tmca-multiteam-'));
+process.env.DATA_DIR = dataDir;
+process.env.COPILOT_WARMUP = 'false';
+
+const { db, now } = await import('../db.js');
+const { MemberService } = await import('../member-service.js');
+const { membersRouter } = await import('../routes/members.js');
+const { conversationsRouter } = await import('../routes/conversations.js');
+const { initTeamScope, requestTeamId } = await import('../middleware/teamScope.js');
+const { StubCopilot, createTestStack } = await import('./support.js');
+
+const memberService = new MemberService(db);
+const stack = createTestStack(db, memberService, new StubCopilot().asCopilot);
+
+let teamA = '';
+let teamB = '';
+
+/** A 团队的成员与房间。 */
+let memberInA = '';
+let roomInA = '';
+/** B 团队的成员与房间。 */
+let memberInB = '';
+let roomInB = '';
+
+let server: Server;
+let base = '';
+
+before(async () => {
+  teamA = stack.structure.ensureDefaultTeam().id;
+  stack.structure.ensureHumanOwner(teamA, 'multi-owner');
+
+  // 第二个 Team：手工插。它是「另一个部署单元」，但共用同一个库。
+  teamB = randomUUID();
+  const timestamp = now();
+  db.prepare(
+    `INSERT INTO team (id, name, description, created_by, created_at, updated_at)
+     VALUES (?, 'Second Team', '', 'multi-owner', ?, ?)`,
+  ).run(teamB, timestamp, timestamp);
+  stack.structure.ensureHumanOwner(teamB, 'multi-owner-b');
+
+  memberInA = stack.team.createMember({ name: 'Member A', role: 'Engineer' }, teamA).id;
+  memberInB = stack.team.createMember({ name: 'Member B', role: 'Engineer' }, teamB).id;
+
+  roomInA = stack.team.createConversation({
+    title: 'Room A',
+    memberIds: [memberInA],
+    teamId: teamA,
+  }).id;
+  roomInB = stack.team.createConversation({
+    title: 'Room B',
+    memberIds: [memberInB],
+    teamId: teamB,
+  }).id;
+
+  initTeamScope(stack.structure, teamA);
+
+  const app = express();
+  app.use(express.json({ limit: '1mb' }));
+  app.use((_req, _res, next) => {
+    (_req as { principal?: unknown }).principal = {
+      kind: 'human',
+      principalId: 'multi-owner',
+      claims: {},
+    };
+    next();
+  });
+  app.use('/api/members', membersRouter(stack.team));
+  app.use(
+    '/api/conversations',
+    conversationsRouter(stack.team, stack.conversationFiles, stack.processor, stack.knowledge),
+  );
+
+  server = app.listen(0);
+  await once(server, 'listening');
+  base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+});
+
+after(async () => {
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+  db.close();
+  fs.rmSync(dataDir, { recursive: true, force: true });
+});
+
+async function json<T>(routePath: string): Promise<T> {
+  const response = await fetch(`${base}${routePath}`);
+  // 先判状态再读 body：`assert.equal(response.status, 200, await response.text())`
+  // 会在断言之前就把 body 读掉，失败信息里那句 body 反而让成功路径也报
+  // 「Body is unusable」—— 参数是先求值的。
+  if (response.status !== 200) {
+    assert.fail(`GET ${routePath} 期望 200，实际 ${response.status}：${await response.text()}`);
+  }
+  return (await response.json()) as T;
+}
+
+// ------------------------------------------------------------------ 用例
+
+describe('多 Team 隔离：Member 列表', () => {
+  it('服务层：按 Team 过滤成员', () => {
+    const inA = stack.team.listMembers(teamA).map((row) => row.id);
+    const inB = stack.team.listMembers(teamB).map((row) => row.id);
+
+    assert.equal(inA.includes(memberInA), true);
+    assert.equal(inA.includes(memberInB), false, 'B 团队的人不能出现在 A 团队的列表里');
+    assert.equal(inB.includes(memberInB), true);
+    assert.equal(inB.includes(memberInA), false);
+  });
+
+  it('不传 teamId = 单 Team 语义：全部返回', () => {
+    const all = stack.team.listMembers().map((row) => row.id);
+    assert.equal(all.includes(memberInA), true);
+    assert.equal(all.includes(memberInB), true, '不传就是不过滤 —— 这条路径给单 Team 部署用');
+  });
+
+  it('HTTP：?teamId= 真的生效（不是被静默忽略）', async () => {
+    const a = await json<{ members: Array<{ id: string }> }>(`/api/members?teamId=${teamA}`);
+    const b = await json<{ members: Array<{ id: string }> }>(`/api/members?teamId=${teamB}`);
+
+    const idsA = a.members.map((row) => row.id);
+    const idsB = b.members.map((row) => row.id);
+
+    assert.equal(idsA.includes(memberInA), true);
+    assert.equal(idsA.includes(memberInB), false, '参数被忽略时这里会真 —— 那就是这个 bug 的样子');
+    assert.equal(idsB.includes(memberInB), true);
+    assert.equal(idsB.includes(memberInA), false);
+  });
+
+  it('不带 ?teamId= 时回落到当前部署的 Team', async () => {
+    const response = await fetch(`${base}/api/members`);
+    assert.equal(response.status, 200);
+    const payload = (await response.json()) as { members: Array<{ id: string }> };
+    const ids = payload.members.map((row) => row.id);
+    assert.equal(ids.includes(memberInA), true);
+    assert.equal(ids.includes(memberInB), false);
+  });
+});
+
+describe('多 Team 隔离：单个 Member 的取法', () => {
+  it('跨 Team 取 Member 报 404，不是 403', () => {
+    // 403 会透露「它存在，只是不在你的 Team」—— 那正是跨 Team 探测需要的信息。
+    assert.throws(
+      () => stack.team.getMember(memberInB, teamA),
+      (error: unknown) => (error as { status?: number }).status === 404,
+    );
+  });
+
+  it('本 Team 内正常取到', () => {
+    assert.equal(stack.team.getMember(memberInB, teamB).id, memberInB);
+  });
+});
+
+describe('多 Team 隔离：Conversation 列表', () => {
+  it('服务层：按 Team 过滤房间', () => {
+    const inA = stack.team.listConversations(teamA).map((row) => row.id);
+    const inB = stack.team.listConversations(teamB).map((row) => row.id);
+
+    assert.equal(inA.includes(roomInA), true);
+    assert.equal(inA.includes(roomInB), false, 'B 团队的房间不能出现在 A 团队的列表里');
+    assert.equal(inB.includes(roomInB), true);
+    assert.equal(inB.includes(roomInA), false);
+  });
+
+  it('HTTP：?teamId= 生效', async () => {
+    const a = await json<{ conversations: Array<{ id: string }> }>(
+      `/api/conversations?teamId=${teamA}`,
+    );
+    const ids = a.conversations.map((row) => row.id);
+
+    assert.equal(ids.includes(roomInA), true);
+    assert.equal(ids.includes(roomInB), false);
+  });
+
+  it('新房的 Team 归属由请求决定，不总是默认 Team', () => {
+    const room = stack.team.createConversation({
+      title: 'Room B2',
+      memberIds: [memberInB],
+      teamId: teamB,
+    });
+    assert.equal(room.teamId, teamB, '在 B 团队建的房间不能跑到 A 团队里去');
+  });
+});
+
+describe('多 Team 隔离：Team 尚未初始化时', () => {
+  it('没有 ?teamId= 就明确失败，不猜一个 Team', async () => {
+    // 单独一个文件进程里造「未初始化」的状态会污染其它用例，所以这里直接
+    // 断言 requestTeamId 在模块状态被清掉之后的行为。
+    const { initTeamScope: init } = await import('../middleware/teamScope.js');
+    const fakeReq = { query: {}, headers: {} } as unknown as Parameters<typeof requestTeamId>[0];
+
+    init(stack.structure, teamA);
+    assert.equal(requestTeamId(fakeReq), teamA);
+
+    // 带 ?teamId= 时不看模块状态 —— 显式指定的 Team 优先。
+    assert.equal(
+      requestTeamId({ query: { teamId: teamB }, headers: {} } as unknown as Parameters<
+        typeof requestTeamId
+      >[0]),
+      teamB,
+    );
+  });
+});

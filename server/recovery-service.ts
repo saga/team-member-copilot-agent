@@ -2,7 +2,11 @@ import type { DatabaseSync } from 'node:sqlite';
 import { ConversationMemberService } from './conversation-member-service.js';
 import { now } from './db.js';
 import type { PendingWake } from './domain.js';
-import type { WorkerLeaseService } from './worker-lease.js';
+import {
+  LEASE_RESOURCE_EXECUTION,
+  LEASE_RESOURCE_RUNTIME,
+  type WorkerLeaseService,
+} from './worker-lease.js';
 
 /**
  * 启动恢复。
@@ -58,16 +62,29 @@ export interface RecoveryReport {
   lostWakes: PendingWake[];
   /** 被复位成 idle 的唤醒状态行数。 */
   wakesReset: number;
+  /**
+   * 被置成 blocked 的 Task 行数（多副本时不含别人正跑着的那些）。
+   *
+   * 必须报出来：这个数字和「房间里有几个 running Task」对不上时，差额就是
+   * 「因为别人在跑而没被收口的」，那正是需要知道的事。
+   */
+  blockedTasks: number;
   /** 因为持有活跃租约而被跳过的行数（多副本时才有意义）。 */
   skippedLeased: number;
 }
 
 const INTERRUPTED_REASON = '进程重启，execution 在运行中被中断（未自动重跑）';
 
-/** 租约保护的资源类型。和 claim 调用方（scheduler）用的字符串必须一致。 */
-export const LEASE_RESOURCE_EXECUTION = 'execution';
-export const LEASE_RESOURCE_RUNTIME = 'runtime';
-export const LEASE_RESOURCE_WAKE = 'wake';
+/**
+ * 租约资源类型与键的定义现在在 worker-lease.ts（和 WorkerLeaseService 在一起）。
+ * 这里转出去是为了不改已有 import 点 —— 常量搬家不该让调用方跟着改。
+ */
+export {
+  LEASE_RESOURCE_EXECUTION,
+  LEASE_RESOURCE_RUNTIME,
+  LEASE_RESOURCE_WAKE,
+  wakeLeaseId,
+} from './worker-lease.js';
 
 export class RecoveryService {
   constructor(
@@ -89,6 +106,7 @@ export class RecoveryService {
       activeExecutionCleared: 0,
       lostWakes: [],
       wakesReset: 0,
+      blockedTasks: 0,
       skippedLeased: 0,
     };
 
@@ -149,13 +167,22 @@ export class RecoveryService {
       //    running」全变成了 interrupted，剩下的 running 都属于别人。所以条件是
       //    「指向一条已经结束的 execution」—— 别人正在跑的 execution 还是
       //    running，它的 runtime 不会被动。
+      //
+      //    **`waiting_for_member` 必须算「还活着」。** 漏掉它会把一条正在等其他
+      //    成员回话的 execution 的 runtime 指针提前清掉：那条链还挂在半空中，
+      //    而它的 runtime 已经「空闲」了 —— 下一个 turn 可以在同一条链恢复之前
+      //    就抢进这个 runtime，单写者保证随之失效。
       const cleared = this.db
         .prepare(
           `
           UPDATE member_runtime
           SET active_execution_id = NULL
           WHERE active_execution_id IS NOT NULL
-            AND active_execution_id NOT IN (SELECT id FROM execution WHERE status = 'running')
+            AND NOT EXISTS (
+              SELECT 1 FROM execution e
+              WHERE e.id = member_runtime.active_execution_id
+                AND e.status IN ('running', 'waiting_for_member')
+            )
           `,
         )
         .run();
@@ -182,22 +209,44 @@ export class RecoveryService {
       //    这两步走 ConversationMemberService 而不是在这里再写一份 SQL：
       //    「什么算 lost wake」只该有一个定义，否则恢复逻辑和调度器会各自漂移。
       //    两边都是同步语句，会加入当前这个事务。
-      report.lostWakes = this.states.findLostWakes();
+      //
+      //    **两步都要认租约。** 只给复位加保护是不够的：`findLostWakes` 在复位
+      //    之前跑，它挑出来的行会被 index.ts 拿去 redispatchWake —— 于是副本 B
+      //    会把副本 A 正持有的唤醒重派一遍，而 A 那一轮的结果稍后写回来。
+      //    保护必须加在「挑」的那一步上，复位那一步是第二道闸。
+      report.lostWakes = this.states.findLostWakes({
+        leaseProtected: this.leases !== undefined,
+      });
       report.wakesReset = this.states.resetWakeStatuses({
         leaseProtected: this.leases !== undefined,
         nowIso: timestamp,
       });
 
       // 5. running 的 Task 不要自动重跑：把它们置成 blocked，前端显示原因并提供重试。
-      this.db
+      //
+      //    **必须保护租约。** 这条 UPDATE 打的是 conversation_task，而 Task 是
+      //    房间里的业务对象 —— 它不属于任何一个进程。多副本时另一个副本正在跑的
+      //    Task 同样是 'running'，无条件置 blocked 会把别人正在做的活标成「需要
+      //    重试」，而那个副本跑完还会把结果写回一条已经被标 blocked 的任务里。
+      //
+      //    判定挂在 Task 当前那条 execution 的租约上：有未过期租约 = 有人在跑。
+      //    current_execution_id 为 NULL 时 NOT EXISTS 为真 —— 没有执行的 running
+      //    Task 本来就该被收口。
+      const blockedTasks = this.db
         .prepare(
           `
           UPDATE conversation_task
           SET status = 'blocked', blocker = ?, updated_at = ?
           WHERE status = 'running'
+            AND ${this.leaseFreeTaskExecution()}
           `,
         )
-        .run('服务重启导致执行中断，检查后可重试', timestamp);
+        .run(
+          '服务重启导致执行中断，检查后可重试',
+          timestamp,
+          ...this.leaseFreeTaskExecutionArgs(),
+        );
+      report.blockedTasks = Number(blockedTasks.changes);
       this.db
         .prepare(
           `UPDATE conversation SET status = 'blocked', updated_at = ?
@@ -240,6 +289,31 @@ export class RecoveryService {
   private leaseFreeArgs(resourceType: string): string[] {
     if (!this.leases) return [];
     return [resourceType, now()];
+  }
+
+  /**
+   * 「这条 Task 当前挂的 execution 没有活跃租约」的 SQL 片段。
+   *
+   * 不能复用 `leaseFree('conversation_task', …)`：那张表上的 id 列是 Task 的
+   * id，而租约是按 **execution** 抢的 —— 拿 Task id 去查租约永远查不到，
+   * 于是保护静默失效（表现为「多副本下 Task 还是被误置 blocked」）。
+   * 要跨一层指向 current_execution_id，所以单独一个片段。
+   */
+  private leaseFreeTaskExecution(): string {
+    if (!this.leases) return '1 = 1';
+    return (
+      `NOT EXISTS (
+         SELECT 1 FROM worker_lease l
+         WHERE l.resource_type = 'execution'
+           AND l.resource_id = conversation_task.current_execution_id
+           AND l.lease_expires_at >= ?
+       )`
+    );
+  }
+
+  private leaseFreeTaskExecutionArgs(): string[] {
+    if (!this.leases) return [];
+    return [now()];
   }
 
   /**

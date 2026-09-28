@@ -96,6 +96,39 @@ export class JiraProvider implements WorkManagementProvider {
     await this.client.transition(ref.key, transitionId);
   }
 
+  /**
+   * 条件流转：先读一次拿版本，再带 `If-Unmodified-Since` 写。
+   *
+   * 和 `addCommentIfVersion` 是同一个形状，理由也相同 —— 但**更必要**：
+   *
+   *   评论写错了是一条多余的信息，可以删；
+   *   流转写错了是把工作项推进到了错误的状态，而 workflow 通常**没有回头路**。
+   *
+   * 「先读再写」的窗口在这里尤其危险：一笔基于「In Review」批准的流转，如果
+   * 期间有人把它退回了「In Progress」，无条件写会把它推到一个当前**不合法**
+   * 的目标状态（或者落到一个语义完全不同的 transition 上），而记录看起来是
+   * 一次正常执行。
+   *
+   * 第一次读不是多余的：它让「已变化」这条错误能带上人话（版本从 A 变成 B），
+   * 而不是一个光秃秃的 412。真正关掉窗口的是**第二次**调用上的版本头 ——
+   * Jira 在事务里比对。
+   */
+  async transitionIfVersion(
+    ref: ExternalWorkRef,
+    transitionId: string,
+    expectedVersion: string,
+  ): Promise<void> {
+    const current = await this.client.getIssue(ref.key);
+
+    if (current.fields.updated !== expectedVersion) {
+      throw new Error(
+        `Jira issue ${ref.key} 已变化（${expectedVersion} → ${current.fields.updated}），拒绝执行旧 Command`,
+      );
+    }
+
+    await this.client.transition(ref.key, transitionId, expectedVersion);
+  }
+
   async assign(ref: ExternalWorkRef, assignee: string | null): Promise<void> {
     await this.client.assign(ref.key, assignee);
   }

@@ -321,6 +321,29 @@ export interface Conversation {
   taskProgress: { total: number; completed: number };
 }
 
+export type ConversationPrincipalType = 'human' | 'agent';
+
+/**
+ * 谁可以进这间房。
+ *
+ * 和 `Conversation.members` 是两件事，刻意不合并：
+ *
+ *   Conversation.members        哪些 Agent 是成员（决定唤醒与上下文）
+ *   ConversationParticipant     哪些 human 可以访问（决定 ACL）
+ *
+ * Agent 的成员关系用 member_id 寻址（有外键指向 member 表），human 的
+ * principalId 来自 OIDC 的 `sub`，两边根本不是同一类 id —— 合并会得到一个
+ * 一半字段为空的联合表，而它迟早会被当成「都是一样的」来用。
+ */
+export interface ConversationParticipant {
+  conversationId: string;
+  principalType: ConversationPrincipalType;
+  principalId: string;
+  /** 谁把人加进来的。null = 建房时自动加入的创建者。 */
+  addedBy: string | null;
+  addedAt: string;
+}
+
 export type MessageSenderType = 'user' | 'member' | 'system';
 
 export interface ConversationMessage {

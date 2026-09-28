@@ -183,8 +183,9 @@ export class SchedulerService {
    * tick 卡住，而重试在 TTL 内也不会成功。跳过是对的 —— 持有者跑完会自己释放，
    * 下一轮 tick 再看。
    *
-   * 心跳间隔取 TTL 的三分之一：留出两次重试的余量，一次抖动不会让租约在自己
-   * 手里过期。TTL 显著大于心跳间隔是租约语义成立的前提（见 worker-lease.ts）。
+   * 心跳间隔取租约服务自己的定义（TTL 的三分之一，或 WORKER_LEASE_HEARTBEAT_MS）。
+   * 以前这里内联算一遍，而 RecoveryService / 执行链那边各有一份 —— 三处换算
+   * 只要有一处改错（间隔 ≥ TTL），租约就会在持有者手里过期。
    *
    * 释放只在 finally 里做：中途抛异常时租约必须回到可用状态，否则这条
    * execution 会被自己的失败卡住，直到 TTL 到期才有人能接手。
@@ -197,7 +198,7 @@ export class SchedulerService {
     const heartbeat = this.leases
       ? setInterval(() => {
           this.leases!.heartbeat(LEASE_RESOURCE_EXECUTION, executionId);
-        }, Math.max(1_000, Math.floor(config.workerLeaseTtlMs / 3)))
+        }, this.leases.heartbeatIntervalMs)
       : null;
     if (heartbeat && typeof heartbeat.unref === 'function') heartbeat.unref();
 

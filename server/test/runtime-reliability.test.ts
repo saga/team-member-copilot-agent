@@ -252,7 +252,13 @@ describe('schema 就位（PRAGMA user_version）', () => {
         'tool_execution_audit',
         'command',
         'approval',
+        // Command 的生命周期事件（requested / policy_decided / approval_* /
+        // executing / completed|failed）—— command 行上只有**当前**状态，
+        // 过程在这里。
+        'command_audit',
         'worker_lease',
+        // 谁可以进这间房（human ACL）。conversation_member 只装 Agent。
+        'conversation_participant',
       ];
       assert.deepEqual(
         Object.fromEntries(tables.map((table) => [table, tableColumns(handle, table)])),
@@ -559,6 +565,9 @@ describe('schema 就位（PRAGMA user_version）', () => {
           'action',
           'target',
           'args_hash',
+          // 冻结的规范化参数原文。执行时从这里读，不接受调用方再传一遍 ——
+          // 否则「批准时看到的」和「真正执行的」可以是两份。
+          'args_json',
           'idempotency_key',
           'resource_version',
           'policy_decision_id',
@@ -585,6 +594,23 @@ describe('schema 就位（PRAGMA user_version）', () => {
           'lease_expires_at',
           'heartbeat_at',
         ],
+        command_audit: [
+          'id',
+          'command_id',
+          'execution_id',
+          'event',
+          'actor_type',
+          'actor_id',
+          'detail',
+          'created_at',
+        ],
+        conversation_participant: [
+          'conversation_id',
+          'principal_type',
+          'principal_id',
+          'added_by',
+          'added_at',
+        ],
       },
     );
 
@@ -599,6 +625,7 @@ describe('schema 就位（PRAGMA user_version）', () => {
       assert.deepEqual(indexes, [
         'idx_capability_binding_provider',
         'idx_capability_binding_scope',
+        'idx_command_audit_command',
         'idx_command_execution',
         'idx_conversation_event_replay',
         'idx_conversation_external_work_key',
@@ -607,6 +634,7 @@ describe('schema 就位（PRAGMA user_version）', () => {
         'idx_conversation_file_status',
         'idx_conversation_goal_revision',
         'idx_conversation_member_state_wake',
+        'idx_conversation_participant_principal',
         'idx_conversation_task_assignee',
         'idx_conversation_task_conversation',
         'idx_conversation_task_revision',

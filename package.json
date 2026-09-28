@@ -13,7 +13,8 @@
     "start": "node dist-server/index.js",
     "preview": "vite preview",
     "typecheck": "tsc -p tsconfig.app.json --noEmit && tsc -p tsconfig.node.json --noEmit && tsc -p server/tsconfig.json --noEmit",
-    "test": "node --import tsx --test server/test/*.test.ts"
+    "test": "node --import tsx --test server/test/*.test.ts",
+    "smoke:boot": "node scripts/smoke-boot.mjs"
   },
   "dependencies": {
     "@ant-design/x": "^2.9.0",

@@ -134,6 +134,124 @@ describe('Worker Lease：同一资源上只有一个 owner', () => {
   });
 });
 
+/**
+ * `heldByMe` / `runWithLease` —— 嵌套调用不能把自己当成别人。
+ *
+ * ── 这一组在锁的东西 ─────────────────────────────────────────────────
+ *
+ * `claim()` 的 WHERE 是 `lease_expires_at < ?`，所以它对**自己**未过期的租约
+ * 同样返回 false。这不是 bug，是「抢」这个动作的定义：已经归我了就没有可抢的。
+ *
+ * 但调用链是嵌套的：SchedulerService 在启动 execution 前抢一次，它调用的
+ * runScheduledExecution → executeMemberTurn 里还会再抢一次。没有 `heldByMe`
+ * 的短路，内层会把自己当别人，`runWithLease` 返回 `{ ran: false }`，整轮被
+ * **静默跳过** —— 接口 200、日志干净、什么都没发生。
+ *
+ * 所以下面既断言「嵌套要跑」，也断言「跑完之后外层的租约还在」。后者同样关键：
+ * 内层如果在 finally 里 release，等于外层还在跑就把资源让出去了。
+ */
+describe('runWithLease：嵌套调用与自己抢占', () => {
+  it('claim 对自己的未过期租约返回 false —— 这正是 heldByMe 存在的理由', () => {
+    const a = worker();
+    assert.equal(a.claim('execution', 'nest-0'), true);
+    assert.equal(a.claim('execution', 'nest-0'), false, '已经归我了，没有可抢的');
+    assert.equal(a.heldByMe('execution', 'nest-0'), true, '但它确实是我的');
+  });
+
+  it('heldByMe 只看本进程：别的实例持有时为 false', () => {
+    const a = worker();
+    const b = worker();
+
+    a.claim('execution', 'nest-1');
+    assert.equal(b.heldByMe('execution', 'nest-1'), false, '别人的租约不是「我的」');
+    assert.equal(b.isHeld('execution', 'nest-1'), true, '但确实有人在持有');
+  });
+
+  it('heldByMe 过期即 false（否则崩溃的进程会永远认为自己在跑）', () => {
+    const a = worker();
+    a.claim('execution', 'nest-2');
+    forceExpire('execution', 'nest-2');
+    assert.equal(a.heldByMe('execution', 'nest-2'), false);
+  });
+
+  it('嵌套 runWithLease：内层照跑，且不释放外层的租约', async () => {
+    const a = worker();
+    let innerRan = false;
+
+    const outer = await a.runWithLease('execution', 'nest-3', async () => {
+      const inner = await a.runWithLease('execution', 'nest-3', async () => {
+        innerRan = true;
+        return 'inner';
+      });
+      assert.equal(inner.ran, true, '本进程已持有，内层必须直接跑');
+      assert.equal(
+        a.heldByMe('execution', 'nest-3'),
+        true,
+        '内层退出时不能释放外层的租约 —— 外层还在跑',
+      );
+      return 'outer';
+    });
+
+    assert.equal(outer.ran, true);
+    assert.equal(innerRan, true);
+    assert.equal(a.heldByMe('execution', 'nest-3'), false, '最外层退出后才释放');
+  });
+
+  it('别人持有期间返回 { ran: false }，并且不执行 fn', async () => {
+    const a = worker();
+    const b = worker();
+
+    let releaseA!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseA = resolve;
+    });
+
+    // runWithLease 的 claim 在第一个 await 之前同步执行，所以这一行返回时
+    // A 已经拿到租约了 —— 不需要 sleep 去等它。
+    const aRun = a.runWithLease('execution', 'nest-4', async () => {
+      await gate;
+      return 'a';
+    });
+
+    let ranInB = false;
+    const bOutcome = await b.runWithLease('execution', 'nest-4', async () => {
+      ranInB = true;
+      return 'b';
+    });
+
+    assert.deepEqual(bOutcome, { ran: false }, '抢不到就是跳过，不等待、不重试');
+    assert.equal(ranInB, false, '跳过时必须一次都不调用 fn');
+
+    releaseA();
+    assert.deepEqual(await aRun, { ran: true, value: 'a' });
+  });
+
+  it('fn 抛错也必须释放（否则要等 TTL 到期才有人能接手）', async () => {
+    const a = worker();
+
+    await assert.rejects(
+      () =>
+        a.runWithLease('execution', 'nest-5', async () => {
+          throw new Error('boom');
+        }),
+      /boom/,
+    );
+
+    assert.equal(a.heldByMe('execution', 'nest-5'), false, '异常路径同样走 finally');
+    assert.equal(worker().claim('execution', 'nest-5'), true);
+  });
+
+  it('心跳间隔默认取 TTL 的三分之一，且不低于 1s', () => {
+    assert.equal(new WorkerLeaseService(db, 30_000).heartbeatIntervalMs, 10_000);
+    assert.equal(new WorkerLeaseService(db, 3_000).heartbeatIntervalMs, 1_000);
+    assert.equal(
+      new WorkerLeaseService(db, 1_000).heartbeatIntervalMs,
+      1_000,
+      '间隔不能低于 1s：太密的心跳只是白烧 CPU',
+    );
+  });
+});
+
 describe('RecoveryService：多副本时不能回收别人正在跑的活', () => {
   const memberService = new MemberService(db);
   const stack = createTestStack(

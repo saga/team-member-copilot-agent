@@ -159,7 +159,7 @@ export interface WorkManagementProvider extends WorkRefFactory {
    * 可选：这条工单当前的并发版本号。
    *
    * 由 Provider 定义「什么算变化」—— Jira 是 `fields.updated`。上层不解释它，
-   * 只负责原样取回来再原样传回 `addCommentIfVersion`。
+   * 只负责原样取回来再原样传回 `addCommentIfVersion` / `transitionIfVersion`。
    */
   versionOf?(ref: ExternalWorkRef): Promise<string | null>;
 
@@ -168,6 +168,24 @@ export interface WorkManagementProvider extends WorkRefFactory {
    * 本地不复制 workflow，所以「这个流转合不合法」永远问 Provider。
    */
   transition(ref: ExternalWorkRef, transitionId: string): Promise<void>;
+
+  /**
+   * 可选：条件流转 —— 版本变了就拒绝执行。
+   *
+   * 和 `addCommentIfVersion` 同一形状，但**更必要**：评论写错了可以删，
+   * 流转写错了是把工作项推进到错误的状态，而 workflow 通常没有回头路。
+   *
+   * 判定必须放在服务端（Jira：`If-Unmodified-Since`）。只做一次「读一下比一比
+   * 再写」不够 —— 那只是把 TOCTOU 窗口缩小，没有关掉它。
+   *
+   * 版本不匹配时**抛**，不静默跳过：一次被放弃的外部写入必须让调用方知道，
+   * 否则 Command 会被记成成功。
+   */
+  transitionIfVersion?(
+    ref: ExternalWorkRef,
+    transitionId: string,
+    expectedVersion: string,
+  ): Promise<void>;
 
   /**
    * 改负责人。`assignee` 是 Provider 的稳定用户标识（Jira：accountId），

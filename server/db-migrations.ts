@@ -20,7 +20,7 @@ import type { DatabaseSync } from 'node:sqlite';
  *
  * 程序不认识任何别的编号 —— 没有升级代码，认出来也无从下手。
  */
-export const SCHEMA_VERSION = 27;
+export const SCHEMA_VERSION = 28;
 
 /**
  * 当前 schema 的完整定义，按最终形状写。
@@ -1003,6 +1003,16 @@ CREATE TABLE command (
   target TEXT NOT NULL,
 
   args_hash TEXT NOT NULL,
+  -- 规范化之后的参数原文。**冻结**在这里，执行时从这里读。
+  --
+  -- 只存 args_hash 是原来的写法，它有一个具体的坏处：执行时参数由**调用方**
+  -- 再传一遍，而哈希只用于事后核对 —— 也就是「批准时看到的那份参数」和
+  -- 「真正执行的那份参数」可以是两份。审批的价值全在这一点上：人批的是他
+  -- 当时看见的东西，执行必须用同一份，否则审批只是个仪式。
+  --
+  -- 存明文而不是只存哈希，也是为了让审批界面有东西可显示。脱敏由展示层做，
+  -- 不在这里 —— 落库的必须是原文，否则 hashJson(args) 永远对不上。
+  args_json TEXT NOT NULL,
   idempotency_key TEXT NOT NULL UNIQUE,
 
   resource_version TEXT,
@@ -1067,6 +1077,105 @@ CREATE TABLE approval (
     REFERENCES command(id)
     ON DELETE CASCADE
 );
+
+-- --------------------------------------------------------- Command 生命周期审计
+--
+-- command 表本身只保留**当前**状态：一条 Command 从 requested 走到 completed，
+-- 中间经历了什么（谁请求的、Policy 判了什么、有没有要人批、谁批的、什么时候
+-- 开始执行）在那一行上全部被覆盖掉了。审计要回答的恰恰是这个过程。
+--
+-- 为什么单独一张表而不是给 command 加一串时间戳列：一次 Command 的事件数是
+-- 可变的（要审批就多两条），而且**同一类事件可能发生多次**（重试执行）。
+-- 定长列表达不了「第几次」，append-only 的事件行可以。
+--
+-- 和 policy_decision_audit / tool_execution_audit 的分工：
+--
+--   policy_decision_audit   工具层的判定（Agent 想调什么工具）
+--   tool_execution_audit    工具层的执行（真的调了、结果如何）
+--   command_audit           **业务动作**层的全过程（谁批的、执行没执行）
+--
+-- 工具层是「Agent 手里有什么」，业务层是「系统对外部世界做了什么」。一次
+-- Jira 流转可能不经过任何工具（控制面发起），但一定经过 Command。
+CREATE TABLE command_audit (
+  id TEXT PRIMARY KEY,
+  command_id TEXT NOT NULL,
+  execution_id TEXT NOT NULL,
+
+  event TEXT NOT NULL
+    CHECK (
+      event IN (
+        'requested',
+        'policy_decided',
+        'approval_requested',
+        'approved',
+        'rejected',
+        'executing',
+        'completed',
+        'failed'
+      )
+    ),
+
+  -- 是谁做的这件事。「system」用于平台自身发起的推进（webhook 回写、调度器），
+  -- 把它和 agent / human 混在一起会让「谁批的」这个问题失去答案。
+  actor_type TEXT NOT NULL
+    CHECK (actor_type IN ('agent', 'human', 'system')),
+  actor_id TEXT NOT NULL,
+
+  -- 事件附带的说明（Policy 理由、失败原因、审批意见）。给人和排查看，不参与判定。
+  detail TEXT,
+
+  created_at TEXT NOT NULL,
+
+  FOREIGN KEY (command_id)
+    REFERENCES command(id)
+    ON DELETE CASCADE
+);
+
+CREATE INDEX idx_command_audit_command
+  ON command_audit(command_id, created_at);
+
+-- ------------------------------------------------ Conversation Participant (human)
+--
+-- 谁**可以进这间房**。和 conversation_member 是两件事，不能合并：
+--
+--   conversation_member      哪些 Agent 是这间房的成员（决定唤醒 / 上下文）
+--   conversation_participant 哪些 human 可以访问这间房（决定 ACL）
+--
+-- conversation_member.member_id 有指向 member(id) 的外键，human 根本进不去，
+-- 所以「把 human 也塞进 conversation_member」在数据模型上就不成立。
+--
+-- ── 为什么需要它 ─────────────────────────────────────────────────────
+--
+-- 在这张表之前，human 的访问判据是「你是这个 Team 的成员」。而 execution /
+-- task / message 是**房间里的东西**：同一个 Team 的两个 human 各自在不同房间里
+-- 工作，能进 Team 不等于能看另一个房间的执行记录 —— 里面有 prompt、工具调用、
+-- 文件引用。少了这一层，任何 Team 成员都能按 id 遍历别人的房间。
+--
+-- ── 为什么保留 owner/admin 兜底 ──────────────────────────────────────
+--
+-- 收紧到「只认 participant」会让现有 owner 立刻看不见已有房间（这张表是空的），
+-- 而那是个纯迁移问题，不是权限问题。owner/admin 保留 Team 级兜底访问，
+-- 普通 member 必须显式加入 —— 越权面从「全体 Team 成员」缩到「owner/admin」，
+-- 而 owner/admin 本来就能改 capability boundary，权限上没有实质提升。
+CREATE TABLE conversation_participant (
+  conversation_id TEXT NOT NULL,
+  principal_type TEXT NOT NULL
+    CHECK (principal_type IN ('human', 'agent')),
+  principal_id TEXT NOT NULL,
+
+  -- 谁把人加进来的。NULL = 建房时自动加入（创建者本人）或迁移回填。
+  added_by TEXT,
+  added_at TEXT NOT NULL,
+
+  PRIMARY KEY (conversation_id, principal_type, principal_id),
+
+  FOREIGN KEY (conversation_id)
+    REFERENCES conversation(id)
+    ON DELETE CASCADE
+);
+
+CREATE INDEX idx_conversation_participant_principal
+  ON conversation_participant(principal_type, principal_id);
 
 -- ------------------------------------------------------------ Worker Lease
 --

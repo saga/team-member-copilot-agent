@@ -1,5 +1,6 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { now } from './db.js';
+import { LEASE_RESOURCE_WAKE } from './worker-lease.js';
 import type {
   ConversationMemberState,
   ConversationMemberStateChange,
@@ -364,8 +365,23 @@ export class ConversationMemberService {
    *
    * 注意「退回」只针对**认不出来**的值。已知的值必须原样重放。判据统一在
    * asWakeReason，不要在调用处另写一套。
+   *
+   * ── 为什么要能保护租约 ──────────────────────────────────────────────
+   *
+   * 多副本时另一个副本正在处理的唤醒也是 `wake_status = 'queued'`（它已经把
+   * durable 行翻成 queued 并抢到了 wake 租约，只是还没跑完）。挑的时候不认租约，
+   * 就会把别人正持有的那一轮重派一遍 —— 而那个副本稍后会把结果写回来，于是
+   * 同一轮唤醒跑了两遍。所以**挑**和**复位**两步都要认租约，缺一不可。
    */
-  findLostWakes(): PendingWake[] {
+  findLostWakes(options: { leaseProtected?: boolean } = {}): PendingWake[] {
+    const leaseGuard = options.leaseProtected
+      ? `AND NOT EXISTS (
+           SELECT 1 FROM worker_lease l
+           WHERE l.resource_type = '${LEASE_RESOURCE_WAKE}'
+             AND l.resource_id = conversation_member_state.conversation_id || ':' || conversation_member_state.member_id
+             AND l.lease_expires_at >= ?
+         )`
+      : '';
     const rows = this.db
       .prepare(
         `
@@ -378,9 +394,10 @@ export class ConversationMemberService {
         FROM conversation_member_state
         WHERE pending_wake = 1
           AND wake_status = 'queued'
+          ${leaseGuard}
         `,
       )
-      .all() as unknown as Array<{
+      .all(...(options.leaseProtected ? [now()] : [])) as unknown as Array<{
       conversation_id: string;
       member_id: string;
       pending_wake_trigger_sequence: number | null;
@@ -418,7 +435,7 @@ export class ConversationMemberService {
     const leaseGuard = options.leaseProtected
       ? `AND NOT EXISTS (
            SELECT 1 FROM worker_lease l
-           WHERE l.resource_type = 'wake'
+           WHERE l.resource_type = '${LEASE_RESOURCE_WAKE}'
              AND l.resource_id = conversation_member_state.conversation_id || ':' || conversation_member_state.member_id
              AND l.lease_expires_at >= ?
          )`

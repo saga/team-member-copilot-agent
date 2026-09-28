@@ -37,6 +37,20 @@ function teamOf(req: Request): string {
   return defaultTeamId;
 }
 
+/**
+ * 这个请求作用在哪个 Team 上。
+ *
+ * 导出它，是为了让**业务层**也能按请求的 Team 取数，而不是各服务自己
+ * `defaultTeam()`（那个函数永远返回「第一个 Team」，多 Team 部署下等于把
+ * 所有请求都当成了同一个 Team 的 —— 而它的表现是「另一个 Team 的成员出现在
+ * 列表里」，看起来只是数据多了几行，不像权限问题）。
+ *
+ * 单 Team 部署下它与 defaultTeamId 是同一个值，所以调用方不需要分情况处理。
+ */
+export function requestTeamId(req: Request): string {
+  return teamOf(req);
+}
+
 /** 必须是 active Team 成员（human 或 agent）。读接口用它。 */
 export function requireTeamMember() {
   return (req: Request, res: Response, next: NextFunction): void => {

@@ -43,6 +43,8 @@ import type {
   ConversationFile,
   ConversationMemberState,
   ConversationMessage,
+  ConversationParticipant,
+  ConversationPrincipalType,
   ConversationTask,
   ExecutionConfigSnapshot,
   ExecutionDecision,
@@ -57,6 +59,7 @@ import type {
   TaskRequirements,
   Team,
   TeamChangeSink,
+  TeamMembership,
   TurnMode,
   WakeReason,
 } from './domain.js';
@@ -65,6 +68,7 @@ import { ConversationService } from './conversation-service.js';
 import { ExecutionService } from './execution-service.js';
 import { TaskApplicationService } from './task-application-service.js';
 import type { TeamInternals } from './team-internals.js';
+import type { WorkerLeaseService } from './worker-lease.js';
 import { ExecutionCancelledError, mapExecution, mapMessage } from './team-shared.js';
 import type { ConversationRow, ExecutionRow, MessageRow } from './team-shared.js';
 export { ExecutionCancelledError } from './team-shared.js';
@@ -144,6 +148,26 @@ export interface CreateConversationInput {
    * 开会话是错的。真正的校验与取证发生在 execution 开始时（控制面，不经 LLM）。
    */
   externalWorkRef?: { provider?: string | null; key: string; externalId?: string | null } | null;
+  /**
+   * 建房者（human principalId，生产里是 OIDC 的 `sub`）。
+   *
+   * 它决定**谁被写进 conversation_participant**，也就是谁能在 ACL 收紧之后
+   * 进这间房。不传时回落到 `config.localActorId`（本地 dev / 测试路径，
+   * 那时两者本来就是同一个身份）。
+   *
+   * 为什么必须由调用方传而不是在服务里读 `config.localUserId`：那个常量是
+   * 「本机单用户」的占位，而真实的 human 身份是每个请求各自的 token sub。
+   * 服务层读不到请求，只能靠调用方把身份传下来。
+   */
+  createdBy?: string;
+  /**
+   * 这间房属于哪个 Team。
+   *
+   * 不传 = 默认 Team（单 Team 部署与测试路径）。多 Team 部署下必须由请求传入 ——
+   * 以前这里只能落到默认 Team，于是「在 B 团队建的工作区」会被记成 A 团队的，
+   * 而它的表现是侧栏里多了一间不该出现的房，不像权限问题。
+   */
+  teamId?: string;
 }
 
 export interface WakePlan {
@@ -351,6 +375,17 @@ export class TeamService {
      * 而不是快照缺一块。
      */
     private readonly authorization?: AuthorizationRevisions,
+    /**
+     * Worker 租约。多副本部署下「谁在跑这一轮」的唯一仲裁点。
+     *
+     * 不传 = 单进程语义（照常执行，不抢）。测试与本地单机跑这条路径；
+     * 生产多副本必须传，否则同一个 execution 会被两个副本各跑一遍。
+     *
+     * 它必须是**装配处那一个**实例（app.ts 的 workerLease），不能在这里
+     * new 一个：租约的 owner 是进程身份，换实例就等于换身份，于是「自己
+     * 正在跑的活」会被自己的恢复流程当成别人的。
+     */
+    private readonly leases?: WorkerLeaseService,
   ) {
     this.contextAssembler = new ContextAssembler(db);
     this.experiences = new ExperienceStore();
@@ -372,6 +407,8 @@ export class TeamService {
           error instanceof Error ? error.message : error,
         );
       },
+      // 多副本时每个 (conversation, member) 的唤醒只由一个副本处理。
+      leases,
     );
     this.orchestrator = new TaskOrchestrator(db, this.tasks, this.states, this.scheduler, {
       onTask: (task) => this.emit(task.conversationId, { type: 'task.updated', data: task }),
@@ -438,6 +475,7 @@ export class TeamService {
       insertMemberMessage: this.insertMemberMessage.bind(this),
       insertMessage: this.insertMessage.bind(this),
       latestExecutionFor: this.latestExecutionFor.bind(this),
+      leases: this.leases,
       memberConversations: this.memberConversations,
       members: this.members,
       nextMessageSequence: this.nextMessageSequence.bind(this),
@@ -466,12 +504,49 @@ export class TeamService {
 
   // ---------------------------------------------------------------- Member
 
-  listMembers(): Member[] {
-    return this.members.list();
+  /**
+   * Member 列表。
+   *
+   * 传 `teamId` 时只返回**这个 Team 的**成员。不传 = 全部（单 Team 部署与
+   * 内部工具用）。
+   *
+   * 为什么需要这个参数：`member` 表本身没有 team_id —— 一个 Member 可以同时
+   * 在几个 Team 里（关系在 team_membership）。所以「按 Team 过滤」不能靠表上的
+   * 列，必须 join。以前这里不传就是全部，于是多 Team 部署下 `/api/members`
+   * 会把别的 Team 的人也列出来 —— 而那个列表是 Member Profile / 任务创建窗口
+   * 的数据源，看起来只是「人多了几个」，不像越权。
+   */
+  listMembers(teamId?: string): Member[] {
+    const all = this.members.list();
+    if (!teamId || !this.structure) return all;
+
+    const rows = this.db
+      .prepare(
+        `SELECT principal_id FROM team_membership
+         WHERE team_id = ? AND kind = 'agent' AND status = 'active'`,
+      )
+      .all(teamId) as unknown as Array<{ principal_id: string }>;
+    const inTeam = new Set(rows.map((row) => row.principal_id));
+    return all.filter((member) => inTeam.has(member.id));
   }
 
-  getMember(id: string): Member {
-    return this.members.get(id);
+  /**
+   * 单个 Member。传 `teamId` 时校验它确实在这个 Team 里。
+   *
+   * 校验失败报 404 而不是 403：对调用方来说「这个 Team 里没有这个人」和
+   * 「这个人不存在」是同一件事 —— 而 403 会透露「它存在，只是不在你的 Team」，
+   * 那正是跨 Team 探测需要的信息。
+   */
+  getMember(id: string, teamId?: string): Member {
+    const member = this.members.get(id);
+    if (teamId && this.structure) {
+      try {
+        this.structure.requireActiveMembership(teamId, 'agent', id);
+      } catch {
+        throw notFound(`Member 不存在：${id}`);
+      }
+    }
+    return member;
   }
 
   /**
@@ -481,15 +556,19 @@ export class TeamService {
    * 新建的人自动继承前两层。给它写一份「默认能力」等于把公司级/团队级的
    * 基线复制到这个人的私有层 —— 之后管理员改 Team 能力，这个人不会跟着变，
    * 而且没有任何地方看得出原因。
+   *
+   * `teamId` 决定它加入哪个 Team。不传时回落到默认 Team（单 Team 部署与测试
+   * 路径）。以前这里**只能**加入默认 Team —— 多 Team 部署下在 B 团队建的
+   * Member 会跑到 A 团队里去。
    */
-  createMember(input: CreateMemberInput): Member {
+  createMember(input: CreateMemberInput, teamId?: string): Member {
     if (input.model?.trim()) resolveMemberModel(modelPolicy, input.model);
     const member = this.members.create(input);
-    // 新 Agent 自动加入默认 Team。membership 是组织状态，不是 persona 的一部分。
+    // 新 Agent 自动加入 Team。membership 是组织状态，不是 persona 的一部分。
     if (this.structure) {
-      const team = this.defaultTeam();
-      this.structure.ensureAgentMembership(team.id, member.id);
-      this.structure.touchPresence(team.id, 'agent', member.id);
+      const team = teamId ?? this.defaultTeam().id;
+      this.structure.ensureAgentMembership(team, member.id);
+      this.structure.touchPresence(team, 'agent', member.id);
     }
     return member;
   }
@@ -569,8 +648,9 @@ export class TeamService {
 
   // ---------------------------------------------------------- Conversation
 
-  listConversations(): Conversation[] {
-    return this.conversations.listConversations();
+  /** 房间列表。传 teamId 时只返回这个 Team 的（多 Team 隔离，见 ConversationService）。 */
+  listConversations(teamId?: string): Conversation[] {
+    return this.conversations.listConversations(teamId);
   }
 
   /**
@@ -621,13 +701,17 @@ export class TeamService {
     return this.conversations.getConversation(id);
   }
 
-  /** Human 访问 Conversation 的前提：是这个 Conversation 所在 Team 的 active 成员。 */
-  requireTeamHumanAccess(teamId: string, principalId: string): void {
+  /**
+   * Human 访问 Conversation 的**第一道**前提：是这个 Conversation 所在 Team
+   * 的 active 成员。返回 membership，因为调用方还需要它的 role 判断兜底访问
+   * （owner/admin 可访问 Team 内全部房间）。
+   */
+  requireTeamHumanAccess(teamId: string, principalId: string): TeamMembership {
     if (!this.structure) {
       throw forbidden('Team structure 未初始化');
     }
     try {
-      this.structure.requireActiveMembership(teamId, 'human', principalId);
+      return this.structure.requireActiveMembership(teamId, 'human', principalId);
     } catch (error) {
       // Team 里查无此人也是 403：这不是“资源不存在”，是“你没资格”。
       // conversation 本身不存在是另一回事，getConversation 在前面报 404。
@@ -636,6 +720,42 @@ export class TeamService {
       }
       throw error;
     }
+  }
+
+  /**
+   * 第二道：这个 human 在不在这间房的参与者名单里。
+   *
+   * 两道**都要过**，不能互相替代。第一道回答「你是这个 Team 的人」，第二道
+   * 回答「这间房允许你进」—— 同一个 Team 的两个 human 各自在不同房间里工作，
+   * 能进 Team 不等于能看另一个房间的执行记录（里面有 prompt、工具调用、文件引用）。
+   */
+  isConversationParticipant(
+    conversationId: string,
+    principalType: ConversationPrincipalType,
+    principalId: string,
+  ): boolean {
+    return this.conversations.isConversationParticipant(conversationId, principalType, principalId);
+  }
+
+  addConversationParticipant(input: {
+    conversationId: string;
+    principalType: ConversationPrincipalType;
+    principalId: string;
+    addedBy?: string | null;
+  }): void {
+    this.conversations.addConversationParticipant(input);
+  }
+
+  removeConversationParticipant(
+    conversationId: string,
+    principalType: ConversationPrincipalType,
+    principalId: string,
+  ): void {
+    this.conversations.removeConversationParticipant(conversationId, principalType, principalId);
+  }
+
+  listConversationParticipants(conversationId: string): ConversationParticipant[] {
+    return this.conversations.listConversationParticipants(conversationId);
   }
 
   createConversation(input: CreateConversationInput, opts?: { autoStartLead?: boolean }): Conversation {
@@ -1493,43 +1613,67 @@ export class TeamService {
   /**
    * 启动恢复用：把一条从未真正跑过的 root execution 重新提交。
    * RecoveryService 只负责把 id 挑出来，真正重新提交由这里做（它需要 CopilotService）。
+   *
+   * ── 为什么必须抢 execution 租约 ──────────────────────────────────────
+   *
+   * 多副本时**每个**副本都会跑一次 recover()，于是每个副本都拿到同一份
+   * requeuedExecutionIds 列表 —— 它们指向的是 DB 里**同一条** execution。
+   * 不抢租约就是「两个副本各自把同一条 execution 跑一遍」，而外部副作用不可撤销。
+   *
+   * 这里按 execution id 抢租约是成立的（与 runWake 不同）：id 已经在库里，
+   * 两个副本看到的是同一个值。
    */
   async resumeQueuedExecution(executionId: string): Promise<void> {
     const execution = this.findExecution(executionId);
     if (!execution || execution.status !== 'queued') return;
 
-    let conversation: Conversation;
-    let member: Member;
-    try {
-      conversation = this.getConversation(execution.conversationId);
-      // 归档的 Member 不再接活：这条 queued 直接判 interrupted 并说明原因
-      member = this.requireActiveMember(conversation, execution.memberId);
-    } catch (error) {
-      this.updateExecution(executionId, {
-        status: 'interrupted',
-        error: `无法恢复：${error instanceof Error ? error.message : String(error)}`,
-        endedAt: now(),
-      });
-      return;
-    }
+    const outcome = await this.executions.withExecutionLease(executionId, async () => {
+      // 抢到租约之后**再确认一次状态**：从上面那次读到这一刻之间，另一个副本
+      // 可能已经跑完并释放了租约。不重查就会在一条已经 completed 的记录上再跑
+      // 一遍 —— 而「重跑」正是这里最不能发生的事。
+      const current = this.findExecution(executionId);
+      if (!current || current.status !== 'queued') return;
 
-    try {
-      await this.executeMemberTurn({
-        conversation,
-        member,
-        execution,
-        prompt: execution.prompt,
-        triggerMessageSequence: execution.triggerMessageSequence,
-        turnMode: this.turnModeFor(conversation, execution),
-        wakeReason: execution.wakeReason,
-      });
-    } catch (error) {
-      // executeMemberTurn 已经把 execution 置为 failed 并广播过，这里只是收口。
+      let conversation: Conversation;
+      let member: Member;
+      try {
+        conversation = this.getConversation(current.conversationId);
+        // 归档的 Member 不再接活：这条 queued 直接判 interrupted 并说明原因
+        member = this.requireActiveMember(conversation, current.memberId);
+      } catch (error) {
+        this.updateExecution(executionId, {
+          status: 'interrupted',
+          error: `无法恢复：${error instanceof Error ? error.message : String(error)}`,
+          endedAt: now(),
+        });
+        return;
+      }
+
+      try {
+        await this.executeMemberTurn({
+          conversation,
+          member,
+          execution: current,
+          prompt: current.prompt,
+          triggerMessageSequence: current.triggerMessageSequence,
+          turnMode: this.turnModeFor(conversation, current),
+          wakeReason: current.wakeReason,
+        });
+      } catch (error) {
+        // executeMemberTurn 已经把 execution 置为 failed 并广播过，这里只是收口。
+        // eslint-disable-next-line no-console
+        console.error(
+          '[team] resume queued execution failed:',
+          error instanceof Error ? error.message : error,
+        );
+      }
+    });
+
+    if (!outcome.ran) {
+      // 另一个副本正持有它 —— 预期行为，不是错误。留一条日志，
+      // 因为「这条 queued 为什么没被我跑」是排查多副本时最常问的问题。
       // eslint-disable-next-line no-console
-      console.error(
-        '[team] resume queued execution failed:',
-        error instanceof Error ? error.message : error,
-      );
+      console.log(`[team] resume ${executionId}: 由其他副本处理，跳过`);
     }
   }
 

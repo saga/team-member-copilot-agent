@@ -3,7 +3,7 @@ import { z } from 'zod';
 import type { TeamService } from '../team-service.js';
 import { sendError } from '../middleware/errorHandler.js';
 import { isAdminAuthorized } from '../middleware/apiScope.js';
-import { isTeamAdmin } from '../middleware/teamScope.js';
+import { isTeamAdmin, requestTeamId } from '../middleware/teamScope.js';
 
 function canAdmin(req: Parameters<typeof isAdminAuthorized>[0]): boolean {
   if (isAdminAuthorized(req)) return true;
@@ -58,8 +58,10 @@ const memorySchema = z.object({
 export function membersRouter(team: TeamService) {
   const router = Router();
 
-  router.get('/', (_req, res) => {
-    res.json({ members: team.listMembers() });
+  router.get('/', (req, res) => {
+    // 按请求的 Team 过滤。多 Team 部署下这是「别人的人不出现在我的列表里」
+    // 的唯一实现 —— member 表没有 team_id，关系在 team_membership。
+    res.json({ members: team.listMembers(requestTeamId(req)) });
   });
 
   // 建 Member 自带一组默认能力，归档则决定它接不接活：都是 Admin 面的写入。
@@ -74,7 +76,9 @@ export function membersRouter(team: TeamService) {
       return;
     }
     try {
-      res.status(201).json({ member: team.createMember(parsed.data) });
+      // 建到**请求的那个 Team** 里，而不是默认 Team：多 Team 部署下
+      // 「在 B 团队建的人跑到 A 团队去了」是一个不会报错的错。
+      res.status(201).json({ member: team.createMember(parsed.data, requestTeamId(req)) });
     } catch (error) {
       sendError(res, error);
     }
@@ -82,7 +86,7 @@ export function membersRouter(team: TeamService) {
 
   router.get('/:id', (req, res) => {
     try {
-      res.json({ member: team.getMember(req.params.id) });
+      res.json({ member: team.getMember(req.params.id, requestTeamId(req)) });
     } catch (error) {
       sendError(res, error);
     }

@@ -44,6 +44,8 @@ import { conversationsRouter } from './routes/conversations.js';
 import { modelsRouter } from './routes/models.js';
 import { executionsRouter } from './routes/executions.js';
 import { tasksRouter } from './routes/tasks.js';
+import { commandsRouter } from './routes/commands.js';
+import { auditRouter } from './routes/audit.js';
 import { teamRouter } from './routes/team.js';
 import { workManagementRouter, describeWebhookBoundary } from './routes/work-management.js';
 import { mcpRouter } from './routes/mcp.js';
@@ -91,7 +93,11 @@ const policyService = new DenyHighRiskPolicyService();
 // Worker 租约：多副本部署下「谁在跑这一轮」的唯一仲裁点。单进程时它仍然存在，
 // 只是永远能抢到 —— 让两条路径共用同一份代码，而不是让「单机模式」走一条
 // 从来没被测试过的分支。
-const workerLease = new WorkerLeaseService(db, config.workerLeaseTtlMs);
+const workerLease = new WorkerLeaseService(
+  db,
+  config.workerLeaseTtlMs,
+  config.workerLeaseHeartbeatMs,
+);
 
 // Team SSE 的事件源。结构服务的每次业务变更都会回调到这里：append 与业务行
 // 同事务落库，广播由 commit hook 保证在 COMMIT 之后 —— 先落库、后广播的纪律
@@ -179,7 +185,7 @@ const workManagement = new WorkManagementRegistry();
 // Policy 单独传进来（而不是复用工具层那份判定）：Command 自己再过一遍 Policy，
 // 是因为**平台也会发起 Command**（控制面回写、webhook），那条路径不经过工具
 // 授权，只有把闸放在 Command 上两条路径才共用同一道。
-const commandService = new CommandService(db, entitlementService, policyService);
+const commandService = new CommandService(db, entitlementService, policyService, auditService);
 
 const jiraConfigured = config.jira.baseUrl && config.jira.email && config.jira.apiToken;
 if (jiraConfigured) {
@@ -211,13 +217,20 @@ if (jiraConfigured) {
     }
     return { commented: ref.key };
   });
-  commandService.registerExecutor('jira.transition_issue', async ({ args }) => {
+  commandService.registerExecutor('jira.transition_issue', async ({ command, args }) => {
     const ref = jiraProvider.ref({ key: String(args.issueKey) });
     const transitionId = String(args.transitionId);
-    // 流转不做条件写：Jira 的 workflow 服务端状态机本来就会拒绝非法流转，
-    // 而「这条流转合不合法」的权威判定在它那边，不在一个版本号上。
-    // `resourceVersion` 仍然记在 Command 上，供将来需要条件流转时使用。
-    await jiraProvider.transition(ref, transitionId);
+    // 版本比对和加评论同源：Command 上记着「批准时看到的版本」，执行时 Jira
+    // 在事务里比。区别在于这里**更必要** —— 评论写错了能删，流转写错了是把
+    // 工作项推进到错误的状态，而 workflow 通常没有回头路。
+    //
+    // 没有版本（Provider 不提供 / 取证失败）时退回无条件流转：把「没有版本」
+    // 当成「这次写入不能做」会让所有没有版本概念的系统完全不可用。
+    if (command.resourceVersion && jiraProvider.transitionIfVersion) {
+      await jiraProvider.transitionIfVersion(ref, transitionId, command.resourceVersion);
+    } else {
+      await jiraProvider.transition(ref, transitionId);
+    }
     return { transitioned: ref.key, transitionId };
   });
 
@@ -291,6 +304,10 @@ teamService = new TeamService(
     policy: () => policyService.revision(),
     entitlement: () => entitlementService.revision(),
   },
+  // 执行链的租约。不启用时传 undefined —— 单进程语义，和 SchedulerService /
+  // RecoveryService 同一套约定。传的是**同一个** workerLease 实例：租约的
+  // owner 是进程身份，换一个实例就等于换一个身份。
+  config.workerLeaseEnabled ? workerLease : undefined,
 );
 
 // Scheduler 也拿同一份租约：多副本时它是「同一条 schedule 被两个副本各跑一遍」
@@ -346,6 +363,11 @@ app.use(
 app.use('/api/models', ...humanApi, modelsRouter());
 app.use('/api/executions', ...humanApi, executionsRouter(teamService));
 app.use('/api/tasks', ...humanApi, tasksRouter(teamService));
+// 外部写入的控制面：默认 Policy 把一切 external-write 停在 policy_pending，
+// 这个路由是唯一的放行出口（审批 / 驳回 / 显式执行）。
+app.use('/api/commands', ...humanApi, commandsRouter(teamService, commandService, auditService));
+// 事后证据：一次 execution 的判定 / 调用 / 业务动作三张表，支持导出。
+app.use('/api/audit', ...humanApi, auditRouter(teamService, auditService));
 // 以某个 Member 的身份说话 —— 独立的命名空间 + token 门禁，见 middleware/apiScope.ts
 app.use('/api/internal', internalRouter(teamService));
 app.use('/api/mcp', ...humanApi, mcpRouter(mcpServerService));

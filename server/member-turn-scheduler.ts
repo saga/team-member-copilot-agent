@@ -1,5 +1,6 @@
 import type { PendingWake, WakeReason } from './domain.js';
 import type { ConversationMemberService } from './conversation-member-service.js';
+import { LEASE_RESOURCE_WAKE, wakeLeaseId, type WorkerLeaseService } from './worker-lease.js';
 
 /**
  * 把「消息到了」和「Agent 开始跑」分成两个阶段。
@@ -19,6 +20,20 @@ import type { ConversationMemberService } from './conversation-member-service.js
  *
  * 真正的 runtime 锁在 TeamService.withRuntimeLock()（按 runtime 串行）。这一层
  * 的排队是「唤醒」层面的，粒度更粗，两者职责不重叠。
+ *
+ * ── 多副本：pending Map 之外还要一把 DB 租约 ─────────────────────────
+ *
+ * `pending` / `inFlight` 的前提是「只有我一个进程」。多副本之后它们各自成立、
+ * 合起来失效：两个副本都从恢复流程里拿到同一个「丢失的唤醒」，各自 enqueue，
+ * 各自 pump —— 同一个 (conversation, member) 上跑了两轮。
+ *
+ * 所以真正开跑前先抢一把 `('wake', conversationId:memberId)` 的 DB 租约。
+ * 抢不到 = 另一个副本正在处理它，**直接跳过**：不等待（会让这一轮卡住）、
+ * 不重试（TTL 内也不会成功）、也不碰 durable 行（那是对方的在途状态，
+ * 动它等于替别人写状态）。
+ *
+ * 为什么不复用 `inFlight`：它只在**一个进程内**互斥。而这里要挡的恰恰是
+ * 跨进程的那一次重复 —— 进程内互斥对它无能为力。
  */
 export class MemberTurnScheduler {
   /** key = `${conversationId}:${memberId}` → 还没开跑的唤醒。 */
@@ -35,6 +50,12 @@ export class MemberTurnScheduler {
      */
     private readonly run: (wake: PendingWake, markStarted: () => void) => Promise<void>,
     private readonly onError: (wake: PendingWake, error: unknown) => void,
+    /**
+     * 不传 = 单进程语义（照常执行，不抢）。用「传没传」而不是一个布尔开关，
+     * 是为了让单机模式和多副本模式共用同一条代码路径 —— 分叉出一条从来没被
+     * 跑过的单机分支是更糟的选择（与 RecoveryService / SchedulerService 同一约定）。
+     */
+    private readonly leases?: WorkerLeaseService,
   ) {}
 
   /**
@@ -137,12 +158,27 @@ export class MemberTurnScheduler {
           this.pending.delete(key);
 
           let started = false;
+          // 被别人抢走时为 true。它同时决定两件事：不再往下跑，以及**不碰**
+          // durable 行（那是对方的在途状态，替它写会把它那一轮的状态覆盖掉）。
+          let skipped = false;
           try {
             // 「排队 → 在跑」的 durable 翻转由 run() 负责，因为它必须与
             // execution 的落库同一个事务。这里只记录它有没有发生。
-            await this.run(wake, () => {
-              started = true;
-            });
+            const task = () =>
+              this.run(wake, () => {
+                started = true;
+              });
+
+            if (this.leases) {
+              const outcome = await this.leases.runWithLease(
+                LEASE_RESOURCE_WAKE,
+                wakeLeaseId(wake.conversationId, wake.memberId),
+                task,
+              );
+              skipped = !outcome.ran;
+            } else {
+              await task();
+            }
           } catch (error) {
             if (!started) {
               // 连 execution 都没建起来（成员在这中间被归档 / 房间被删）。
@@ -155,9 +191,19 @@ export class MemberTurnScheduler {
           } finally {
             // 只有在没有新 pending 时才回到 idle，否则下一轮紧接着就要跑，
             // 中间闪一下 idle 会让 UI 抖。
-            if (!this.pending.has(key)) {
+            if (!skipped && !this.pending.has(key)) {
               this.states.setWakeStatus(wake.conversationId, wake.memberId, 'idle');
             }
+          }
+
+          if (skipped) {
+            // 跳过是**预期行为**（另一个副本在跑），不是错误：不打 onError，
+            // 否则多副本下每个正常轮次都会在日志里留下一条「失败」。
+            // 但必须留痕 —— 「这一轮为什么没跑」是排查时最需要知道的。
+            // eslint-disable-next-line no-console
+            console.log(
+              `[scheduler] wake ${wake.memberId}@${wake.conversationId} 由其他副本处理，跳过`,
+            );
           }
         }
       } finally {

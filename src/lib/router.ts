@@ -10,6 +10,7 @@ import { useCallback, useEffect, useState } from 'react';
  *   /tasks                  工作面，未选工作区
  *   /tasks/:conversationId  工作面，打开指定工作区（可深链 / 刷新恢复）
  *   /team                   管理面
+ *   /approvals              审批收件箱（待审批的外部写入）
  *   /settings               能力配置，公司默认
  *   /settings/team          能力配置，团队默认
  *   /settings/member/:id    能力配置，指定成员的增量
@@ -22,6 +23,7 @@ export type SettingsSection = 'capabilities' | 'mcp';
 export type Route =
   | { view: 'tasks'; conversationId: string | null }
   | { view: 'team' }
+  | { view: 'approvals' }
   | {
       view: 'settings';
       section: SettingsSection;
@@ -32,6 +34,9 @@ export type Route =
 export function parseRoute(pathname: string): Route {
   const parts = pathname.split('/').filter(Boolean);
   if (parts[0] === 'team') return { view: 'team' };
+  // 审批收件箱：外部写入的放行出口。它有自己的地址而不是做成 Team 页的一个
+  // 弹窗 —— 「有一笔等待我批的写入」是要能深链、能刷新后还在的状态。
+  if (parts[0] === 'approvals') return { view: 'approvals' };
   if (parts[0] === 'settings') {
     if (parts[1] === 'mcp') {
       return { view: 'settings', section: 'mcp', scope: 'global', memberId: null };
@@ -57,6 +62,8 @@ export function routeToPath(route: Route): string {
   switch (route.view) {
     case 'team':
       return '/team';
+    case 'approvals':
+      return '/approvals';
     case 'settings':
       if (route.section === 'mcp') {
         return '/settings/mcp';

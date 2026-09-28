@@ -31,6 +31,7 @@ process.env.COPILOT_WARMUP = 'false';
 const { db } = await import('../db.js');
 const { MemberService } = await import('../member-service.js');
 const { conversationsRouter } = await import('../routes/conversations.js');
+const { initTeamScope } = await import('../middleware/teamScope.js');
 const { StubCopilot, createTestStack, reportTaskTurns } = await import('./support.js');
 
 const memberService = new MemberService(db);
@@ -52,6 +53,9 @@ before(async () => {
   // 一个已登录 human（principal 由 requireHumanAuth 写，这里直接写）。
   const defaultTeam = stack.structure.ensureDefaultTeam();
   stack.structure.ensureHumanOwner(defaultTeam.id, 'test-user');
+  // 路由里 `requestTeamId(req)` 读的是这个模块级状态，不初始化它就会 403
+  // （「Team 尚未初始化」）。生产里由 index.ts 在启动时调，这里手动补上。
+  initTeamScope(stack.structure, defaultTeam.id);
 
   const app = express();
   app.use(express.json({ limit: '1mb' }));

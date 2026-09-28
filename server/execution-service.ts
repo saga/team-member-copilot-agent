@@ -10,6 +10,7 @@ import { BUILTIN_POLICY_REVISION } from './policy.js';
 import type { TeamInternals } from './team-internals.js';
 import { ACTIVE_STATUSES, CANCEL_REASON, ExecutionCancelledError, TERMINAL_STATUSES, mapExecution } from './team-shared.js';
 import type { ExecutionRow } from './team-shared.js';
+import { LEASE_RESOURCE_EXECUTION } from './worker-lease.js';
 
 /**
  * ExecutionService
@@ -19,6 +20,46 @@ import type { ExecutionRow } from './team-shared.js';
  */
 export class ExecutionService {
   constructor(private readonly internals: TeamInternals) {}
+
+  /**
+   * 在 execution 租约保护下跑一段逻辑。
+   *
+   * ── 为什么普通 execution 也需要租约 ─────────────────────────────────
+   *
+   * 租约原先只加在 scheduled execution 上（SchedulerService 那条路径），
+   * 而普通 execution —— 聊天消息唤醒、retry、崩溃恢复重新提交 —— 是**另外
+   * 三条**入口，它们直接调 executeMemberTurn，一个租约都没有。多副本时：
+   *
+   *   副本 A 收到消息 → 建 execution → 开始跑
+   *   副本 B 启动恢复 → 看到这条 queued/running → 也跑一遍
+   *
+   * 于是同一轮跑两遍，而 Jira 评论、流转这类外部副作用不可撤销。scheduled
+   * 路径上的租约挡不住它 —— 那是**另一条**路径。
+   *
+   * ── 为什么放在这里而不是各入口各写一遍 ──────────────────────────────
+   *
+   * 四条入口共用同一个「抢 → 心跳 → 释放」时序。分开写的话，「忘了在 finally
+   * 里释放」会出现在其中一处，而它的表现是「这条 execution 要等到 TTL 到期
+   * 才有人能接手」—— 一条几乎不可能被联想到是租约的 bug。
+   *
+   * 不传 leases（单进程）时直接跑，与以前完全一致：单机模式下「running」必然
+   * 属于自己，抢租约只是多一次写库。
+   *
+   * ── 为什么是 public ────────────────────────────────────────────────
+   *
+   * `resumeQueuedExecution` / `runScheduledExecution` 还在 TeamService 上
+   * （它们要用 CopilotService 和 schedule 记账），但它们的**第一步**必须是
+   * 抢这把租约。让它们各自再写一遍时序等于把这段时序分叉成三份 —— 而其中
+   * 两份不会在同一个用例里被跑到。
+   */
+  async withExecutionLease<T>(
+    executionId: string,
+    fn: () => Promise<T>,
+  ): Promise<{ ran: false } | { ran: true; value: T }> {
+    const leases = this.internals.leases;
+    if (!leases) return { ran: true, value: await fn() };
+    return leases.runWithLease(LEASE_RESOURCE_EXECUTION, executionId, fn);
+  }
 
   getExecution(id: string): ExecutionRecord {
     const row = this.internals.db.prepare(`SELECT * FROM execution WHERE id = ?`).get(id) as unknown as
@@ -103,15 +144,21 @@ export class ExecutionService {
     this.internals.insertExecution(retry);
     this.internals.emitExecution(retry);
 
-    void this.executeMemberTurn({
-      conversation,
-      member,
-      execution: retry,
-      prompt: retry.prompt,
-      triggerMessageSequence: retry.triggerMessageSequence,
-      turnMode: this.internals.turnModeFor(conversation, retry),
-      wakeReason: retry.wakeReason,
-    }).catch((error: unknown) => {
+    // retry 是一条**新**的 execution，走和普通唤醒一样的租约路径。
+    // 以前这里直接 executeMemberTurn：多副本时两个副本各自 retry 一次，
+    // 同一个动作跑两遍，而 retry 的语义恰恰是「把同一轮再跑一次」——
+    // 跑两次就是两次副作用。
+    void this.withExecutionLease(retry.id, () =>
+      this.executeMemberTurn({
+        conversation,
+        member,
+        execution: retry,
+        prompt: retry.prompt,
+        triggerMessageSequence: retry.triggerMessageSequence,
+        turnMode: this.internals.turnModeFor(conversation, retry),
+        wakeReason: retry.wakeReason,
+      }),
+    ).catch((error: unknown) => {
       // eslint-disable-next-line no-console
       console.error(
         '[team] retry execution failed:',
@@ -198,6 +245,19 @@ export class ExecutionService {
    * 表示这条 wake 已不可安全重放。scheduler 用它区分「跑失败了」和
    * 「连跑都没跑起来」——后者要把 durable 的 pending 标记清掉，否则每次重启
    * 都会重派一条注定失败的唤醒。
+   *
+   * ── 这里为什么不抢 execution 租约 ───────────────────────────────────
+   *
+   * 因为抢不到它：execution id 是**这一刻**才 randomUUID() 出来的，另一副本
+   * 不可能持有同一个 id。两个副本各跑一遍同一轮时，它们生成的是**两个不同
+   * 的 execution id**，所以按 id 抢的租约天然挡不住这件事。
+   *
+   * 挡住它的是 scheduler 那一层的 **wake 租约**（键是 conversation:member，
+   * 不随 id 变化）。两条路径的租约分工：
+   *
+   *   wake 租约       同一轮唤醒不被两个副本各跑一遍（键与 id 无关）
+   *   execution 租约  同一条**已存在**的 execution 不被两个副本各跑一遍
+   *                   （retry / 崩溃恢复的重新提交 —— 那里 id 是已知的）
    */
   async runWake(wake: PendingWake, markStarted: () => void): Promise<void> {
     const conversation = this.internals.getConversation(wake.conversationId);

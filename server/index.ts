@@ -24,6 +24,10 @@ import { ConversationMemberService } from './conversation-member-service.js';
 import { CapabilityProvisioner } from './capabilities/provisioner.js';
 import { seedMemberTemplates } from './member-template-seeder.js';
 import { describeApiBoundary } from './middleware/apiScope.js';
+import {
+  configuredBootstrapPrincipal,
+  resolveBootstrapOwner,
+} from './bootstrap-owner.js';
 
 // 与 app.ts 用同一个基准，避免两处 DIST_DIR 指向不同目录
 const DIST_DIR = path.resolve(process.cwd(), 'dist');
@@ -68,6 +72,15 @@ async function bootstrap(): Promise<void> {
   if (config.recoverOnStartup && config.workerReplicas > 1 && !config.workerLeaseEnabled) {
     throw new Error('WORKER_REPLICAS > 1 时必须启用 WORKER_LEASE_ENABLED=true');
   }
+  // 心跳间隔 ≥ TTL 等于租约永不续期：持有者手里的租约会在自己还在跑的时候就
+  // 过期，于是另一个副本接手 —— 两边都以为自己在跑。这个不变式以前只写在
+  // worker-lease.ts 的注释里，而配错一次就是永久双跑，所以在这里拦住。
+  if (config.workerLeaseEnabled && config.workerLeaseHeartbeatMs >= config.workerLeaseTtlMs) {
+    throw new Error(
+      `WORKER_LEASE_HEARTBEAT_MS(${config.workerLeaseHeartbeatMs}) 必须小于 ` +
+        `WORKER_LEASE_TTL_MS(${config.workerLeaseTtlMs})，否则租约会在持有者还在跑时过期`,
+    );
+  }
   // eslint-disable-next-line no-console
   console.log(
     migration.created
@@ -76,8 +89,35 @@ async function bootstrap(): Promise<void> {
   );
 
   // 默认 Team 先行：membership / conversation team_id / teamScope 都依赖它。
-  const team = structureService.ensureDefaultTeam();
-  structureService.ensureHumanOwner(team.id, config.localActorId);
+  //
+  // ── owner 用哪个身份 ────────────────────────────────────────────────
+  //
+  // dev 模式用 LOCAL_ACTOR_ID（那时它就是唯一的人）。生产模式必须用
+  // OIDC_BOOTSTRAP_OWNER_SUB —— 真实用户的 principalId 是 token 里的 sub，
+  // 拿 local-user 建 owner 会让 owner 席位被一个**永远无法登录的身份**占着，
+  // 第一个真正的管理员进来发现自己什么都改不了，只能手工改库。
+  //
+  // 判定本身在 bootstrap-owner.ts：它决定「谁能改这个部署的配置」，而判错的
+  // 两个方向都是静默的（该拦没拦 → 无主 Team 静默跑起来；拦错了 → 每次重启
+  // 都要填一个占位值）。唯一能被看见的失败是「进程起不来」，所以它必须能在
+  // 启动之前被验证。
+  const bootstrapPrincipal = configuredBootstrapPrincipal({
+    authDevMode: config.authDevMode,
+    localActorId: config.localActorId,
+    oidcBootstrapOwnerSub: config.oidcBootstrapOwnerSub,
+  });
+  const team = structureService.ensureDefaultTeam(bootstrapPrincipal || undefined);
+
+  const ownerDecision = resolveBootstrapOwner({
+    authDevMode: config.authDevMode,
+    localActorId: config.localActorId,
+    oidcBootstrapOwnerSub: config.oidcBootstrapOwnerSub,
+    hasHumanOwner: structureService.hasHumanOwner(team.id),
+  });
+  if (ownerDecision.kind === 'missing') throw new Error(ownerDecision.reason);
+  if (ownerDecision.kind === 'create') {
+    structureService.ensureHumanOwner(team.id, ownerDecision.principalId);
+  }
   initTeamScope(structureService, team.id);
   // eslint-disable-next-line no-console
   console.log(`[server] team: ${team.name} (${team.id})`);
@@ -180,6 +220,7 @@ async function bootstrap(): Promise<void> {
         `activeCleared=${report.activeExecutionCleared} ` +
         `requeue=${report.requeuedExecutionIds.length} ` +
         `lostWakes=${report.lostWakes.length} ` +
+        `blockedTasks=${report.blockedTasks} ` +
         // 「跳过了几条」必须打出来：多副本时这个数字不为零是正常的，但没人
         // 知道它就等于「有些 execution 莫名没被回收」，而那是要查的事。
         `skippedLeased=${report.skippedLeased}`,

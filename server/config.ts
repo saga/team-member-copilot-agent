@@ -124,6 +124,20 @@ export const config = {
   /** 租约 TTL（毫秒）。必须显著大于一次 heartbeat 间隔，否则会频繁出现双跑。 */
   workerLeaseTtlMs: intEnv('WORKER_LEASE_TTL_MS', 30_000),
   /**
+   * 租约心跳间隔（毫秒）。持有者按这个间隔把自己的 TTL 往后推。
+   *
+   * ── 为什么它是配置而不是各处自己算 ──────────────────────────────────
+   *
+   * 它和 TTL 是一对**必须一起看**的参数，而在此之前三个调用点各自写着
+   * `Math.max(1_000, Math.floor(ttlMs / 3))`。分开写的坏处不是重复，是
+   * 「改了 TTL 忘了改心跳」—— 而那个组合（间隔 ≥ TTL）的表现是租约在自己
+   * 手里就过期，于是另一个副本接手，两边都以为自己在跑。
+   *
+   * 启动时会校验 heartbeat < ttl（见 index.ts）：这个不变式只写在注释里
+   * 是不够的，配错一次就永久双跑。
+   */
+  workerLeaseHeartbeatMs: intEnv('WORKER_LEASE_HEARTBEAT_MS', 10_000),
+  /**
    * 单次 Member turn 的等待上限（毫秒）。
    * Copilot SDK 的 sendAndWait 默认 60s，对带工具调用的真实 agent 工作太短，
    * 会把正常的长任务判成 failed。这里默认放宽到 10 分钟。
@@ -226,6 +240,23 @@ export const config = {
    * 测试与本地 dev 用 true，生产必须 false（见 index.ts 启动检查）。
    */
   authDevMode: env('AUTH_DEV_MODE', 'false') === 'true',
+  /**
+   * 首次初始化时被建成 Team owner 的 human 身份（OIDC 的 `sub`）。
+   *
+   * ── 为什么不能用 LOCAL_ACTOR_ID 顶上 ────────────────────────────────
+   *
+   * `LOCAL_ACTOR_ID` 是「没有真实用户系统时的占位」。生产模式配了 OIDC 之后，
+   * 真实用户的 principalId 是 token 里的 `sub`（形如 `auth0|65f3…`），而
+   * `local-user` 永远不会出现在任何一张 token 里。拿它建 owner 的结果是：
+   *
+   *   - 真正的第一个管理员登录进来，发现自己不是 owner，改不了任何配置
+   *   - 而 `local-user` 这个身份谁也无法登录 —— owner 席位被一个**不存在的人**
+   *     永久占着，只能手工改库才能解开
+   *
+   * 所以生产模式下它必须显式配置。dev 模式仍然回落到 LOCAL_ACTOR_ID
+   * （那里两者本来就是同一个东西）。
+   */
+  oidcBootstrapOwnerSub: env('OIDC_BOOTSTRAP_OWNER_SUB', ''),
   oidc: {
     issuer: env('OIDC_ISSUER', ''),
     audience: env('OIDC_AUDIENCE', ''),
