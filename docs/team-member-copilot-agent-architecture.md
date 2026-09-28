@@ -1,7 +1,7 @@
 # team-member-copilot-agent 当前架构解析
 
-> 基于 `saga/team-member-copilot-agent` `main` 分支当前代码整理。  
-> 当前基准提交：`9295e52224f8a278b9c442689aff1a9c3460a574`（2026-09-27）。
+> 基于 `saga/team-member-copilot-agent` `main` 分支当前代码整理（0.4.3）。  
+> 当前基准提交：`0e53e3d4be755b6b85bff3d7284e6938596dccfa`。
 >
 > 仓库：<https://github.com/saga/team-member-copilot-agent>
 
@@ -181,7 +181,44 @@ Lead 可以把不同任务分给不同 Member，依赖满足时并行运行。
 
 ---
 
-## 5. Task：系统真正的业务执行单位
+## 5. Goal / Task：业务目标有版本，任务属于某个版本
+
+Goal Revision = 业务目标版本，Task = 某个 Goal Revision 下的执行单元，
+旧 Goal 的 Task = 历史事实，不再推进。
+
+```text
+Initial Goal
+    ↓
+plan_tasks
+    ↓
+Goal v1
+
+
+用户/Lead 修改目标
+    ↓
+update_goal
+    ↓
+Goal v2
+    ↓
+旧未完成 Task → cancelled（活着的 execution 级联停掉，含 Lead 自己的那一轮）
+    ↓
+replan_tasks
+    ↓
+Goal v2 Task Plan
+```
+
+规则（`server/task-service.ts` reviseGoal + `server/team-service.ts` updateGoal）：
+
+```text
+plan()        只在还没有正式 Goal（revision 0）时建 v1
+replan()      只在已有 Goal、且当前版本无任务时重建计划
+update_goal   生成不可变的新版本；v1 历史永不修改，“恢复旧版”也是新版本
+旧 Task       只读历史：update / retry / reassign 拒绝跨版本操作
+add_task      依赖只能是同版本 + pending / ready / running / completed，
+              旧版本与 failed / blocked / cancelled 一律拒绝
+Lead 那一轮   用户改 Goal 时正在跑也照停；停不掉的 race 由 turn 收尾的
+              版本号守卫兜底（旧 Goal 回复不落库、不自唤醒）
+```
 
 Task 包含：
 
@@ -197,6 +234,7 @@ blocker
 currentExecutionId
 modelTier
 status
+goal_revision
 ```
 
 状态：
@@ -230,6 +268,15 @@ all completed
 
 存在 failed / blocked
     → conversation blocked
+```
+
+`TaskService.list()` 只返回当前 Goal Revision：
+
+```text
+ConversationTask 当前列表 = 当前 Goal Revision
+旧 Goal Task = 历史，不进入当前执行计划
+
+Goal Revision History + 旧 Task + 旧 Execution = 完整历史追踪链
 ```
 
 ---
@@ -1207,7 +1254,12 @@ Filesystem = human-readable / large / append-oriented artifacts
 Schema 当前采用：
 
 ```text
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 23
+
+conversation.goal_revision
+conversation_goal_revision（不可变版本历史）
+conversation_task.goal_revision
+execution.goal_revision
 ```
 
 没有 migration chain；schema shape 不匹配则拒绝启动并重建本地库。
@@ -1220,6 +1272,8 @@ SCHEMA_VERSION = 20
 User
  ↓
 Task Conversation
+ ↓
+Current Goal Revision
  ↓
 persist message
  ↓
@@ -1245,19 +1299,18 @@ Copilot Capability Adapter
  ↓
 Copilot SDK
  ↓
-LLM
- ├─ Knowledge
- ├─ Skill
- ├─ Tool
+ LLM
+ ├─ Knowledge / Skill / Tool / ask_member / jira_search / learn_experience
+ ├─ update_goal
  ├─ plan_tasks
- ├─ update_task
- ├─ ask_member
- ├─ jira_search
- └─ learn_experience
+ ├─ replan_tasks
+ ├─ add_task
+ ├─ reassign_task
+ └─ update_task
  ↓
 Execution result
  ↓
-Task/Conversation state
+Task / Goal State
  ↓
 Durable Event
  ↓
@@ -1397,6 +1450,7 @@ Security Boundary
 | Application wiring | `server/app.ts` |
 | Team / Conversation / Execution | `server/team-service.ts` |
 | Task state | `server/task-service.ts` |
+| Goal Revision | `server/task-service.ts` + `server/team-service.ts` + `server/test/goal-revision.test.ts` |
 | Task orchestration | `server/task-orchestrator.ts` |
 | Wake scheduler | `server/member-turn-scheduler.ts` |
 | Crash recovery | `server/recovery-service.ts` |
@@ -1417,7 +1471,7 @@ Security Boundary
 | Jira provider | `server/work-management/jira-provider.ts` |
 | Jira client | `server/jira/client.ts` |
 | Files | `server/conversation-file-service.ts` |
-| Schema | `server/db-migrations.ts` |
+| Schema | `server/db-migrations.ts`（SCHEMA_VERSION 23） |
 | Frontend Task Workspace | `src/components/team/*` |
 
 ---

@@ -655,6 +655,15 @@ export class TaskService {
       if (dependency.conversationId !== input.conversationId) {
         throw badRequest(`依赖的任务不属于当前工作区：${dependencyId}`);
       }
+      // 旧 Goal 的任务是历史事实：允许依赖它等于把失效的计划重新接回当前计划。
+      if (dependency.goalRevision !== currentRevision) {
+        throw badRequest(`不能依赖旧 Goal v${dependency.goalRevision} 的任务：${dependencyId}`);
+      }
+      // failed / blocked / cancelled 的依赖会直接毒死新任务（见 dependencyStates），
+      // 在这里就拒绝，而不是落库一个注定失败的任务。
+      if (!['pending', 'ready', 'running', 'completed'].includes(dependency.status)) {
+        throw badRequest(`不能依赖状态为 ${dependency.status} 的任务：${dependencyId}`);
+      }
     }
     const sortRow = this.db
       .prepare(`SELECT COALESCE(MAX(sort_order), -1) + 1 AS sort_order FROM conversation_task WHERE conversation_id = ?`)

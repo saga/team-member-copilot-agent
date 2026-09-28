@@ -953,6 +953,93 @@ describe('Task 生命周期补严', () => {
     }
   });
 
+  it('add_task 不能依赖旧 Goal 的任务，也不能依赖坏掉的任务', async () => {
+    stub.reset();
+    const room = team.createConversation({
+      kind: 'task',
+      title: 'CrossGoalDeps',
+      memberIds: [alice.id, bob.id],
+      leadMemberId: alice.id,
+    });
+    const requirements = { facts: [], assumptions: [], constraints: [], successCriteria: [] };
+    // 执行人静音：v1 任务停在 ready 不开跑，改 Goal 时 deterministic。
+    team.setMemberMuted(room.id, bob.id, true);
+    await team.planTasks({
+      conversationId: room.id,
+      memberId: alice.id,
+      objective: '做 A',
+      requirements,
+      tasks: [{ key: 'a', title: 'A', assigneeMemberId: bob.id }],
+    });
+    const v1 = team.listTasks(room.id);
+    // v1 A 进不了 v2 的依赖：旧 Goal 的任务是历史事实。
+    await team.updateGoal({
+      conversationId: room.id,
+      actorType: 'user',
+      actorId: 'u1',
+      objective: '改成做 B',
+      changeKind: 'scope_change',
+    });
+    await assert.rejects(
+      team.addTask({
+        conversationId: room.id,
+        memberId: alice.id,
+        title: 'B',
+        assigneeMemberId: bob.id,
+        dependencies: [v1[0].id],
+      }),
+      /旧 Goal/,
+    );
+
+    // blocked 的任务也不能当依赖：依赖它等于落库一个注定被毒死的任务。
+    const addedC = await team.addTask({
+      conversationId: room.id,
+      memberId: alice.id,
+      title: 'C',
+      assigneeMemberId: bob.id,
+    });
+    assert.match(addedC, /已增加任务/);
+    const taskC = team.listTasks(room.id).find((task) => task.title === 'C')!;
+    await team.updateTask({
+      conversationId: room.id,
+      memberId: bob.id,
+      taskId: taskC.id,
+      status: 'blocked',
+      summary: 'C 卡住了',
+    });
+    await assert.rejects(
+      team.addTask({
+        conversationId: room.id,
+        memberId: alice.id,
+        title: 'D',
+        assigneeMemberId: bob.id,
+        dependencies: [taskC.id],
+      }),
+      /不能依赖状态为 blocked/,
+    );
+    // 同版本 + 健康状态的依赖照常通过。
+    team.setMemberMuted(room.id, bob.id, false);
+    const addedE = await team.addTask({
+      conversationId: room.id,
+      memberId: alice.id,
+      title: 'E',
+      assigneeMemberId: bob.id,
+    });
+    assert.match(addedE, /已增加任务/);
+    const taskE = team.listTasks(room.id).find((task) => task.title === 'E')!;
+    const waiting = await team.addTask({
+      conversationId: room.id,
+      memberId: alice.id,
+      title: 'F',
+      assigneeMemberId: bob.id,
+      dependencies: [taskE.id],
+    });
+    assert.match(waiting, /等待依赖完成/);
+    await waitForConversationIdle(room.id);
+    const done = team.listTasks(room.id).filter((task) => task.title === 'E' || task.title === 'F');
+    assert.ok(done.every((task) => task.status === 'completed'), '健康依赖的任务照常跑完');
+  });
+
   it('Lead 给未开始任务换执行人：running/completed 换不动', async () => {
     stub.reset();
     const room = team.createConversation({

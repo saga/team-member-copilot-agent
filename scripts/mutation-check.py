@@ -1012,6 +1012,50 @@ MUTATIONS = [
         ],
     },
     {
+        "name": "user 改 Goal 不停 Lead 的执行（旧 Goal 那一轮继续跑）",
+        "test": "server/test/goal-revision.test.ts",
+        "steps": [
+            (
+                "server/team-service.ts",
+                "    if (input.actorType === 'user') {\n      // Lead 自己的 execution 不属于任何 Task，不在 result.executionIds 里。\n",
+                "    if (false) {\n      // Lead 自己的 execution 不属于任何 Task，不在 result.executionIds 里。\n",
+            )
+        ],
+    },
+    {
+        "name": "turn 收尾不判 Goal 版本（旧 Goal 回复落库）",
+        "test": "server/test/goal-revision.test.ts",
+        "steps": [
+            (
+                "server/team-service.ts",
+                "      if (content && input.turnMode === 'lead' && !goalStale) {\n",
+                "      if (content && input.turnMode === 'lead') {\n",
+            )
+        ],
+    },
+    {
+        "name": "add_task 接受旧 Goal 依赖（历史计划被接回当前）",
+        "test": "server/test/task-service.test.ts",
+        "steps": [
+            (
+                "server/task-service.ts",
+                "      if (dependency.goalRevision !== currentRevision) {\n        throw badRequest(`不能依赖旧 Goal v${dependency.goalRevision} 的任务：${dependencyId}`);\n      }\n",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "add_task 接受坏掉的依赖（落库注定失败的任务）",
+        "test": "server/test/task-service.test.ts",
+        "steps": [
+            (
+                "server/task-service.ts",
+                "      if (!['pending', 'ready', 'running', 'completed'].includes(dependency.status)) {\n        throw badRequest(`不能依赖状态为 ${dependency.status} 的任务：${dependencyId}`);\n      }\n",
+                "",
+            )
+        ],
+    },
+    {
         "name": "Goal 唤醒走普通消息通道（不用 Strong 规划）",
         "test": "server/test/goal-revision.test.ts",
         "steps": [

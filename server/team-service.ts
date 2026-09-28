@@ -1400,6 +1400,7 @@ export class TeamService {
       });
     }
 
+    const handledExecutionIds = new Set<string>(result.executionIds);
     for (const executionId of result.executionIds) {
       if (executionId === input.executionId) continue;
       try {
@@ -1407,6 +1408,27 @@ export class TeamService {
       } catch {
         // Goal revision 已经提交。如果执行引擎已经收尾或 cancellation race，
         // 不能回滚 Goal —— 旧任务行已经是 cancelled，引擎侧自己收尾即可。
+      }
+    }
+
+    if (input.actorType === 'user') {
+      // Lead 自己的 execution 不属于任何 Task，不在 result.executionIds 里。
+      // 用户改 Goal 时它可能正在 running：不先停掉，它会带着旧 Goal 跑完，
+      // 还可能继续调工具。调用者自己的 execution 除外 —— Lead 调 update_goal
+      // 工具时那一轮就是当前 turn，停掉等于自杀；那一轮由收尾的版本号守卫兜底。
+      const active = this.db
+        .prepare(
+          `SELECT id FROM execution
+           WHERE conversation_id = ? AND status IN ('queued', 'running', 'waiting_for_member')`,
+        )
+        .all(conversation.id) as Array<{ id: string }>;
+      for (const row of active) {
+        if (row.id === input.executionId || handledExecutionIds.has(row.id)) continue;
+        try {
+          await this.cancelExecutionTree(row.id);
+        } catch {
+          // 同上：Goal 已提交，cancellation race 不能回滚。
+        }
       }
     }
 
@@ -3018,8 +3040,13 @@ export class TeamService {
       // 只进 execution.response + task.result，Task 面板是它的事实源。
       // 两边都写会让同一个回答在 Activity 与 Task 里各出现一次。
       const taskAfterTurn = input.taskId ? this.safeGetTask(input.taskId) : null;
+      // Goal 在本轮中途被改掉（user 改 Goal / Lead 调 update_goal）：这一轮看到
+      // 的全是旧世界。cancel 是第一道闸，但它有 race —— execution 跑完才发现
+      // Goal 已经往前走时，旧 Goal 的 Lead 回复不再落库，也不再触发下一轮。
+      const goalStale =
+        input.execution.goalRevision !== this.currentGoalRevision(input.conversation.id);
       let message: ConversationMessage | null = null;
-      if (content && input.turnMode === 'lead') {
+      if (content && input.turnMode === 'lead' && !goalStale) {
         message = this.insertMemberMessage({
           conversationId: input.conversation.id,
           memberId: input.member.id,
@@ -3069,8 +3096,9 @@ export class TeamService {
         this.orchestrator.onTaskChanged(taskAfterTurn.id);
       } else if (taskAfterTurn && message) {
         this.emit(input.conversation.id, { type: 'task.updated', data: this.tasks.get(taskAfterTurn.id) });
-      } else if (!taskAfterTurn && input.turnMode === 'lead') {
+      } else if (!taskAfterTurn && input.turnMode === 'lead' && !goalStale) {
         // Lead 一轮结束：如果期间产生了任务，推进就绪的；否则有新用户消息就再唤醒。
+        // 旧 Goal 的 turn 不推进也不自唤 —— 新计划由 goal_changed 那一轮驱动。
         this.orchestrator.startReadyTasks(input.conversation.id);
         const latest = this.getConversation(input.conversation.id);
         // 本轮刚发的回复不算「没看到的新消息」：messageSequence 被自己的回复

@@ -225,6 +225,187 @@ describe('Goal revision', () => {
     assert.equal(oldTask.status, 'cancelled', '旧 Task 不能被 turn 收尾改成 failed');
   });
 
+  it('user 改 Goal 时 Lead 正在 running：旧 Lead execution 被取消，不留旧 Goal 回复', async () => {
+    stub.reset();
+    const room = makeRoom('GoalLeadRace');
+    // 执行人静音：v1 任务停在 ready 不开跑，工作区保持 running，用户消息才能进来。
+    team.setMemberMuted(room.id, bob.id, true);
+    await team.planTasks({
+      conversationId: room.id,
+      memberId: alice.id,
+      objective: '做 A',
+      requirements,
+      tasks: [{ key: 'a', title: 'A', assigneeMemberId: bob.id }],
+    });
+    assert.equal(team.getConversation(room.id).goalRevision, 1);
+
+    // 按住 Lead 的 turn：用户消息已经唤醒它，但它还在跑。
+    // 共享 stub 没有 cancelTurn（真引擎才有 abort）：这里临时补一个「找到但
+    // 停不掉」的实现 —— cancel 发得出信号（cancelRequests），但按住的 turn
+    // 照跑，收尾时自己看到信号停下来。测完删掉，不影响其它用例。
+    let release!: () => void;
+    stub.hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    stub.holdMemberIds = new Set([alice.id]);
+    const stubAny = stub as unknown as { cancelTurn?: unknown };
+    const originalCancelTurn = stubAny.cancelTurn;
+    stubAny.cancelTurn = async () => ({ found: false, aborted: false, idle: false });
+    try {
+      await team.sendMessage({ conversationId: room.id, content: '先按 v1 做' });
+      let leadExecutionId: string | null = null;
+      for (let attempt = 0; attempt < 400; attempt += 1) {
+        const row = db
+          .prepare(
+            `SELECT id FROM execution WHERE conversation_id = ? AND member_id = ? AND task_id IS NULL
+             AND status = 'running' ORDER BY created_at DESC LIMIT 1`,
+          )
+          .get(room.id, alice.id) as unknown as { id: string } | undefined;
+        if (row) {
+          leadExecutionId = row.id;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.ok(leadExecutionId, 'Lead turn 必须先跑起来');
+
+      // updateGoal 会卡在等 Lead turn 收尾（cancel 要等 runtime idle），所以先不 await。
+      const updating = team.updateGoal({
+        conversationId: room.id,
+        actorType: 'user',
+        actorId: 'u1',
+        objective: '改成做 B',
+        changeKind: 'scope_change',
+      });
+      // cancel 再慢，Goal 版本号也是先提交的 —— 调用方看到 v2 时旧 Lead 还在跑。
+      for (let attempt = 0; attempt < 400; attempt += 1) {
+        if (team.getConversation(room.id).goalRevision === 2) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.equal(team.getConversation(room.id).goalRevision, 2);
+      const during = db
+        .prepare(`SELECT status FROM execution WHERE id = ?`)
+        .get(leadExecutionId) as unknown as { status: string };
+      assert.equal(during.status, 'running', 'cancel 发出去了，但被按住的 turn 还没收尾');
+
+      release();
+      await updating;
+    } finally {
+      release();
+      stub.hold = null;
+      stub.holdMemberIds = null;
+      if (originalCancelTurn === undefined) delete stubAny.cancelTurn;
+      else stubAny.cancelTurn = originalCancelTurn;
+    }
+    await waitForConversationIdle(room.id);
+
+    // 第一道闸（cancel）生效：旧 Lead execution 是 cancelled，不是 completed。
+    const leadExecutionId = (
+      db
+        .prepare(
+          `SELECT id FROM execution WHERE conversation_id = ? AND member_id = ? AND task_id IS NULL
+           AND wake_reason = 'lead_message' ORDER BY created_at DESC LIMIT 1`,
+        )
+        .get(room.id, alice.id) as unknown as { id: string } | undefined
+    )?.id;
+    assert.ok(leadExecutionId);
+    assert.equal(team.getExecution(leadExecutionId).status, 'cancelled');
+    // 旧 Goal 的回复没有落库：cancel race 漏过去也还有收尾的版本号守卫。
+    const staleMessages = db
+      .prepare(`SELECT COUNT(*) AS n FROM conversation_message WHERE execution_id = ?`)
+      .get(leadExecutionId) as unknown as { n: number };
+    assert.equal(staleMessages.n, 0, '旧 Goal 的 Lead 回复不能写进消息表');
+    // 新 goal_changed wake 照常排上。
+    const changed = db
+      .prepare(
+        `SELECT id FROM execution WHERE conversation_id = ? AND wake_reason = 'goal_changed'
+         ORDER BY created_at DESC LIMIT 1`,
+      )
+      .get(room.id) as unknown as { id: string } | undefined;
+    assert.ok(changed, 'goal_changed wake 必须存在');
+  });
+
+  it('Lead 调 update_goal 那一轮正常跑完：旧 Goal 回复不落库，也不再自唤醒', async () => {
+    stub.reset();
+    const room = makeRoom('GoalLeadTool');
+    team.setMemberMuted(room.id, bob.id, true);
+    await team.planTasks({
+      conversationId: room.id,
+      memberId: alice.id,
+      objective: '做 A',
+      requirements,
+      tasks: [{ key: 'a', title: 'A', assigneeMemberId: bob.id }],
+    });
+
+    // 按住 Lead turn，turn 里（工具调用点）改 Goal：member 分支不 cancel
+    // 自己的 execution，这一轮会正常跑完 —— 收尾的版本号守卫是唯一的闸。
+    let release!: () => void;
+    stub.hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    stub.holdMemberIds = new Set([alice.id]);
+    try {
+      await team.sendMessage({ conversationId: room.id, content: '按 v1 做' });
+      let leadExecutionId: string | null = null;
+      for (let attempt = 0; attempt < 400; attempt += 1) {
+        const row = db
+          .prepare(
+            `SELECT id FROM execution WHERE conversation_id = ? AND member_id = ? AND task_id IS NULL
+             AND status = 'running' ORDER BY created_at DESC LIMIT 1`,
+          )
+          .get(room.id, alice.id) as unknown as { id: string } | undefined;
+        if (row) {
+          leadExecutionId = row.id;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.ok(leadExecutionId);
+
+      const reply = await team.updateGoalTool({
+        conversationId: room.id,
+        memberId: alice.id,
+        executionId: leadExecutionId,
+        objective: '改成做 B',
+        changeKind: 'scope_change',
+      });
+      assert.match(reply, /v2/);
+      assert.equal(team.getConversation(room.id).goalRevision, 2);
+
+      release();
+    } finally {
+      release();
+      stub.hold = null;
+      stub.holdMemberIds = null;
+    }
+    await waitForConversationIdle(room.id);
+
+    const leadExecutionId = (
+      db
+        .prepare(
+          `SELECT id FROM execution WHERE conversation_id = ? AND member_id = ? AND task_id IS NULL
+           AND wake_reason = 'lead_message' ORDER BY created_at DESC LIMIT 1`,
+        )
+        .get(room.id, alice.id) as unknown as { id: string } | undefined
+    )?.id;
+    assert.ok(leadExecutionId);
+    // 没人 cancel 它：正常跑完，execution 事实是 completed。
+    assert.equal(team.getExecution(leadExecutionId).status, 'completed');
+    // 但旧 Goal 的回复不能落库。
+    const staleMessages = db
+      .prepare(`SELECT COUNT(*) AS n FROM conversation_message WHERE execution_id = ?`)
+      .get(leadExecutionId) as unknown as { n: number };
+    assert.equal(staleMessages.n, 0, '旧 Goal 的 Lead 回复不能写进消息表');
+    // 也不能自己再唤醒一轮：member 调的 update_goal 不排 goal_changed，
+    // 旧 turn 自唤醒会被守卫拦掉，所以 Lead execution 只有这一条。
+    const leadTurns = db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM execution WHERE conversation_id = ? AND member_id = ? AND task_id IS NULL`,
+      )
+      .get(room.id, alice.id) as unknown as { n: number };
+    assert.equal(leadTurns.n, 1, '旧 Goal 的 turn 不能再唤醒出新 turn');
+  });
+
   it('completed v1 tasks remain historical', async () => {
     stub.reset();
     const room = makeRoom('GoalHistory');
