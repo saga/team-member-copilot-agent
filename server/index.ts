@@ -56,10 +56,15 @@ let server: Server | null = null;
 async function bootstrap(): Promise<void> {
   // 生产模式必须配 OIDC：没有真实用户系统就拒绝启动，而不是悄悄回落
   // 到 LOCAL_ACTOR_ID。本地开发与测试走 AUTH_DEV_MODE=true。
-  if (!config.authDevMode) {
+  // 注意这个检查必须 gate isProduction：dev 下无 OIDC 是正常情况（走本地
+  // Copilot CLI + 无 Human 认证），抛错会把 `npm run dev` 直接拦死。
+  if (config.isProduction) {
     if (!config.oidc.issuer || !config.oidc.audience || !config.oidc.jwksUrl) {
       throw new Error('生产模式必须配置 OIDC_ISSUER / OIDC_AUDIENCE / OIDC_JWKS_URL');
     }
+  } else if (!config.oidc.issuer || !config.oidc.audience || !config.oidc.jwksUrl) {
+    // eslint-disable-next-line no-console
+    console.warn('[server] 未配置 OIDC：开发模式放行，但 Human API 无认证，只应监听本机');
   }
   // 生产 fail-closed：下面这些一旦放行就是绕过 Human OIDC 的入口，
   // 只打 warning 拦不住部署，必须启动失败。

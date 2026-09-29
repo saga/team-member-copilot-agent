@@ -45,6 +45,8 @@ const dataDir = path.resolve(env('DATA_DIR', '.data'));
  * NODE_ENV 未设置时按 development 处理，方便 `npm run dev`。
  */
 const isProduction = env('NODE_ENV', 'development') === 'production';
+/** 显式值优先；未配置时跟随 NODE_ENV（dev 默认开，production 默认关）。 */
+const authDevModeEnv = env('AUTH_DEV_MODE', '');
 
 export const config = {
   port: Number(env('PORT', '3001')),
@@ -320,11 +322,13 @@ export const config = {
   /** 没有真正用户系统时的 human actor 占位。接 Entra/OIDC 后只换 teamScope 的解析。 */
   localActorId: env('LOCAL_ACTOR_ID', 'local-user'),
   /**
-   * human 认证模式。false = 生产模式：必须配 OIDC，走真实 JWT；
-   * true = 本地开发：无 Bearer 时回落 LOCAL_ACTOR_ID。
-   * 测试与本地 dev 用 true，生产必须 false（见 index.ts 启动检查）。
+   * human 认证模式。true = 无 Bearer 时回落 LOCAL_ACTOR_ID。
+   *
+   * 未显式配置时跟随 NODE_ENV：development 默认 true（零配置 `npm run dev`
+   * 开箱即用），production 默认 false。显式值在两种环境都优先——dev 下配
+   * false 可用真实 OIDC 联调；production 配 true 会被 index.ts 直接拒绝启动。
    */
-  authDevMode: env('AUTH_DEV_MODE', 'false') === 'true',
+  authDevMode: authDevModeEnv === '' ? !isProduction : authDevModeEnv === 'true',
   /**
    * 首次初始化时被建成 Team owner 的 human 身份（OIDC 的 `sub`）。
    *
