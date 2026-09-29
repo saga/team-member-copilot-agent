@@ -1360,7 +1360,7 @@ export class ExecutionService {
    * visited 防环：等待图理论上无环（delegation 建边时检查过），但取消路径上
    * 不再假设一次 —— 环了就停，而不是转死。
    */
-  cancelExecutionTree(
+  async cancelExecutionTree(
     executionId: string,
     visited = new Set<string>(),
   ): Promise<void> {

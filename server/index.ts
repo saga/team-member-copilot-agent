@@ -61,6 +61,26 @@ async function bootstrap(): Promise<void> {
       throw new Error('生产模式必须配置 OIDC_ISSUER / OIDC_AUDIENCE / OIDC_JWKS_URL');
     }
   }
+  // 生产 fail-closed：下面这些一旦放行就是绕过 Human OIDC 的入口，
+  // 只打 warning 拦不住部署，必须启动失败。
+  if (config.isProduction && config.authDevMode) {
+    throw new Error('production 禁止 AUTH_DEV_MODE=true（会回落到 LOCAL_ACTOR_ID，绕过 OIDC）');
+  }
+  if (config.isProduction && !config.internalApiToken) {
+    throw new Error('production 必须配置 INTERNAL_API_TOKEN（否则 /api/internal 无需认证即可代理任意 Member 身份）');
+  }
+  if (config.isProduction && !config.githubToken) {
+    throw new Error('production 必须配置 GITHUB_TOKEN（不留半 dev 半 production 的 Copilot 认证状态）');
+  }
+  if (config.isProduction && config.allowHostCodingTools) {
+    throw new Error('production 当前禁止 HOST_CODING_TOOLS=true，除非启用受控 sandbox');
+  }
+  if (config.isProduction && config.mcpLocalEnabled) {
+    throw new Error('production 当前禁止 MCP_LOCAL_ENABLED=true，除非启用受控 runtime');
+  }
+  if (config.isProduction && !config.jira.webhookSecret) {
+    throw new Error('production 必须配置 JIRA_WEBHOOK_SECRET（否则任何人可伪造 Jira webhook）');
+  }
   // 多副本 + 启动恢复 + 没有租约 = 一定会双跑。
   //
   // 具体怎么坏：两个副本同时启动，各自把对方正在跑的 execution 标成 interrupted，

@@ -1243,7 +1243,8 @@ scripts/
 | `PORT` | `3001` | HTTP 端口 |
 | `DATA_DIR` | `.data` | 数据根目录 |
 | `COPILOT_BASE_DIRECTORY` | `<DATA_DIR>/copilot` | Copilot SDK 的 session state / compaction checkpoint 根目录。**容器里必须指到持久卷**，否则每次重启都从零开始（resume 失败会静默回落到新建 session）。刻意和 Member workspace 分开 |
-| `GITHUB_TOKEN` | 空 | 留空则用本机 `copilot` CLI 已登录用户 |
+| `NODE_ENV` | `development` | `production` = 生产模式：Copilot 用 `empty` + 隔离目录，并触发下面的 fail-closed 启动检查 |
+| `GITHUB_TOKEN` | 空 | 生产必填（启动强制检查）。development 直接忽略，即使残留也不生效；dev 一律用本机 `copilot` CLI 登录 |
 | `COPILOT_MODEL` | `gpt-5` | 默认模型（Strong Lead 未单独配置时的回落值） |
 | `COPILOT_LEAD_MODEL` | 跟 `COPILOT_MODEL` 同值 | 旧配置名，仍兼容；等价于 `COPILOT_LEAD_STRONG_MODEL` |
 | `COPILOT_LEAD_STRONG_MODEL` | 跟 `COPILOT_MODEL` 同值 | Strong Lead：规划 / 澄清 / 恢复 / 综合时用，绝不能配给普通 Task |
@@ -1263,16 +1264,16 @@ scripts/
 | `MAX_CONVERSATION_FILES_PER_MESSAGE` | `10` | 一条消息最多带几个文件（也是 `fileIds` 的上限） |
 | `MAX_CONVERSATION_FILES_PER_CONVERSATION` | `500` | 单个会话最多留几份文件（不含已软删除的） |
 | `MAX_EXTRACTED_TEXT_CHARS` | `500000` | 单份文件提取出的文本上限（字符），超过截断。超过知识库单份上限的文本仍可搜，但 promote 会被拒 |
-| `HOST_CODING_TOOLS` | `false` | 是否允许 `bash` / `edit` / `grep` / `web_fetch`。**不随能力绑定打开** |
+| `HOST_CODING_TOOLS` | `false` | 是否允许 `bash` / `edit` / `grep` / `web_fetch`。**不随能力绑定打开**；生产设为 `true` 直接拒绝启动（除非启用受控 sandbox） |
 | `MCP_SERVERS_FILE` | `config/mcp-servers.json` | MCP Server 定义文件（怎么连 + 允许哪些工具）。文件不存在 = 不接 MCP，不影响启动 |
-| `MCP_LOCAL_ENABLED` | `false` | 是否允许注册 local/stdio MCP Server（SDK 会在服务机器上起子进程）。远程不受影响 |
+| `MCP_LOCAL_ENABLED` | `false` | 是否允许注册 local/stdio MCP Server（SDK 会在服务机器上起子进程）。远程不受影响；生产设为 `true` 直接拒绝启动 |
 | `JIRA_BASE_URL` / `JIRA_EMAIL` / `JIRA_API_TOKEN` | 空 | Jira Cloud 连接。三项齐了才注册 `atlassian.jira-tools`（jira_search / jira_get_issue / jira_add_comment / jira_transition_issue）并让控制面能取证；不配置则本地只有引用、没有工单工具，execution 也不会有 `external_work_snapshot` |
-| `JIRA_WEBHOOK_SECRET` | 空 | Jira webhook 的共享密钥（`X-Jira-Webhook-Secret` 头）。空 = 端点无门禁（仅限本机单用户） |
-| `INTERNAL_API_TOKEN` | 空 | Internal API 门禁；空 = 不校验（仅限本机单用户） |
+| `JIRA_WEBHOOK_SECRET` | 空 | Jira webhook 的共享密钥（`X-Jira-Webhook-Secret` 头）。空 = 端点无门禁（仅限本机单用户）；生产必填，否则拒绝启动 |
+| `INTERNAL_API_TOKEN` | 空 | Internal API 门禁；空 = 不校验（仅限本机单用户）。生产必填，否则拒绝启动（该入口可代理任意 Member 身份） |
 | `ADMIN_API_TOKEN` | 空 | Admin 写入（capabilities / knowledge 管理 / skills 安装 / 建 Member / 归档）门禁；空 = 不校验（仅限本机单用户）。Team owner/admin 与 token 任一通过 |
 | `TEAM_NAME` | `AI Team` | 默认 Team 名，启动 ensure，不提供新建入口 |
 | `LOCAL_ACTOR_ID` | `local-user` | 无用户系统时 human actor 占位（仅 `AUTH_DEV_MODE=true` 时生效） |
-| `AUTH_DEV_MODE` | `false` | 本地开发模式：无 Bearer 时回落 `LOCAL_ACTOR_ID`。生产必须 `false` + 配齐 OIDC |
+| `AUTH_DEV_MODE` | `false` | 本地开发模式：无 Bearer 时回落 `LOCAL_ACTOR_ID`。生产设为 `true` 直接拒绝启动（`NODE_ENV=production` 配 `AUTH_DEV_MODE=true` 属于部署错误，不是合法组合） |
 | `OIDC_ISSUER` / `OIDC_AUDIENCE` / `OIDC_JWKS_URL` | 空 | 生产 Human 认证（JWT）。不齐则拒绝启动；Human API 还要求调用方是 Team 的 active human 成员 |
 | `SCHEDULER_INTERVAL_MS` | `2000` | Scheduler tick 间隔（once + interval，不做 Calendar/RRULE） |
 | `MEMBER_TEMPLATES_DIR` | `config/member-templates` | 默认 Member 模板目录（Member 层 provisioning baseline） |
@@ -1302,13 +1303,19 @@ runtime 仍然是宿主机上的进程 —— 没有沙箱时 `bash` 能走到 w
 ## 前提
 
 - Node.js >= 22.13（`engines` 要求；`node:sqlite` 会打印一条 experimental 警告，属正常）
-- Copilot 认证二选一：本机 `copilot` CLI 已登录，或 `.env` 里填 `GITHUB_TOKEN`
+- Copilot 认证按环境二分：development 用本机 `copilot` CLI 登录（`GITHUB_TOKEN` 直接忽略）；production 必须填 `GITHUB_TOKEN`，否则拒绝启动
 - `@github/copilot-sdk` pin 在 `1.0.14`；升级时需同步验证 runtime 行为
+
+## 作者判断：现在不做的事
+
+- **不做 DB migration**：`db-migrations.ts` 保持「空库建表、版本不对拒绝启动、删库重建」的单 shape 策略。这是作者当前的有意决定，不是待办——migration 代码只在升级瞬间执行，是最难被日常测试覆盖的代码；宁可在启动时明确报错，也不要维护一条没人验证的升级路径。后果是生产升级需要停机 + 人工处理数据，这个代价目前接受。
+- **多副本不上 SQLite 之外的库**：`WORKER_REPLICAS > 1` 的 lease/fencing/recovery 整套设计保留，但数据库保持 SQLite 单文件。真进 K8s 多 pod 时，共享 SQLite 文件本身就是架构错配——到那时换 PostgreSQL，而不是现在给 SQLite 加网络盘方案。
+- **production fail-closed，而不是 warning**：`NODE_ENV=production` 时，`AUTH_DEV_MODE=true`、缺 `INTERNAL_API_TOKEN` / `GITHUB_TOKEN` / `JIRA_WEBHOOK_SECRET`、开 `HOST_CODING_TOOLS` / `MCP_LOCAL_ENABLED`，一律拒绝启动。安全边界不能靠“日志里看到 warning”来保证。
 
 ## 后续扩展点
 
 - **Execution UI**：`ExecutionStrip` / `ExecutionTree`（客户端按 `parentExecutionId` 组树）+ retry / cancel 按钮。`TeamChat.tsx` 已拆到 `src/components/team/`，但 execution 视图还没有独立组件。
-- **多副本**：`RecoveryService` 与 `cancelRequests` 目前都假设单进程。多副本前要把「谁是 owner」和取消信号都升级成 DB lease / 跨进程通道。
+- **多副本**：`RecoveryService` 与 `cancelRequests` 目前都假设单进程。多副本前要把「谁是 owner」和取消信号都升级成 DB lease / 跨进程通道（且数据库要先换成 PostgreSQL，见上一节作者判断）。
 - **认证**：`local-user` 是占位，仅 `AUTH_DEV_MODE=true` 时生效。生产走 OIDC/JWT（`requireHumanAuth`）+ Team Membership + Conversation ACL 三层。
 - **会话记忆 vs Member 记忆**：`conversation_message` 是会话上下文，全局 `members/<id>/memory/MEMORY.md` 是跨 Team 的长期记忆，`members/<id>/teams/<teamId>/MEMORY.md` 是 Team 上下文，三者不要混。
 - **Member 记忆提案**：让模型用 `propose_member_memory` 提议、由应用审核后再落盘，而不是让 `remember_member` 直接写。

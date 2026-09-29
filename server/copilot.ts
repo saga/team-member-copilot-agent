@@ -241,9 +241,13 @@ export class CopilotService {
       const client =
         this.options.createClient?.() ??
         new CopilotClient({
-          // "empty" 模式：应用显式控制工具与工作目录，不继承 CLI 的环境。
-          // 工具、workingDirectory、MCP、权限等继续由本应用显式控制。
-          mode: 'empty',
+          // production = empty：关闭 CLI ambient capabilities，适合 server /
+          // multi-user，工具与工作目录由本应用显式控制。
+          //
+          // development = copilot-cli：与本机 CLI 共享登录/session，适合开发机。
+          // empty 模式要求 baseDirectory 或 sessionFs 二选一，不传会直接抛错，
+          // 所以 dev 不能只去掉 baseDirectory，必须连 mode 一起切。
+          mode: config.isProduction ? 'empty' : 'copilot-cli',
 
           // development:
           //   undefined → SDK 使用当前用户默认 ~/.copilot
@@ -258,11 +262,9 @@ export class CopilotService {
           // development:
           //   使用当前机器已经 copilot login 的用户
           //
-          // production + GITHUB_TOKEN:
-          //   使用服务显式提供的 token，不依赖宿主机登录
-          //
-          // production without GITHUB_TOKEN:
-          //   仍允许从隔离 COPILOT_HOME 的登录状态读取
+          // production:
+          //   必须配 GITHUB_TOKEN（启动时强制检查），使用服务显式提供的
+          //   token，不依赖宿主机登录。不留半 dev 半 production 状态。
           ...(config.githubToken
             ? {
                 gitHubToken: config.githubToken,

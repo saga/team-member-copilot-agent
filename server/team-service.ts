@@ -25,14 +25,12 @@ import type { CopilotService } from './copilot.js';
 import type { CapabilityResolver } from './capabilities/resolver.js';
 import type { CapabilityService } from './capabilities/service.js';
 import type { TeamStructureService } from './team-structure-service.js';
-import type { RuntimeCapabilities } from './capabilities/types.js';
 import {
   normalizeExternalWorkRef,
   parseExternalWorkRef,
   serializeExternalWorkRef,
   serializeExternalWorkSnapshot,
   WorkManagementRegistry,
-  type ExternalWorkRef,
   type ExternalWorkSnapshot,
 } from './work-management/types.js';
 import type {
@@ -429,7 +427,10 @@ export class TeamService {
       alignRuntimeCheckpoint: this.alignRuntimeCheckpoint.bind(this),
       assertMemberNotBusy: this.assertMemberNotBusy.bind(this),
       authorization: this.authorization,
-      cancelExecutionTree: this.executions.cancelExecutionTree.bind(this.executions),
+      // executions 在 buildInternals 之后才构造：这里不能 bind，只能闭包延迟求值。
+      // （memberConversations 的 () => this.internals 是同一手法，方向反过来。）
+      cancelExecutionTree: (executionId, visited) =>
+        this.executions.cancelExecutionTree(executionId, visited),
       cancelRequests: this.cancelRequests,
       capabilities: this.capabilities,
       capabilityResolver: this.capabilityResolver,
@@ -440,7 +441,8 @@ export class TeamService {
       currentGoalRevision: this.currentGoalRevision.bind(this),
       db: this.db,
       defaultTeam: this.defaultTeam.bind(this),
-      detectDelegationWaitCycle: this.executions.detectDelegationWaitCycle.bind(this.executions),
+      detectDelegationWaitCycle: (parentRuntimeId, targetRuntimeId) =>
+        this.executions.detectDelegationWaitCycle(parentRuntimeId, targetRuntimeId),
       emit: this.emit.bind(this),
       emitExecution: this.emitExecution.bind(this),
       ensureRuntime: this.ensureRuntime.bind(this),
@@ -455,7 +457,8 @@ export class TeamService {
       insertExecution: this.insertExecution.bind(this),
       insertMemberMessage: this.insertMemberMessage.bind(this),
       insertMessage: this.insertMessage.bind(this),
-      latestExecutionFor: this.executions.latestExecutionFor.bind(this.executions),
+      latestExecutionFor: (conversationId, memberId) =>
+        this.executions.latestExecutionFor(conversationId, memberId),
       leases: this.leases,
       memberConversations: this.memberConversations,
       members: this.members,
@@ -466,7 +469,7 @@ export class TeamService {
       requireConversationFiles: this.requireConversationFiles.bind(this),
       requireConversationMember: this.requireConversationMember.bind(this),
       requireMessageInConversation: this.requireMessageInConversation.bind(this),
-      resolveExternalWorkRef: this.executions.resolveExternalWorkRef.bind(this.executions),
+      resolveExternalWorkRef: (input) => this.executions.resolveExternalWorkRef(input),
       retireRuntime: this.retireRuntime.bind(this),
       scheduler: this.scheduler,
       states: this.states,
@@ -474,7 +477,7 @@ export class TeamService {
       tasks: this.tasks,
       touchConversation: this.touchConversation.bind(this),
       transaction: this.transaction.bind(this),
-      turnModeFor: this.executions.turnModeFor.bind(this.executions),
+      turnModeFor: (conversation, execution) => this.executions.turnModeFor(conversation, execution),
       updateExecution: this.updateExecution.bind(this),
       waitForRuntimeIdle: this.waitForRuntimeIdle.bind(this),
       withRuntimeLock: this.withRuntimeLock.bind(this),
