@@ -17,6 +17,7 @@ import {
   conversationFileToolHost,
 } from '../capabilities/providers/conversation-file-tools.js';
 import { ConversationFileService } from '../conversation-file-service.js';
+import { EvidenceService } from '../evidence-service.js';
 import { ConversationFileProcessor } from '../conversation-file-processor.js';
 import { KnowledgeToolProvider } from '../capabilities/providers/knowledge-tools.js';
 import { HostCodingToolProvider } from '../capabilities/providers/host-tools.js';
@@ -42,6 +43,8 @@ export interface CapabilityStack {
   knowledge: LocalFilesystemKnowledgeProvider;
   registry: CapabilityRegistry;
   resolver: CapabilityResolver;
+  /** 依据链。检索工具与 TeamService 都用同一个实例。 */
+  evidence: EvidenceService;
   /** 会话文件（聊天附件）。工具注册与 TeamService 都用同一个实例。 */
   conversationFiles: ConversationFileService;
 }
@@ -90,6 +93,10 @@ export function createCapabilityStack(
   );
   registry.registerKnowledgeProvider(knowledge);
 
+  // 依据链排在检索工具之前：检索工具要把「这一轮真的检索过哪些引用」写回它。
+  const resolver = new CapabilityResolver(registry);
+  const evidence = new EvidenceService(db, capabilities, resolver);
+
   registry.registerToolProvider(
     new CoreTeamToolProvider({
       delegateMember: (input) => resolveTeam().delegateMember(input),
@@ -103,9 +110,21 @@ export function createCapabilityStack(
       updateGoal: (input) => resolveTeam().updateGoalTool(input),
       replanTasks: (input) => resolveTeam().replanTasks(input),
       updateTask: (input) => resolveTeam().updateTask(input),
+      reportEvidence: (input) =>
+        evidence.recordEvidence(input.executionId, input.claims).then((result) =>
+          JSON.stringify({
+            evidenceScore: result.evidenceScore,
+            evidenceLevel: result.evidenceLevel,
+            claimCount: result.claims.length,
+          }),
+        ),
     }),
   );
-  registry.registerToolProvider(new KnowledgeToolProvider());
+  registry.registerToolProvider(
+    new KnowledgeToolProvider({
+      recordSeenCitations: (input) => evidence.recordSeen(input),
+    }),
+  );
   registry.registerToolProvider(new HostCodingToolProvider());
 
   // 会话文件：和 app.ts 一样先建服务再注册工具 —— 全局能力模板引用了
@@ -125,7 +144,8 @@ export function createCapabilityStack(
     capabilities,
     knowledge,
     registry,
-    resolver: new CapabilityResolver(registry),
+    resolver,
+    evidence,
     conversationFiles,
   };
 }
@@ -162,6 +182,7 @@ export function createTestStack(
     copilot,
     stack.capabilities,
     stack.resolver,
+    stack.evidence,
     structure,
     undefined,
     workManagement,

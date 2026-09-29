@@ -11,10 +11,12 @@ import type { CapabilityBinding } from '../../domain.js';
 import type { CapabilityService } from '../service.js';
 import type {
   CapabilityContext,
+  KnowledgeAuthority,
   KnowledgeDocument,
   KnowledgeProvider,
   KnowledgeSearchHit,
   KnowledgeSource,
+  ResolvedCitation,
 } from '../types.js';
 
 /**
@@ -67,6 +69,7 @@ export class LocalFilesystemKnowledgeProvider implements KnowledgeProvider {
         name: kb.name,
         description: kb.description,
         scope: kb.scope === 'personal' ? 'personal' : 'team',
+        authority: kb.authority,
       },
     ];
   }
@@ -117,6 +120,7 @@ export class LocalFilesystemKnowledgeProvider implements KnowledgeProvider {
       snippet: row.snippet,
       citation: citationOf(kb.key, row.document_id),
       sourceUri: row.source_uri,
+      authority: kb.authority,
     }));
   }
 
@@ -129,6 +133,7 @@ export class LocalFilesystemKnowledgeProvider implements KnowledgeProvider {
           kb.scope AS kb_scope,
           kb.key AS kb_key,
           kb.name AS kb_name,
+          kb.authority AS kb_authority,
           kb.member_id AS kb_member_id
         FROM knowledge_document d
         JOIN knowledge_base kb ON kb.id = d.knowledge_base_id
@@ -140,6 +145,7 @@ export class LocalFilesystemKnowledgeProvider implements KnowledgeProvider {
           kb_scope: KnowledgeBaseScope;
           kb_key: string;
           kb_name: string;
+          kb_authority: KnowledgeAuthority;
           kb_member_id: string | null;
         })
       | undefined;
@@ -154,6 +160,7 @@ export class LocalFilesystemKnowledgeProvider implements KnowledgeProvider {
       key: row.kb_key,
       name: row.kb_name,
       description: '',
+      authority: row.kb_authority,
       memberId: row.kb_member_id,
       createdAt: '',
       updatedAt: '',
@@ -173,6 +180,59 @@ export class LocalFilesystemKnowledgeProvider implements KnowledgeProvider {
       content,
       citation: citationOf(kb.key, row.id),
       sourceUri: row.source_uri,
+      authority: kb.authority,
+    };
+  }
+
+  /**
+   * 把 citation 还原成它指的那份资料，连同这个库的权威等级。
+   *
+   * 判据和 `open` 完全一致（同一个人、同一套 binding）：看不到的资料解析成
+   * null，而不是「解析成功但 authority 低」—— 否则「引用了一份自己没权限看的
+   * 权威资料」会被当成权威依据计进分数。
+   */
+  async resolveCitation(
+    context: CapabilityContext,
+    citation: string,
+  ): Promise<ResolvedCitation | null> {
+    const parsed = parseCitation(citation);
+    if (!parsed) return null;
+
+    const row = this.db
+      .prepare(
+        `
+        SELECT
+          d.id AS document_id,
+          d.title,
+          d.source_uri,
+          kb.id AS id,
+          kb.scope,
+          kb.key,
+          kb.name,
+          kb.description,
+          kb.authority,
+          kb.member_id,
+          kb.created_at,
+          kb.updated_at
+        FROM knowledge_document d
+        JOIN knowledge_base kb ON kb.id = d.knowledge_base_id
+        WHERE kb.key = ? AND d.id = ?
+        `,
+      )
+      .get(parsed.key, parsed.documentId) as unknown as
+      | (KnowledgeBaseRow & { document_id: string; title: string; source_uri: string | null })
+      | undefined;
+
+    if (!row) return null;
+
+    const kb = mapKnowledgeBase(row);
+    if (this.accessIssue(context.teamId, context.memberId, kb)) return null;
+
+    return {
+      citation: citation.trim(),
+      title: row.title,
+      sourceUri: row.source_uri,
+      authority: kb.authority,
     };
   }
 
@@ -213,7 +273,12 @@ export class LocalFilesystemKnowledgeProvider implements KnowledgeProvider {
     return Number(row?.count ?? 0);
   }
 
-  createTeamKnowledgeBase(input: { key: string; name: string; description?: string }): KnowledgeBase {
+  createTeamKnowledgeBase(input: {
+    key: string;
+    name: string;
+    description?: string;
+    authority?: KnowledgeAuthority;
+  }): KnowledgeBase {
     const key = safeSegment(input.key);
     if (this.findByKey('team', key)) {
       throw badRequest(`team Knowledge Base 已存在：${key}`);
@@ -224,11 +289,21 @@ export class LocalFilesystemKnowledgeProvider implements KnowledgeProvider {
     this.db
       .prepare(
         `
-        INSERT INTO knowledge_base (id, scope, key, name, description, member_id, created_at, updated_at)
-        VALUES (?, 'team', ?, ?, ?, NULL, ?, ?)
+        INSERT INTO knowledge_base (
+          id, scope, key, name, description, authority, member_id, created_at, updated_at
+        )
+        VALUES (?, 'team', ?, ?, ?, ?, NULL, ?, ?)
         `,
       )
-      .run(id, key, input.name.trim(), input.description?.trim() ?? '', timestamp, timestamp);
+      .run(
+        id,
+        key,
+        input.name.trim(),
+        input.description?.trim() ?? '',
+        input.authority ?? 'reference',
+        timestamp,
+        timestamp,
+      );
 
     const created = this.get(id);
     fs.mkdirSync(this.rootOf(created), { recursive: true });
@@ -251,8 +326,10 @@ export class LocalFilesystemKnowledgeProvider implements KnowledgeProvider {
     this.db
       .prepare(
         `
-        INSERT INTO knowledge_base (id, scope, key, name, description, member_id, created_at, updated_at)
-        VALUES (?, 'personal', ?, ?, ?, ?, ?, ?)
+        INSERT INTO knowledge_base (
+          id, scope, key, name, description, authority, member_id, created_at, updated_at
+        )
+        VALUES (?, 'personal', ?, ?, ?, 'reference', ?, ?, ?)
         `,
       )
       .run(
@@ -268,6 +345,28 @@ export class LocalFilesystemKnowledgeProvider implements KnowledgeProvider {
     const created = this.get(id);
     fs.mkdirSync(this.rootOf(created), { recursive: true });
     return created;
+  }
+
+  /**
+   * 改一个 team 库的权威等级。
+   *
+   * 只有 team 库能改：personal 是个人笔记，再怎么标也只是个人笔记，给它一个
+   * 「权威」的档位等于让「我记的」和「公司定的」在依据链里等权。
+   */
+  updateTeamKnowledgeBaseAuthority(
+    knowledgeBaseId: string,
+    authority: KnowledgeAuthority,
+  ): KnowledgeBase {
+    const kb = this.get(knowledgeBaseId);
+    if (kb.scope !== 'team') {
+      throw badRequest('只有团队资料库能设置来源等级，个人资料库固定是「参考」');
+    }
+
+    this.db
+      .prepare(`UPDATE knowledge_base SET authority = ?, updated_at = ? WHERE id = ?`)
+      .run(authority, now(), knowledgeBaseId);
+
+    return this.get(knowledgeBaseId);
   }
 
   /**
@@ -414,17 +513,29 @@ export class LocalFilesystemKnowledgeProvider implements KnowledgeProvider {
     return this.createTeamKnowledgeBase({ key: selector, name: selector });
   }
 
-  private assertMemberCanAccess(teamId: string, memberId: string, kb: KnowledgeBase): void {
+  /**
+   * 「这个 Member 能不能看这个库」的唯一判据。返回 null = 可以看。
+   *
+   * 断言版（抛 403）和布尔版（resolveCitation 用）共用它：判据写两遍的话，
+   * 一定会漂成「查得到但打开报错」或者反过来。
+   */
+  private accessIssue(teamId: string, memberId: string, kb: KnowledgeBase): string | null {
     // personal 的属主判断不能省：`$personal` 这条 binding 每个 Member 都有，
     // 光看 binding 会让 A 打开 B 的个人资料。
     if (kb.scope === 'personal' && kb.memberId !== memberId) {
-      throw forbidden('这是别人的个人资料库，没有权限查看');
+      return '这是别人的个人资料库，没有权限查看';
     }
 
-    const selector = kb.scope === 'personal' ? PERSONAL_SELECTOR : kb.key;
+    const selector = selectorOf(kb);
     if (!this.capabilities.hasEffectiveKnowledgeBinding(teamId, memberId, this.id, selector)) {
-      throw forbidden(`这个成员没有绑定资料库（${selector}），先在能力配置里勾选`);
+      return `这个成员没有绑定资料库（${selector}），先在能力配置里勾选`;
     }
+    return null;
+  }
+
+  private assertMemberCanAccess(teamId: string, memberId: string, kb: KnowledgeBase): void {
+    const issue = this.accessIssue(teamId, memberId, kb);
+    if (issue) throw forbidden(issue);
   }
 
   /** KB 根目录之下递归索引所有文件（相对路径即文档路径，标题取文件名）。 */
@@ -579,6 +690,8 @@ export interface KnowledgeBase {
   key: string;
   name: string;
   description: string;
+  /** 这个库作为资料来源的权威等级。personal 库固定 reference。 */
+  authority: KnowledgeAuthority;
   /** personal KB 的属主；team KB 为 null。 */
   memberId: string | null;
   createdAt: string;
@@ -604,6 +717,7 @@ interface KnowledgeBaseRow {
   key: string;
   name: string;
   description: string;
+  authority: KnowledgeAuthority;
   member_id: string | null;
   created_at: string;
   updated_at: string;
@@ -626,6 +740,7 @@ function mapKnowledgeBase(row: KnowledgeBaseRow): KnowledgeBase {
     key: row.key,
     name: row.name,
     description: row.description,
+    authority: row.authority,
     memberId: row.member_id,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -668,6 +783,18 @@ function toFtsQuery(query: string): string {
 
 function citationOf(kbKey: string, documentId: string): string {
   return `[KB:${kbKey}/${documentId}]`;
+}
+
+/** citationOf 的逆向。citation 是模型给的，格式不对就解析不出来，不去猜。 */
+function parseCitation(citation: string): { key: string; documentId: string } | null {
+  const match = /^\[KB:([^/]+)\/([^\]]+)\]$/.exec(citation.trim());
+  if (!match) return null;
+  return { key: match[1], documentId: match[2] };
+}
+
+/** 一个库在 capability_binding 里的写法。判据和建库共用，避免两处各拼一遍。 */
+function selectorOf(kb: KnowledgeBase): string {
+  return kb.scope === 'personal' ? PERSONAL_SELECTOR : kb.key;
 }
 
 function warnSkip(target: string, error: unknown): void {

@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { z } from 'zod';
 import type { TeamService } from '../team-service.js';
 import { sendError } from '../middleware/errorHandler.js';
 import { requireResourceConversationAccess } from '../middleware/conversationAccess.js';
@@ -23,6 +24,26 @@ export function tasksRouter(team: TeamService) {
     '/:id',
     requireResourceConversationAccess(team, (id) => team.getTask(id).conversationId, 'id', 'Task'),
   );
+
+  /**
+   * 设置「这个任务的结果要不要人看过」。
+   *
+   * Agent 没有这个 HTTP 能力（整段挂在 requireHumanAuth 下），它的工具
+   * plan_tasks / add_task / update_task 也都不认这个字段 —— 让被审核的一方
+   * 决定自己要不要被审核，开关就没有意义了。
+   */
+  router.patch('/:id/review-policy', (req, res) => {
+    const parsed = z.object({ requiresHumanReview: z.boolean() }).safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: '请求里要带 requiresHumanReview，值只能是 true 或 false' });
+      return;
+    }
+    try {
+      res.json({ task: team.setTaskHumanReview(req.params.id, parsed.data.requiresHumanReview) });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
 
   /** 单个 Task。 */
   router.get('/:id', (req, res) => {

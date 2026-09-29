@@ -13,10 +13,19 @@ import { canAdmin } from '../middleware/adminAccess.js';
  * 混在一个命名空间里，会让人以为换掉后端之后这套接口还会存在。
  */
 
+/**
+ * 资料来源等级。
+ *
+ * 建库时默认 reference：一个刚建出来的库没有任何凭据说明它是正式来源，
+ * 默认成 authoritative 等于让「谁先建库谁就权威」。
+ */
+const authoritySchema = z.enum(['authoritative', 'approved', 'reference']);
+
 const createBaseSchema = z.object({
   key: z.string().trim().min(1).max(200),
   name: z.string().trim().min(1).max(200),
   description: z.string().max(2000).optional(),
+  authority: authoritySchema.default('reference'),
 });
 
 const documentSchema = z.object({
@@ -45,6 +54,32 @@ export function knowledgeRouter(knowledge: LocalFilesystemKnowledgeProvider) {
     }
     try {
       res.status(201).json({ knowledgeBase: knowledge.createTeamKnowledgeBase(parsed.data) });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  // 改来源等级。和建库一样只有 admin 能改：这个等级直接决定依据链怎么给
+  // 引用打分，谁都能改的话分数就没有意义了。
+  router.patch('/team/:knowledgeBaseId/authority', (req, res) => {
+    if (!canAdmin(req)) {
+      res.status(403).json({ error: '需要 Team owner 或 admin 权限' });
+      return;
+    }
+    const parsed = authoritySchema.safeParse(req.body?.authority);
+    if (!parsed.success) {
+      res.status(400).json({
+        error: '来源等级只能是「正式来源」「已审核」「参考」这三种之一',
+      });
+      return;
+    }
+    try {
+      res.json({
+        knowledgeBase: knowledge.updateTeamKnowledgeBaseAuthority(
+          req.params.knowledgeBaseId,
+          parsed.data,
+        ),
+      });
     } catch (error) {
       sendError(res, error);
     }

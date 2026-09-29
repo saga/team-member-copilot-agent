@@ -54,6 +54,7 @@ interface TaskRow {
   blocker: string | null;
   current_execution_id: string | null;
   model_tier: string | null;
+  requires_human_review: number;
   sort_order: number;
   created_at: string;
   updated_at: string;
@@ -247,6 +248,8 @@ export class TaskService {
           result: null,
           blocker: null,
           current_execution_id: null,
+          // Agent 写入路径上一律 0：要不要人看只能由人设（setRequiresHumanReview）。
+          requires_human_review: 0,
           model_tier: normalizeModelTier(task.modelTier),
           sort_order: index,
           created_at: createdAt,
@@ -716,6 +719,22 @@ export class TaskService {
     return this.get(input.taskId);
   }
 
+  /**
+   * 设置「这个任务的结果要不要人看过」。
+   *
+   * Agent 的 plan / add / update 输入里都没有这个字段，所以这是唯一的写入路径，
+   * 调用方是 TeamService.setTaskHumanReview（那头由 Human-only 的 HTTP 路由进来）。
+   */
+  setRequiresHumanReview(taskId: string, required: boolean): ConversationTask {
+    const result = this.db
+      .prepare(`UPDATE conversation_task SET requires_human_review = ?, updated_at = ? WHERE id = ?`)
+      .run(required ? 1 : 0, now(), taskId);
+    if (Number(result.changes) === 0) {
+      throw notFound(`任务不存在：${taskId}`);
+    }
+    return this.get(taskId);
+  }
+
   requestClarification(input: {
     conversationId: string;
     memberId: string;
@@ -1064,6 +1083,7 @@ export function mapTask(row: TaskRow): ConversationTask {
     blocker: row.blocker,
     currentExecutionId: row.current_execution_id,
     modelTier: (row.model_tier ?? null) as TaskModelTier | null,
+    requiresHumanReview: Number(row.requires_human_review) === 1,
     sortOrder: row.sort_order,
     createdAt: row.created_at,
     updatedAt: row.updated_at,

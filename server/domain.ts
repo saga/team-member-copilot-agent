@@ -182,6 +182,17 @@ export interface ConversationTask {
    * 'strong' = 复杂任务升级到 Strong 模型。只能由 Lead 定。
    */
   modelTier: TaskModelTier | null;
+  /**
+   * 这个任务的结果要不要人看过才算数。
+   *
+   * 只能由人设置（PATCH /api/tasks/:id/review-policy）。Agent 的 plan_tasks /
+   * add_task / update_task 都不认这个字段 —— 让被审核的一方决定自己要不要
+   * 被审核，这个开关就没有意义了。
+   *
+   * 它管的是「要不要人看」，不是「这轮跑完没有」：跑完但没审核是一个合法
+   * 且常见的状态，不能因此把任务或执行标成失败。
+   */
+  requiresHumanReview: boolean;
   sortOrder: number;
   createdAt: string;
   updatedAt: string;

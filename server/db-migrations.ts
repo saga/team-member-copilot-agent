@@ -20,7 +20,7 @@ import type { DatabaseSync } from 'node:sqlite';
  *
  * 程序不认识任何别的编号 —— 没有升级代码，认出来也无从下手。
  */
-export const SCHEMA_VERSION = 29;
+export const SCHEMA_VERSION = 30;
 
 /**
  * 当前 schema 的完整定义，按最终形状写。
@@ -544,6 +544,13 @@ CREATE TABLE conversation_task (
   -- 只有 Lead 能在 plan/add 里定（'strong' 把某个复杂任务升级到 Strong 模型），
   -- update_task / reassign 改不到它 —— 执行人不能给自己升级。
   model_tier TEXT CHECK (model_tier IN ('cheap', 'standard', 'strong')),
+  -- 这个任务的结果要不要人看过才算数。
+  --
+  -- 只有人能通过 HTTP 改它（PATCH /api/tasks/:id/review-policy）：Agent 在
+  -- plan_tasks / add_task / update_task 里都碰不到这个字段。放在 Agent 的写入
+  -- 路径上，等于让它自己决定「我这份结论不用人看」。
+  requires_human_review INTEGER NOT NULL DEFAULT 0
+    CHECK (requires_human_review IN (0,1)),
   sort_order INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
@@ -742,6 +749,17 @@ CREATE TABLE knowledge_base (
   key TEXT NOT NULL,
   name TEXT NOT NULL,
   description TEXT NOT NULL DEFAULT '',
+
+  -- 这个库作为**资料来源**的权威等级，不代表里面每句话都正确：
+  --   authoritative = 正式政策 / 监管 / 官方事实源
+  --   approved      = 已审核通过的业务资料
+  --   reference     = 一般参考资料
+  --
+  -- 由人（Team owner / admin）设定，Agent 检索时看得到、改不了。
+  -- personal 库固定是 reference —— 自己记的东西再权威也只是个人笔记。
+  authority TEXT NOT NULL DEFAULT 'reference'
+    CHECK (authority IN ('authoritative', 'approved', 'reference')),
+
   member_id TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
@@ -1320,6 +1338,88 @@ CREATE TABLE worker_lease (
     resource_type,
     resource_id
   )
+);
+
+-- ─────────────────────────────────────────────── Evidence ────────────────
+--
+-- 一条执行结果的「依据」与「人工审核」。
+--
+-- 这条链刻意很窄，只回答三个问题，而且这三个问题**互不等价**：
+--
+--   execution.status   这轮 Agent 跑完了没有
+--   evidence_score     当前依据有多强
+--   review_status      人有没有看过
+--
+-- 所以「completed + 高分 + pending」是一个正常且常见的状态：Agent 已经干完活、
+-- 依据很硬，但这个任务被标了「要人看」，还没人看。不能因为没审核就把
+-- execution 改成 failed —— 那是把三件事合成了一件。
+--
+-- evidence_score **不是「正确率」也不是概率**。91 只能读成「当前证据强度
+-- 91/100」，读成「91% 可能是对的」就超过了它能支撑的结论。
+
+CREATE TABLE execution_evidence (
+  execution_id TEXT PRIMARY KEY,
+
+  evidence_score INTEGER NOT NULL DEFAULT 0
+    CHECK (evidence_score BETWEEN 0 AND 100),
+
+  evidence_level TEXT NOT NULL DEFAULT 'low'
+    CHECK (evidence_level IN ('low', 'medium', 'high')),
+
+  -- 只保留两级：没人看过 / 已经有人独立看过。
+  -- 不做「机器互评」「模型自评」这类中间态 —— 它们看着像审核，实际是
+  -- 同一个系统给自己打分。
+  verification_level TEXT NOT NULL DEFAULT 'none'
+    CHECK (verification_level IN ('none', 'human')),
+
+  review_required INTEGER NOT NULL DEFAULT 0
+    CHECK (review_required IN (0,1)),
+
+  review_status TEXT NOT NULL DEFAULT 'not_required'
+    CHECK (review_status IN (
+      'not_required',
+      'pending',
+      'approved',
+      'rejected'
+    )),
+
+  claims_json TEXT NOT NULL DEFAULT '[]',
+
+  review_note TEXT NOT NULL DEFAULT '',
+  reviewed_by TEXT,
+  reviewed_at TEXT,
+
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+
+  FOREIGN KEY (execution_id)
+    REFERENCES execution(id)
+    ON DELETE CASCADE
+);
+
+CREATE INDEX idx_execution_evidence_review
+  ON execution_evidence(review_required, review_status);
+
+-- 这一轮执行**真的检索过**哪些 citation。
+--
+-- 没有这张表，「引用」就只是 Agent 自己申报的一句话：它可以拿一个真实存在、
+-- 自己根本没看过的 citation 去支持一段毫不相干的结论，服务器从数据上无从
+-- 分辨（citation 洗衣）。有了它，report_evidence 只能从这个集合里挑。
+--
+-- 记的是「看到过」，不是「引用得当」—— 声明和结论到底对不对得上，仍然要人看。
+-- 写入方只有检索工具（search_knowledge / open_knowledge_document），
+-- Agent 没有任何路径能往这里加一行。
+CREATE TABLE execution_evidence_seen (
+  execution_id TEXT NOT NULL,
+  citation TEXT NOT NULL,
+  provider_id TEXT NOT NULL,
+  seen_at TEXT NOT NULL,
+
+  PRIMARY KEY (execution_id, citation),
+
+  FOREIGN KEY (execution_id)
+    REFERENCES execution(id)
+    ON DELETE CASCADE
 );
 `;
 

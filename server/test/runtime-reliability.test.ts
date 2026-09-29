@@ -240,7 +240,6 @@ describe('schema 就位（PRAGMA user_version）', () => {
         'conversation_file',
         'conversation_message_file',
         'conversation_file_fts',
-        'conversation_task',
         // 授权与证据链（见 db-migrations.ts 的对应段落）：
         //   data_entitlement        能碰什么数据
         //   policy_decision_audit   谁批的（含拒绝）
@@ -261,6 +260,9 @@ describe('schema 就位（PRAGMA user_version）', () => {
         'worker_lease',
         // 谁可以进这间房（human ACL）。conversation_member 只装 Agent。
         'conversation_participant',
+        // 依据链：这一轮的依据强度与审核状态，以及它真的检索过哪些引用。
+        'execution_evidence',
+        'execution_evidence_seen',
       ];
       assert.deepEqual(
         Object.fromEntries(tables.map((table) => [table, tableColumns(handle, table)])),
@@ -394,6 +396,7 @@ describe('schema 就位（PRAGMA user_version）', () => {
             'blocker',
             'current_execution_id',
             'model_tier',
+            'requires_human_review',
             'sort_order',
             'created_at',
             'updated_at',
@@ -479,6 +482,7 @@ describe('schema 就位（PRAGMA user_version）', () => {
           'key',
           'name',
           'description',
+          'authority',
           'member_id',
           'created_at',
           'updated_at',
@@ -636,6 +640,21 @@ describe('schema 就位（PRAGMA user_version）', () => {
           'added_by',
           'added_at',
         ],
+        execution_evidence: [
+          'execution_id',
+          'evidence_score',
+          'evidence_level',
+          'verification_level',
+          'review_required',
+          'review_status',
+          'claims_json',
+          'review_note',
+          'reviewed_by',
+          'reviewed_at',
+          'created_at',
+          'updated_at',
+        ],
+        execution_evidence_seen: ['execution_id', 'citation', 'provider_id', 'seen_at'],
       },
     );
 
@@ -669,6 +688,7 @@ describe('schema 就位（PRAGMA user_version）', () => {
         'idx_conversation_team',
         'idx_data_entitlement_lookup',
         'idx_execution_conversation_created',
+        'idx_execution_evidence_review',
         'idx_execution_external_work_key',
         'idx_execution_goal_revision',
         'idx_execution_parent',

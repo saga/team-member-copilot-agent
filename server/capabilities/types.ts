@@ -138,6 +138,21 @@ export interface KnowledgeDocument {
   content: string;
   citation: string;
   sourceUri: string | null;
+  authority?: KnowledgeAuthority;
+}
+
+/**
+ * 一个 citation 解析出来的样子。
+ *
+ * citation 的格式归 Provider 自己定（本地是 `[KB:<key>/<documentId>]`），
+ * 所以「这段引用到底指哪份资料、那份资料有多权威」也只有 Provider 答得出来。
+ * 平台只负责原样递进去、拿到结果 —— 它自己不去拼格式、也不直连任何一张表。
+ */
+export interface ResolvedCitation {
+  citation: string;
+  title: string;
+  sourceUri: string | null;
+  authority: KnowledgeAuthority;
 }
 
 export interface KnowledgeProvider {
@@ -165,6 +180,24 @@ export interface KnowledgeProvider {
    * 它能看的」。
    */
   open(context: CapabilityContext, documentRef: string): Promise<KnowledgeDocument>;
+
+  /**
+   * 把一个 citation 还原成「它来自哪份资料、那份资料有多权威」。
+   *
+   * ── 为什么要有这个方法 ────────────────────────────────────────────
+   *
+   * 依据链要按 citation 的权威等级打分，而 citation 长什么样是后端自己的事。
+   * 让调用方去拼 `[KB:key/documentId]` 再直连 knowledge_document 查，等于在
+   * 平台里开了第二条读取路径：换一个后端（企业搜索 / 远程 RAG）时，那条路径
+   * 不会报错，只会静默地算出错误的分数。
+   *
+   * 解析不出来（格式不对、这份资料不在它可见范围内）就返回 null：
+   * 「引用不成立」和「引用了但不权威」是两件事，调用方按前者记 0 分。
+   */
+  resolveCitation(
+    context: CapabilityContext,
+    citation: string,
+  ): Promise<ResolvedCitation | null>;
 }
 
 /** 一条 binding 解析后的结果：Provider 本体 + 原始 binding + 它能看到的源。 */

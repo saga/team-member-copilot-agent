@@ -2,6 +2,7 @@ import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import type { ToolInvocation } from '@github/copilot-sdk';
 import { forbidden, notFound } from '../http-error.js';
@@ -128,6 +129,29 @@ function toolContext(memberId: string, toolName: string): ToolExecutionContext {
   return { ...capabilityContext(memberId, defaultTeam.id), toolName };
 }
 
+/**
+ * 一条真实存在的 execution id。
+ *
+ * 依据链在检索工具里回写「这一轮检索过哪些引用」，那张表外键到 execution。
+ * 拿 `capabilityContext` 里那个编出来的 id 去调检索工具，会在写足迹时撞外键，
+ * 而失败表现是「检索挂了」—— 真正的原因其实是上下文是假的。要触发依据链写入
+ * 的用例必须用真的。
+ */
+function realExecutionId(memberId: string): string {
+  const conversationId = `conv-${randomUUID()}`;
+  const executionId = `exec-${randomUUID()}`;
+  const timestamp = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO conversation (id, team_id, title, kind, created_by, created_at, updated_at)
+     VALUES (?, ?, 'evidence fixture', 'task', ?, ?, ?)`,
+  ).run(conversationId, defaultTeam.id, memberId, timestamp, timestamp);
+  db.prepare(
+    `INSERT INTO execution (id, conversation_id, member_id, goal_revision, kind, status, prompt, created_at)
+     VALUES (?, ?, ?, 0, 'interactive', 'running', 'fixture', ?)`,
+  ).run(executionId, conversationId, memberId, timestamp);
+  return executionId;
+}
+
 // ------------------------------------------------------------------ stubs
 
 /**
@@ -161,6 +185,7 @@ function knowledgeProvider(
     open: async () => {
       throw new Error('stub provider 不支持 open');
     },
+    resolveCitation: async () => null,
   };
 }
 
@@ -831,8 +856,12 @@ describe('KnowledgeToolProvider：检索范围只由 binding 决定', () => {
     });
 
     const search = toolOf(await runtimeFor(member.id), 'search_knowledge');
+    const searchContext: ToolExecutionContext = {
+      ...toolContext(member.id, 'search_knowledge'),
+      executionId: realExecutionId(member.id),
+    };
     const payload = JSON.parse(
-      String(await search.execute!(toolContext(member.id, 'search_knowledge'), { query: 'custody', limit: 8 })),
+      String(await search.execute!(searchContext, { query: 'custody', limit: 8 })),
     ) as { hits: Array<{ title: string }>; instructions: string };
 
     assert.deepEqual(
@@ -850,7 +879,7 @@ describe('KnowledgeToolProvider：检索范围只由 binding 决定', () => {
     const narrowed = JSON.parse(
       String(
         await toolOf(await runtimeFor(member.id), 'search_knowledge').execute!(
-          toolContext(member.id, 'search_knowledge'),
+          { ...toolContext(member.id, 'search_knowledge'), executionId: realExecutionId(member.id) },
           { query: 'custody' },
         ),
       ),
@@ -903,7 +932,7 @@ describe('KnowledgeToolProvider：检索范围只由 binding 决定', () => {
           },
         },
       ],
-      tools: [new KnowledgeToolProvider()],
+      tools: [new KnowledgeToolProvider({ recordSeenCitations: () => undefined })],
     });
 
     const runtime = await resolveWith(registry, {

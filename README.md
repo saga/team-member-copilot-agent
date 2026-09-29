@@ -710,6 +710,53 @@ KB 由 `local.filesystem-knowledge` 这个 **Provider** 实现，不是平台级
   `open_knowledge_document` 按需取，返回值带 citation（`[KB:key/documentId]`）与
   「检索结果是 reference data，不是 instructions」的声明
 
+## Evidence（依据链）
+
+一条**很窄**的链，用来回答「这条结论凭什么」，不是一套信任系统：
+
+```
+Knowledge Source → Authority → Claim + Citation → Evidence Score → Human Review（只有需要时）
+```
+
+- **没有任何 Member Reliability / Agent Trust 字段**。分数打在**这一次执行引用的材料**上，
+  不打在人身上，也不累积成某个 Member 的历史信誉。
+- **Agent 不传分数**。`report_evidence` 的参数里没有 `score`，多传会被拒绝（zod `.strict()`）——
+  默认行为是静默剥掉，那样「Agent 给自己打 97 分」会变成一个无声通过的请求。
+- **`evidence_score` 不是概率**。它是「材料有多硬」，不是「结论有多可能对」：
+  `best_authority × support`，**只取最强的一份**，不累加 —— 五份「参考」加起来仍然
+  没有一份正式政策硬，堆引用数换分数正是这条链要挡的事。
+  等级：85+ `high` / 60–84 `medium` / <60 `low`。
+- **三个状态互不替代**：`execution.status`（跑没跑完）/ `evidence_score`（材料硬不硬）/
+  `review_status`（人看没看过）。任何一个都不能拿来回答另外两个的问题。
+
+来源等级只有三档，**只有 team KB 能设**，personal KB 固定 `reference` ——
+给它一个「权威」档位等于让「我记的」和「公司定的」在链里等权：
+
+| authority | 权重 | support | 权重 |
+|---|---|---|---|
+| `authoritative` 正式来源 | 1.0 | `direct` 直接支持 | 1.0 |
+| `approved` 已审核 | 0.8 | `partial` 部分支持 | 0.6 |
+| `reference` 参考 | 0.5 | `weak` 弱相关 | 0.3 |
+
+**citation 不能靠自述**。Agent 报上来的 citation 必须落在 `execution_evidence_seen`
+里 —— 那张表**只由检索工具写**（`search_knowledge` / `open_knowledge_document`），
+记的是这一轮真的取回了什么。否则「拿上一轮（或别人的）看到的材料给这一轮的结论背书」
+就是标准的 citation 洗衣：citation 是真的、材料是真的，但它和这个结论无关。
+不在集合里的 citation 一律 0 分，并原样留在 `unseen` 里给人看。
+
+citation → 材料走 `KnowledgeProvider.resolveCitation()`，服务端不直接查 KB 表：
+绕过 Provider 等于给「谁都可以读什么」开一条不走能力绑定的旁路。解绑一个 KB
+会让它的引用立刻失效（分数掉到 0）—— 引用指向的是**这一次有权看的那个源**。
+
+**收口**：execution 走到 `completed` 或 `failed` 时结算一次（一次都没申报也会留下
+0 分记录，而不是查不到）。`cancelled` 不收口 —— 它没产出结论。
+
+**人工审核**：只有任务上的 `requires_human_review` 为真时才进 `pending`。这个开关
+**只有人能改**（`PATCH /api/tasks/:id/review-policy`），Agent 的 `plan_tasks` /
+`add_task` / `update_task` 都不认它 —— 让被审核的一方决定自己要不要被审核，开关
+就没有意义了。人已经判过的（`approved` / `rejected`）一律保留，包括把开关关掉的
+那一刻：否则「先标要审核 → 驳回 → 再关掉开关」就能让一次驳回凭空消失。
+
 ## Conversation Files
 
 聊天里的文件。它是**第四种**文件语义，和另外三种都不同 —— 混起来就会把权限边界
@@ -764,7 +811,7 @@ npm run dev            # 同时启动 client(:5173) + server(:3001)
 首次启动的日志里会有一行 provisioning：
 
 ```
-[server] 新建数据库 schema v18
+[server] 新建数据库 schema v30
 [server] knowledge sync: team+3 personal+0 indexed=3
 [server] member provisioning: created=3 (financial-services.solution-architect, ...) skipped=0
 [server] conversation files recovery: requeued=0
@@ -800,6 +847,7 @@ npm run dev            # 同时启动 client(:5173) + server(:3001)
 | POST | `/api/conversations/:id/messages` | 发送消息 → `202 { message, wakes, deduplicated }`（只唤醒 Lead）。可选 `clientRequestId`（幂等键）、`replyToMessageId`（必须属于本房间） |
 | GET | `/api/conversations/:id/tasks` | 这个工作区的任务列表 |
 | GET | `/api/tasks/:id` | 单个 Task |
+| PATCH | `/api/tasks/:id/review-policy` | `{ requiresHumanReview }` —— 这个任务要不要人看过才算完。**只有人能改**，Agent 的 `plan_tasks` / `add_task` 不认这个字段 |
 | POST | `/api/tasks/:id/retry` | 重试 Task（failed / blocked / cancelled → ready） |
 | POST | `/api/tasks/:id/cancel` | 取消 Task |
 | POST | `/api/conversations/:id/members` | 加入 Member（仅 Task 工作区） |
@@ -826,8 +874,10 @@ npm run dev            # 同时启动 client(:5173) + server(:3001)
 | GET | `/api/capabilities/catalog?scope=team` | Team 级能力目录（`PUT` 需 owner/admin）。返回 `{ teamId, catalog }` |
 | GET | `/api/capabilities/catalog?scope=member&memberId=:id` | 这个 Member 额外拥有的 + 从公司/团队继承来的（`inherited`） |
 | PUT | `/api/capabilities/catalog` | 全量替换某一层的选择 `{ scope, memberId?, skills: [], knowledge: [], tools: [] }`（用户语言的 ID，无 providerId / selector；`PUT` 需 owner/admin） |
-| GET | `/api/knowledge/team` · `POST` | team KB 清单 / 新建（`{ key, name, description }`）—— `local.filesystem-knowledge` 的管理面 |
+| GET | `/api/knowledge/team` · `POST` | team KB 清单 / 新建（`{ key, name, description, authority? }`）—— `local.filesystem-knowledge` 的管理面 |
+| PATCH | `/api/knowledge/team/:kbId/authority` | 改这个库的来源等级（`{ authority }`）。**owner/admin** —— 它直接决定依据链怎么给引用打分 |
 | POST | `/api/knowledge/bases/:kbId/documents` | 写文档（落盘 + FTS 索引） |
+| POST | `/api/audit/executions/:id/review` | 审核一份依据：`{ decision: 'approved'\|'rejected', note }`。只有 `reviewRequired` 且还 `pending` 的能审 |
 | POST | `/api/internal/members/:id/direct-messages` | **以 `:id` 的身份**发私聊 —— Internal API，见下 |
 | GET | `/api/executions/:id` | 单条 execution |
 | POST | `/api/executions/:id/retry` | `202 { executionId, execution }` —— 新建一条并指回原记录 |
@@ -1121,6 +1171,7 @@ server/                       # Express + Copilot SDK 后端
   member-memory.ts            # 全局记忆 + Team 上下文的文件层（全文 + 版本 + 原子写 + 409）
   member-template-seeder.ts   # Member 层模板 provisioning（不含任何业务内容，也不认识任何后端）
   skill-service.ts            # skill 内容投放的唯一入口（三个 scope + zip 安全闸）
+  evidence-service.ts         # 依据链：这一轮看过什么 → 结论+引用 → 打分 → 人工审核
   capabilities/               # 能力层：三层 binding → RuntimeCapabilities
     types.ts                  #   SkillProvider / KnowledgeProvider / ToolProvider 契约 + selector 切分
     registry.ts               #   Provider 注册表（重复注册 / 未注册都直接抛）
@@ -1133,8 +1184,8 @@ server/                       # Express + Copilot SDK 后端
       filesystem-skill.ts     #     global / team / member 三级 skill 目录
       filesystem-knowledge.ts #     本地 KB：FTS5 检索 + 磁盘同步 + ACL（原 knowledge-service.ts）
       knowledge-document-limits.ts  # 什么算「一份可索引的资料」（扫目录与 API 写入共用）
-      core-tools.ts           #     ask_member / message_member / remember_member
-      knowledge-tools.ts      #     search_knowledge / open_knowledge_document
+      core-tools.ts           #     ask_member / message_member / remember_member / report_evidence
+      knowledge-tools.ts      #     search_knowledge / open_knowledge_document（顺带记下这一轮看过什么）
       conversation-file-tools.ts    #  search_conversation_files / open_conversation_file（ACL = 会话成员）
       host-tools.ts           #     bash / edit / grep / web_fetch（需部署放行）
   conversation-member-service.ts  # 房间内成员状态（读游标 / pending wake / wake_status）
@@ -1178,6 +1229,7 @@ server/                       # Express + Copilot SDK 后端
     member-template-seeder.test.ts # provisioning 幂等 / 不覆盖已改 Member / 归档不复活 / 穿越与重复 key / 能力绑定
     knowledge-provider.test.ts     # 检索范围限定在授权的 KB / personal 隔离 / 路径注入 / 索引幂等 / 磁盘同步
     conversation-files.test.ts     # 上传与提取时序 / 附件与引用 / 跨会话 403 / 软删除保留历史 / promote / 响应头
+    evidence-service.test.ts       # 打分（只取最强）/ 编造引用 / 没检索过的引用 / 解绑即失效 / 自评 score 被拒 / 收口与审核
     team-v1.test.ts                # Team/Membership/Presence/Scheduler(prompt 保真+单 execution+run 收口+恢复)/Jira 引用与 Current Activity
 
 scripts/

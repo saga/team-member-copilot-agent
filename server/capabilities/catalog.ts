@@ -162,6 +162,9 @@ const TOOL_DISPLAY: Record<string, { displayName: string; group: string }> = {
   ask_member: { displayName: 'Ask another member', group: 'Team collaboration' },
   message_member: { displayName: 'Message another member', group: 'Team collaboration' },
   remember_member: { displayName: 'Remember information', group: 'Memory' },
+  // 依据申报归到「治理」组：它和 remember 不同，写的是这一轮结论的出处，
+  // 不是长期事实。放在 Memory 里会让人以为它也是「记住点什么」。
+  report_evidence: { displayName: 'Report evidence', group: 'Governance' },
   bash: { displayName: 'Run commands', group: 'Workspace & Web' },
   edit: { displayName: 'Edit files', group: 'Workspace & Web' },
   grep: { displayName: 'Search files', group: 'Workspace & Web' },

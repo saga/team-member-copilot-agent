@@ -89,6 +89,7 @@ describe('Resolver：Tool selector 只给点名的工具', () => {
       'reassign_task',
       'remember_member',
       'replan_tasks',
+      'report_evidence',
       'request_clarification',
       'update_goal',
       'update_task',

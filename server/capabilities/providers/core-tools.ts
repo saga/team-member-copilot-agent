@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import type { CapabilityBinding } from '../../domain.js';
 import type { RuntimeTool, ToolProvider, ToolProviderContext } from '../types.js';
+import type { EvidenceSupport } from '../../evidence-service.js';
 
 /**
  * 团队协作工具（原来硬编码在 CopilotService 里的三个 custom tool）。
@@ -29,6 +30,20 @@ export interface CoreToolHost {
     memberId: string;
     teamId: string;
     content: string;
+  }): Promise<string>;
+
+  /**
+   * 申报这一轮结论的依据。
+   *
+   * Agent 只给「结论 + 引用 + 支持程度」，分数由服务器算。
+   */
+  reportEvidence(input: {
+    executionId: string;
+    claims: Array<{
+      claim: string;
+      citations: string[];
+      support: EvidenceSupport;
+    }>;
   }): Promise<string>;
 
   /**
@@ -235,6 +250,56 @@ export class CoreTeamToolProvider implements ToolProvider {
             teamId: context.teamId,
             content: String(args.content),
           }),
+      },
+      {
+        providerId: this.id,
+        implementation: 'app' as const,
+        kind: 'custom',
+        name: 'report_evidence',
+        description:
+          'Record what your important conclusions in this turn are based on. ' +
+          'Copy citation markers exactly as returned by search_knowledge or ' +
+          'open_knowledge_document (for example [KB:policy/documentId]). ' +
+          'Support means how directly the material backs the claim. ' +
+          'Do not invent citations and do not score yourself: the server computes ' +
+          'evidence strength, and citations you did not actually retrieve count as zero.',
+        risk: 'coordination',
+        parameters: z.object({
+          claims: z
+            .array(
+              z.object({
+                claim: z.string().min(1).max(4000).describe('The conclusion you are backing'),
+                citations: z
+                  .array(z.string().min(1).max(300))
+                  .max(8)
+                  .describe('Citation markers you actually retrieved this turn'),
+                support: z
+                  .enum(['direct', 'partial', 'weak'])
+                  .describe('How directly the cited material backs the claim'),
+              })
+                // strict：zod 默认会把 `score` 这类多余的键**静默剥掉**，于是
+                // 「Agent 给自己打 97 分」会变成一个无声通过的请求。这里要的是
+                // 拒绝，让模型看见「没有这个参数」，而不是假装没收到。
+                .strict(),
+            )
+            .min(1)
+            .max(12),
+        }),
+        execute: (context, args) => {
+          const claims = (
+            args as {
+              claims: Array<{ claim: string; citations: string[]; support: EvidenceSupport }>;
+            }
+          ).claims;
+          return this.host.reportEvidence({
+            executionId: context.executionId,
+            claims: claims.map((claim) => ({
+              claim: String(claim.claim),
+              citations: claim.citations.map(String),
+              support: claim.support,
+            })),
+          });
+        },
       },
       {
         providerId: this.id,

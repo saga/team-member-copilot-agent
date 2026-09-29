@@ -49,6 +49,7 @@ import { executionsRouter } from './routes/executions.js';
 import { tasksRouter } from './routes/tasks.js';
 import { commandsRouter } from './routes/commands.js';
 import { auditRouter } from './routes/audit.js';
+import { EvidenceService } from './evidence-service.js';
 import { teamRouter } from './routes/team.js';
 import { workManagementRouter, describeWebhookBoundary } from './routes/work-management.js';
 import { mcpRouter } from './routes/mcp.js';
@@ -146,9 +147,19 @@ registry.registerToolProvider(
     updateGoal: (input) => teamService.updateGoalTool(input),
     replanTasks: (input) => teamService.replanTasks(input),
     updateTask: (input) => teamService.updateTask(input),
+    reportEvidence: (input) =>
+      evidenceService.recordEvidence(input.executionId, input.claims).then((evidence) =>
+        JSON.stringify({
+          evidenceScore: evidence.evidenceScore,
+          evidenceLevel: evidence.evidenceLevel,
+          claimCount: evidence.claims.length,
+          // 把没检索过的引用回给模型：它得知道这次申报没被采信，而不是只看到
+          // 一个分数然后以为是「引用得不够多」。
+          unseenCitations: evidence.claims.flatMap((claim) => claim.unseen),
+        }),
+      ),
   }),
 );
-registry.registerToolProvider(new KnowledgeToolProvider());
 registry.registerToolProvider(new HostCodingToolProvider());
 
 // MCP Server 定义：DB（mcp_server 表）是运行时 source of truth，
@@ -260,6 +271,24 @@ if (jiraConfigured) {
 const capabilityResolver = new CapabilityResolver(registry, new EnvSecretProvider());
 
 /**
+ * 依据链。
+ *
+ * 检索工具往这里回写「这一轮真的检索过哪些引用」，Agent 的申报在这里被校验、
+ * 打分、留痕。它不认识任何具体 Provider：citation 解析一律交回注册进来的
+ * KnowledgeProvider（见 evidence-service.ts 的 resolveCitation）。
+ */
+const evidenceService = new EvidenceService(db, capabilityService, capabilityResolver);
+
+// 知识检索工具在这里注册而不是和上面那批一起：它要把「看到过的引用」写回
+// evidenceService，所以必须排在它后面。注册顺序不影响解析 —— resolver 是
+// 在 resolve() 那一刻才去 registry 里查的。
+registry.registerToolProvider(
+  new KnowledgeToolProvider({
+    recordSeenCitations: (input) => evidenceService.recordSeen(input),
+  }),
+);
+
+/**
  * 会话文件（聊天附件）。
  *
  * 它在 TeamService **之前**构造：TeamService 要用它挂附件、取附件。反向的那条
@@ -313,6 +342,7 @@ teamService = new TeamService(
   copilotService,
   capabilityService,
   capabilityResolver,
+  evidenceService,
   structureService,
   // Member Activity：业务工作在 Jira，本地广播「谁在跑哪张工单的这一轮」。
   (teamId, type, payload) => teamEvents.append(teamId, type, payload),
@@ -387,7 +417,7 @@ app.use('/api/tasks', ...humanApi, tasksRouter(teamService));
 // 这个路由是唯一的放行出口（审批 / 驳回 / 显式执行）。
 app.use('/api/commands', ...humanApi, commandsRouter(teamService, commandService, auditService));
 // 事后证据：一次 execution 的判定 / 调用 / 业务动作三张表，支持导出。
-app.use('/api/audit', ...humanApi, auditRouter(teamService, auditService));
+app.use('/api/audit', ...humanApi, auditRouter(teamService, auditService, evidenceService));
 // 以某个 Member 的身份说话 —— 独立的命名空间 + token 门禁，见 middleware/apiScope.ts
 app.use('/api/internal', internalRouter(teamService));
 app.use('/api/mcp', ...humanApi, mcpRouter(mcpServerService));
@@ -427,6 +457,7 @@ export {
   schedulerService,
   conversationFiles,
   conversationFileProcessor,
+  evidenceService,
   teamEvents,
   workManagement,
   entitlementService,

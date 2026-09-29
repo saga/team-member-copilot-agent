@@ -16,6 +16,7 @@ import { TaskService, parseRequirements, parseStringArray, type TaskPlanInput } 
 import { badRequest, conflict, forbidden, notFound } from './http-error.js';
 import { MemberConversationService, type MemberDirectMessage } from './member-conversation-service.js';
 import type { ConversationFileService } from './conversation-file-service.js';
+import type { EvidenceService } from './evidence-service.js';
 import {
   MemberService,
   type CreateMemberInput,
@@ -348,6 +349,12 @@ export class TeamService {
      * 就不再反映这一轮真的用了什么。
      */
     private readonly capabilityResolver: CapabilityResolver,
+    /**
+     * 依据链。**必填**，而且排在可选参数之前：不传的话 execution 收口时不会建
+     * 依据记录，而「没有记录」和「没这个功能」在审计里长得一模一样 —— 那正是
+     * 这类可选依赖最容易留下的静默缺口。
+     */
+    private readonly evidence: EvidenceService,
     private readonly structure?: TeamStructureService,
     /** Member Activity 的 Team 级广播口。结构服务不认识 execution，所以在这里发。 */
     private readonly onTeamActivity?: TeamChangeSink,
@@ -1200,6 +1207,22 @@ export class TeamService {
     blocker?: string;
   }): Promise<string> {
     return this.taskApplication.updateTask(input);
+  }
+
+  /**
+   * 设置「这个任务的结果要不要人看过」。
+   *
+   * 这是**人**的开关，Agent 的工具路径上没有它（planTasks / addTask / updateTask
+   * 都不认这个字段）。把审核要求放进 Agent 的写入面，等于让被审核的一方决定
+   * 自己要不要被审核。
+   *
+   * 改的是任务行，不是已有证据：已经跑完的那几轮各自记着自己的审核状态，
+   * 不会因为这里开关一下就被改写。
+   */
+  setTaskHumanReview(taskId: string, required: boolean): ConversationTask {
+    const task = this.tasks.setRequiresHumanReview(taskId, required);
+    this.emit(task.conversationId, { type: 'task.updated', data: task });
+    return task;
   }
 
   private latestExecutionFor(conversationId: string, memberId: string): string | null {
@@ -2391,6 +2414,10 @@ export class TeamService {
         );
       }
 
+      // 依据链收口放在 completed **写回成功**之后：写回被 fencing 挡下时这一轮
+      // 的结果并不落库，给它建依据记录等于替接手的那个副本记账。
+      if (completedWrite) this.evidence.finalizeExecution(executionId);
+
       if (message) this.emit(input.conversation.id, { type: 'message.created', data: message });
       this.emitExecution(this.getExecution(executionId));
       this.touchConversation(input.conversation.id);
@@ -2464,6 +2491,10 @@ export class TeamService {
           `[team] execution ${executionId}: 终态写回被 fencing 拒绝（租约已被其他 worker 接手），本进程不再修改这条记录`,
         );
       }
+      // 跑挂了也要有一条 0 分依据：「没提供依据」和「没跑完」是两件事，
+      // 审计里必须分得开。取消的不建 —— 那一轮的工作根本没发生。
+      if (terminalWrite && !cancelled) this.evidence.finalizeExecution(executionId);
+
       this.emitExecution(this.getExecution(executionId));
       this.touchAgentPresence(input.member.id);
 
@@ -2721,7 +2752,14 @@ export class TeamService {
         .filter((source) => (scope === 'personal' ? source.scope === 'personal' : source.scope !== 'personal'));
       return sources.length
         ? sources
-            .map((source) => `- ${source.name} (${source.id}): ${source.description || '(no description)'}`)
+            // authority 直接写进清单：模型选材料时要能一眼看出哪份是正式来源。
+            // 只在检索结果里给，等于让它先检索一次才知道该信谁。
+            .map(
+              (source) =>
+                `- ${source.name} (${source.id}, authority=${source.authority ?? 'reference'}): ${
+                  source.description || '(no description)'
+                }`,
+            )
             .join('\n')
         : '(none)';
     };
@@ -2779,6 +2817,16 @@ export class TeamService {
       '5. Preserve the citation marker (e.g. [KB:key/documentId]) for material enterprise-specific claims.',
       '6. Absence of a document is not proof that something is prohibited or permitted.',
       '7. If authoritative Team Knowledge is missing or contradictory, say so explicitly.',
+      '',
+      'Evidence:',
+      '8. For material factual, policy, compliance, or business claims, prefer retrieved evidence over model memory.',
+      '9. A citation proves where the material came from; it does not by itself prove the claim is correct.',
+      '10. Before finishing substantive work, call report_evidence for the claims that materially affect your conclusion.',
+      '11. Use only citation markers actually returned by search_knowledge or open_knowledge_document. Never invent one.',
+      '12. A citation you did not retrieve this turn counts as zero evidence, so do not pad a claim with extra markers.',
+      '13. authoritative means a formal, current source; approved means reviewed business material; reference means useful but not authoritative.',
+      '14. Never say a claim is verified, approved, or confirmed unless the review status explicitly says so.',
+      '15. If authoritative evidence is missing or contradictory, say the evidence is insufficient instead of filling the gap from model memory.',
       '',
       'Retrieval:',
       'Use search_knowledge to find material across the sources listed above;',

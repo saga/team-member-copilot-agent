@@ -1176,6 +1176,72 @@ MUTATIONS = [
             )
         ],
     },
+    {
+        "name": "依据：不校验「这一轮检索过没有」（拿别的轮次看到的材料来背书）",
+        "test": "server/test/evidence-service.test.ts",
+        "steps": [
+            (
+                "server/evidence-service.ts",
+                "      if (!seen.has(citation)) {\n        unseen.push(citation);\n        continue;\n      }\n",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "依据：多份引用取平均而不是取最强（堆引用数换分数）",
+        "test": "server/test/evidence-service.test.ts",
+        "steps": [
+            (
+                "server/evidence-service.ts",
+                "    const bestAuthority = Math.max(\n      ...sources.map((source) => AUTHORITY_WEIGHT[source.authority] ?? 0),\n    );\n",
+                "    const weights = sources.map((source) => AUTHORITY_WEIGHT[source.authority] ?? 0);\n    const bestAuthority = weights.reduce((sum, weight) => sum + weight, 0) / weights.length;\n",
+            )
+        ],
+    },
+    {
+        "name": "依据：收口不读任务上的审核开关（标了要人看也永远 not_required）",
+        "test": "server/test/evidence-service.test.ts",
+        "steps": [
+            (
+                "server/evidence-service.ts",
+                "    const reviewRequired = Number(task?.requires_human_review ?? 0) === 1;\n",
+                "    const reviewRequired = false;\n",
+            )
+        ],
+    },
+    {
+        "name": "依据：关掉审核开关时抹掉已判结果（一次驳回凭空消失）",
+        "test": "server/test/evidence-service.test.ts",
+        "steps": [
+            (
+                "server/evidence-service.ts",
+                "    const decided =\n      evidence.reviewStatus === 'approved' || evidence.reviewStatus === 'rejected';\n    const reviewStatus = decided\n      ? evidence.reviewStatus\n      : reviewRequired\n        ? 'pending'\n        : 'not_required';\n",
+                "    const reviewStatus = reviewRequired ? 'pending' : 'not_required';\n",
+            )
+        ],
+    },
+    {
+        "name": "依据：Agent 可以给自己传 score（自评重新生效）",
+        "test": "server/test/evidence-service.test.ts",
+        "steps": [
+            (
+                "server/capabilities/providers/core-tools.ts",
+                "                .strict(),\n",
+                "                .passthrough(),\n",
+            )
+        ],
+    },
+    {
+        "name": "依据：个人库也能设成权威来源（我记的 = 公司定的）",
+        "test": "server/test/evidence-service.test.ts",
+        "steps": [
+            (
+                "server/capabilities/providers/filesystem-knowledge.ts",
+                "    if (kb.scope !== 'team') {\n      throw badRequest('只有团队资料库能设置来源等级，个人资料库固定是「参考」');\n    }\n",
+                "",
+            )
+        ],
+    },
 ]
 
 
