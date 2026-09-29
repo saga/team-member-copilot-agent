@@ -65,7 +65,6 @@ const memberTemplateSchema = z.object({
   name: z.string().min(1).max(100),
   role: z.string().min(1).max(200),
   description: z.string().max(2000).default(''),
-  style: z.string().max(2000).default(''),
   /**
    * `null` = 用部署的默认模型（`COPILOT_MODEL`）。
    *
@@ -224,7 +223,6 @@ export function seedMemberTemplates(
         handle: template.handle,
         role: template.role,
         description: template.description,
-        style: template.style,
         systemPrompt,
         model: template.model ?? undefined,
       },

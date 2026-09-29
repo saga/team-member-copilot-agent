@@ -20,7 +20,7 @@ import type { DatabaseSync } from 'node:sqlite';
  *
  * 程序不认识任何别的编号 —— 没有升级代码，认出来也无从下手。
  */
-export const SCHEMA_VERSION = 30;
+export const SCHEMA_VERSION = 31;
 
 /**
  * 当前 schema 的完整定义，按最终形状写。
@@ -36,7 +36,6 @@ CREATE TABLE member (
   name TEXT NOT NULL,
   role TEXT NOT NULL,
   description TEXT NOT NULL DEFAULT '',
-  style TEXT NOT NULL DEFAULT '',
   system_prompt TEXT NOT NULL DEFAULT '',
   model TEXT,
   status TEXT NOT NULL DEFAULT 'active'
@@ -544,6 +543,9 @@ CREATE TABLE conversation_task (
   -- 只有 Lead 能在 plan/add 里定（'strong' 把某个复杂任务升级到 Strong 模型），
   -- update_task / reassign 改不到它 —— 执行人不能给自己升级。
   model_tier TEXT CHECK (model_tier IN ('cheap', 'standard', 'strong')),
+  -- 是否独立分析：1 = 不读取共享房间 transcript，防止第二意见被第一意见锚定。
+  independent_context INTEGER NOT NULL DEFAULT 0
+    CHECK (independent_context IN (0, 1)),
   -- 这个任务的结果要不要人看过才算数。
   --
   -- 只有人能通过 HTTP 改它（PATCH /api/tasks/:id/review-policy）：Agent 在

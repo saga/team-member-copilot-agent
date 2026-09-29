@@ -15,7 +15,6 @@ const createMemberSchema = z.object({
   handle: z.string().trim().min(1).max(50).optional(),
   role: z.string().trim().min(1).max(200),
   description: z.string().max(2000).optional(),
-  style: z.string().max(2000).optional(),
   systemPrompt: z.string().max(12000).optional(),
   model: z.string().trim().min(1).max(100).optional(),
 });
@@ -38,7 +37,6 @@ const updateMemberSchema = z.object({
   handle: z.string().trim().min(1).max(50).optional(),
   role: z.string().trim().min(1).max(200).optional(),
   description: z.string().max(2000).optional(),
-  style: z.string().max(2000).optional(),
   systemPrompt: z.string().max(12000).optional(),
   model: z.string().trim().max(100).nullable().optional(),
   status: z.enum(['active', 'archived']).optional(),

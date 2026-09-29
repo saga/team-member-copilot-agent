@@ -82,7 +82,6 @@ interface MemberRow {
   name: string;
   role: string;
   description: string;
-  style: string;
   system_prompt: string;
   model: string | null;
   status: 'active' | 'archived';
@@ -993,6 +992,7 @@ export class TeamService {
       dependencies?: string[];
       acceptanceCriteria?: string[];
       modelTier?: 'cheap' | 'standard' | 'strong';
+      independentContext?: boolean;
     }>;
   }): Promise<string> {
     return this.taskApplication.planTasks(input);
@@ -1032,6 +1032,7 @@ export class TeamService {
     dependencies?: string[];
     acceptanceCriteria?: string[];
     modelTier?: 'cheap' | 'standard' | 'strong';
+    independentContext?: boolean;
   }): Promise<string> {
     return this.taskApplication.addTask(input);
   }
@@ -2000,7 +2001,6 @@ export class TeamService {
         name: member.name,
         role: member.role,
         description: member.description,
-        style: member.style,
         systemPrompt: member.system_prompt,
         model: member.model,
         status: member.status,

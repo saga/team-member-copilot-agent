@@ -32,6 +32,8 @@ export interface TaskPlanInput {
    * 'strong' 把某个复杂任务升级到 Strong 模型。
    */
   modelTier?: TaskModelTier | null;
+  /** 独立分析：不读共享房间 transcript。默认 false。 */
+  independentContext?: boolean;
 }
 
 /** refreshReady 一次扫出的两种变化：新就绪的与新被阻塞的。 */
@@ -54,6 +56,7 @@ interface TaskRow {
   blocker: string | null;
   current_execution_id: string | null;
   model_tier: string | null;
+  independent_context: number;
   requires_human_review: number;
   sort_order: number;
   created_at: string;
@@ -251,6 +254,7 @@ export class TaskService {
           // Agent 写入路径上一律 0：要不要人看只能由人设（setRequiresHumanReview）。
           requires_human_review: 0,
           model_tier: normalizeModelTier(task.modelTier),
+          independent_context: task.independentContext ? 1 : 0,
           sort_order: index,
           created_at: createdAt,
           updated_at: createdAt,
@@ -260,13 +264,13 @@ export class TaskService {
             `INSERT INTO conversation_task (
               id, conversation_id, goal_revision, title, description, assignee_member_id, status,
               dependencies_json, acceptance_criteria_json, result, blocker,
-              current_execution_id, model_tier, sort_order, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              current_execution_id, model_tier, independent_context, sort_order, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           )
           .run(
             row.id, row.conversation_id, row.goal_revision, row.title, row.description, row.assignee_member_id,
             row.status, row.dependencies_json, row.acceptance_criteria_json, row.result,
-            row.blocker, row.current_execution_id, row.model_tier, row.sort_order, row.created_at, row.updated_at,
+            row.blocker, row.current_execution_id, row.model_tier, row.independent_context, row.sort_order, row.created_at, row.updated_at,
           );
         created.push(mapTask(row));
       });
@@ -564,11 +568,12 @@ export class TaskService {
               blocker,
               current_execution_id,
               model_tier,
+              independent_context,
               sort_order,
               created_at,
               updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, NULL, NULL, NULL, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?)
             `,
           )
           .run(
@@ -585,6 +590,7 @@ export class TaskService {
             ),
             JSON.stringify((task.acceptanceCriteria ?? []).slice(0, 20)),
             normalizeModelTier(task.modelTier),
+            task.independentContext ? 1 : 0,
             index,
             createdAt,
             createdAt,
@@ -619,6 +625,7 @@ export class TaskService {
     dependencies?: string[];
     acceptanceCriteria?: string[];
     modelTier?: TaskModelTier | null;
+    independentContext?: boolean;
   }): ConversationTask {
     const currentRevision = (
       this.db
@@ -678,8 +685,8 @@ export class TaskService {
         `INSERT INTO conversation_task (
           id, conversation_id, goal_revision, title, description, assignee_member_id, status,
           dependencies_json, acceptance_criteria_json, result, blocker,
-          current_execution_id, model_tier, sort_order, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, NULL, NULL, NULL, ?, ?, ?, ?)`,
+          current_execution_id, model_tier, independent_context, sort_order, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -691,6 +698,7 @@ export class TaskService {
         JSON.stringify(dependencies),
         JSON.stringify((input.acceptanceCriteria ?? []).slice(0, 20)),
         normalizeModelTier(input.modelTier),
+        input.independentContext ? 1 : 0,
         sortRow.sort_order,
         createdAt,
         createdAt,
@@ -1083,6 +1091,7 @@ export function mapTask(row: TaskRow): ConversationTask {
     blocker: row.blocker,
     currentExecutionId: row.current_execution_id,
     modelTier: (row.model_tier ?? null) as TaskModelTier | null,
+    independentContext: row.independent_context === 1,
     requiresHumanReview: Number(row.requires_human_review) === 1,
     sortOrder: row.sort_order,
     createdAt: row.created_at,

@@ -32,7 +32,6 @@ export interface Member {
   name: string;
   role: string;
   description: string;
-  style: string;
   systemPrompt: string;
   model: string | null;
   status: 'active' | 'archived';
@@ -891,7 +890,6 @@ export const api = {
     handle?: string;
     role: string;
     description?: string;
-    style?: string;
     systemPrompt?: string;
     model?: string;
   }): Promise<{ member: Member }> {
@@ -913,7 +911,6 @@ export const api = {
       handle?: string;
       role?: string;
       description?: string;
-      style?: string;
       systemPrompt?: string;
       model?: string | null;
       status?: 'active' | 'archived';

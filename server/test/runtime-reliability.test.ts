@@ -273,7 +273,6 @@ describe('schema 就位（PRAGMA user_version）', () => {
             'name',
             'role',
             'description',
-            'style',
             'system_prompt',
             'model',
             'status',
@@ -396,6 +395,7 @@ describe('schema 就位（PRAGMA user_version）', () => {
             'blocker',
             'current_execution_id',
             'model_tier',
+            'independent_context',
             'requires_human_review',
             'sort_order',
             'created_at',
@@ -837,6 +837,47 @@ describe('ContextAssembler：增量上下文而不是整段重放', () => {
     assert.ok(runtime.last_context_message_sequence > 0);
   });
 
+});
+
+describe('独立 Task 不读共享房间上下文', () => {
+  it('independent task 不读取 shared conversation messages，也不推进水位线', async () => {
+    const conv = team.createConversation({
+      kind: 'task',
+      title: 'Isolated',
+      memberIds: [alice.id, bob.id],
+      leadMemberId: alice.id,
+    });
+    // 先让房间里有讨论内容，再建独立任务：普通任务会看到这些，
+    // independent 任务必须看不到。
+    await sendMessage({ actorId: 'test-user', conversationId: conv.id, content: 'ROOM-CHATTER-MARKER' });
+    await team.planTasks({
+      conversationId: conv.id,
+      memberId: alice.id,
+      objective: '独立审查',
+      requirements: { facts: [], assumptions: [], constraints: [], successCriteria: [] },
+      tasks: [{ key: 'iso', title: 'IsoTask', assigneeMemberId: bob.id, independentContext: true }],
+    });
+    await waitForConversationIdle(conv.id);
+
+    const bobTurns = stub.turnsFor(bob.id);
+    assert.ok(bobTurns.length > 0, '独立任务也要执行');
+    const bobPrompt = bobTurns.at(-1)!.prompt;
+    assert.match(bobPrompt, /IsoTask/, '自己的任务描述必须在 prompt 里');
+    assert.doesNotMatch(
+      bobPrompt,
+      /ROOM-CHATTER-MARKER/,
+      '房间讨论不能进独立任务的 prompt，否则第二意见就被第一意见锚定了',
+    );
+
+    // 没读过的消息不能标成已消费：水位线必须原地不动。
+    const runtime = runtimeRow(conv.id, bob.id);
+    assert.ok(runtime);
+    assert.equal(
+      runtime.last_context_message_sequence,
+      0,
+      '独立任务没读房间消息，水位线不能推进',
+    );
+  });
 });
 
 describe('checkpoint 只在 turn 成功后推进', () => {

@@ -1,5 +1,3 @@
-import fs from 'node:fs';
-import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { now } from './db.js';
@@ -26,7 +24,6 @@ interface MemberRow {
   name: string;
   role: string;
   description: string;
-  style: string;
   system_prompt: string;
   model: string | null;
   status: 'active' | 'archived';
@@ -35,12 +32,12 @@ interface MemberRow {
   updated_at: string;
 }
 
+
 export interface CreateMemberInput {
   name: string;
   handle?: string;
   role: string;
   description?: string;
-  style?: string;
   systemPrompt?: string;
   model?: string;
 }
@@ -62,7 +59,6 @@ export interface UpdateMemberInput {
   handle?: string;
   role?: string;
   description?: string;
-  style?: string;
   systemPrompt?: string;
   model?: string | null;
   status?: 'active' | 'archived';
@@ -75,7 +71,6 @@ function mapRow(row: MemberRow): Member {
     name: row.name,
     role: row.role,
     description: row.description,
-    style: row.style,
     systemPrompt: row.system_prompt,
     model: row.model,
     status: row.status,
@@ -99,7 +94,7 @@ export interface MemberMemory extends MemoryDocument {}
 
 /**
  * 长期 Member 身份。Member 是跨 conversation 稳定的业务对象，
- * 它的 SOUL / memory / skills 落在 member home，而不是任何 conversation 里。
+ * 它的 memory / skills 落在 member home，而不是任何 conversation 里。
  *
  * Skill 的安装 / 列举 / 删除**不在这里** —— 见 `skill-service.ts`。skill 内容
  * 投放有三个 scope（global / team / member），把它挂在「某个 Member」的服务上
@@ -163,7 +158,6 @@ export class MemberService {
           name,
           role,
           description,
-          style,
           system_prompt,
           model,
           status,
@@ -171,7 +165,7 @@ export class MemberService {
           created_at,
           updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
         `,
       )
       .run(
@@ -180,7 +174,6 @@ export class MemberService {
         input.name.trim(),
         role,
         input.description?.trim() ?? '',
-        input.style?.trim() ?? '',
         input.systemPrompt?.trim() ?? '',
         input.model?.trim() || null,
         options.seedKey ?? null,
@@ -196,9 +189,7 @@ export class MemberService {
       this.replaceMemory(id, options.initialMemory);
     }
 
-    const member = this.get(id);
-    this.writeSoul(member);
-    return member;
+    return this.get(id);
   }
 
   update(id: string, input: UpdateMemberInput): Member {
@@ -208,7 +199,6 @@ export class MemberService {
       handle: input.handle === undefined ? current.handle : this.resolveHandle(input.handle, id),
       role: input.role ?? current.role,
       description: input.description ?? current.description,
-      style: input.style ?? current.style,
       systemPrompt: input.systemPrompt ?? current.systemPrompt,
       model: input.model === undefined ? current.model : input.model?.trim() || null,
       status: input.status ?? current.status,
@@ -224,7 +214,6 @@ export class MemberService {
           handle = ?,
           role = ?,
           description = ?,
-          style = ?,
           system_prompt = ?,
           model = ?,
           status = ?,
@@ -237,7 +226,6 @@ export class MemberService {
         next.handle,
         next.role,
         next.description,
-        next.style,
         next.systemPrompt,
         next.model,
         next.status,
@@ -245,9 +233,7 @@ export class MemberService {
         id,
       );
 
-    const member = this.get(id);
-    this.writeSoul(member);
-    return member;
+    return this.get(id);
   }
 
   archive(id: string): void {
@@ -362,26 +348,4 @@ export class MemberService {
     ensureMemberHome(memberId);
   }
 
-  private writeSoul(member: Member): void {
-    const file = path.join(this.homePath(member.id), 'SOUL.md');
-    const content = `# ${member.name}
-
-## Role
-${member.role}
-
-## Description
-${member.description}
-
-## Style
-${member.style}
-
-## System Prompt
-${member.systemPrompt}
-
-## Authorization
-Your role describes how you work. It does not grant authorization to access data,
-execute privileged actions, approve requests, or bypass application policy.
-`;
-    fs.writeFileSync(file, content, 'utf8');
-  }
 }

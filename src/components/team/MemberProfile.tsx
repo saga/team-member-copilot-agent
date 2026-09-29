@@ -22,7 +22,7 @@ type TabKey = 'profile' | 'memory' | 'team' | 'skills';
  *
  * 四个页签对应 Member 模型的四块：
  *
- *   Profile —— 它是谁（跨 Team 稳定的人格）
+ *   Profile —— Identity & Work Contract
  *   Memory  —— 跨 Team 稳定的长期习惯
  *   Team Context —— 只属于当前 Team 的上下文
  *   Skills  —— 这个 Member 自己的 skill 目录

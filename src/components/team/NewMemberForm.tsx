@@ -9,7 +9,7 @@ interface NewMemberFormProps {
 /**
  * 快速新建 Member：只收 name + role。
  *
- * 剩下的 description / style / systemPrompt / model 由 MemberProfile 补 ——
+ * 剩下的 description / systemPrompt / model 由 MemberProfile 补 ——
  * 那是一个需要人认真填的表单，不该塞进侧栏。
  */
 export function NewMemberForm({ onCreate, onCancel }: NewMemberFormProps) {

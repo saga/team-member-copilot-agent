@@ -118,24 +118,36 @@ export class ContextAssembler {
       MessageRow[];
 
     const messages = rows.map(mapMessage);
+    // 独立分析的 Task（independentContext）与 delegation 不读共享房间记录：
+    // 第二意见不能先被第一意见锚定。delegation 只拿 task 包里的结构化事实。
+    const isolatedTask =
+      input.turnMode === 'delegation' ||
+      (input.turnMode === 'task' && input.currentTask?.independentContext === true);
+
     // 水位线要覆盖「读到的全部消息」，包括被过滤掉的那两类：
     // 它们的内容确实已经进了 session history。
     //
     // 注意它取的是**读到的**最后一条，而不是注入窗口的最后一条：窗口是按大小
     // 截的，截法是保留最新的那些，所以两者在正常情况下重合；但即使不重合，
     // checkpoint 也必须是「这一轮真的处理到哪」——否则同一批消息每轮重放。
-    const consumedThroughSequence =
-      messages.length > 0
+    //
+    // 独立 Task 例外：没读过的消息不能标成已消费，否则等于把没看过的房间
+    // 记录悄悄丢掉，水位线只会单调吞掉它们。
+    const consumedThroughSequence = isolatedTask
+      ? input.runtime.lastContextMessageSequence
+      : messages.length > 0
         ? messages[messages.length - 1].messageSequence
         : input.runtime.lastContextMessageSequence;
 
-    const relevant = messages.filter((message) => {
-      // 当前 runtime 自己产出的历史消息已经在 session history 里（assistant turn）
-      if (message.senderType === 'member' && message.senderId === input.runtime.memberId) {
-        return false;
-      }
-      return message.messageSequence !== input.triggerMessageSequence;
-    });
+    const relevant = isolatedTask
+      ? []
+      : messages.filter((message) => {
+          // 当前 runtime 自己产出的历史消息已经在 session history 里（assistant turn）
+          if (message.senderType === 'member' && message.senderId === input.runtime.memberId) {
+            return false;
+          }
+          return message.messageSequence !== input.triggerMessageSequence;
+        });
 
     const { included, elided } = selectWindow(
       relevant,
@@ -230,33 +242,6 @@ export class ContextAssembler {
       sections.push(header, [notice, this.transcript(sharedMessages)].filter(Boolean).join('\n\n'));
     }
 
-    // 同一条 mention chain 的前序回答：窗口截断可能把它裁掉，这里确定性补一份。
-    // 只补 sharedMessages 里没有的 —— 重复贴两遍是浪费 token。
-    if (input.turnMode === 'mention' && input.triggerMessageSequence !== null) {
-      const previousMentionResponses = this.findPreviousMentionResponses(
-        input.conversation.id,
-        input.triggerMessageSequence,
-        input.member.id,
-      );
-      if (previousMentionResponses.length > 0) {
-        const alreadyVisible = new Set(sharedMessages.map((message) => message.id));
-        const omittedPreviousResponses = previousMentionResponses.filter(
-          (message) => !alreadyVisible.has(message.id),
-        );
-        if (omittedPreviousResponses.length > 0) {
-          sections.push(
-            [
-              'Previous Member responses to this same user request:',
-              this.transcript(omittedPreviousResponses),
-              '',
-              'These responses were produced earlier in this same mention round.',
-              'Build on them instead of repeating them.',
-            ].join('\n'),
-          );
-        }
-      }
-    }
-
     if (input.turnMode === 'delegation') {
       sections.push('Task:', input.currentPrompt);
       return sections.join('\n\n');
@@ -329,35 +314,6 @@ export class ContextAssembler {
     return lines.filter(Boolean).join('\n');
   }
 
-  /**
-   * 同一条 mention chain 里、当前 Member 之前已经回答完的 Member 回复。
-   *
-   * 判据是 execution 行（同 trigger + user_mention + completed），不是消息时间：
-   * 只有真正跑完的那一轮才有完整回答，进窗口一半的半截内容不算。
-   */
-  private findPreviousMentionResponses(
-    conversationId: string,
-    triggerMessageSequence: number,
-    currentMemberId: string,
-  ): ConversationMessage[] {
-    const rows = this.db
-      .prepare(
-        `SELECT m.* FROM conversation_message m
-         JOIN execution e ON e.id = m.execution_id
-         WHERE m.conversation_id = ?
-           AND m.message_sequence > ?
-           AND m.sender_type = 'member'
-           AND m.sender_id <> ?
-           AND e.trigger_message_sequence = ?
-           AND e.wake_reason = 'user_mention'
-           AND e.status = 'completed'
-         ORDER BY m.message_sequence`,
-      )
-      .all(conversationId, triggerMessageSequence, currentMemberId, triggerMessageSequence) as unknown as
-      MessageRow[];
-    return rows.map(mapMessage);
-  }
-
   private transcript(messages: ConversationMessage[]): string {
     const names = this.memberNames();
     return messages
@@ -386,26 +342,18 @@ export class ContextAssembler {
 }
 
 const MEMBER_MENTION_INSTRUCTION = [
-  'You were directly addressed by the user with an @mention in this task workspace.',
-  'Answer the user directly from your own role, expertise, and available capabilities.',
+  'You were directly addressed by the user.',
+  'Answer independently from your assigned role, available capabilities, and evidence.',
   '',
-  'MULTI-MEMBER MENTION:',
-  'This may be an ordered multi-member mention round.',
-  'Earlier Members in the same user request may already have answered before you.',
-  'Review those earlier answers before producing your response.',
-  'Treat their responses as working context, not authoritative truth.',
-  'Do not repeat points that have already been adequately explained.',
-  'Focus on what is missing, different, deeper, or more actionable from your own perspective.',
-  'If another Member identified a risk, requirement, or conclusion, build on it instead of restarting the analysis.',
-  'If you disagree with a previous answer, explicitly explain the disagreement.',
-  'If there is no materially new information to add, say so briefly rather than producing another generic answer.',
+  'Other Members may provide different answers.',
+  'Do not treat another Member conclusion as evidence.',
+  'Do not anchor on another Member conclusion unless the user explicitly asks for a comparison or review.',
+  'Focus on your own analysis and the evidence available to you.',
   '',
   'DIRECT RESPONSE:',
-  'Do not route the user back through the Lead merely because you are not the Lead.',
-  'Do not act as a coordinator unless the user explicitly asks you to coordinate the team.',
+  'Answer the user directly.',
+  'Do not act as the coordinator unless explicitly asked.',
   'Do not create or re-plan the workspace task plan.',
-  'Use available knowledge and tools when useful.',
-  'Keep the answer focused on the question you were directly asked.',
 ].join('\n');
 
 const MEMBER_DM_INSTRUCTION = [
@@ -435,6 +383,19 @@ const LEAD_INSTRUCTION = [
   'Do not assume the Jira issue is complete just because it exists.',
   'Check the available description, acceptance criteria, current status, existing subtasks and dependencies.',
   'If the Jira information is materially incomplete, ask the user instead of inventing missing business requirements.',
+  '',
+  'MULTI-AGENT ROUTING:',
+  'Start with the smallest number of workers that can complete the work correctly.',
+  'Do not create multiple Members merely because different roles exist.',
+  'Prefer a single strong worker when the work is sequential, tightly coupled, ' +
+    'based on the same context, difficult to split cleanly, or unlikely to benefit ' +
+    'from independent verification.',
+  'Use multiple workers only when there is a real reason: independent parallel ' +
+    'workstreams, independent second opinion, different data or authorization ' +
+    'boundaries, different tools or runtime capabilities, context size requires ' +
+    'separation, or long-running independent execution.',
+  'Different personas are not a reason to create another task.',
+  'Different names are not a reason to create another task.',
   '',
   'TASK PLANNING:',
   'If the workspace has no tasks, create the initial execution plan with plan_tasks.',

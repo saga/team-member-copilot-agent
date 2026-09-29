@@ -73,6 +73,7 @@ interface TemplateFiles {
   key: string;
   handle?: string;
   name?: string;
+  role?: string;
   extraManifest?: Record<string, unknown>;
   systemPrompt?: string;
   memory?: string;
@@ -107,7 +108,7 @@ function writeTemplate(root: string, directory: string, files: TemplateFiles): v
       key: files.key,
       handle: files.handle ?? directory.replace(/[^a-z0-9-]/gi, '-'),
       name: files.name ?? directory,
-      role: files.extraManifest?.role ?? 'Test Role',
+      role: files.role ?? 'Test Role',
       systemPromptFile: files.systemPromptFile ?? 'SYSTEM_PROMPT.md',
       memoryFile: files.memoryFile ?? 'MEMORY.md',
       capabilities: files.capabilities ?? FIXTURE_CAPABILITIES,
@@ -174,9 +175,11 @@ describe('真实模板目录：三个默认 Member', () => {
       );
     }
 
-    // system prompt 是从磁盘读进来的，不是模板 JSON 里的某个字符串字段
+    // system prompt 是从磁盘读进来的，不是模板 JSON 里的某个字符串字段；
+    // 开头是工作契约（Role + Output contract），不是“你是一位资深……”人格描述
     assert.ok(architect.systemPrompt.length > 200, 'architect 的 system prompt 应该来自 SYSTEM_PROMPT.md');
-    assert.match(architect.systemPrompt, /解决方案架构师/);
+    assert.match(architect.systemPrompt, /architecture planning worker/);
+    assert.doesNotMatch(architect.systemPrompt, /你是一位资深/);
 
     // 模板里 model 是 null → 用部署默认模型，而不是某个写死的模型名
     assert.equal(architect.model, null);
@@ -266,6 +269,21 @@ describe('模板只负责第一次', () => {
       'Template prompt v1',
       '模板是 baseline，不是 source of truth —— 升级必须是显式操作',
     );
+  });
+
+  it('模板不再需要 style 字段，没有它也能正常 provision', () => {
+    const root = newTemplateRoot();
+    writeTemplate(root, 'nostyle', {
+      key: 'test.nostyle',
+      handle: 'nostyle',
+      name: 'NoStyle',
+      role: 'Reviewer',
+    });
+
+    seedMemberTemplates(memberService, root, stack.capabilities, stack.resolver);
+    const created = memberService.findBySeedKey('test.nostyle')!;
+    assert.equal(created.handle, 'nostyle');
+    assert.ok(!('style' in created), 'Member 对象上不该再有 style');
   });
 
   it('初始记忆写进 member home 的 MEMORY.md', () => {

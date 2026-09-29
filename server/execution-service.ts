@@ -1204,12 +1204,9 @@ export class ExecutionService {
     };
 
     return [
-      `You are ${member.name}.`,
+      `Member role: ${member.role}`,
       '',
-      `Role: ${member.role}`,
-      `Description: ${member.description}`,
-      `Style: ${member.style}`,
-      '',
+      'Work contract:',
       member.systemPrompt,
       '',
       'Authorization rule:',

@@ -84,9 +84,16 @@ export interface Member {
   id: string;
   handle: string;
   name: string;
+  /** 工作职责，不等于能力。 */
   role: string;
+  /** 给 UI 展示的简短说明，不作为授权，也不作为主要模型指令。 */
   description: string;
-  style: string;
+  /**
+   * Member 的工作契约 / system prompt。
+   *
+   * 描述它负责什么、如何工作、输出什么、哪些事情不负责。
+   * 不代表授权，也不是安全边界。
+   */
   systemPrompt: string;
   model: string | null;
   status: MemberStatus;
@@ -182,6 +189,13 @@ export interface ConversationTask {
    * 'strong' = 复杂任务升级到 Strong 模型。只能由 Lead 定。
    */
   modelTier: TaskModelTier | null;
+  /**
+   * 是否独立分析。
+   *
+   * true 时不把房间内其它 Agent 的讨论结果注入本次 Task 的共享上下文，
+   * 防止第二意见被第一意见锚定。
+   */
+  independentContext: boolean;
   /**
    * 这个任务的结果要不要人看过才算数。
    *
@@ -508,10 +522,10 @@ export type ExecutionStatus =
  * 为什么需要它：Member 的配置（system prompt / memory / 能力组成 / model）是
  * **会变的**，而 execution 是「当时真的这样跑过一轮」的记录。没有快照，事后只能
  * 看到两条 execution 行为不同，看不到它们的输入不同 —— 尤其是 retry：同一份
- * prompt 在今天重跑，用的已经是另一个人格、另一份记忆、另一组能力。
+ * prompt 在今天重跑，用的已经是另一份 work contract、另一份记忆、另一组能力。
  *
  * `memberRevision` 用 `member.updated_at`：它是这个 Member 身份字段的写序号，
- * 换过任何一个人格字段都会变。
+ * 换过任何一个身份字段都会变。
  *
  * `capabilityManifestHash` 覆盖 skill / knowledge / tool 三层的组成与版本。
  * 单独记 skill 清单是不够的 —— 9 月 25 日和 9 月 30 日可以是同一份 system

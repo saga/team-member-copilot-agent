@@ -29,4 +29,13 @@ describe('Member schema', () => {
     assert.equal('toolProfile' in parsed, false);
     assert.equal('capabilities' in parsed, false);
   });
+
+  it('Member 身份里没有 style —— strip 模式下多传会被丢掉，不可能写进库', () => {
+    const parsed = CreateMemberBody.parse({
+      name: 'Researcher',
+      role: 'Research Analyst',
+      style: '严谨、怀疑、证据优先',
+    }) as Record<string, unknown>;
+    assert.equal('style' in parsed, false);
+  });
 });

@@ -36,6 +36,7 @@ export class TaskApplicationService {
       dependencies?: string[];
       acceptanceCriteria?: string[];
       modelTier?: 'cheap' | 'standard' | 'strong';
+      independentContext?: boolean;
     }>;
   }): Promise<string> {
     const conversation = this.internals.getConversation(input.conversationId);
@@ -73,6 +74,7 @@ export class TaskApplicationService {
     dependencies?: string[];
     acceptanceCriteria?: string[];
     modelTier?: 'cheap' | 'standard' | 'strong';
+    independentContext?: boolean;
   }): Promise<string> {
     const conversation = this.internals.getConversation(input.conversationId);
     this.internals.requireActiveMember(conversation, input.memberId);
@@ -88,6 +90,7 @@ export class TaskApplicationService {
       dependencies: input.dependencies,
       acceptanceCriteria: input.acceptanceCriteria,
       modelTier: input.modelTier,
+      independentContext: input.independentContext,
     });
     this.internals.emit(conversation.id, { type: 'task.updated', data: task });
     this.internals.emit(conversation.id, { type: 'conversation.updated', data: this.internals.getConversation(conversation.id) });

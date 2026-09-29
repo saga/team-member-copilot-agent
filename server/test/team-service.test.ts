@@ -168,7 +168,7 @@ describe('Member 是跨 conversation 的长期身份', () => {
   it('member home 落在 .data/members/<id> 下，与 conversation 无关', () => {
     const home = memberService.homePath(researcher.id);
     assert.equal(home, path.join(config.memberHomeRoot, researcher.id));
-    assert.ok(fs.existsSync(path.join(home, 'SOUL.md')));
+    assert.ok(!fs.existsSync(path.join(home, 'SOUL.md')), 'SOUL.md 已删除，不再生成');
     assert.ok(fs.existsSync(path.join(home, 'memory', 'MEMORY.md')));
     assert.ok(fs.existsSync(path.join(home, 'skills')));
   });
@@ -481,6 +481,32 @@ describe('delegation 业务控制', () => {
 
     // 子 execution 用的是 Coder 在这个 conversation 里的独立 runtime
     assert.equal(child.runtime_id, runtimeRow(teamConversationId, coder.id)?.id);
+  });
+
+  it('delegation 只拿聚焦的 task 上下文，不继承房间闲聊 transcript', async () => {
+    const { executionId } = await sendMessage({ actorId: 'test-user', conversationId: teamConversationId,
+      content: 'ROOM-SMALLTALK-MARKER unrelated chatter',
+    });
+    await waitForStatus(executionId, 'completed');
+
+    await team.delegateMember({
+      conversationId: teamConversationId,
+      fromMemberId: researcher.id,
+      parentExecutionId: executionId,
+      targetMemberId: coder.id,
+      task: 'FOCUSED-DELEGATION-TASK 检查授权逻辑',
+    });
+    await waitForConversationIdle(teamConversationId);
+
+    const coderTurns = stub.turns.filter((turn) => turn.member.id === coder.id);
+    assert.ok(coderTurns.length > 0);
+    const prompt = coderTurns.at(-1)!.prompt;
+    assert.match(prompt, /FOCUSED-DELEGATION-TASK/, '聚焦的 task 必须在 prompt 里');
+    assert.doesNotMatch(
+      prompt,
+      /ROOM-SMALLTALK-MARKER/,
+      '房间闲聊不能进 delegation 的默认输入，调用方要在 task 里给足信息',
+    );
   });
 
   it('A → B → C → A 被拒绝（cycle 跨层级）', async () => {

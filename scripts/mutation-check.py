@@ -719,7 +719,7 @@ MUTATIONS = [
         "test": "server/test/model-policy.test.ts",
         "steps": [
             (
-                "server/team-service.ts",
+                "server/execution-service.ts",
                 "      const userFacingTurn =\n        input.turnMode === 'lead' ||\n        input.turnMode === 'mention' ||\n        input.turnMode === 'member_message';\n      if (content && userFacingTurn && !goalStale) {",
                 "      if (content) {",
             )
@@ -1061,7 +1061,7 @@ MUTATIONS = [
         "test": "server/test/member-mention-routing.test.ts",
         "steps": [
             (
-                "server/team-service.ts",
+                "server/execution-service.ts",
                 "      const userFacingTurn =\n        input.turnMode === 'lead' ||\n        input.turnMode === 'mention' ||\n        input.turnMode === 'member_message';\n",
                 "      const userFacingTurn = input.turnMode === 'lead';\n",
             )

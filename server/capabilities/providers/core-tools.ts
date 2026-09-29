@@ -85,6 +85,7 @@ export interface CoreToolHost {
       dependencies?: string[];
       acceptanceCriteria?: string[];
       modelTier?: 'cheap' | 'standard' | 'strong';
+      independentContext?: boolean;
     }>;
   }): Promise<string>;
 
@@ -97,6 +98,7 @@ export interface CoreToolHost {
     dependencies?: string[];
     acceptanceCriteria?: string[];
     modelTier?: 'cheap' | 'standard' | 'strong';
+    independentContext?: boolean;
   }): Promise<string>;
 
   reassignTask(input: {
@@ -136,6 +138,7 @@ export interface CoreToolHost {
       dependencies?: string[];
       acceptanceCriteria?: string[];
       modelTier?: 'cheap' | 'standard' | 'strong';
+      independentContext?: boolean;
     }>;
   }): Promise<string>;
 
@@ -166,8 +169,11 @@ export class CoreTeamToolProvider implements ToolProvider {
         kind: 'custom',
         name: 'ask_member',
         description:
-          'Ask another Team Member to perform a focused piece of work. ' +
-          'This creates a delegated execution in the current conversation.',
+          'Delegate a focused piece of work to another specialized worker. ' +
+          'Use this only when another worker has a materially different: ' +
+          'responsibility, capability, knowledge scope, tool set, or independent verification role. ' +
+          'Do not use this merely to get another conversational opinion. ' +
+          'Do not delegate work that the current worker can complete directly.',
         risk: 'coordination',
         parameters: z.object({
           memberId: z.string().describe('Target Team Member ID'),
@@ -380,6 +386,7 @@ export class CoreTeamToolProvider implements ToolProvider {
                 dependencies: z.array(z.string()).max(20).default([]),
                 acceptanceCriteria: z.array(z.string().min(1).max(1000)).max(20).default([]),
                 modelTier: z.enum(['cheap', 'standard', 'strong']).optional(),
+                independentContext: z.boolean().optional(),
               }),
             )
             .min(1)
@@ -405,7 +412,13 @@ export class CoreTeamToolProvider implements ToolProvider {
           'reassign_task when an unstarted task has the wrong assignee. ' +
           'Set modelTier to strong for an unusually complex task that needs the strongest model; ' +
           'omit it to follow the assignee default. ' +
-          'Tasks start automatically once dependencies are met.',
+          'Tasks start automatically once dependencies are met. ' +
+          'Do not create multiple tasks merely to simulate different team members. ' +
+          'Prefer one strong worker when one worker can complete the work. ' +
+          'Use multiple workers only when the work has genuinely different: ' +
+          'parallel workstreams, data or capability boundaries, tools, contexts, ' +
+          'responsibilities, or independent review requirements. ' +
+          'Set independentContext=true for an independent second opinion or adversarial review.',
         risk: 'coordination',
         availableTo: ['lead'],
         parameters: z.object({
@@ -437,6 +450,7 @@ export class CoreTeamToolProvider implements ToolProvider {
                 acceptanceCriteria: z.array(z.string().min(1).max(1000)).max(20).default([]),
                 // 只有 Lead 能定：复杂任务升级 Strong。省略 = 跟执行人默认。
                 modelTier: z.enum(['cheap', 'standard', 'strong']).optional(),
+                independentContext: z.boolean().optional(),
               }),
             )
             .min(1)
@@ -471,6 +485,7 @@ export class CoreTeamToolProvider implements ToolProvider {
           dependencies: z.array(z.string().min(1)).max(20).default([]),
           acceptanceCriteria: z.array(z.string().min(1).max(1000)).max(20).default([]),
           modelTier: z.enum(['cheap', 'standard', 'strong']).optional(),
+          independentContext: z.boolean().optional(),
         }),
         execute: (context, args) =>
           this.host.addTask({
@@ -484,6 +499,9 @@ export class CoreTeamToolProvider implements ToolProvider {
             ...((args as { modelTier?: string }).modelTier === undefined
               ? {}
               : { modelTier: (args as { modelTier: 'cheap' | 'standard' | 'strong' }).modelTier }),
+            ...((args as { independentContext?: boolean }).independentContext === undefined
+              ? {}
+              : { independentContext: Boolean((args as { independentContext?: boolean }).independentContext) }),
           }),
       },
       {

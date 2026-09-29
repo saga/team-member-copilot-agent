@@ -879,8 +879,9 @@ B
 这样：
 
 ```text
-不同 Member = parallel
-同一 Member = serial
+Independent workstream = parallel
+Same Member = serial
+Different Member does NOT automatically imply parallelism.
 ```
 
 ---
@@ -4873,6 +4874,57 @@ Audit Evidence
 ### 8
 
 > **Recovery 的第一原则是避免重复副作用，而不是追求自动重跑率。**
+
+### 9
+
+> **Member = persistent specialized agent worker。**
+
+```text
+Member provides:
+- stable identity
+- role/work contract
+- model
+- capability scope
+- knowledge scope
+- memory
+- runtime session
+- task ownership
+```
+
+Persona / personality affects presentation and interaction style,
+but is not treated as a capability multiplier.
+
+### Member specialization rule
+
+A separate Member is justified only when at least one is materially different:
+
+1. data
+2. tools
+3. context
+4. responsibility
+5. output contract
+6. execution lifecycle
+
+Different names, personalities, or styles alone are not sufficient.
+
+### Multi-Agent is an execution strategy, not a product requirement
+
+Default:
+
+```text
+Single strong Agent + Skills + MCP + Knowledge
+```
+
+Use multiple Agents only when decomposition creates a real benefit:
+
+- parallelism
+- specialization
+- independent verification
+- context isolation
+- capability/data boundary
+- long-running independent work
+
+Do not create multiple Agents only to simulate a human team.
 
 ---
 

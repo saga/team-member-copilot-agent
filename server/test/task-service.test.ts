@@ -358,6 +358,71 @@ describe('Task 执行', () => {
   });
 });
 
+describe('Task 独立上下文 independentContext', () => {
+  const requirements = { facts: [], assumptions: [], constraints: [], successCriteria: [] };
+
+  it('默认 independentContext = false；plan/add/replan 可设 true；只有 Lead 能设', async () => {
+    const room = team.createConversation({
+      kind: 'task',
+      title: 'IndependentDefault',
+      memberIds: [alice.id, bob.id],
+      leadMemberId: alice.id,
+    });
+    // 执行人静音：任务停在 ready 不开跑，工作区不会提前 completed。
+    team.setMemberMuted(room.id, bob.id, true);
+    await team.planTasks({
+      conversationId: room.id,
+      memberId: alice.id,
+      objective: '默认关闭',
+      requirements,
+      tasks: [{ key: 'a', title: 'A', assigneeMemberId: bob.id }],
+    });
+    assert.equal(team.listTasks(room.id)[0].independentContext, false);
+
+    // 非 Lead 连门都进不去
+    await assert.rejects(
+      () =>
+        team.addTask({
+          conversationId: room.id,
+          memberId: bob.id,
+          title: 'B',
+          assigneeMemberId: bob.id,
+          independentContext: true,
+        }),
+      /Lead/,
+    );
+
+    await team.addTask({
+      conversationId: room.id,
+      memberId: alice.id,
+      title: 'B',
+      assigneeMemberId: bob.id,
+      independentContext: true,
+    });
+    await waitForConversationIdle(room.id);
+    const tasks = team.listTasks(room.id);
+    assert.equal(tasks.find((task) => task.title === 'B')?.independentContext, true);
+    assert.equal(tasks.find((task) => task.title === 'A')?.independentContext, false);
+
+    // replan 同样可以设置
+    await team.updateGoal({
+      conversationId: room.id,
+      actorType: 'user',
+      actorId: 'u1',
+      objective: '改成做 C',
+      changeKind: 'scope_change',
+    });
+    await team.replanTasks({
+      conversationId: room.id,
+      memberId: alice.id,
+      tasks: [{ key: 'c', title: 'C', assigneeMemberId: bob.id, independentContext: true }],
+    });
+    team.setMemberMuted(room.id, bob.id, false);
+    await waitForConversationIdle(room.id);
+    assert.equal(team.listTasks(room.id)[0].independentContext, true);
+  });
+});
+
 describe('Task 生命周期补严', () => {
   const requirements = { facts: [], assumptions: [], constraints: [], successCriteria: [] };
 

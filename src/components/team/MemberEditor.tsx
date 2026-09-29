@@ -15,10 +15,10 @@ interface MemberEditorProps {
  *
  * 字段和数据库一一对应，不做二次抽象：
  *
- *   name / handle / role / description / style / systemPrompt / model
+ *   name / handle / role / description / systemPrompt / model
  *
- * 这些字段最后会拼进 system prompt（见 TeamService.buildMemberSystemPrompt），
- * 所以它们是**人格定义**，不是元数据装饰。`model` 只能选策略里的 Member 模型
+ * role + systemPrompt（工作契约）会拼进 system prompt（见 execution-service
+ * buildMemberSystemPrompt）。`model` 只能选策略里的 Member 模型
  * （Standard / Cheap，Strong 不在下拉里），留空 = 显式回落默认 Member 模型，
  * 所以提交时要用 null 而不是空串。
  *
@@ -42,7 +42,6 @@ export function MemberEditor({ member, modelPolicy, onSaved, onCancel }: MemberE
         ...(values.handle.trim() ? { handle: values.handle.trim() } : {}),
         role: values.role.trim(),
         description: values.description.trim(),
-        style: values.style.trim(),
         systemPrompt: values.systemPrompt,
         // 空 = 显式回落默认 Member 模型（后端按 !== undefined 判断，不会被 ?? 吃掉）
         model: values.model?.trim() || null,
@@ -89,7 +88,6 @@ export function MemberEditor({ member, modelPolicy, onSaved, onCancel }: MemberE
         handle: member.handle,
         role: member.role,
         description: member.description,
-        style: member.style,
         systemPrompt: member.systemPrompt,
         model: member.model ?? '',
       }}
@@ -108,13 +106,10 @@ export function MemberEditor({ member, modelPolicy, onSaved, onCancel }: MemberE
         <Input.TextArea placeholder="负责投资研究和事实核查" autoSize />
       </Form.Item>
       <Form.Item
-        name="style"
-        label="Personality / Style"
-        extra="这位成员的长期角色与工作风格，所有团队通用。不要填某个项目或团队的临时要求。"
+        name="systemPrompt"
+        label="Work Instructions"
+        extra="定义这个 Member 负责什么、怎么工作、需要输出什么。它不是权限配置。专业能力主要由 Role、Knowledge、Skills、Tools、MCP 和 Task 决定。"
       >
-        <Input.TextArea placeholder="严谨、怀疑、证据优先、少说废话" autoSize />
-      </Form.Item>
-      <Form.Item name="systemPrompt" label="System Prompt">
         <Input.TextArea rows={5} placeholder="优先区分事实、推论和不确定性……" />
       </Form.Item>
       <Form.Item

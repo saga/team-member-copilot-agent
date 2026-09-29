@@ -57,7 +57,7 @@ const stub = {
 const { team } = createTestStack(db, memberService, stub as unknown as CopilotService);
 
 function makeMember(name: string, handle: string): Member {
-  return memberService.create({ name, handle, role: 'Analyst', style: 'concise' });
+  return memberService.create({ name, handle, role: 'Analyst' });
 }
 
 async function waitForConversationIdle(conversationId: string): Promise<void> {

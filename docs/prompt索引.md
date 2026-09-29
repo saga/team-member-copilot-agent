@@ -1,26 +1,28 @@
 # Prompt 索引
 
 > 收录标准：进模型的指令文本（system prompt、turn instruction、tool description、服务端生成的触发消息）。
-> 不单列：`MEMORY.md` / 团队上下文 / 知识库正文 / 会话附件——它们是数据，由 persona 组装器注入；
+> 不单列：`MEMORY.md` / 团队上下文 / 知识库正文 / 会话附件——它们是数据，由 work contract 组装器注入；
 > Scheduler 里用户手写的 prompt 是运行时输入，不是代码。
 
-## 一、身份与行为（persona / system prompt）
+## 一、Member Identity & Work Contract
 
 | Prompt 名称 | 文件名 | 目的（summary） |
 |---|---|---|
-| Member Persona 组装器 | `server/team-service.ts`（`buildMemberSystemPrompt`） | 把身份、角色、systemPrompt、授权规则、房间成员、知识源清单、长期记忆 + Team 上下文拼成每轮的 system prompt |
-| Security Reviewer 人设 | `config/member-templates/financial-security-reviewer/SYSTEM_PROMPT.md` | 安全架构评审人格：只发现风险、不做最终审批、不授予权限 |
-| Senior Software Engineer 人设 | `config/member-templates/financial-senior-engineer/SYSTEM_PROMPT.md` | 资深服务端工程师人格：把架构和需求转成可靠可测的实现 |
-| Solution Architect 人设 | `config/member-templates/financial-solution-architect/SYSTEM_PROMPT.md` | 金融解决方案架构师人格：业务需求转可落地、可被工程实现、可被安全评审的方案 |
+| Member Work Contract 组装器 | `server/execution-service.ts`（`buildMemberSystemPrompt`） | 把身份、角色、工作契约、授权规则、房间成员、知识源清单、长期记忆 + Team 上下文拼成每轮的 system prompt |
+| Security Reviewer Work Contract | `config/member-templates/financial-security-reviewer/SYSTEM_PROMPT.md` | 独立安全评审工作契约：只发现风险、不做最终审批、不授予权限，先独立分析再看他人结论 |
+| Senior Software Engineer Work Contract | `config/member-templates/financial-senior-engineer/SYSTEM_PROMPT.md` | 实现工人工作契约：把架构和需求转成可靠可测的实现，附带输出契约 |
+| Solution Architect Work Contract | `config/member-templates/financial-solution-architect/SYSTEM_PROMPT.md` | 架构规划工人工作契约：业务需求转可落地、可被工程实现、可被安全评审的方案，附带输出契约 |
 
 ## 二、工作模式指令（每轮 user prompt 尾部）
 
 | Prompt 名称 | 文件名 | 目的（summary） |
 |---|---|---|
-| LEAD_INSTRUCTION | `server/context-assembler.ts` | Lead 工作手册：需求 intake、Jira 先审后规划、只 plan 一次（增量用 add/reassign）、Jira subtask 不自动复制、学经验、只推进不闲聊 |
-| TASK_INSTRUCTION | `server/context-assembler.ts` | Task 执行人工作手册：埋头干活、用 update_task 报告完成或阻塞、可顺手存经验、不说废话 |
-| User prompt 组装器 | `server/context-assembler.ts`（`buildPrompt`） | 把 work item 引用、workspace 头、附件清单、经验段、消息转录、当前任务/消息按顺序拼成一轮的 user prompt |
-| 经验注入段 | `server/context-assembler.ts`（`buildPrompt` 内） | 把检索到的经验列成 `Relevant past experiences`，并声明“只是建议，当前需求与权威知识优先” |
+| LEAD_INSTRUCTION | `server/context-assembler.ts` | Lead 工作手册：Single-Agent-first 路由、需求 intake、Jira 先审后规划、只 plan 一次（增量用 add/reassign）、Jira subtask 不自动复制、只推进不闲聊 |
+| TASK_INSTRUCTION | `server/context-assembler.ts` | Task 执行人工作手册：埋头干活、用 update_task 报告完成或阻塞、不说废话 |
+| User prompt 组装器 | `server/context-assembler.ts`（`buildPrompt`） | 把 work item 引用、workspace 头、附件清单、消息转录、当前任务/消息按顺序拼成一轮的 user prompt；independentContext 的 Task 与 delegation 不注入共享房间记录 |
+| Task independent context | `server/context-assembler.ts`（`buildPrompt` 内） | independentContext Task 与 delegation 只拿任务包，不读共享 transcript；水位线也不推进 |
+| Mention independence | `server/context-assembler.ts` | 被 @ 的 Member 独立回答，不读前序 Member 结论，不被锚定 |
+| Single-Agent-first routing | `server/context-assembler.ts`（LEAD_INSTRUCTION 内） | 默认一个强 worker；多人只在并行/独立审查/边界不同时启用 |
 
 ## 三、协作工具描述（模型可见的英文说明，决定模型何时调什么）
 
@@ -28,7 +30,7 @@
 
 | Prompt 名称 | 文件名 | 目的（summary） |
 |---|---|---|
-| ask_member | `server/capabilities/providers/core-tools.ts` | 找其他成员干一件聚焦的小活（阻塞等结果），不是房间聊天 |
+| ask_member | `server/capabilities/providers/core-tools.ts` | 委派给职责/能力/知识/工具显著不同的 specialized worker（阻塞等结果）；能自己干完的不委派，不要只为要个意见 |
 | message_member | `server/capabilities/providers/core-tools.ts` | 给其他成员发私聊消息（发完即返，不等回复） |
 | remember_member | `server/capabilities/providers/core-tools.ts` | 往当前 Team 上下文记长期事实/习惯，不进全局记忆 |
 | request_clarification | `server/capabilities/providers/core-tools.ts` | 缺关键信息时向用户要答案（一次最多 3 个），工作区进 waiting_user |
@@ -36,7 +38,6 @@
 | add_task | `server/capabilities/providers/core-tools.ts` | 给已有计划补一个真正缺失的任务，不复制已有任务或 Jira subtask |
 | reassign_task | `server/capabilities/providers/core-tools.ts` | 给没跑起来的任务换执行人（ready/running/completed/cancelled 不许换） |
 | update_task | `server/capabilities/providers/core-tools.ts` | 执行人上报进展：做完报 completed，卡住报 blocked，不许只用文字糊弄 |
-| learn_experience | `server/capabilities/providers/core-tools.ts` | 存可复用的 trigger→lesson（用户纠正/成功复盘/策略发现），不记流水账和授权规则 |
 
 `server/capabilities/providers/knowledge-tools.ts`：
 

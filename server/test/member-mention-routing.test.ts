@@ -110,6 +110,17 @@ describe('User @mention routing', () => {
       [alice.id, bob.id, charlie.id],
     );
     await waitForConversationIdle(conversation.id);
+
+    // 没有人给后回答者“参考前人答案”：串行锚定用的确定性注入区必须消失。
+    // B 的 prompt 里可以出现房间共享记录，但不能出现专门为 mention chain
+    // 准备的 Previous Member responses 段。
+    for (const turn of stub.turns) {
+      assert.doesNotMatch(
+        turn.prompt,
+        /Previous Member responses/,
+        'mention 之间互相独立，不再互相锚定',
+      );
+    }
   });
 
   it('没有匹配到有效 @Member 时继续走 Lead', async () => {
