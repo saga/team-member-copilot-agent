@@ -345,8 +345,8 @@ MUTATIONS = [
         "test": "server/test/member-memory.test.ts",
         "steps": [
             (
-                "server/team-service.ts",
-                "    return Promise.resolve(this.members.appendTeamMemory(input.memberId, teamId, input.content));",
+                "server/collaboration-service.ts",
+                "    return Promise.resolve(this.internals.members.appendTeamMemory(input.memberId, teamId, input.content));",
                 "    return Promise.resolve(this.members.appendMemory(input.memberId, input.content));",
             )
         ],
@@ -659,7 +659,7 @@ MUTATIONS = [
         "test": "server/test/task-service.test.ts",
         "steps": [
             (
-                "server/team-service.ts",
+                "server/conversation-service.ts",
                 "    if (conversation.status === 'completed' || conversation.status === 'cancelled') {\n      throw conflict('这个工作已经结束，不能再发消息：要继续做事请新建一个工作区');\n    }\n",
                 "",
             )
@@ -670,12 +670,12 @@ MUTATIONS = [
         "test": "server/test/task-service.test.ts",
         "steps": [
             (
-                "server/team-service.ts",
-                "    if (conversation.status !== 'intake' && conversation.status !== 'waiting_user') {\n      throw conflict('任务已经开始，不能修改成员');\n    }\n\n    const member = this.members.get(memberId);",
+                "server/conversation-service.ts",
+                "    if (conversation.status !== 'intake' && conversation.status !== 'waiting_user') {\n      throw conflict('任务已经开始，不能修改成员');\n    }\n\n    const member = this.internals.members.get(memberId);",
                 "\n    const member = this.members.get(memberId);",
             ),
             (
-                "server/team-service.ts",
+                "server/conversation-service.ts",
                 "    if (conversation.status !== 'intake' && conversation.status !== 'waiting_user') {\n      throw conflict('任务已经开始，不能修改成员');\n    }\n\n    // 移出前必须没有在飞的活。",
                 "\n    // 移出前必须没有在飞的活。",
             ),
@@ -698,8 +698,8 @@ MUTATIONS = [
         "steps": [
             (
                 "server/model-policy.ts",
-                "  // 显式原因优先于任务计数：用户刚回答澄清 / 任务刚失败阻塞，\n  // 这一轮的性质由触发原因决定，而不是由“有没有 Task”猜。\n  if (input.wakeReason === 'lead_clarification') {\n    return 'clarification';\n  }\n  if (input.wakeReason === 'lead_recovery') {\n    return 'recovery';\n  }\n  // 没有 Task 时，Lead 的职责就是理解目标 / 澄清 / 初始规划。\n  if (input.taskCount === 0) {\n    return 'planning';\n  }",
-                "  if (input.taskCount === 0) {\n    return 'planning';\n  }\n  if (input.wakeReason === 'lead_clarification') {\n    return 'clarification';\n  }\n  if (input.wakeReason === 'lead_recovery') {\n    return 'recovery';\n  }",
+                "  if (input.wakeReason === 'lead_clarification') {\n    return 'clarification';\n  }\n  if (input.wakeReason === 'lead_recovery') {\n    return 'recovery';\n  }",
+                "  if (false) {\n    return 'clarification';\n  }\n  if (input.wakeReason === 'lead_recovery') {\n    return 'recovery';\n  }",
             )
         ],
     },
@@ -720,7 +720,7 @@ MUTATIONS = [
         "steps": [
             (
                 "server/team-service.ts",
-                "      if (content && input.turnMode === 'lead') {",
+                "      const userFacingTurn =\n        input.turnMode === 'lead' ||\n        input.turnMode === 'mention' ||\n        input.turnMode === 'member_message';\n      if (content && userFacingTurn && !goalStale) {",
                 "      if (content) {",
             )
         ],
@@ -752,9 +752,9 @@ MUTATIONS = [
         "test": "server/test/data-integrity.test.ts",
         "steps": [
             (
-                "server/team-service.ts",
-                "      policyRevision: 'builtin-deny-high-risk-v1',\n",
-                "",
+                "server/execution-service.ts",
+                "      turnMode,\n      policyRevision,\n      entitlementRevision,\n",
+                "      turnMode,\n      entitlementRevision,\n",
             )
         ],
     },
@@ -786,8 +786,8 @@ MUTATIONS = [
         "steps": [
             (
                 "server/task-orchestrator.ts",
-                "      if (this.hasActiveExecution(conversationId, task.assigneeMemberId)) continue;",
-                "      if (this.scheduler.isBusy(conversationId, task.assigneeMemberId)) continue;\n      if (this.hasActiveExecution(conversationId, task.assigneeMemberId)) continue;",
+                "      if (this.hasActiveExecution(conversationId, task.assigneeMemberId)) {\n        continue;\n      }",
+                "      if (this.scheduler.isBusy(conversationId, task.assigneeMemberId)) {\n        continue;\n      }\n      if (this.hasActiveExecution(conversationId, task.assigneeMemberId)) {\n        continue;\n      }",
             )
         ],
     },
@@ -796,23 +796,13 @@ MUTATIONS = [
         "test": "server/test/task-service.test.ts",
         "steps": [
             (
-                "server/team-service.ts",
-                "    this.requireActiveMember(conversation, input.memberId);\n    if (conversation.leadMemberId !== input.memberId) {\n      throw badRequest('只有负责这个工作的 Lead 才能增加任务');\n    }\n",
+                "server/task-application-service.ts",
+                "    this.internals.requireActiveMember(conversation, input.memberId);\n    if (conversation.leadMemberId !== input.memberId) {\n      throw badRequest('只有负责这个工作的 Lead 才能增加任务');\n    }\n",
                 "    this.requireActiveMember(conversation, input.memberId);\n",
             )
         ],
     },
-    {
-        "name": "检索到的经验不注入 prompt（存了也白存）",
-        "test": "server/test/experience-store.test.ts",
-        "steps": [
-            (
-                "server/team-service.ts",
-                "      tasks: allTasks,\n      experiences,\n",
-                "      tasks: allTasks,\n",
-            )
-        ],
-    },
+
     {
         "name": "strong 任务不升级（档位被忽略）",
         "test": "server/test/task-service.test.ts",
@@ -1016,7 +1006,7 @@ MUTATIONS = [
         "test": "server/test/goal-revision.test.ts",
         "steps": [
             (
-                "server/team-service.ts",
+                "server/conversation-service.ts",
                 "    if (input.actorType === 'user') {\n      // Lead 自己的 execution 不属于任何 Task，不在 result.executionIds 里。\n",
                 "    if (false) {\n      // Lead 自己的 execution 不属于任何 Task，不在 result.executionIds 里。\n",
             )
@@ -1028,8 +1018,8 @@ MUTATIONS = [
         "steps": [
             (
                 "server/team-service.ts",
-                "      if (content && input.turnMode === 'lead' && !goalStale) {\n",
-                "      if (content && input.turnMode === 'lead') {\n",
+                "      if (content && userFacingTurn && !goalStale) {\n",
+                "      if (content && userFacingTurn) {\n",
             )
         ],
     },
@@ -1060,7 +1050,7 @@ MUTATIONS = [
         "test": "server/test/member-mention-routing.test.ts",
         "steps": [
             (
-                "server/team-service.ts",
+                "server/conversation-service.ts",
                 "    if (mentionedMembers.length > 0) {\n",
                 "    if (false) {\n",
             )
@@ -1072,7 +1062,7 @@ MUTATIONS = [
         "steps": [
             (
                 "server/team-service.ts",
-                "      const userFacingTurn = input.turnMode === 'lead' || input.turnMode === 'mention';\n",
+                "      const userFacingTurn =\n        input.turnMode === 'lead' ||\n        input.turnMode === 'mention' ||\n        input.turnMode === 'member_message';\n",
                 "      const userFacingTurn = input.turnMode === 'lead';\n",
             )
         ],
@@ -1082,8 +1072,8 @@ MUTATIONS = [
         "test": "server/test/member-mention-routing.test.ts",
         "steps": [
             (
-                "server/team-service.ts",
-                "    // 用户真正开始交互时，取消尚未完成的自动 bootstrap。\n    await this.cancelLeadBootstrap(fresh);\n",
+                "server/conversation-service.ts",
+                "    // 用户真正开始交互时，取消尚未完成的自动 bootstrap。\n    await this.internals.cancelLeadBootstrap(fresh);\n",
                 "",
             )
         ],
@@ -1093,7 +1083,7 @@ MUTATIONS = [
         "test": "server/test/member-mention-routing.test.ts",
         "steps": [
             (
-                "server/team-service.ts",
+                "server/conversation-service.ts",
                 "      fresh.status === 'waiting_user' && (mentionedMembers.length === 0 || leadIsMentioned);\n",
                 "      fresh.status === 'waiting_user';\n",
             )
@@ -1115,7 +1105,7 @@ MUTATIONS = [
         "test": "server/test/auth.test.ts",
         "steps": [
             (
-                "server/team-service.ts",
+                "server/conversation-service.ts",
                 "      senderType: 'user',\n      senderId: input.actorId,\n",
                 "      senderType: 'user',\n      senderId: config.localUserId,\n",
             )
@@ -1143,36 +1133,15 @@ MUTATIONS = [
             )
         ],
     },
-    {
-        "name": "学经验默认全 Team 可见（未审批也共享）",
-        "test": "server/test/experience-store.test.ts",
-        "steps": [
-            (
-                "server/experience-store.ts",
-                "    // 默认只给自己：team scope 是影响所有人的写入，必须经过审批。\n    const scope = input.scope ?? 'member';\n",
-                "    // 默认只给自己：team scope 是影响所有人的写入，必须经过审批。\n    const scope = input.scope ?? 'team';\n",
-            )
-        ],
-    },
-    {
-        "name": "team 候选不审批也可见（审批门形同虚设）",
-        "test": "server/test/experience-store.test.ts",
-        "steps": [
-            (
-                "server/experience-store.ts",
-                "        return item.scope === 'team' && item.reviewStatus === 'approved';\n",
-                "        return item.scope === 'team';\n",
-            )
-        ],
-    },
+
     {
         "name": "Goal 唤醒走普通消息通道（不用 Strong 规划）",
         "test": "server/test/goal-revision.test.ts",
         "steps": [
             (
-                "server/team-service.ts",
-                "      this.orchestrator.ensureLeadWake(\n        latest.id,\n        latest.leadMemberId,\n        latest.messageSequence,\n        'goal_changed',\n      );\n",
-                "      this.orchestrator.ensureLeadWake(\n        latest.id,\n        latest.leadMemberId,\n        latest.messageSequence,\n        'lead_message',\n      );\n",
+                "server/conversation-service.ts",
+                "      this.internals.orchestrator.ensureLeadWake(\n        latest.id,\n        latest.leadMemberId,\n        latest.messageSequence,\n        'goal_changed',\n      );\n",
+                "      this.internals.orchestrator.ensureLeadWake(\n        latest.id,\n        latest.leadMemberId,\n        latest.messageSequence,\n        'lead_message',\n      );\n",
             )
         ],
     },

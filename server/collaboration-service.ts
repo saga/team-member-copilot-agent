@@ -2,7 +2,6 @@ import { randomUUID } from 'node:crypto';
 import { config } from './config.js';
 import { now } from './db.js';
 import type { Conversation, ExecutionRecord, Member } from './domain.js';
-import type { ExperienceKind } from './experience-store.js';
 import { badRequest } from './http-error.js';
 import type { TeamInternals } from './team-internals.js';
 import type { SendMessageResult } from './team-service.js';
@@ -56,19 +55,6 @@ export class CollaborationService {
     // 防 A → B → C → D → ...
     if (parent.delegationPath.length >= config.maxDelegationDepth) {
       throw badRequest(`超过最大 delegation depth：${config.maxDelegationDepth}`);
-    }
-
-    // Budget：先问「这次还跑得起吗」。它管的是资源上限，不管「谁有权做什么」
-    // （那是 Capability / Entitlement / Policy），也不管「要不要人批」（那是
-    // Approval）—— 三者混在一起会让每一条拒绝都说不清是哪一层拦的。
-    //
-    // 放在委派这个入口而不是每次工具调用里：委派是**扇出**的唯一来源。一个
-    // Member 委派给另一个、另一个再委派，深度 6 层 × 每层 3 个就是几百条
-    // execution，而单条都不慢也不超时 —— 这是「只看时长」永远发现不了的那类
-    // 失控。上面那条 depth 检查只挡住「一条链」，这里挡的是「整棵树」。
-    const budget = this.internals.budget.check(this.internals.budgetUsage(parent));
-    if (!budget.allowed) {
-      throw badRequest(`超过执行预算：${budget.reason}`);
     }
 
     // 注意：下面这段（检测 → 建 child → 标记父为 waiting）之间 **不能有 await**，
@@ -261,43 +247,6 @@ export class CollaborationService {
     this.internals.emit(conversation.id, { type: 'message.created', data: message });
     this.internals.emit(conversation.id, { type: 'conversation.updated', data: this.internals.getConversation(conversation.id) });
     return `已记录 ${input.questions.length} 个待确认问题，工作区进入 waiting_user`;
-  }
-
-  /**
-   * Member 的学习入口（learn_experience tool）。
-   *
-   * 只收 trigger → lesson 的可复用经验，不收事件流水账；授权类内容
-   * （capability / policy / model）由 Control Plane 管，不经过这里 ——
-   * prompt 里有明确禁令，见 context-assembler 的 LEARNING 段。
-   */
-  async learnExperience(input: {
-    conversationId: string;
-    memberId: string;
-    executionId?: string | null;
-    kind: ExperienceKind;
-    trigger: string;
-    lesson: string;
-    evidence?: string;
-    scope?: 'member' | 'team';
-    confidence?: number;
-  }): Promise<string> {
-    const conversation = this.internals.getConversation(input.conversationId);
-    this.internals.requireActiveMember(conversation, input.memberId);
-    const scope = input.scope ?? 'member';
-    const experience = this.internals.experiences.add({
-      memberId: input.memberId,
-      teamId: conversation.teamId,
-      sourceExecutionId: input.executionId ?? null,
-      kind: input.kind,
-      trigger: input.trigger,
-      lesson: input.lesson,
-      evidence: input.evidence,
-      scope,
-      confidence: input.confidence ?? 0.8,
-    });
-    return scope === 'team'
-      ? `已保存 team 经验候选，待 owner/admin 审核后其他成员才能检索到：${experience.lesson}`
-      : `已保存可复用经验：${experience.lesson}`;
   }
 
   rememberMember(input: {

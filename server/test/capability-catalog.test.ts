@@ -83,7 +83,6 @@ describe('Resolver：Tool selector 只给点名的工具', () => {
     assert.deepEqual(toolNamesOf(all.tools), [
       'add_task',
       'ask_member',
-      'learn_experience',
       'message_member',
       'plan_tasks',
       'reassign_task',

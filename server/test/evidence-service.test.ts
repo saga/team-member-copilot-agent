@@ -257,7 +257,6 @@ describe('分数只能由服务器算', () => {
       planTasks: async () => '',
       addTask: async () => '',
       reassignTask: async () => '',
-      learnExperience: async () => '',
       updateGoal: async () => '',
       replanTasks: async () => '',
       updateTask: async () => '',

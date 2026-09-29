@@ -143,7 +143,7 @@ registry.registerToolProvider(
     planTasks: (input) => teamService.planTasks(input),
     addTask: (input) => teamService.addTask(input),
     reassignTask: (input) => teamService.reassignTask(input),
-    learnExperience: (input) => teamService.learnExperience(input),
+
     updateGoal: (input) => teamService.updateGoalTool(input),
     replanTasks: (input) => teamService.replanTasks(input),
     updateTask: (input) => teamService.updateTask(input),
@@ -403,7 +403,7 @@ app.use(
   }),
 );
 app.use('/api/knowledge', ...humanApi, knowledgeRouter(localKnowledgeProvider));
-app.use('/api/team', ...humanApi, teamRouter(structureService, teamEvents, teamService));
+app.use('/api/team', ...humanApi, teamRouter(structureService, teamEvents));
 app.use('/api/work-management', workManagementRouter(teamService, workManagement));
 app.use(
   '/api/conversations',

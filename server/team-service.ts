@@ -4,11 +4,9 @@ import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { config, modelPolicy } from './config.js';
 import { classifyLeadTurn, chooseLeadModel, resolveMemberModel, resolveTaskModel } from './model-policy.js';
-import { BudgetService, type BudgetUsage } from './budget-service.js';
 import { runInTransaction } from './db-tx.js';
 import { now } from './db.js';
 import { ContextAssembler } from './context-assembler.js';
-import { ExperienceStore, type ExperienceKind, type ExperienceRecord } from './experience-store.js';
 import { ConversationMemberService } from './conversation-member-service.js';
 import { MemberTurnScheduler } from './member-turn-scheduler.js';
 import { TaskOrchestrator } from './task-orchestrator.js';
@@ -287,22 +285,8 @@ export class TeamService {
   private readonly scheduler: MemberTurnScheduler;
   /** Task 状态的唯一业务入口。 */
   private readonly tasks: TaskService;
-  /**
-   * 可检索的工作经验库。MEMORY.md 是长期事实/习惯，这个是 trigger → lesson、
-   * 按需检索注入 prompt —— 两类记忆的读写与消费路径都分开。
-   */
-  private readonly experiences: ExperienceStore;
   /** Task 就绪 → 入队、完成 → 推进下一批。 */
   private readonly orchestrator: TaskOrchestrator;
-  /**
-   * 一次执行的资源上限（时长 / 工具调用数 / 委派深度 / 子执行数）。
-   *
-   * 额度来自 `DEFAULT_BUDGET_LIMIT`（见 budget-service.ts），不是配置项：
-   * 这四个数回答的是「这一轮还跑得起吗」，而它们目前由平台自己数得出来，
-   * 没有按租户调的必要。真要做成可配的，那是加一个 config 字段，不是把
-   * 这个类变成有状态的。
-   */
-  private readonly budget = new BudgetService();
   /** Member ↔ Member 私聊的房间拓扑（find-or-create / 列表 / 发送）。 */
   private readonly memberConversations: MemberConversationService;
   /**
@@ -395,7 +379,6 @@ export class TeamService {
     private readonly leases?: WorkerLeaseService,
   ) {
     this.contextAssembler = new ContextAssembler(db);
-    this.experiences = new ExperienceStore();
     this.states = new ConversationMemberService(db, (conversationId, change) => {
       // 房间状态变化（读游标 / 唤醒状态 / 静音）也走同一条 durable 事件通道。
       this.emit(conversationId, { type: 'conversation_member_state.updated', data: change });
@@ -446,7 +429,7 @@ export class TeamService {
    *
    * ── 为什么字段是直接读、方法才 bind ─────────────────────────────────
    *
-   * 字段（db / states / tasks / budget…）是共享的**对象引用**，服务要看到的是
+   * 字段（db / states / tasks…）是共享的**对象引用**，服务要看到的是
    * 同一个实例；bind 一个字段没有意义。方法则必须绑定，否则 `internals.emit(...)`
    * 里的 this 会指向 internals 自己。
    */
@@ -455,8 +438,6 @@ export class TeamService {
       alignRuntimeCheckpoint: this.alignRuntimeCheckpoint.bind(this),
       assertMemberNotBusy: this.assertMemberNotBusy.bind(this),
       authorization: this.authorization,
-      budget: this.budget,
-      budgetUsage: this.budgetUsage.bind(this),
       cancelExecutionTree: this.cancelExecutionTree.bind(this),
       cancelLeadBootstrap: this.cancelLeadBootstrap.bind(this),
       cancelRequests: this.cancelRequests,
@@ -470,7 +451,6 @@ export class TeamService {
       emitExecution: this.emitExecution.bind(this),
       ensureRuntime: this.ensureRuntime.bind(this),
       executeMemberTurn: this.executeMemberTurn.bind(this),
-      experiences: this.experiences,
       findExecution: this.findExecution.bind(this),
       findMessageByClientRequestId: this.findMessageByClientRequestId.bind(this),
       findMessageBySequence: this.findMessageBySequence.bind(this),
@@ -1437,37 +1417,6 @@ export class TeamService {
 
   // ----------------------------------------------------------- Delegation
 
-  /**
-   * 一条 execution 此刻的资源用量。
-   *
-   * 四个维度**全部由平台自己数得出来**：时长来自 execution 的起止，调用次数
-   * 来自 `tool_execution_audit`（审计表在这里顺便成了计数的依据 —— 它本来
-   * 就逐条记着每一次工具调用），委派深度来自 `delegation_path`，子执行数来自
-   * 一次 count。不需要模型报数，也不需要接计费系统。
-   *
-   * 时长用 `startedAt ?? createdAt`：还没开跑的 execution（queued）也有一个
-   * 起点，否则排队很久之后一开跑就会被算成「刚起步」，那正好掩盖了排队本身
-   * 也是一种消耗。
-   */
-  private budgetUsage(execution: ExecutionRecord): BudgetUsage {
-    const toolCalls = this.db
-      .prepare(`SELECT COUNT(*) AS n FROM tool_execution_audit WHERE execution_id = ?`)
-      .get(execution.id) as unknown as { n: number };
-    const children = this.db
-      .prepare(`SELECT COUNT(*) AS n FROM execution WHERE parent_execution_id = ?`)
-      .get(execution.id) as unknown as { n: number };
-
-    const startedAt = execution.startedAt ?? execution.createdAt;
-    const startedMs = Date.parse(startedAt);
-
-    return {
-      durationMs: Number.isFinite(startedMs) ? Math.max(0, Date.now() - startedMs) : 0,
-      toolCalls: Number(toolCalls.n),
-      delegationDepth: execution.delegationPath.length,
-      childExecutions: Number(children.n),
-    };
-  }
-
   async delegateMember(input: {
     conversationId: string;
     fromMemberId: string;
@@ -1485,35 +1434,6 @@ export class TeamService {
     content: string;
   }): Promise<string> {
     return this.collaboration.rememberMember(input);
-  }
-
-  async learnExperience(input: {
-    conversationId: string;
-    memberId: string;
-    executionId?: string | null;
-    kind: ExperienceKind;
-    trigger: string;
-    lesson: string;
-    evidence?: string;
-    scope?: 'member' | 'team';
-    confidence?: number;
-  }): Promise<string> {
-    return this.collaboration.learnExperience(input);
-  }
-
-  /** §21：审批一条 team scope 经验候选。owner/admin 门禁在 route 层。 */
-  approveTeamExperience(teamId: string, experienceId: string, approver: string): ExperienceRecord {
-    return this.experiences.approveTeam(teamId, experienceId, approver);
-  }
-
-  /** §21：驳回一条 team scope 经验候选（删掉）。owner/admin 门禁在 route 层。 */
-  rejectTeamExperience(teamId: string, experienceId: string): void {
-    this.experiences.rejectTeam(teamId, experienceId);
-  }
-
-  /** §21：列出经验（含待审候选，供审批界面用）。可见性由调用方按权限过滤。 */
-  listTeamExperiences(teamId: string): ExperienceRecord[] {
-    return this.experiences.list(teamId);
   }
 
   /**
@@ -2225,20 +2145,6 @@ export class TeamService {
 
     const currentTask = input.taskId ? this.safeGetTask(input.taskId) : null;
     const allTasks = this.safeListTasks(input.conversation.id);
-    // 经验检索由控制面做，不经过 LLM：Agent 不需要记得检索，检索条件是
-    // 这一轮的原始输入（prompt + 目标 + 当前任务），不是 assemble 后的全文。
-    const experiences = this.experiences.search({
-      memberId: input.member.id,
-      teamId: input.conversation.teamId,
-      query: [
-        input.prompt,
-        input.conversation.objective,
-        currentTask?.title ?? '',
-        currentTask?.description ?? '',
-        currentTask?.acceptanceCriteria.join(' ') ?? '',
-      ].join('\n'),
-      limit: 5,
-    });
     const context = this.contextAssembler.assemble({
       runtime,
       conversation: input.conversation,
@@ -2249,7 +2155,6 @@ export class TeamService {
       currentPrompt: input.prompt,
       currentTask,
       tasks: allTasks,
-      experiences,
       // 优先用取证返回的规范引用：工单被改过 key 时，告诉 Agent 的是**现在**的
       // key，而不是建会话那天记下的那个。
       work: this.workContextFor(workSnapshot?.ref ?? input.execution.externalWorkRef),

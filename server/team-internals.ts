@@ -1,11 +1,8 @@
 import { DatabaseSync } from 'node:sqlite';
-import { BudgetService } from './budget-service.js';
-import type { BudgetUsage } from './budget-service.js';
 import { ConversationFileService } from './conversation-file-service.js';
 import { ConversationMemberService } from './conversation-member-service.js';
 import { CopilotService } from './copilot.js';
 import type { Conversation, ConversationEvent, ConversationFile, ConversationMessage, ExecutionConfigSnapshot, ExecutionDecision, ExecutionRecord, ExecutionStatus, Member, MemberRuntime, TurnMode, WakeReason } from './domain.js';
-import { ExperienceStore } from './experience-store.js';
 import { MemberConversationService } from './member-conversation-service.js';
 import { MemberService } from './member-service.js';
 import { MemberTurnScheduler } from './member-turn-scheduler.js';
@@ -42,8 +39,6 @@ export interface TeamInternals {
   alignRuntimeCheckpoint(conversationId: string, memberId: string, sequence: number): void;
   assertMemberNotBusy(memberId: string, action: string, conversationId?: string): void;
   readonly authorization: AuthorizationRevisions | undefined;
-  readonly budget: BudgetService;
-  budgetUsage(execution: ExecutionRecord): BudgetUsage;
   cancelExecutionTree(executionId: string, visited?: Set<string>): Promise<void>;
   cancelLeadBootstrap(conversation: Conversation): Promise<void>;
   readonly cancelRequests: Set<string>;
@@ -75,7 +70,6 @@ export interface TeamInternals {
      */
     lease?: LeaseGrant | null;
   }): Promise<string>;
-  readonly experiences: ExperienceStore;
   findExecution(id: string): ExecutionRecord | null;
   findMessageByClientRequestId(conversationId: string, clientRequestId: string): ConversationMessage | null;
   findMessageBySequence(conversationId: string, sequence: number | null | undefined): ConversationMessage | null;
