@@ -1,4 +1,4 @@
-import type { ConversationKind, ConversationMessage, ConversationStatus, ExecutionConfigSnapshot, ExecutionDecision, ExecutionKind, ExecutionRecord, ExecutionStatus, WakeReason } from './domain.js';
+import type { ConversationKind, ConversationMessage, ConversationStatus, ExecutionConfigSnapshot, ExecutionDecision, ExecutionKind, ExecutionRecord, ExecutionStatus, MemberRuntime, WakeReason } from './domain.js';
 import { badRequest } from './http-error.js';
 import { parseExternalWorkRef, parseExternalWorkSnapshot } from './work-management/types.js';
 
@@ -178,6 +178,32 @@ export function mapMessage(row: MessageRow): ConversationMessage {
     // 装配（一条 SQL 拿一页），逐条查会变成 N+1。
     files: [],
     createdAt: row.created_at,
+  };
+}
+
+export interface RuntimeRow {
+  id: string;
+  conversation_id: string;
+  member_id: string;
+  copilot_session_id: string;
+  workspace_path: string;
+  status: MemberRuntime['status'];
+  active_execution_id: string | null;
+  last_context_message_sequence: number;
+  last_used_at: string | null;
+}
+
+export function mapRuntime(row: RuntimeRow): MemberRuntime {
+  return {
+    id: row.id,
+    conversationId: row.conversation_id,
+    memberId: row.member_id,
+    copilotSessionId: row.copilot_session_id,
+    workspacePath: row.workspace_path,
+    status: row.status,
+    activeExecutionId: row.active_execution_id,
+    lastContextMessageSequence: row.last_context_message_sequence,
+    lastUsedAt: row.last_used_at,
   };
 }
 

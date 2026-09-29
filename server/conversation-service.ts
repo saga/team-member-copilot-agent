@@ -522,7 +522,7 @@ export class ConversationService {
       !!fresh.leadMemberId && mentionedMembers.some((member) => member.id === fresh.leadMemberId);
 
     // 用户真正开始交互时，取消尚未完成的自动 bootstrap。
-    await this.internals.cancelLeadBootstrap(fresh);
+    await this.cancelLeadBootstrap(fresh);
 
     // @别的 Member 不是在回答 Lead 的澄清问题：waiting_user 和 openQuestions
     // 都保留。只有普通消息、或明确 @Lead，才算把 Lead 等的那轮问题接过去。
@@ -618,7 +618,7 @@ export class ConversationService {
       )
       .all(conversationId, limit) as unknown as MessageRow[];
 
-    return this.internals.withMessageFiles(rows.reverse().map(mapMessage));
+    return this.withMessageFiles(rows.reverse().map(mapMessage));
   }
 
   /** 房间里每个 Member 的读游标 / 唤醒状态 / 未读数。 */
@@ -741,6 +741,83 @@ export class ConversationService {
       conversation: latest,
       revision: result.revision,
     };
+  }
+
+  /** CoreToolHost：Lead 修改 Goal（update_goal 工具）。 */
+  async updateGoalTool(input: {
+    conversationId: string;
+    memberId: string;
+    executionId: string;
+    objective: string;
+    requirements?: TaskRequirements;
+    changeKind:
+      | 'clarification'
+      | 'scope_change'
+      | 'success_criteria_change'
+      | 'correction';
+    reason?: string;
+  }): Promise<string> {
+    const conversation = this.getConversation(input.conversationId);
+    this.internals.requireActiveMember(conversation, input.memberId);
+    if (conversation.leadMemberId !== input.memberId) {
+      throw badRequest('只有 Lead 可以修改 Goal');
+    }
+    const result = await this.updateGoal({
+      conversationId: conversation.id,
+      actorType: 'member',
+      actorId: input.memberId,
+      executionId: input.executionId,
+      objective: input.objective,
+      requirements: input.requirements,
+      changeKind: input.changeKind,
+      reason: input.reason,
+    });
+    return `Goal 已更新为 v${result.revision.revision}。旧任务计划已失效，请继续调用 replan_tasks 创建新计划。`;
+  }
+
+  /**
+   * 用户真正开始交互时，取消尚未完成的自动 bootstrap。
+   *
+   * bootstrap 是可丢弃的启动动作（“房间空着，Lead 先开口”），用户消息才是
+   * 真正的工作输入：旧 Lead 那一轮带着 opener 跑完，只会往 Activity 里多写
+   * 一条没人要的回复。分两步停 —— pending 的直接删，在跑的走正常取消。
+   */
+  private async cancelLeadBootstrap(conversation: Conversation): Promise<void> {
+    const leadMemberId = conversation.leadMemberId;
+    if (!leadMemberId) return;
+
+    this.internals.scheduler.cancelPending(
+      conversation.id,
+      leadMemberId,
+      (wake) => wake.reason === 'lead_bootstrap',
+    );
+
+    const active = this.internals.db
+      .prepare(
+        `SELECT id FROM execution
+         WHERE conversation_id = ?
+           AND member_id = ?
+           AND wake_reason = 'lead_bootstrap'
+           AND status IN ('queued', 'running', 'waiting_for_member')
+         ORDER BY created_at DESC`,
+      )
+      .all(conversation.id, leadMemberId) as Array<{ id: string }>;
+    for (const row of active) {
+      try {
+        await this.internals.cancelExecutionTree(row.id);
+      } catch {
+        // 用户消息已经提交；cancellation race 不应阻塞真正的用户消息。
+      }
+    }
+  }
+
+  private withMessageFiles(messages: ConversationMessage[]): ConversationMessage[] {
+    if (!this.internals.conversationFiles || messages.length === 0) return messages;
+    const byMessage = this.internals.conversationFiles.filesForMessages(messages.map((m) => m.id));
+    return messages.map((message) => ({
+      ...message,
+      files: byMessage.get(message.id) ?? [],
+    }));
   }
 
   /** Goal 版本历史（倒序）：v1 永不修改，只能往前加。 */

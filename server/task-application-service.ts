@@ -208,4 +208,10 @@ export class TaskApplicationService {
     }
     return `任务「${updated.title}」已分派给新的执行 Member`;
   }
+
+  setTaskHumanReview(taskId: string, required: boolean): ConversationTask {
+    const task = this.internals.tasks.setRequiresHumanReview(taskId, required);
+    this.internals.emit(task.conversationId, { type: 'task.updated', data: task });
+    return task;
+  }
 }

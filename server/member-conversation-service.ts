@@ -1,7 +1,10 @@
+import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
-import type { Conversation, ConversationMessage, Member } from './domain.js';
-import type { SendMessageResult, TeamService } from './team-service.js';
+import type { Conversation, ConversationMessage, Member, PendingWake } from './domain.js';
+import type { SendMessageResult, TeamService, WakePlan } from './team-service.js';
+import { now } from './db.js';
 import { badRequest } from './http-error.js';
+import type { TeamInternals } from './team-internals.js';
 
 /**
  * Member ↔ Member 的私聊（DM）。
@@ -36,7 +39,13 @@ export class MemberConversationService {
   constructor(
     private readonly db: DatabaseSync,
     private readonly team: TeamService,
+    private readonly getInternals: () => TeamInternals,
   ) {}
+
+  /** buildInternals 捕获本服务，早于 internals 就绪只能晚绑定（SchedulerService 同款）。 */
+  private get internals(): TeamInternals {
+    return this.getInternals();
+  }
 
   /**
    * 找 (a, b) 之间已有的 DM 房间。顺序无关：a↔b 和 b↔a 是同一个房间。
@@ -115,7 +124,7 @@ export class MemberConversationService {
     const conversation = this.open(input.fromMemberId, input.toMemberId);
     const peer = this.team.getMember(input.toMemberId);
 
-    const result = await this.team.sendMemberMessage({
+    const result = await this.sendMemberMessage({
       conversationId: conversation.id,
       fromMemberId: input.fromMemberId,
       targetMemberId: input.toMemberId,
@@ -123,6 +132,73 @@ export class MemberConversationService {
     });
 
     return { ...result, conversation, peer };
+  }
+
+  /**
+   * 以某个 Member 的身份发一条消息 —— Member ↔ Member 私聊的写入路径。
+   *
+   * 私聊直接唤醒对端，不经过任何 dispatcher。
+   *
+   * 刻意不复用 delegateMember：那条路是**阻塞**的（父 execution 进
+   * waiting_for_member，一直等到子 execution 跑完并返回结果），适合 ask_member
+   * 的「我必须拿到答案才能继续」。DM 是一条消息，发出去就该返回。
+   */
+  async sendMemberMessage(input: {
+    conversationId: string;
+    fromMemberId: string;
+    targetMemberId: string;
+    content: string;
+  }): Promise<SendMessageResult> {
+    const conversation = this.internals.getConversation(input.conversationId);
+    const content = input.content.trim();
+    if (!content) throw badRequest('消息内容不能为空');
+
+    const from = this.internals.requireActiveMember(conversation, input.fromMemberId);
+    const target = this.internals.requireActiveMember(conversation, input.targetMemberId);
+    if (from.id === target.id) throw badRequest('不能给自己发消息');
+
+    const message: ConversationMessage = {
+      id: randomUUID(),
+      conversationId: conversation.id,
+      messageSequence: this.internals.nextMessageSequence(conversation.id),
+      senderType: 'member',
+      senderId: from.id,
+      replyToMessageId: null,
+      taskId: null,
+      // DM 是「发出去就该返回」的一条消息，没有重试语义，也就不需要幂等键
+      clientRequestId: null,
+      content,
+      executionId: null,
+      files: [],
+      createdAt: now(),
+    };
+
+    this.internals.insertMessage(message);
+    this.internals.touchConversation(conversation.id);
+    this.internals.emit(conversation.id, { type: 'message.created', data: message });
+
+    // 私聊直接唤醒对端，不经过任何 dispatcher。忙也不丢：scheduler 自己负责
+    // idle → 立即执行、busy → pending、pending → coalesce。
+    // 私聊是 member_message，不是 Lead turn：对端按自己的 Member 身份回话。
+    const state = this.internals.states.get(conversation.id, target.id);
+    const wakes: WakePlan[] = [];
+    if (!state.muted) {
+      const wake: PendingWake = {
+        conversationId: conversation.id,
+        memberId: target.id,
+        taskId: null,
+        reason: 'member_message',
+        triggerSequence: message.messageSequence,
+      };
+      this.internals.scheduler.enqueue(wake);
+      wakes.push({ memberId: target.id, reason: 'member_message', taskId: null, triggerSequence: message.messageSequence });
+    }
+
+    return {
+      message,
+      wakes,
+      deduplicated: false,
+    };
   }
 
   /** 某个 Member 参与的全部 DM，按房间最后活动时间倒序。 */

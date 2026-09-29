@@ -1,7 +1,11 @@
 import { DatabaseSync } from 'node:sqlite';
+import type { CapabilityResolver } from './capabilities/resolver.js';
+import type { CapabilityService } from './capabilities/service.js';
+import type { ContextAssembler } from './context-assembler.js';
 import { ConversationFileService } from './conversation-file-service.js';
 import { ConversationMemberService } from './conversation-member-service.js';
 import { CopilotService } from './copilot.js';
+import type { EvidenceService } from './evidence-service.js';
 import type { Conversation, ConversationEvent, ConversationFile, ConversationMessage, ExecutionConfigSnapshot, ExecutionDecision, ExecutionRecord, ExecutionStatus, Member, MemberRuntime, TurnMode, WakeReason } from './domain.js';
 import { MemberConversationService } from './member-conversation-service.js';
 import { MemberService } from './member-service.js';
@@ -12,7 +16,7 @@ import type { AuthorizationRevisions } from './team-service.js';
 import type { ConversationRow } from './team-shared.js';
 import { TeamStructureService } from './team-structure-service.js';
 import type { LeaseGrant, WorkerLeaseService } from './worker-lease.js';
-import type { ExternalWorkRef, ExternalWorkSnapshot } from './work-management/types.js';
+import type { ExternalWorkRef, ExternalWorkSnapshot, WorkManagementRegistry } from './work-management/types.js';
 
 /**
  * TeamService 与四个拆分出去的领域服务之间的共享内部表面。
@@ -40,8 +44,10 @@ export interface TeamInternals {
   assertMemberNotBusy(memberId: string, action: string, conversationId?: string): void;
   readonly authorization: AuthorizationRevisions | undefined;
   cancelExecutionTree(executionId: string, visited?: Set<string>): Promise<void>;
-  cancelLeadBootstrap(conversation: Conversation): Promise<void>;
   readonly cancelRequests: Set<string>;
+  readonly capabilities: CapabilityService;
+  readonly capabilityResolver: CapabilityResolver;
+  readonly contextAssembler: ContextAssembler;
   readonly conversationFiles: ConversationFileService | undefined;
   readonly copilot: CopilotService;
   currentGoalRevision(conversationId: string): number;
@@ -51,6 +57,7 @@ export interface TeamInternals {
   emit(conversationId: string, event: ConversationEvent): void;
   emitExecution(execution: ExecutionRecord): void;
   ensureRuntime(conversation: Conversation, member: Member): MemberRuntime;
+  readonly evidence: EvidenceService;
   executeMemberTurn(input: {
     conversation: Conversation;
     member: Member;
@@ -107,19 +114,6 @@ export interface TeamInternals {
   requireMessageInConversation(conversationId: string, messageId: string | undefined): string | null;
   resolveExternalWorkRef(input: { provider?: string | null; key: string; externalId?: string | null } | null | undefined): ExternalWorkRef | null;
   retireRuntime(conversationId: string, memberId: string): void;
-  runTurn(input: {
-    conversation: Conversation;
-    member: Member;
-    execution: ExecutionRecord;
-    prompt: string;
-    sourceMemberId?: string;
-    taskId?: string | null;
-    triggerMessageSequence: number | null;
-    turnMode: TurnMode;
-    wakeReason: WakeReason | null;
-    runtime: MemberRuntime;
-    lease?: LeaseGrant | null;
-  }): Promise<string>;
   readonly scheduler: MemberTurnScheduler;
   readonly states: ConversationMemberService;
   readonly structure: TeamStructureService | undefined;
@@ -140,6 +134,6 @@ export interface TeamInternals {
       endedAt: string | null;
     }>, fencingToken?: number | null): boolean;
   waitForRuntimeIdle(runtimeId: string): Promise<void>;
-  withMessageFiles(messages: ConversationMessage[]): ConversationMessage[];
   withRuntimeLock<T>(runtimeId: string, fn: () => Promise<T>): Promise<T>;
+  readonly workManagement?: WorkManagementRegistry;
 }
