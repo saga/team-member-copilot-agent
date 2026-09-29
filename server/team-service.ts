@@ -259,6 +259,9 @@ export interface AuthorizationRevisions {
  */
 export class TeamService {
   private readonly listeners = new Map<string, Set<Listener>>();
+
+  /** 事务期间攒下的 durable 事件，COMMIT 之后再广播。 */
+  private readonly broadcastLogFile = path.join(config.dataDir, 'team-agent-copilot.log');
   /**
    * per-runtime 串行锁。一个 MemberRuntime 同时只能跑一个 turn，
    * 否则同一个 Copilot session 会被并发 sendAndWait 撕裂。
@@ -3444,6 +3447,18 @@ export class TeamService {
   }
 
   private broadcast(conversationId: string, event: StoredConversationEvent): void {
+    fs.appendFileSync(
+      this.broadcastLogFile,
+      `${JSON.stringify({
+        event: "broadcast",
+        conversationId,
+        type: event.type,
+        createdAt: event.createdAt,
+        data: event.data,
+      })}\n`,
+      'utf8',
+    );
+
     const listeners = this.listeners.get(conversationId);
     if (!listeners) return;
     for (const listener of listeners) {

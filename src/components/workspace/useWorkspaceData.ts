@@ -302,16 +302,9 @@ export function useWorkspaceData({ onError }: { onError: (message: string | null
       const message = parseEvent<ConversationMessage>(event as MessageEvent);
       if (!message) return;
 
+      // 不在这里清streaming[executionId].
       setMessages((current) => mergeMessages(current, [message]));
 
-      if (message.executionId) {
-        const executionId = message.executionId;
-        setStreaming((current) => {
-          const next = { ...current };
-          delete next[executionId];
-          return next;
-        });
-      }
     });
 
     source.addEventListener('message.delta', (event) => {
