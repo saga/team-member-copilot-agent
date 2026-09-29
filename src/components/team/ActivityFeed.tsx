@@ -45,6 +45,16 @@ interface ActivityFeedProps {
  *
  * 这里是「工作过程中发生了什么」，不是聊天：Member 消息头带上所属任务。
  */
+/** 气泡头的时间：当天只显示时分，隔天前面加月/日。 */
+function formatMessageTime(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return '';
+  const time = `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+  return date.toDateString() === new Date().toDateString()
+    ? time
+    : `${date.getMonth() + 1}/${date.getDate()} ${time}`;
+}
+
 export function ActivityFeed({
   conversation,
   messages,
@@ -89,7 +99,7 @@ export function ActivityFeed({
           {mcpTags(message.executionId)}
         </>
       ),
-      header:
+      header: [
         message.senderType === 'member'
           ? taskLabel(message.taskId)
             ? `${memberLabel(message.senderId)} · ${taskLabel(message.taskId)}`
@@ -97,6 +107,10 @@ export function ActivityFeed({
           : message.senderType === 'user'
             ? 'You'
             : 'System',
+        formatMessageTime(message.createdAt),
+      ]
+        .filter(Boolean)
+        .join(' · '),
       avatar:
         message.senderType === 'member' ? (
           <Avatar size="small">{memberLabel(message.senderId).slice(0, 1).toUpperCase()}</Avatar>
