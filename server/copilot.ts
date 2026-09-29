@@ -242,11 +242,35 @@ export class CopilotService {
         this.options.createClient?.() ??
         new CopilotClient({
           // "empty" 模式：应用显式控制工具与工作目录，不继承 CLI 的环境。
+          // 工具、workingDirectory、MCP、权限等继续由本应用显式控制。
           mode: 'empty',
-          baseDirectory: config.copilotBaseDirectory,
+
+          // development:
+          //   undefined → SDK 使用当前用户默认 ~/.copilot
+          //
+          // production:
+          //   .data/copilot 或 COPILOT_BASE_DIRECTORY
+          // 注意 baseDirectory 不能显式传 undefined，以展开方式省略。
+          ...(config.copilotBaseDirectory
+            ? { baseDirectory: config.copilotBaseDirectory }
+            : {}),
+
+          // development:
+          //   使用当前机器已经 copilot login 的用户
+          //
+          // production + GITHUB_TOKEN:
+          //   使用服务显式提供的 token，不依赖宿主机登录
+          //
+          // production without GITHUB_TOKEN:
+          //   仍允许从隔离 COPILOT_HOME 的登录状态读取
           ...(config.githubToken
-            ? { gitHubToken: config.githubToken, useLoggedInUser: false }
-            : { useLoggedInUser: true }),
+            ? {
+                gitHubToken: config.githubToken,
+                useLoggedInUser: false,
+              }
+            : {
+                useLoggedInUser: true,
+              }),
         });
       await client.start();
       this.client = client;
@@ -369,7 +393,8 @@ export class CopilotService {
          *
          * SDK 到 backgroundCompactionThreshold 时**后台**压缩（这一轮不受影响），
          * 到 bufferExhaustionThreshold 时**阻塞**压缩（否则下一轮没地方放）。
-         * 压缩结果作为 checkpoint 持久化在 copilotBaseDirectory 下，resume 时恢复。
+         * 压缩结果作为 checkpoint 持久化在 Copilot HOME 下（production 是
+         * copilotBaseDirectory，development 是 SDK 默认的 ~/.copilot），resume 时恢复。
          *
          * 关键点：压缩的是「这个 Member 自己的 Copilot Session」，也就是它作为
          * Agent 的工作上下文 —— 不是 conversation_message（那是永久原始记录，

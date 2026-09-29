@@ -250,6 +250,20 @@ async function bootstrap(): Promise<void> {
   server = app.listen(config.port, () => {
     // eslint-disable-next-line no-console
     console.log(`[server] listening on http://localhost:${config.port}`);
+    // Copilot 身份落在哪个模式，启动时就说出来：配错环境（比如 production
+    // 却进了 .data/copilot，或 dev 却没用 ~/.copilot）第一时间就能看见。
+    // eslint-disable-next-line no-console
+    console.log(
+      `[server] copilot auth mode: ${
+        config.isProduction
+          ? config.githubToken
+            ? 'production / GITHUB_TOKEN'
+            : 'production / isolated COPILOT_HOME'
+          : 'development / local Copilot CLI login'
+      }`,
+    );
+    // eslint-disable-next-line no-console
+    console.log(`[server] copilot home: ${config.copilotBaseDirectory ?? '~/.copilot (user default)'}`);
     // 边界只在日志里说出来才存在：没配 token 时得让人知道这个服务只该待在本机。
     // eslint-disable-next-line no-console
     console.log(`[server] ${describeApiBoundary()}`);

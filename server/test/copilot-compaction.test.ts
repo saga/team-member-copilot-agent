@@ -109,19 +109,13 @@ describe('compaction / 上下文窗口的配置默认值', () => {
     assert.equal(config.maxContextChars, 32_000);
   });
 
-  it('copilotBaseDirectory 是可配置的绝对路径，且默认落在 DATA_DIR 下', () => {
-    // 必须是绝对路径：Infinite Session 的 checkpoint 写在这里，相对路径会随
-    // 进程 cwd 漂移，于是 resume 找不到上一次的 session。
-    assert.ok(
-      path.isAbsolute(config.copilotBaseDirectory),
-      `copilotBaseDirectory 必须是绝对路径，实际 ${config.copilotBaseDirectory}`,
-    );
-    assert.equal(path.basename(config.copilotBaseDirectory), 'copilot');
-    // 默认值必须在 DATA_DIR 之内 —— 这样「整个数据目录搬家」仍然是一个操作。
-    assert.ok(
-      config.copilotBaseDirectory.startsWith(config.dataDir + path.sep),
-      `默认应落在 DATA_DIR 下，实际 ${config.copilotBaseDirectory} vs ${config.dataDir}`,
-    );
+  it('development 不设 copilotBaseDirectory：SDK 用 ~/.copilot', () => {
+    // 测试进程 NODE_ENV 未设置 = development。此时必须为 undefined，
+    // CopilotClient 才不会收到 baseDirectory，SDK 自己用 ~/.copilot。
+    // production 的绝对路径约束由部署环境保证，不在这里断言。
+    assert.equal(config.isProduction, false);
+    assert.equal(config.copilotBaseDirectory, undefined);
+    assert.equal(config.githubToken, undefined);
   });
 });
 

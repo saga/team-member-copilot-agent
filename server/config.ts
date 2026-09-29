@@ -31,10 +31,37 @@ const standardLeadModel = env('COPILOT_LEAD_STANDARD_MODEL', configuredMemberMod
 
 const dataDir = path.resolve(env('DATA_DIR', '.data'));
 
+/**
+ * Copilot 的运行环境：
+ *
+ * development:
+ *   不设置 baseDirectory，让 Copilot SDK 使用当前用户的默认
+ *   ~/.copilot，从而复用本机 copilot CLI 的登录状态。
+ *
+ * production:
+ *   使用独立 COPILOT_BASE_DIRECTORY，避免服务依赖宿主机用户的
+ *   ~/.copilot / credential store。
+ *
+ * NODE_ENV 未设置时按 development 处理，方便 `npm run dev`。
+ */
+const isProduction = env('NODE_ENV', 'development') === 'production';
+
 export const config = {
   port: Number(env('PORT', '3001')),
   corsOrigin: env('CORS_ORIGIN', 'http://localhost:5173'),
-  githubToken: env('GITHUB_TOKEN', '') || undefined,
+  isProduction,
+  /**
+   * 只有 production 才设置。
+   *
+   * development = undefined
+   *   → SDK 自己使用 ~/.copilot
+   *
+   * production = .data/copilot（可通过 COPILOT_BASE_DIRECTORY 覆盖）
+   *   → 独立 Copilot HOME
+   */
+  githubToken: isProduction
+    ? env('GITHUB_TOKEN', '') || undefined
+    : undefined,
   defaultModel: legacyDefaultModel,
   /**
    * Lead 模型不是固定一个：
@@ -113,7 +140,13 @@ export const config = {
    * （它的产物、它 cwd 下的文件），这里是 SDK 的会话状态。混在一起的话，
    * 「清一次 workspace」会连带把会话历史删掉。见计划 §十五。
    */
-  copilotBaseDirectory: path.resolve(env('COPILOT_BASE_DIRECTORY', path.join(dataDir, 'copilot'))),
+  /**
+   * 只有 production 才设置，development = undefined（SDK 用 ~/.copilot）。
+   * production 默认 <DATA_DIR>/copilot，可通过 COPILOT_BASE_DIRECTORY 覆盖。
+   */
+  copilotBaseDirectory: isProduction
+    ? path.resolve(env('COPILOT_BASE_DIRECTORY', path.join(dataDir, 'copilot')))
+    : undefined,
   /**
    * 后台 compaction 触发阈值（占模型上下文窗口的比例）。
    *

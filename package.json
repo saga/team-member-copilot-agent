@@ -10,7 +10,7 @@
     "dev:server": "tsx watch server/index.ts",
     "build": "tsc -b && vite build && npm run build:server",
     "build:server": "tsc -p server/tsconfig.json",
-    "start": "node dist-server/index.js",
+    "start": "NODE_ENV=production node dist-server/index.js",
     "preview": "vite preview",
     "typecheck": "tsc -p tsconfig.app.json --noEmit && tsc -p tsconfig.node.json --noEmit && tsc -p server/tsconfig.json --noEmit",
     "test": "node --import tsx --test server/test/*.test.ts",

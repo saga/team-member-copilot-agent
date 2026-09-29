@@ -7,7 +7,10 @@ import { migrate } from './db-migrations.js';
 fs.mkdirSync(config.dataDir, { recursive: true });
 fs.mkdirSync(config.memberHomeRoot, { recursive: true });
 fs.mkdirSync(config.workspaceRoot, { recursive: true });
-fs.mkdirSync(config.copilotBaseDirectory, { recursive: true });
+// development 下 copilotBaseDirectory 为空：SDK 用 ~/.copilot，这里没什么可建的。
+if (config.copilotBaseDirectory) {
+  fs.mkdirSync(config.copilotBaseDirectory, { recursive: true });
+}
 
 export const db = new DatabaseSync(config.dbPath);
 
