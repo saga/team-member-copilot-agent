@@ -20,7 +20,7 @@ import type { DatabaseSync } from 'node:sqlite';
  *
  * 程序不认识任何别的编号 —— 没有升级代码，认出来也无从下手。
  */
-export const SCHEMA_VERSION = 31;
+export const SCHEMA_VERSION = 32;
 
 /**
  * 当前 schema 的完整定义，按最终形状写。
@@ -658,6 +658,30 @@ CREATE TABLE execution (
   delegation_path TEXT NOT NULL DEFAULT '[]',
   kind TEXT NOT NULL
     CHECK (kind IN ('interactive', 'member_delegate', 'member_work')),
+  -- 这一轮用哪个 Copilot session。
+  --
+  --   persistent = 复用 (conversation, member) 那个长期 session（默认）
+  --   isolated   = 每次 execution 一个全新 session，跑完就不再复用
+  --
+  -- 为什么要它：independentContext 只挡住了「共享 transcript 注入 prompt」，
+  -- 挡不住 session history —— 同一个 session 里上一轮的 assistant 消息还在，
+  -- 于是「独立复核」读得到被复核对象的推理过程。两件事必须一起做。
+  session_mode TEXT NOT NULL DEFAULT 'persistent'
+    CHECK (session_mode IN ('persistent', 'isolated')),
+  -- 谁发起的这一轮。
+  --
+  -- 没有它，审计只能说「发生了什么」，说不出「谁让它发生的」——
+  -- 人发的消息、Agent 的委托、定时任务在 execution 里长得一模一样。
+  initiated_by_type TEXT NOT NULL DEFAULT 'system'
+    CHECK (initiated_by_type IN ('human', 'agent', 'system')),
+  -- human = OIDC sub / 消息发送者；agent = Member id；system = scheduler / recovery / 唤醒原因。
+  initiated_by_id TEXT NOT NULL DEFAULT 'system',
+  -- 取消请求。**DB 是权威信号，进程内的 Set 只是快路径。**
+  --
+  -- 只有 Set 时，cancel 活在发起请求的那个进程里：另一个副本（或重启后接手
+  -- 的新 worker）看不到它，于是「点了取消但还在跑」变成玄学。
+  cancel_requested_at TEXT,
+  cancel_requested_by TEXT,
   status TEXT NOT NULL DEFAULT 'queued'
     CHECK (
       status IN (

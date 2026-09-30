@@ -41,10 +41,19 @@ after(() => {
 // ------------------------------------------------------------------ helpers
 
 interface TurnInput {
-  runtime: { id: string; conversationId: string; memberId: string };
+  runtime: {
+    id: string;
+    conversationId: string;
+    memberId: string;
+    /** (conversation, member) 的长期 session。persistent 轮次用它。 */
+    copilotSessionId: string;
+  };
   member: { id: string };
   prompt: string;
   executionId: string;
+  /** isolated 轮次才有：execution 专属的 session。 */
+  sessionId?: string;
+  releaseSession?: boolean;
 }
 
 class StubCopilot {
@@ -59,6 +68,11 @@ class StubCopilot {
     if (this.hold) await this.hold;
     if (this.failWith) throw new Error(this.failWith);
     return `stub reply from ${input.member.id}`;
+  }
+
+  /** 这一轮真正交给引擎的 session id（不传 = 复用 runtime 上的长期 session）。 */
+  sessionIdOf(turn: TurnInput): string {
+    return turn.sessionId ?? turn.runtime.copilotSessionId;
   }
 
   turnsFor(memberId: string): TurnInput[] {
@@ -461,6 +475,14 @@ describe('schema 就位（PRAGMA user_version）', () => {
             'parent_execution_id',
             'delegation_path',
             'kind',
+            // 这一轮开新 session 还是复用长期的那个
+            'session_mode',
+            // 谁发起的这一轮（human / agent / system）
+            'initiated_by_type',
+            'initiated_by_id',
+            // 取消请求：DB 是权威信号，进程内的 Set 只是快路径
+            'cancel_requested_at',
+            'cancel_requested_by',
             'status',
             'prompt',
             'response',
@@ -877,6 +899,93 @@ describe('独立 Task 不读共享房间上下文', () => {
       0,
       '独立任务没读房间消息，水位线不能推进',
     );
+  });
+
+  it('独立任务连 Copilot session 也换掉，并且跑完即释放', async () => {
+    const conv = team.createConversation({
+      kind: 'task',
+      title: 'IsolatedSession',
+      memberIds: [alice.id, bob.id],
+      leadMemberId: alice.id,
+    });
+    await team.planTasks({
+      conversationId: conv.id,
+      memberId: alice.id,
+      objective: '独立审查',
+      requirements: { facts: [], assumptions: [], constraints: [], successCriteria: [] },
+      tasks: [{ key: 'iso2', title: 'IsoTask2', assigneeMemberId: bob.id, independentContext: true }],
+    });
+    await waitForConversationIdle(conv.id);
+
+    const execution = db
+      .prepare(
+        `SELECT id, session_mode FROM execution WHERE conversation_id = ? AND member_id = ?`,
+      )
+      .get(conv.id, bob.id) as unknown as { id: string; session_mode: string } | undefined;
+    assert.ok(execution, '独立任务要留下 execution');
+    assert.equal(execution.session_mode, 'isolated');
+
+    const turn = stub.turns.find((item) => item.executionId === execution.id);
+    assert.ok(turn, '这一轮要真的跑到引擎');
+    // 只挡住 prompt 不换 session 是不够的：同一个 session 里上一轮的 assistant
+    // 消息还在，「独立复核」照样读得到被复核对象的推理过程。
+    assert.equal(
+      stub.sessionIdOf(turn),
+      `execution-${execution.id}`,
+      '独立任务必须开一个 execution 专属的 session',
+    );
+    assert.equal(turn.releaseSession, true, '独立 session 跑完必须释放，否则下次会被 resume 回来');
+  });
+
+  it('普通 Task 与 Lead 仍复用长期 session', async () => {
+    const conv = team.createConversation({
+      kind: 'task',
+      title: 'SharedSession',
+      memberIds: [alice.id, bob.id],
+      leadMemberId: alice.id,
+    });
+    await sendMessage({ actorId: 'test-user', conversationId: conv.id, content: 'NORMAL-1' });
+    await waitForConversationIdle(conv.id);
+    await sendMessage({ actorId: 'test-user', conversationId: conv.id, content: 'NORMAL-2' });
+    await waitForConversationIdle(conv.id);
+
+    const aliceTurns = stub
+      .turnsFor(alice.id)
+      .filter((turn) => turn.runtime.conversationId === conv.id);
+    assert.ok(aliceTurns.length >= 2, '同一个 Lead 至少跑了两轮');
+    const ids = new Set(aliceTurns.map((turn) => stub.sessionIdOf(turn)));
+    assert.equal(ids.size, 1, '普通轮次必须复用同一个长期 session');
+    assert.equal(
+      aliceTurns.every((turn) => !turn.releaseSession),
+      true,
+      '长期 session 不能在轮次结束时被删掉',
+    );
+  });
+});
+
+describe('execution 上的发起人', () => {
+  it('人发的消息 → human，id 是发消息的那个人', async () => {
+    const conv = team.createConversation({
+      kind: 'task',
+      title: 'ActorHuman',
+      memberIds: [alice.id],
+      leadMemberId: alice.id,
+    });
+    const { executionId } = await sendMessage({
+      actorId: 'user-42',
+      conversationId: conv.id,
+      content: '看一下这个方案',
+    });
+    await waitForStatus(executionId, 'completed');
+
+    const row = db
+      .prepare(`SELECT initiated_by_type, initiated_by_id FROM execution WHERE id = ?`)
+      .get(executionId) as unknown as
+      | { initiated_by_type: string; initiated_by_id: string }
+      | undefined;
+    assert.ok(row);
+    assert.equal(row.initiated_by_type, 'human');
+    assert.equal(row.initiated_by_id, 'user-42', '记发消息的人，不记一个全局的 localUserId');
   });
 });
 

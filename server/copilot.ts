@@ -57,6 +57,15 @@ type PermissionResult = Awaited<ReturnType<PermissionHook>>;
 
 export interface RunMemberTurnInput {
   runtime: MemberRuntime;
+  /**
+   * 这一轮用哪个 Copilot session。
+   *
+   * 不传 = 复用 `runtime.copilotSessionId`（(conversation, member) 的长期 session）。
+   * isolated 轮次由调用方传一个 execution 专属 id。
+   */
+  sessionId?: string;
+  /** true = 这一轮结束后删掉 session（isolated 轮次专用）。 */
+  releaseSession?: boolean;
   member: Member;
   /**
    * 这一轮真正用的模型，由 TeamService 按模型策略决定后传进来。
@@ -327,6 +336,8 @@ export class CopilotService {
       // fencing 的两个字段也在这里进上下文：它们随这一轮冻结，和工具集合同一
       // 生命周期。工具执行时读到的是同一份 —— 不会出现「工具用的是新的租约、
       // 判定用的是旧的」这种漂移。
+      const sessionId = input.sessionId ?? input.runtime.copilotSessionId;
+
       const runtimeContext: CapabilityContext = {
         teamId: input.teamId,
         memberId: input.member.id,
@@ -356,7 +367,10 @@ export class CopilotService {
       }
 
       const sessionConfig = {
-        sessionId: input.runtime.copilotSessionId,
+        sessionId,
+        // 只给长期 session 设空闲回收。isolated session 跑完就被删掉，
+        // 给它一个 TTL 只会让「什么时候没的」多一个说不清的原因。
+        ...(input.sessionId ? {} : { sessionIdleTimeoutSeconds: config.copilotSessionIdleTimeoutSeconds }),
         model: input.model,
         workingDirectory: input.runtime.workspacePath,
         systemMessage: {
@@ -420,11 +434,7 @@ export class CopilotService {
 
       // resumeSession 的第二个参数是 ResumeSessionConfig（没有 sessionId 字段）。
       // 多传一个 sessionId 是无害的：resume RPC 逐字段取值，sessionId 来自第一个参数。
-      const session = await this.acquireSession(
-        client,
-        input.runtime.copilotSessionId,
-        sessionConfig,
-      );
+      const session = await this.acquireSession(client, sessionId, sessionConfig);
 
       this.activeSessions.set(input.executionId, session);
 
@@ -454,7 +464,7 @@ export class CopilotService {
         console.info(
           JSON.stringify({
             event: 'copilot.compaction_start',
-            sessionId: input.runtime.copilotSessionId,
+            sessionId,
             executionId: input.executionId,
             conversationId: input.conversationId,
             memberId: input.member.id,
@@ -473,7 +483,7 @@ export class CopilotService {
         console.info(
           JSON.stringify({
             event: 'copilot.compaction_complete',
-            sessionId: input.runtime.copilotSessionId,
+            sessionId,
             executionId: input.executionId,
             conversationId: input.conversationId,
             memberId: input.member.id,
@@ -537,6 +547,19 @@ export class CopilotService {
           await session.disconnect();
         } catch {
           // ignore
+        }
+        // isolated session 用完即删。不删的话它只是「没人再用」，但仍然躺在
+        // 引擎里：同一个 id 下次进来会被 resume，于是「独立复核」拿到了上一轮
+        // 的 session history —— 隔离形同没有。
+        if (input.releaseSession) {
+          try {
+            await client.deleteSession(sessionId);
+          } catch {
+            // 删不掉不影响业务状态，但它的后果是「下次可能被 resume 到」，
+            // 所以记一条而不是静默吞掉。
+            // eslint-disable-next-line no-console
+            console.warn(`[copilot] isolated session ${sessionId} 释放失败`);
+          }
         }
       }
     });

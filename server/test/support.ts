@@ -338,6 +338,15 @@ export interface StubTurn {
   model: string;
   systemPrompt: string;
   prompt: string;
+  /**
+   * 这一轮实际交给引擎的 session id。
+   *
+   * 断言「独立分析真的换了 session」只能看它：execution 上的 `sessionMode`
+   * 只是意图，真正生效的是引擎收到哪个 id。
+   */
+  sessionId: string;
+  /** 引擎侧要不要在轮次结束后删掉这个 session。 */
+  releaseSession: boolean;
 }
 
 /**
@@ -418,6 +427,8 @@ export class StubCopilot {
       model: input.model,
       systemPrompt: input.systemPrompt,
       prompt: input.prompt,
+      sessionId: input.sessionId ?? input.runtime.copilotSessionId,
+      releaseSession: input.releaseSession === true,
     });
     if (this.hold && (!this.holdMemberIds || this.holdMemberIds.has(input.member.id))) {
       await this.hold;

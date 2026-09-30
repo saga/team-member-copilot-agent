@@ -1116,7 +1116,7 @@ MUTATIONS = [
         "test": "server/test/member-dm.test.ts",
         "steps": [
             (
-                "server/team-service.ts",
+                "server/member-conversation-service.ts",
                 "      wakes.push({ memberId: target.id, reason: 'member_message', taskId: null, triggerSequence: message.messageSequence });\n",
                 "      wakes.push({ memberId: target.id, reason: 'lead_message', taskId: null, triggerSequence: message.messageSequence });\n",
             )
@@ -1197,6 +1197,79 @@ MUTATIONS = [
                 "server/capabilities/providers/core-tools.ts",
                 "                .strict(),\n",
                 "                .passthrough(),\n",
+            )
+        ],
+    },
+    {
+        "name": "独立分析：只挡 prompt 不换 session（换了题目没换脑子）",
+        "test": "server/test/runtime-reliability.test.ts",
+        "steps": [
+            (
+                "server/execution-service.ts",
+                "...(isolated\n          ? { sessionId: `execution-${executionId}`, releaseSession: true }\n          : {}),",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "独立 session 跑完不释放（下次被 resume 回来，隔离形同没有）",
+        "test": "server/test/runtime-correctness.test.ts",
+        "steps": [
+            ("server/copilot.ts", "        if (input.releaseSession) {", "        if (false) {")
+        ],
+    },
+    {
+        "name": "独立任务也算 persistent（session_mode 恒为 persistent）",
+        "test": "server/test/runtime-reliability.test.ts",
+        "steps": [
+            (
+                "server/team-shared.ts",
+                "  return input.kind === 'member_delegate' || input.independentContext === true\n    ? 'isolated'\n    : 'persistent';",
+                "  return 'persistent';",
+            )
+        ],
+    },
+    {
+        "name": "发起人一律记成 human（Agent 私聊触发的一轮也算人发的）",
+        "test": "server/test/member-dm.test.ts",
+        "steps": [
+            (
+                "server/team-shared.ts",
+                "  if (trigger?.senderType === 'user') return { type: 'human', id: trigger.senderId };",
+                "  if (trigger) return { type: 'human', id: trigger.senderId };",
+            )
+        ],
+    },
+    {
+        "name": "取消只写进程内的 Set（另一个副本看不到这一次取消）",
+        "test": "server/test/runtime-correctness.test.ts",
+        "steps": [
+            (
+                "server/execution-service.ts",
+                "    this.requestCancellation(executionId, requestedBy);",
+                "",
+            )
+        ],
+    },
+    {
+        "name": "取消信号不读 DB（别的副本写的请求被本进程忽略）",
+        "test": "server/test/runtime-correctness.test.ts",
+        "steps": [
+            (
+                "server/execution-service.ts",
+                "      this.internals.cancelRequests.has(executionId) ||\n      this.internals.isCancellationRequested(executionId)",
+                "      this.internals.cancelRequests.has(executionId)",
+            )
+        ],
+    },
+    {
+        "name": "Member 可以同时属于两个 Team（两份模型档位 / 状态 / 记忆）",
+        "test": "server/test/multi-team-isolation.test.ts",
+        "steps": [
+            (
+                "server/team-structure-service.ts",
+                "    if (elsewhere) {\n      throw conflict(",
+                "    if (false) {\n      throw conflict(",
             )
         ],
     },

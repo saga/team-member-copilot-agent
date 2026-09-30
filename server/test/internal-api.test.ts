@@ -7,6 +7,8 @@ import express from 'express';
 import { config } from '../config.js';
 import { internalRouter } from '../routes/internal.js';
 import { membersRouter } from '../routes/members.js';
+import { initTeamScope } from '../middleware/teamScope.js';
+import type { TeamStructureService } from '../team-structure-service.js';
 import type { TeamService } from '../team-service.js';
 
 /**
@@ -22,6 +24,14 @@ import type { TeamService } from '../team-service.js';
  * 挂载顺序刻意与 app.ts 保持一致（members 在前、internal 在后、最后是 /api 404），
  * 这样「旧路径现在返回 404」才是对真实路由表的断言。
  */
+
+/**
+ * 私聊落在某个 Team 上，所以路由需要一个「当前 Team」。
+ *
+ * 这里只登记一个 id —— 这个用例证明的是「路径归属 + token 门禁」，
+ * Team 上的成员校验由 `member-dm.test.ts` 用真库覆盖。
+ */
+const SCOPE_TEAM_ID = 'test-team';
 
 interface DirectMessageCall {
   fromMemberId: string;
@@ -45,6 +55,7 @@ let base: string;
 const originalToken = config.internalApiToken;
 
 before(async () => {
+  initTeamScope({} as unknown as TeamStructureService, SCOPE_TEAM_ID);
   const app = express();
   app.use(express.json({ limit: '1mb' }));
   app.use('/api/members', membersRouter(fakeTeam));
@@ -88,7 +99,9 @@ describe('以 Member 身份说话：路径归属', () => {
 
     const internal = await post('/api/internal/members/m1/direct-messages', VALID_BODY);
     assert.equal(internal.status, 202);
-    assert.deepEqual(calls, [{ fromMemberId: 'm1', toMemberId: 'm2', content: '看一下风险' }]);
+    assert.deepEqual(calls, [
+      { teamId: SCOPE_TEAM_ID, fromMemberId: 'm1', toMemberId: 'm2', content: '看一下风险' },
+    ]);
   });
 });
 

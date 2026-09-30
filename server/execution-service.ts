@@ -10,7 +10,7 @@ import { conflict, notFound } from './http-error.js';
 import { classifyLeadTurn, chooseLeadModel, resolveTaskModel } from './model-policy.js';
 import { BUILTIN_POLICY_REVISION } from './policy.js';
 import type { TeamInternals } from './team-internals.js';
-import { ACTIVE_STATUSES, CANCEL_REASON, ExecutionCancelledError, TERMINAL_STATUSES, mapExecution, mapRuntime } from './team-shared.js';
+import { ACTIVE_STATUSES, CANCEL_REASON, ExecutionCancelledError, TERMINAL_STATUSES, actorFromTrigger, mapExecution, mapRuntime, sessionModeOf } from './team-shared.js';
 import type { ExecutionRow, RuntimeRow } from './team-shared.js';
 import { normalizeExternalWorkRef } from './work-management/types.js';
 import type { ExternalWorkRef, ExternalWorkSnapshot } from './work-management/types.js';
@@ -182,6 +182,10 @@ export class ExecutionService {
       parentExecutionId: original.parentExecutionId,
       delegationPath: [...original.delegationPath],
       kind: original.kind,
+      // retry 是「把同一轮再跑一次」：独立上下文与发起人一并继承。
+      // 换一个人来背这条 execution 会让审计链上多出一个不存在的动作。
+      sessionMode: original.sessionMode,
+      initiatedBy: { ...original.initiatedBy },
       status: 'queued',
       prompt: original.prompt,
       response: null,
@@ -244,7 +248,10 @@ export class ExecutionService {
    * 取消一棵正在等待的子树属于 cancellation propagation，要连子树的执行体一起处理。
    * 这里的范围只覆盖 queued / running。
    */
-  async cancelExecution(executionId: string): Promise<ExecutionRecord> {
+  async cancelExecution(
+    executionId: string,
+    requestedBy = 'unknown',
+  ): Promise<ExecutionRecord> {
     const execution = this.getExecution(executionId);
 
     if (execution.status === 'cancelled') return execution;
@@ -268,7 +275,13 @@ export class ExecutionService {
       return this.getExecution(executionId);
     }
 
-    // running：先发信号 + abort，再等这一轮的 turn 自己收尾。
+    // running：先把取消**落库**，再发信号 + abort，最后等这一轮的 turn 自己收尾。
+    //
+    // 顺序不能反：DB 是权威信号，进程内的 Set 只是快路径。只写 Set 的话，
+    // 接手这条 execution 的另一个副本（或重启后的新 worker）从来没见过这个
+    // 请求 —— 它会把一条「用户已经取消」的 execution 从头跑到尾。
+    this.requestCancellation(executionId, requestedBy);
+
     const runtimeId = execution.runtimeId;
     this.internals.cancelRequests.add(executionId);
     let result: Awaited<ReturnType<CopilotService['cancelTurn']>>;
@@ -293,6 +306,35 @@ export class ExecutionService {
       );
     }
     return final;
+  }
+
+  /**
+   * 把「有人要取消这一轮」写进 DB。
+   *
+   * 只对还活着的 execution 生效：已经结束的再写一次只是制造噪音（而且会被
+   * 读成「取消过但没生效」）。第一次写入才算数 —— 重复点取消不该把
+   * `cancel_requested_at` 刷新成后一次的时间，那会让人以为请求发生在取消生效之后。
+   */
+  private requestCancellation(executionId: string, requestedBy: string): void {
+    this.internals.db
+      .prepare(
+        `
+        UPDATE execution
+        SET cancel_requested_at = ?, cancel_requested_by = ?
+        WHERE id = ?
+          AND status IN ('queued', 'running', 'waiting_for_member')
+          AND cancel_requested_at IS NULL
+        `,
+      )
+      .run(now(), requestedBy, executionId);
+  }
+
+  /** 本轮要不要停下来：本进程的快路径（Set）或 DB 上的权威信号，任一成立即停。 */
+  private cancellationRequested(executionId: string): boolean {
+    return (
+      this.internals.cancelRequests.has(executionId) ||
+      this.internals.isCancellationRequested(executionId)
+    );
   }
 
   /**
@@ -378,6 +420,8 @@ export class ExecutionService {
     // 新 execution 指回去，审计链不断。首次执行时为 null。
     const retryOfExecutionId = task?.currentExecutionId ?? null;
 
+    const kind: ExecutionRecord['kind'] = task ? 'member_work' : 'interactive';
+
     const execution: ExecutionRecord = {
       id: randomUUID(),
       conversationId: conversation.id,
@@ -390,7 +434,9 @@ export class ExecutionService {
       workerFencingToken: lease?.fencingToken ?? null,
       parentExecutionId: null,
       delegationPath: [member.id],
-      kind: task ? 'member_work' : 'interactive',
+      kind,
+      sessionMode: sessionModeOf({ kind, independentContext: task?.independentContext ?? false }),
+      initiatedBy: actorFromTrigger(trigger, wake.reason ?? 'wake'),
       status: 'queued',
       prompt: task ? task.description || task.title : (trigger?.content ?? ''),
       response: null,
@@ -666,9 +712,10 @@ export class ExecutionService {
       // 无 structure 时跳过
     }
 
-    // 上面两次写之间是 cancel 的窗口期：cancel 对 running 只发信号、不写 DB，
+    // 上面两次写之间是 cancel 的窗口期：cancel 对 running 只发信号、不改状态，
     // 所以这里必须再确认一次信号，避免「信号发了但这一轮照跑到底」。
-    if (this.internals.cancelRequests.has(executionId)) {
+    // 读 DB 而不只读 Set：请求可能来自另一个副本。
+    if (this.cancellationRequested(executionId)) {
       throw new ExecutionCancelledError();
     }
 
@@ -751,8 +798,15 @@ export class ExecutionService {
         fencingToken,
       );
 
+      const isolated = input.execution.sessionMode === 'isolated';
+
       const result = await this.internals.copilot.runMemberTurn({
         runtime,
+        // isolated 轮次开一个 execution 专属的 session 并跑完即删；
+        // persistent 轮次不传，走 runtime 上那个 (conversation, member) 的长期 session。
+        ...(isolated
+          ? { sessionId: `execution-${executionId}`, releaseSession: true }
+          : {}),
         member: input.member,
         model: modelSelection.model,
         systemPrompt,
@@ -793,7 +847,7 @@ export class ExecutionService {
 
       // abort 会让 sendAndWait **正常返回**半截结果（不是抛错），所以取消检查
       // 不能只放在 catch 里，否则被取消的 execution 会被记成 completed。
-      if (this.internals.cancelRequests.has(executionId)) {
+      if (this.cancellationRequested(executionId)) {
         throw new ExecutionCancelledError();
       }
 
@@ -911,7 +965,7 @@ export class ExecutionService {
       return content;
     } catch (error) {
       const cancelled =
-        error instanceof ExecutionCancelledError || this.internals.cancelRequests.has(executionId);
+        error instanceof ExecutionCancelledError || this.cancellationRequested(executionId);
       const message = error instanceof Error ? error.message : String(error);
 
       // 取消不是故障：runtime 回到 idle 而不是 error，checkpoint 不推进

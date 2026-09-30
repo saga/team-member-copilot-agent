@@ -219,6 +219,17 @@ export const config = {
    */
   executionTimeoutMs: intEnv('EXECUTION_TIMEOUT_MS', 600_000),
   /**
+   * 长期（persistent）Copilot session 的空闲回收时间（秒）。
+   *
+   * 每个 (conversation, member) 一个长期 session，房间多了之后它们会一直挂在
+   * 引擎里。不设上限就是「用过的 session 永不释放」。
+   *
+   * 到期被回收不是故障 —— 下一轮会重建 session 并从 DB 恢复上下文
+   * （见 CopilotService.acquireSession 的 resume → create 兜底）。所以它必须
+   * 可配而不是写死：回收太激进会让人人都在重建，太松则等于没设。
+   */
+  copilotSessionIdleTimeoutSeconds: intEnv('COPILOT_SESSION_IDLE_TIMEOUT_SECONDS', 1800),
+  /**
    * 单轮注入到 prompt 的 shared message 条数上限。
    *
    * 没有它时会有一个很具体的事故：一个 Member 沉默很久（或被静音一段时间）

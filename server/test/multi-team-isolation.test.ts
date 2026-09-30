@@ -210,6 +210,27 @@ describe('多 Team 隔离：Conversation 列表', () => {
   });
 });
 
+describe('一个 Member 只属于一个 Team', () => {
+  it('A 团队的人加进 B 团队直接被拒绝', () => {
+    assert.throws(
+      () => stack.structure.ensureAgentMembership(teamB, memberInA),
+      /只能属于一个 Team/,
+      '同一个人挂在两个 Team 上时，模型档位 / 状态 / 能力绑定 / 记忆与 Team 上下文' +
+        ' 都会同时出现两套答案 —— 一次性拒绝，而不是逐处修补',
+    );
+  });
+
+  it('已经是本 Team 的人重复加入仍然幂等', () => {
+    const before = stack.structure.listMemberships(teamA).length;
+    stack.structure.ensureAgentMembership(teamA, memberInA);
+    assert.equal(
+      stack.structure.listMemberships(teamA).length,
+      before,
+      '建 Member / provisioning / 加人都会走到这里，重复调用不能新增一行',
+    );
+  });
+});
+
 describe('多 Team 隔离：Team 尚未初始化时', () => {
   it('没有 ?teamId= 就明确失败，不猜一个 Team', async () => {
     // 单独一个文件进程里造「未初始化」的状态会污染其它用例，所以这里直接

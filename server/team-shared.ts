@@ -1,4 +1,4 @@
-import type { ConversationKind, ConversationMessage, ConversationStatus, ExecutionConfigSnapshot, ExecutionDecision, ExecutionKind, ExecutionRecord, ExecutionStatus, MemberRuntime, WakeReason } from './domain.js';
+import type { ConversationKind, ConversationMessage, ConversationStatus, ExecutionActor, ExecutionActorType, ExecutionConfigSnapshot, ExecutionDecision, ExecutionKind, ExecutionRecord, ExecutionSessionMode, ExecutionStatus, MemberRuntime, WakeReason } from './domain.js';
 import { badRequest } from './http-error.js';
 import { parseExternalWorkRef, parseExternalWorkSnapshot } from './work-management/types.js';
 
@@ -9,6 +9,38 @@ import { parseExternalWorkRef, parseExternalWorkSnapshot } from './work-manageme
  * 这些既不属于某一个服务，也不该留在 TeamService 里：留在那里会让拆分出去的
  * 服务反向 import TeamService，形成运行时循环依赖。放这里，两边都向下依赖。
  */
+
+/**
+ * 这一轮要不要开一个全新的 Copilot session。
+ *
+ * 两个判据：任务标了 independentContext，或者这一轮本身就是委托下级
+ * （delegation）。后者也隔离，是因为「帮我看一眼这个」不该让下级的 session
+ * 里堆着委托方自己的推理过程 —— 那等于把答案塞进题目。
+ */
+export function sessionModeOf(input: {
+  kind: ExecutionKind;
+  independentContext?: boolean;
+}): ExecutionSessionMode {
+  return input.kind === 'member_delegate' || input.independentContext === true
+    ? 'isolated'
+    : 'persistent';
+}
+
+/**
+ * 谁发起的这一轮。
+ *
+ * 有触发消息时以**消息的发送者**为准：那条消息就是这一轮存在的理由，它的作者
+ * 就是发起人。没有触发消息（定时任务 / 恢复 / Goal 变更）时按系统原因记，
+ * 把原因本身写进 id —— 「系统」太粗，事后看不出是调度器还是恢复逻辑。
+ */
+export function actorFromTrigger(
+  trigger: { senderType: 'user' | 'member' | 'system'; senderId: string } | null,
+  systemId: string,
+): ExecutionActor {
+  if (trigger?.senderType === 'user') return { type: 'human', id: trigger.senderId };
+  if (trigger?.senderType === 'member') return { type: 'agent', id: trigger.senderId };
+  return { type: 'system', id: systemId };
+}
 
 /** 还在推进中的 execution 状态。 */
 export const ACTIVE_STATUSES: ReadonlySet<ExecutionStatus> = new Set([
@@ -63,6 +95,9 @@ export interface ExecutionRow {
   parent_execution_id: string | null;
   delegation_path: string;
   kind: ExecutionKind;
+  session_mode: ExecutionSessionMode;
+  initiated_by_type: ExecutionActorType;
+  initiated_by_id: string;
   status: ExecutionStatus;
   prompt: string;
   response: string | null;
@@ -146,6 +181,8 @@ export function mapExecution(row: ExecutionRow): ExecutionRecord {
     parentExecutionId: row.parent_execution_id,
     delegationPath: JSON.parse(row.delegation_path) as string[],
     kind: row.kind,
+    sessionMode: row.session_mode,
+    initiatedBy: { type: row.initiated_by_type, id: row.initiated_by_id },
     status: row.status,
     prompt: row.prompt,
     response: row.response,

@@ -81,7 +81,29 @@ export class TeamStructureService {
     return this.upsertMembership(teamId, 'human', principalId, 'owner', 'active');
   }
 
+  /**
+   * 把 Member 加进这个 Team。
+   *
+   * **一个 Member 只属于一个 Team。** 已经属于别的 Team 时直接拒绝，而不是
+   * 让它同时挂在两边 —— 多 Team 的 Member 会让下面这些「看起来是 Member 级、
+   * 实际是 Team 级」的东西同时出现两套答案：模型档位、状态、能力绑定、记忆
+   * 与 Team 上下文、审核策略。一次性消掉的是一整类冲突，而不是一处 bug。
+   *
+   * 幂等：已经在**这个** Team 里就原样返回（建 Member、provisioning、加人
+   * 都会走到这里，重复调用必须无害）。
+   */
   ensureAgentMembership(teamId: string, memberId: string): TeamMembership {
+    const existing = this.db
+      .prepare(
+        `SELECT team_id FROM team_membership WHERE kind = 'agent' AND principal_id = ?`,
+      )
+      .all(memberId) as unknown as Array<{ team_id: string }>;
+    const elsewhere = existing.find((row) => row.team_id !== teamId);
+    if (elsewhere) {
+      throw conflict(
+        `这个 Member 已经属于另一个 Team（${elsewhere.team_id}），一个 Member 只能属于一个 Team`,
+      );
+    }
     return this.upsertMembership(teamId, 'agent', memberId, 'member', 'active');
   }
 

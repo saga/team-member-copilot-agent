@@ -2,6 +2,7 @@ import { Router } from 'express';
 import type { TeamService } from '../team-service.js';
 import { sendError } from '../middleware/errorHandler.js';
 import { requireResourceConversationAccess } from '../middleware/conversationAccess.js';
+import { resolveActor } from '../middleware/teamScope.js';
 
 /**
  * Execution API。
@@ -61,7 +62,8 @@ export function executionsRouter(team: TeamService) {
    */
   router.post('/:id/cancel', async (req, res) => {
     try {
-      res.json({ execution: await team.cancelExecution(req.params.id) });
+      // 谁点的取消要落库：事后只能看到「取消过」，看不到是谁要求的。
+      res.json({ execution: await team.cancelExecution(req.params.id, resolveActor(req).principalId) });
     } catch (error) {
       sendError(res, error);
     }

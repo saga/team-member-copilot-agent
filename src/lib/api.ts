@@ -386,6 +386,8 @@ export interface ConversationTask {
   blocker: string | null;
   currentExecutionId: string | null;
   modelTier: TaskModelTier | null;
+  /** 独立分析：不把房间里的讨论结果注入这一轮，防止第二意见被第一意见锚定。 */
+  independentContext: boolean;
   sortOrder: number;
   createdAt: string;
   updatedAt: string;

@@ -45,6 +45,8 @@ export interface TeamInternals {
   readonly authorization: AuthorizationRevisions | undefined;
   cancelExecutionTree(executionId: string, visited?: Set<string>): Promise<void>;
   readonly cancelRequests: Set<string>;
+  /** 这一轮有没有人请求过取消。读 DB，跨进程 / 跨重启都成立。 */
+  isCancellationRequested(executionId: string): boolean;
   readonly capabilities: CapabilityService;
   readonly capabilityResolver: CapabilityResolver;
   readonly contextAssembler: ContextAssembler;

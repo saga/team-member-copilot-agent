@@ -3,6 +3,7 @@ import { z } from 'zod';
 import type { TeamService } from '../team-service.js';
 import { sendError } from '../middleware/errorHandler.js';
 import { requireInternalToken } from '../middleware/apiScope.js';
+import { requestTeamId } from '../middleware/teamScope.js';
 
 /**
  * Internal Member runtime API。
@@ -52,6 +53,9 @@ export function internalRouter(team: TeamService) {
     try {
       res.status(202).json(
         await team.sendDirectMessage({
+          // 目标房间属于哪个 Team 由请求的 Team 决定，不由 body 决定：
+          // 内部调用方可以「代表某个 Member」，不能顺便换一个 Team。
+          teamId: requestTeamId(req),
           fromMemberId: req.params.id,
           toMemberId: parsed.data.toMemberId,
           content: parsed.data.content,

@@ -3,7 +3,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import type { Conversation, ConversationMessage, Member, PendingWake } from './domain.js';
 import type { SendMessageResult, TeamService, WakePlan } from './team-service.js';
 import { now } from './db.js';
-import { badRequest } from './http-error.js';
+import { badRequest, forbidden } from './http-error.js';
 import type { TeamInternals } from './team-internals.js';
 
 /**
@@ -79,15 +79,32 @@ export class MemberConversationService {
   }
 
   /**
-   * 拿到 (a, b) 的 DM 房间，没有就建一个。
+   * 同一 Team 内两人都必须是 active membership，否则 403。
+   * 不存在也按 403 处理：不向跨 Team 调用方透露对方是否存在。
+   */
+  private requireActiveMembership(teamId: string, memberId: string): void {
+    if (!this.internals.structure) {
+      throw forbidden('Member is not active in this team');
+    }
+    try {
+      this.internals.structure.requireActiveMembership(teamId, 'agent', memberId);
+    } catch {
+      throw forbidden('Member is not active in this team');
+    }
+  }
+
+  /**
+   * 拿到同一 Team 内 (a, b) 的 DM 房间，没有就建一个。
    *
    * 「查 → 建」之间没有 await，且 node:sqlite 是同步 API，所以整段是一个不可
    * 分割的同步块：两个 Member 同时给对方发第一条消息时，只会有一个人真的建出房间。
    * （和 delegation 的「检测 → 建 child」同理。）
    */
-  open(a: string, b: string): Conversation {
+  open(teamId: string, a: string, b: string): Conversation {
     if (a === b) throw badRequest('Member 不能和自己建立私聊');
 
+    this.requireActiveMembership(teamId, a);
+    this.requireActiveMembership(teamId, b);
     const from = this.team.getMember(a);
     const to = this.team.getMember(b);
     if (from.status !== 'active' || to.status !== 'active') {
@@ -95,7 +112,10 @@ export class MemberConversationService {
     }
 
     const existing = this.find(a, b);
-    if (existing) return existing;
+    if (existing) {
+      if (existing.teamId !== teamId) throw forbidden('Member is not active in this team');
+      return existing;
+    }
 
     // title 显式写成双方，避免落到 createConversation 的默认值（取
     // members[0].name）—— 那会让人分不清这是「和 Alice 单聊」还是「Alice 和 Bob 在聊」。
@@ -103,6 +123,7 @@ export class MemberConversationService {
       kind: 'direct',
       title: `${from.name} · ${to.name}`,
       memberIds: [from.id, to.id],
+      teamId,
     });
   }
 
@@ -113,6 +134,7 @@ export class MemberConversationService {
    * 「找到人并说话」是一步，不该暴露「先开房间再发消息」两段式。
    */
   async send(input: {
+    teamId: string;
     fromMemberId: string;
     toMemberId: string;
     content: string;
@@ -121,7 +143,7 @@ export class MemberConversationService {
     const content = input.content.trim();
     if (!content) throw badRequest('消息内容不能为空');
 
-    const conversation = this.open(input.fromMemberId, input.toMemberId);
+    const conversation = this.open(input.teamId, input.fromMemberId, input.toMemberId);
     const peer = this.team.getMember(input.toMemberId);
 
     const result = await this.sendMemberMessage({

@@ -54,6 +54,9 @@ interface ExecutionRow {
   parent_execution_id: string | null;
   delegation_path: string;
   kind: string;
+  session_mode: string;
+  initiated_by_type: string;
+  initiated_by_id: string;
   status: string;
   response: string | null;
   error: string | null;
@@ -481,6 +484,13 @@ describe('delegation 业务控制', () => {
 
     // 子 execution 用的是 Coder 在这个 conversation 里的独立 runtime
     assert.equal(child.runtime_id, runtimeRow(teamConversationId, coder.id)?.id);
+
+    // 发起人是委托方那个 Agent：ask_member 是它自己的决定，不是「系统」。
+    // 写成系统就回答不了「是谁让它跑的」。
+    assert.equal(child.initiated_by_type, 'agent');
+    assert.equal(child.initiated_by_id, researcher.id);
+    // 委托也是一次独立分析：session 隔离，不只挡 transcript。
+    assert.equal(child.session_mode, 'isolated');
   });
 
   it('delegation 只拿聚焦的 task 上下文，不继承房间闲聊 transcript', async () => {

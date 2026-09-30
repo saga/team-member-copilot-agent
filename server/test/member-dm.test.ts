@@ -29,7 +29,8 @@ const { executionIdForWake, StubCopilot, createTestStack } = await import('./sup
 
 const stub = new StubCopilot();
 const memberService = new MemberService(db);
-const { team } = createTestStack(db, memberService, stub.asCopilot);
+const { team, structure } = createTestStack(db, memberService, stub.asCopilot);
+const teamId = structure.ensureDefaultTeam().id;
 
 /** 每对成员只服务一个用例，避免 (a, b) 的房间唯一性把用例互相串起来。 */
 let seq = 0;
@@ -95,8 +96,8 @@ describe('私聊房间', () => {
   it('同一对 Member 只有一个房间，顺序无关', () => {
     const [a, b] = newPair();
 
-    const first = team.openDirectMessage(a.id, b.id);
-    const again = team.openDirectMessage(b.id, a.id);
+    const first = team.openDirectMessage(teamId, a.id, b.id);
+    const again = team.openDirectMessage(teamId, b.id, a.id);
 
     assert.equal(first.id, again.id, 'a↔b 和 b↔a 必须是同一个房间');
     assert.equal(first.members.length, 2);
@@ -111,6 +112,7 @@ describe('私聊消息', () => {
     const [a, b] = newPair();
 
     const result = await team.sendDirectMessage({
+      teamId,
       fromMemberId: a.id,
       toMemberId: b.id,
       content: '帮我看一下这个方案的风险',
@@ -134,11 +136,23 @@ describe('私聊消息', () => {
     assert.equal(messages.length, 2);
     assert.equal(messages[1].senderType, 'member');
     assert.equal(messages[1].senderId, b.id);
+
+    // 这一轮是 A 让它跑起来的，不是「系统」，也不是 B 自己。
+    // 只看 message.senderType 会漏：发消息的人和发起这一轮的人是两个概念。
+    const row = db
+      .prepare(`SELECT initiated_by_type, initiated_by_id FROM execution WHERE id = ?`)
+      .get(executionId) as unknown as
+      | { initiated_by_type: string; initiated_by_id: string }
+      | undefined;
+    assert.ok(row);
+    assert.equal(row.initiated_by_type, 'agent');
+    assert.equal(row.initiated_by_id, a.id);
   });
 
   it('member DM uses member_message turn mode', async () => {
     const [a, b] = newPair();
     const result = await team.sendDirectMessage({
+      teamId,
       fromMemberId: a.id,
       toMemberId: b.id,
       content: 'hello',
@@ -156,6 +170,7 @@ describe('私聊消息', () => {
     const [a, b] = newPair();
 
     const opened = await team.sendDirectMessage({
+      teamId,
       fromMemberId: a.id,
       toMemberId: b.id,
       content: '你怎么看？',

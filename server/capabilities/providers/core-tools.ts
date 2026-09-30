@@ -53,7 +53,12 @@ export interface CoreToolHost {
    * delegateMember 会阻塞到对方交付结果（父 execution 进 waiting_for_member），
    * 这里只是投递。要对方回了才推进当前工作，就该用 ask_member。
    */
+  /**
+   * `teamId` 由调用方从 turn 上下文带进来，不进工具的 parameters ——
+   * 让模型自己填「我要在哪个 Team 里说话」等于让它挑 ACL 作用域。
+   */
   messageMember(input: {
+    teamId: string;
     fromMemberId: string;
     targetMemberId: string;
     content: string;
@@ -208,6 +213,7 @@ export class CoreTeamToolProvider implements ToolProvider {
         }),
         execute: async (context, args) => {
           const result = await this.host.messageMember({
+            teamId: context.teamId,
             fromMemberId: context.memberId,
             targetMemberId: String(args.memberId),
             content: String(args.content),

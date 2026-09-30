@@ -202,6 +202,7 @@ export class SchedulerService {
     if (this.leases && !grant) return;
 
     let lost = false;
+    let stopRequested = false;
     const heartbeat = grant
       ? setInterval(() => {
           if (lost) return;
@@ -211,7 +212,25 @@ export class SchedulerService {
           } catch {
             ok = false;
           }
-          if (ok) return;
+          // 取消请求是 DB 上的权威信号，可能来自另一个副本：本进程没见过它，
+          // 但这一轮仍然必须停。心跳是执行期间唯一稳定的周期点。
+          if (ok) {
+            if (stopRequested) return;
+            let requested = false;
+            try {
+              requested = this.team().isCancellationRequested(executionId);
+            } catch {
+              requested = false;
+            }
+            if (!requested) return;
+            stopRequested = true;
+            void this.team()
+              .cancelExecution(executionId, 'lease-heartbeat')
+              .catch(() => {
+                // 已经收尾 / 状态不允许取消 —— 那正是想要的结果。
+              });
+            return;
+          }
           // 只触发一次：心跳是周期性的，租约丢了之后每一次都会失败，重复
           // abort 只会把日志淹没在一堆同样的告警里。
           lost = true;

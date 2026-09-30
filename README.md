@@ -95,7 +95,7 @@ Lead 只负责澄清与规划，执行由各 Task 的执行人推进，依赖由
 | **CopilotSession** | Runtime 的执行引擎状态。**内部实现细节，不是业务对象。** |
 | **Execution** | Agent 实际跑了一轮。记录 `parent_execution_id` / `delegation_path` / `external_work_ref`（开始时从 conversation 快照）/ `external_work_snapshot`（开始时向外部系统取证），构成完整审计链。状态：`queued` / `running` / `waiting_for_member` / `completed` / `failed` / `cancelled` / `interrupted`。 |
 | **Team** | 顶层协作边界（单 Team 部署，`team_id` 为以后多 Team 留结构）。 |
-| **TeamMembership** | 谁属于 Team：`human`（`principalId=user id`，单机为 `LOCAL_ACTOR_ID`）/ `agent`（`principalId=member.id`），`role=owner/admin/member`。`Member.role` 是职业角色，两者绝不合并。 |
+| **TeamMembership** | 谁属于 Team：`human`（`principalId=user id`，单机为 `LOCAL_ACTOR_ID`）/ `agent`（`principalId=member.id`），`role=owner/admin/member`。`Member.role` 是职业角色，两者绝不合并。**一个 Member 只属于一个 Team**：把它加进第二个 Team 直接拒绝（`ensureAgentMembership`）。多 Team 的 Member 会让模型档位、状态、能力绑定、记忆与 Team 上下文、审核策略同时出现两套答案 —— 一次性拒绝，而不是逐处修补。 |
 | **Jira（外部事实源）** | 业务工作（工单、状态、负责人、工作流）以 Jira 为准，**本地不复制**。本地只有两个值对象：`ExternalWorkRef`（provider/externalId/key/url，挂在 Conversation 与 Execution 上）和 `ExternalWorkSnapshot`（execution 开始时向 Jira 取证的最小字段）。没有 Project / WorkItem / JiraIssue 这些本地业务对象。`Current Work` = active execution → 外部引用。Agent 通过 `atlassian.jira-tools` 读写工单；控制面（取证、webhook 定位房间）走 `WorkManagementProvider` 直连，**不经过 LLM**。 |
 | **Presence** | Team 层可接工作状态：落库只有 `available/away/paused`，`busy/offline` 由 active execution / lastSeen 计算。`paused` 只拦自动唤醒，不拦 @ 点名。 |
 | **Experience** | 可检索的工作经验（`trigger → lesson`），落在 `.data/experiences/<teamId>/experiences.jsonl`，不进数据库。MEMORY.md 是长期事实/习惯（全文 append），Experience 是面向任务复用的经验（按需检索）。Agent 用 `learn_experience` 存（用户纠正/成功复盘/策略发现），控制面每轮按原始输入自动检索、经 ContextAssembler 注入 prompt —— Agent 不需要记得检索。授权/政策/模型规则禁止当经验存，经验只是建议，当前需求与权威知识优先。 |
@@ -352,6 +352,45 @@ Copilot Session                     = 当前 Agent 的工作上下文 → 由 SD
 所以这里没有 ConversationSummaryService，也没有「每 N 轮自动摘要」：那等于把永久原始记录降级成摘要的副本，而摘要一旦和原始记录不一致，就没有权威来源了。同理 SDK 自带的 Memory 显式关闭（`memory: { enabled: false }`）—— 长期记忆只由 Member / Team Memory 承担，两套记忆并存会让「哪套生效」不可预测。
 
 > **多副本前提**：SDK 不提供「同一个 session 被两个进程并发访问」的互斥，`withLock(runtime.id)` 只在单进程内有效。单副本直接可用；多副本必须先做完 Worker Lease + execution 归属 + session 归属（见 §Worker Lease）。
+
+#### isolated session
+
+`execution.session_mode` 决定这一轮用哪个 session：
+
+| mode | session id | 生命周期 |
+|---|---|---|
+| `persistent`（默认） | `member_runtime.copilot_session_id` | 长期复用，空闲 `COPILOT_SESSION_IDLE_TIMEOUT_SECONDS` 后被回收 |
+| `isolated` | `execution-<id>` | 跑完即删 |
+
+独立分析（任务标了 `independentContext`）与 delegation 走 `isolated`。**两件事必须一起做**：
+
+- `independentContext` 只挡住「共享 transcript 注入 prompt」
+- session 隔离挡住「上一个轮次的 assistant 消息还在 session history 里」
+
+只有前者时，「独立复核」照样读得到被复核对象的推理过程 —— 换了 prompt 没换脑子。
+长期 session 被回收（或引擎侧丢掉）不是故障：下一轮 `resumeSession` 失败且确认
+session 不存在时会新建，上下文从 DB 里的 durable 记录恢复。
+
+#### 谁发起的这一轮
+
+`execution.initiated_by_type` / `initiated_by_id`：
+
+| type | id | 来源 |
+|---|---|---|
+| `human` | 发消息的人 | 触发这一轮的那条消息的发送者 |
+| `agent` | Member id | 委托方（`ask_member`） |
+| `system` | `scheduler` / 唤醒原因 | 定时任务、恢复、Goal 变更 |
+
+`user_id` 不再统一填 `config.localUserId` —— 那会让「人发的」「Agent 委托的」
+「定时跑的」在审计里长得一模一样。retry 继承原记录的发起人：它是「把同一轮
+再跑一次」，换一个人来背会在审计链上多出一个不存在的动作。
+
+#### 取消是 DB 上的信号
+
+`execution.cancel_requested_at` / `cancel_requested_by`。**DB 是权威信号，
+进程内的 `Set` 只是本进程的快路径**：只写 Set 时，接手这条 execution 的另一个
+副本从来没见过这个请求，于是「点了取消但还在跑」没有解释。租约心跳是执行期间
+唯一稳定的周期点，它在那里被读出来并转成一次真的 abort。
 
 ### 3. Durable event + SSE replay
 
@@ -811,7 +850,7 @@ npm run dev            # 同时启动 client(:5173) + server(:3001)
 首次启动的日志里会有一行 provisioning：
 
 ```
-[server] 新建数据库 schema v30
+[server] 新建数据库 schema v32
 [server] knowledge sync: team+3 personal+0 indexed=3
 [server] member provisioning: created=3 (financial-services.solution-architect, ...) skipped=0
 [server] conversation files recovery: requeued=0
@@ -1254,6 +1293,7 @@ scripts/
 | `COPILOT_WARMUP` | `true` | 启动时预热 Copilot client |
 | `MAX_DELEGATION_DEPTH` | `4` | `delegation_path` 最大长度 |
 | `EXECUTION_TIMEOUT_MS` | `600000` | 单次 turn 上限（SDK 默认 60s 对带工具的真实任务太短） |
+| `COPILOT_SESSION_IDLE_TIMEOUT_SECONDS` | `1800` | 长期（persistent）Copilot session 的空闲回收时间。到期被回收不是故障 —— 下一轮会重建 session 并从 DB 恢复上下文 |
 | `RECOVER_ON_STARTUP` | `true` | 启动时跑 `RecoveryService`（单进程独占 DB 才安全） |
 | `MAX_CONTEXT_MESSAGES` | `60` | 注入 prompt 的 shared message 条数上限（从最新往前取，至少 1 条）。只是这一轮的输入之一：Member 自己的 Copilot Session 带着自己的历史，Goal / Task / Approval 是结构化事实，Memory 管跨会话长期记忆 |
 | `MAX_CONTEXT_CHARS` | `32000` | 注入 prompt 的字符数上限（含每条 32 字符的固定开销），与条数上限同时生效。两条都超时按先到的截，被截掉的部分会在 transcript 前显式说明 |

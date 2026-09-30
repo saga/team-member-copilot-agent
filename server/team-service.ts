@@ -66,7 +66,7 @@ import { ExecutionService } from './execution-service.js';
 import { TaskApplicationService } from './task-application-service.js';
 import type { TeamInternals } from './team-internals.js';
 import type { LeaseGrant, WorkerLeaseService } from './worker-lease.js';
-import { mapExecution, mapMessage, mapRuntime } from './team-shared.js';
+import { mapExecution, mapMessage, mapRuntime, sessionModeOf } from './team-shared.js';
 import type { ConversationRow, ExecutionRow, MessageRow, RuntimeRow } from './team-shared.js';
 export { ExecutionCancelledError } from './team-shared.js';
 
@@ -431,6 +431,7 @@ export class TeamService {
       cancelExecutionTree: (executionId, visited) =>
         this.executions.cancelExecutionTree(executionId, visited),
       cancelRequests: this.cancelRequests,
+      isCancellationRequested: this.isCancellationRequested.bind(this),
       capabilities: this.capabilities,
       capabilityResolver: this.capabilityResolver,
       contextAssembler: this.contextAssembler,
@@ -526,6 +527,26 @@ export class TeamService {
         this.structure.requireActiveMembership(teamId, 'agent', id);
       } catch {
         throw notFound(`Member 不存在：${id}`);
+      }
+    }
+    return member;
+  }
+
+  /**
+   * Member 维度子资源的统一门禁：member 必须存在且属于该 Team。
+   *
+   * 和 getMember(id, teamId) 的区别：那个是身份查询，用 404 抹平「不存在」与
+   * 「不在本 Team」（防跨 Team 探测）；这里是资源门禁，不存在报 404，
+   * 存在但不在本 Team 报 403。各 member-target 路由统一走这里，
+   * 不要自己写查询。
+   */
+  requireMemberInTeam(teamId: string, memberId: string): Member {
+    const member = this.members.get(memberId);
+    if (this.structure) {
+      try {
+        this.structure.requireActiveMembership(teamId, 'agent', memberId);
+      } catch {
+        throw forbidden('Member 不属于这个 Team');
       }
     }
     return member;
@@ -900,12 +921,18 @@ export class TeamService {
     return this.memberConversations.list(memberId);
   }
 
-  /** 找到或创建两个 Member 之间的私聊房间。 */
-  openDirectMessage(a: string, b: string): Conversation {
-    return this.memberConversations.open(a, b);
+  /**
+   * 找到或创建两个 Member 之间的私聊房间。
+   *
+   * teamId 是必填参数而不是从别处推出来的：DM 房间属于某个 Team，
+   * 「两个人在同一 Team 里」是它成立的前提，不是事后校验的附属条件。
+   */
+  openDirectMessage(teamId: string, a: string, b: string): Conversation {
+    return this.memberConversations.open(teamId, a, b);
   }
 
   sendDirectMessage(input: {
+    teamId: string;
     fromMemberId: string;
     toMemberId: string;
     content: string;
@@ -914,6 +941,7 @@ export class TeamService {
   }
 
   async messageMember(input: {
+    teamId: string;
     fromMemberId: string;
     targetMemberId: string;
     content: string;
@@ -1311,8 +1339,23 @@ export class TeamService {
     return this.executions.listExecutions(conversationId, limit);
   }
 
-  async cancelExecution(executionId: string): Promise<ExecutionRecord> {
-    return this.executions.cancelExecution(executionId);
+  /** `requestedBy` 落进 `cancel_requested_by`：谁点的取消，事后要答得出来。 */
+  async cancelExecution(executionId: string, requestedBy = 'unknown'): Promise<ExecutionRecord> {
+    return this.executions.cancelExecution(executionId, requestedBy);
+  }
+
+  /**
+   * 这一轮有没有人请求过取消。
+   *
+   * 判据是 **DB，不是进程内的 Set**。Set 只活在收到请求的那个进程里：
+   * 另一个副本（或重启后接手这条 execution 的 worker）看不到它，于是
+   * 「点了取消但还在跑」没有解释。DB 是权威信号，Set 只是本进程的快路径。
+   */
+  isCancellationRequested(executionId: string): boolean {
+    const row = this.db
+      .prepare(`SELECT cancel_requested_at FROM execution WHERE id = ?`)
+      .get(executionId) as unknown as { cancel_requested_at: string | null } | undefined;
+    return row?.cancel_requested_at != null;
   }
 
   retryExecution(executionId: string): { executionId: string } {
@@ -1368,6 +1411,8 @@ export class TeamService {
       parentExecutionId: null,
       delegationPath: [member.id],
       kind: 'member_work',
+      sessionMode: sessionModeOf({ kind: 'member_work' }),
+      initiatedBy: { type: 'system', id: 'scheduler' },
       status: 'queued',
       prompt,
       response: null,
@@ -2048,6 +2093,9 @@ export class TeamService {
           parent_execution_id,
           delegation_path,
           kind,
+          session_mode,
+          initiated_by_type,
+          initiated_by_id,
           status,
           prompt,
           response,
@@ -2062,7 +2110,7 @@ export class TeamService {
           ended_at,
           created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `,
       )
       .run(
@@ -2078,6 +2126,9 @@ export class TeamService {
         execution.parentExecutionId,
         JSON.stringify(execution.delegationPath),
         execution.kind,
+        execution.sessionMode,
+        execution.initiatedBy.type,
+        execution.initiatedBy.id,
         execution.status,
         execution.prompt,
         execution.response,

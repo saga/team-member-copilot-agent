@@ -600,6 +600,24 @@ export interface ExecutionConfigSnapshot {
   canonicalHash?: string;
 }
 
+/**
+ * 这一轮用哪个 Copilot session。
+ *
+ * `persistent` 复用 (conversation, member) 那个长期 session，`isolated` 每次
+ * execution 开一个全新的。独立分析（independentContext）与委托下级都用后者 ——
+ * 只挡住共享 transcript 不换 session 的话，「独立复核」仍然读得到被复核对象
+ * 在同一 session 里的推理过程。
+ */
+export type ExecutionSessionMode = 'persistent' | 'isolated';
+
+export type ExecutionActorType = 'human' | 'agent' | 'system';
+
+export interface ExecutionActor {
+  type: ExecutionActorType;
+  /** human = OIDC sub / 消息发送者；agent = Member id；system = scheduler / recovery / 唤醒原因。 */
+  id: string;
+}
+
 export interface ExecutionRecord {
   id: string;
   conversationId: string;
@@ -634,6 +652,15 @@ export interface ExecutionRecord {
   /** 从根到当前的 Member 链，用来防 A→B→C→A 和无限深链。 */
   delegationPath: string[];
   kind: ExecutionKind;
+  /** 这一轮开一个新 session 还是复用长期的那个。 */
+  sessionMode: ExecutionSessionMode;
+  /**
+   * 谁发起的这一轮。
+   *
+   * 它不是「执行人」（那是 memberId）：人发消息、Agent 委托、定时任务
+   * 都会让同一个 Member 跑起来，只有它回答得了「是谁让它跑的」。
+   */
+  initiatedBy: ExecutionActor;
   status: ExecutionStatus;
   prompt: string;
   response: string | null;

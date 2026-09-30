@@ -119,6 +119,7 @@ export function membersRouter(team: TeamService) {
    */
   router.get('/:id/memory', (req, res) => {
     try {
+      team.requireMemberInTeam(requestTeamId(req), req.params.id);
       res.json(team.getMemberMemory(req.params.id));
     } catch (error) {
       sendError(res, error);
@@ -142,6 +143,7 @@ export function membersRouter(team: TeamService) {
       return;
     }
     try {
+      team.requireMemberInTeam(requestTeamId(req), req.params.id);
       res.json(
         team.replaceMemberMemory(req.params.id, parsed.data.content, parsed.data.expectedVersion),
       );
@@ -160,7 +162,8 @@ export function membersRouter(team: TeamService) {
    */
   router.get('/:id/team-context', (req, res) => {
     try {
-      const teamId = typeof req.query.teamId === 'string' ? req.query.teamId : undefined;
+      const teamId = typeof req.query.teamId === 'string' ? req.query.teamId : requestTeamId(req);
+      team.requireMemberInTeam(teamId, req.params.id);
       res.json(team.getMemberTeamContext(req.params.id, teamId));
     } catch (error) {
       sendError(res, error);
@@ -179,7 +182,8 @@ export function membersRouter(team: TeamService) {
     }
     try {
       const body = req.body as { teamId?: unknown };
-      const teamId = typeof body.teamId === 'string' ? body.teamId : undefined;
+      const teamId = typeof body.teamId === 'string' ? body.teamId : requestTeamId(req);
+      team.requireMemberInTeam(teamId, req.params.id);
       res.json(
         team.replaceMemberTeamContext(
           req.params.id,
@@ -201,6 +205,7 @@ export function membersRouter(team: TeamService) {
    */
   router.get('/:id/conversations', (req, res) => {
     try {
+      team.requireMemberInTeam(requestTeamId(req), req.params.id);
       res.json({ conversations: team.listMemberConversations(req.params.id) });
     } catch (error) {
       sendError(res, error);
@@ -209,6 +214,7 @@ export function membersRouter(team: TeamService) {
 
   router.get('/:id/teams', (req, res) => {
     try {
+      team.requireMemberInTeam(requestTeamId(req), req.params.id);
       res.json({ teams: team.listMemberTeams(req.params.id) });
     } catch (error) {
       sendError(res, error);
@@ -229,6 +235,7 @@ export function membersRouter(team: TeamService) {
    */
   router.get('/:id/direct-messages', (req, res) => {
     try {
+      team.requireMemberInTeam(requestTeamId(req), req.params.id);
       res.json({ conversations: team.listDirectMessages(req.params.id) });
     } catch (error) {
       sendError(res, error);

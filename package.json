@@ -1,7 +1,7 @@
 {
   "name": "team-member-copilot-agent",
   "private": true,
-  "version": "0.4.9",
+  "version": "0.5.1",
   "type": "module",
   "description": "Copilot SDK + Vite + TypeScript + Express 基础框架（参考 ai-interview-questions 的前后端同源结构）",
   "scripts": {
@@ -19,7 +19,7 @@
   "dependencies": {
     "@ant-design/x": "^2.9.0",
     "@ant-design/x-markdown": "2.9.0",
-    "@github/copilot-sdk": "^1.0.14",
+    "@github/copilot-sdk": "^1.0.15",
     "antd": "^6.6.5",
     "cors": "^2.8.6",
     "dotenv": "^18.0.4",

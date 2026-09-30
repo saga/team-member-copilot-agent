@@ -3,6 +3,7 @@ import { config } from './config.js';
 import { now } from './db.js';
 import type { Conversation, ExecutionRecord, Member } from './domain.js';
 import { badRequest } from './http-error.js';
+import { sessionModeOf } from './team-shared.js';
 import type { TeamInternals } from './team-internals.js';
 import type { SendMessageResult } from './team-service.js';
 
@@ -99,6 +100,10 @@ export class CollaborationService {
       parentExecutionId: parent.id,
       delegationPath: [...parent.delegationPath, targetMember.id],
       kind: 'member_delegate',
+      sessionMode: sessionModeOf({ kind: 'member_delegate' }),
+      // 发起人是委托方那个 Agent，不是「系统」：ask_member 是它自己的决定，
+      // 审计要能回答「是谁让它跑的」。
+      initiatedBy: { type: 'agent', id: fromMember.id },
       status: 'queued',
       prompt: input.task.trim(),
       response: null,
@@ -198,11 +203,13 @@ export class CollaborationService {
 
   /** CopilotHost 的实现：Member 在自己 turn 里调 message_member tool 时走这里。 */
   async messageMember(input: {
+    teamId: string;
     fromMemberId: string;
     targetMemberId: string;
     content: string;
   }): Promise<{ conversationId: string; messageId: string }> {
     const result = await this.internals.memberConversations.send({
+      teamId: input.teamId,
       fromMemberId: input.fromMemberId,
       toMemberId: input.targetMemberId,
       content: input.content,
@@ -212,6 +219,7 @@ export class CollaborationService {
 
   /** 以某个 Member 的身份给另一个 Member 发消息（UI / REST 侧）。 */
   sendDirectMessage(input: {
+    teamId: string;
     fromMemberId: string;
     toMemberId: string;
     content: string;

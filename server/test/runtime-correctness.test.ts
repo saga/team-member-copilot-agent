@@ -208,7 +208,7 @@ function createFakeSession(options: {
 
 interface FakeClient {
   client: CopilotClient;
-  calls: { resume: number; create: number; metadata: number };
+  calls: { resume: number; create: number; metadata: number; deleted: string[] };
 }
 
 function createFakeClient(config: {
@@ -224,12 +224,15 @@ function createFakeClient(config: {
    */
   onConfig?: (config: unknown) => void;
 }): FakeClient {
-  const calls = { resume: 0, create: 0, metadata: 0 };
+  const calls = { resume: 0, create: 0, metadata: 0, deleted: [] as string[] };
 
   const client = {
     async start() {},
     async stop() {
       return [];
+    },
+    async deleteSession(sessionId: string) {
+      calls.deleted.push(sessionId);
     },
     async resumeSession(sessionId: string, sessionConfig?: unknown) {
       calls.resume += 1;
@@ -340,6 +343,37 @@ describe('resumeSession 的降级必须窄', () => {
     assert.equal(fake.calls.metadata, 0, '已经明确匹配就不需要再问一次');
   });
 
+});
+
+describe('isolated session 用完即删', () => {
+  it('releaseSession = true 时引擎侧真的删掉这个 session', async () => {
+    const fresh = createFakeSession({ sessionId: 'sess-iso' });
+    const fake = createFakeClient({
+      resume: async () => fresh.session,
+      create: async () => fresh.session,
+    });
+    const copilot = new CopilotService({ createClient: () => fake.client });
+
+    await copilot.runMemberTurn({
+      ...turnInput(),
+      sessionId: 'execution-exec-9',
+      releaseSession: true,
+    });
+
+    // 不删的话它只是「没人再用」，但仍然躺在引擎里：同一个 id 下次进来会被
+    // resume，于是「独立复核」拿到了上一轮的 session history。
+    assert.deepEqual(fake.calls.deleted, ['execution-exec-9']);
+  });
+
+  it('persistent 轮次绝不删长期 session', async () => {
+    const fresh = createFakeSession({ sessionId: 'sess-1' });
+    const fake = createFakeClient({ resume: async () => fresh.session });
+    const copilot = new CopilotService({ createClient: () => fake.client });
+
+    await copilot.runMemberTurn(turnInput());
+
+    assert.deepEqual(fake.calls.deleted, [], '长期 session 被删掉等于清空这个人的工作上下文');
+  });
 });
 
 describe('sendAndWait 超时 → abort', () => {
@@ -672,6 +706,64 @@ describe('Execution cancel 状态机', () => {
         'idle',
         '取消不是故障，runtime 应回到 idle 而不是 error',
       );
+    } finally {
+      release?.();
+      stub.hold = null;
+    }
+  });
+
+  it('cancel 先落库：谁点的、什么时候点的都在 DB 上', async () => {
+    const conv = newConversation();
+    let release!: () => void;
+    stub.hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    try {
+      const sent = await sendMessage({ actorId: 'test-user', conversationId: conv.id, content: 'long task' });
+      await waitForStatus(sent.executionId, 'running');
+
+      const cancelPromise = team.cancelExecution(sent.executionId, 'user-9');
+      release();
+      stub.hold = null;
+      await cancelPromise;
+
+      const row = db
+        .prepare(`SELECT cancel_requested_at, cancel_requested_by FROM execution WHERE id = ?`)
+        .get(sent.executionId) as unknown as
+        | { cancel_requested_at: string | null; cancel_requested_by: string | null }
+        | undefined;
+      assert.ok(row);
+      assert.ok(row.cancel_requested_at, '取消请求必须落库：进程内的 Set 换一个副本就消失了');
+      assert.equal(row.cancel_requested_by, 'user-9');
+    } finally {
+      release?.();
+      stub.hold = null;
+    }
+  });
+
+  it('别的副本写的取消请求，本进程这一轮也会停下来', async () => {
+    const conv = newConversation();
+    let release!: () => void;
+    stub.hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    try {
+      const sent = await sendMessage({ actorId: 'test-user', conversationId: conv.id, content: 'long task' });
+      await waitForStatus(sent.executionId, 'running');
+
+      // 直接写库，模拟「取消请求来自另一个副本」—— 本进程的 cancelRequests
+      // 里没有它，只有读 DB 才看得到。
+      db.prepare(
+        `UPDATE execution SET cancel_requested_at = ?, cancel_requested_by = ?
+         WHERE id = ? AND cancel_requested_at IS NULL`,
+      ).run(new Date().toISOString(), 'replica-b', sent.executionId);
+      assert.equal(team.isCancellationRequested(sent.executionId), true);
+
+      release();
+      stub.hold = null;
+      await waitForStatus(sent.executionId, 'cancelled');
     } finally {
       release?.();
       stub.hold = null;
