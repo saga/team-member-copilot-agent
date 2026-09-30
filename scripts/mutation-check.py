@@ -1379,6 +1379,28 @@ MUTATIONS = [
             )
         ],
     },
+    {
+        "name": "description 也拼进 system prompt（同一份职责写两处）",
+        "test": "server/test/runtime-reliability.test.ts",
+        "steps": [
+            (
+                "server/execution-service.ts",
+                "      `Member role: ${member.role}`,\n      '',\n      'Work contract:',",
+                "      `Member role: ${member.role}`,\n      `Member description: ${member.description}`,\n      '',\n      'Work contract:',",
+            )
+        ],
+    },
+    {
+        "name": "PATCH 的 schema 漏掉 description（编辑器保存后重开就没了）",
+        "test": "server/test/multi-team-isolation.test.ts",
+        "steps": [
+            (
+                "server/routes/members.ts",
+                "  role: z.string().trim().min(1).max(200).optional(),\n  description: z.string().max(2000).optional(),\n  systemPrompt: z.string().max(12000).optional(),",
+                "  role: z.string().trim().min(1).max(200).optional(),\n  systemPrompt: z.string().max(12000).optional(),",
+            )
+        ],
+    },
 ]
 
 

@@ -269,6 +269,28 @@ describe('多 Team 隔离：Member 写入路径', () => {
     assert.equal(restored.status, 200, await restored.text());
   });
 
+  it('HTTP：description 是身份字段，PATCH 之后读得回来', async () => {
+    // description 是「给人看的职责摘要」，和 role / systemPrompt 是三个不同的东西。
+    // 它必须整条链路都在：路由 schema（strip 模式下漏了就会被静默丢掉）→
+    // TeamService → member 表 → 读回来。任何一环少一个字段，表现都是
+    // 「编辑器里填了、保存 200、重开就没了」—— 不报错，只是内容消失。
+    const updated = await fetch(`${base}/api/members/${memberInA}?teamId=${teamA}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ description: '负责从安全角度独立审查方案与实现' }),
+    });
+    assert.equal(updated.status, 200, await updated.text());
+    assert.equal(
+      stack.team.getMember(memberInA).description,
+      '负责从安全角度独立审查方案与实现',
+    );
+
+    const read = await fetch(`${base}/api/members/${memberInA}?teamId=${teamA}`);
+    assert.equal(read.status, 200);
+    const body = (await read.json()) as { member: { description: string } };
+    assert.equal(body.member.description, '负责从安全角度独立审查方案与实现');
+  });
+
   it('归档的 Member 仍然能恢复：归属校验不看 status', () => {
     // 恢复归档要能走通。PATCH 如果改用 requireMemberInTeam（它跑
     // requireActiveMembership），归档的人 membership 是 inactive，

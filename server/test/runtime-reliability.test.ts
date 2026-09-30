@@ -49,6 +49,14 @@ interface TurnInput {
     copilotSessionId: string;
   };
   member: { id: string };
+  /**
+   * 身份 / 工作契约那段（`buildMemberSystemPrompt` 的产物）。
+   *
+   * 和 `prompt` 分开记：`prompt` 是这一轮的房间上下文（user prompt），
+   * `systemPrompt` 是稳定的身份段。两者的内容边界本身就是一条要断言的契约
+   * —— 例如 description 只该出现在 UI，两个都不该有它。
+   */
+  systemPrompt: string;
   prompt: string;
   executionId: string;
   /** isolated 轮次才有：execution 专属的 session。 */
@@ -871,6 +879,47 @@ describe('ContextAssembler：增量上下文而不是整段重放', () => {
     assert.ok(runtime.last_context_message_sequence > 0);
   });
 
+});
+
+describe('Member 身份字段的分工', () => {
+  it('role / systemPrompt 进 system prompt，description 不进', async () => {
+    // 三个字段职责不同：role 是短职责标签、systemPrompt 是工作契约、
+    // description 是给人看的职责摘要。把 description 也拼进 prompt，就等于
+    // 同一份职责写两处 —— 改一处忘一处之后没人知道哪份才是真实职责。
+    const member = team.createMember({
+      name: 'Field Contract',
+      role: 'ROLE-MARKER',
+      description: 'DESCRIPTION-MARKER 负责投资研究与事实核查',
+      systemPrompt: 'PROMPT-MARKER 先区分事实与推论。',
+    });
+    const conv = team.createConversation({
+      kind: 'task',
+      title: 'Field contract',
+      memberIds: [member.id],
+      leadMemberId: member.id,
+    });
+
+    const sent = await sendMessage({ actorId: 'test-user', conversationId: conv.id, content: 'HELLO' });
+    await waitForStatus(sent.executionId, 'completed');
+
+    const turn = stub.turnsFor(member.id).at(-1)!;
+    assert.match(turn.systemPrompt, /ROLE-MARKER/, 'role 是身份的一部分，必须在 system prompt 里');
+    assert.match(
+      turn.systemPrompt,
+      /PROMPT-MARKER/,
+      'systemPrompt 是工作契约，必须在 system prompt 里',
+    );
+    assert.doesNotMatch(
+      turn.systemPrompt,
+      /DESCRIPTION-MARKER/,
+      'description 是给人看的职责摘要，不是人格提示，也不该进 prompt',
+    );
+    assert.doesNotMatch(
+      turn.prompt,
+      /DESCRIPTION-MARKER/,
+      '房间上下文里也不该出现它 —— 它是身份字段，不是房间事实',
+    );
+  });
 });
 
 describe('独立 Task 不读共享房间上下文', () => {
