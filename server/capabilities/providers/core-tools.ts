@@ -26,11 +26,7 @@ export interface CoreToolHost {
     reason?: string;
   }): Promise<string>;
 
-  rememberMember(input: {
-    memberId: string;
-    teamId: string;
-    content: string;
-  }): Promise<string>;
+  rememberMember(input: { memberId: string; content: string }): Promise<string>;
 
   /**
    * 申报这一轮结论的依据。
@@ -227,21 +223,21 @@ export class CoreTeamToolProvider implements ToolProvider {
         kind: 'custom',
         name: 'remember_member',
         description:
-          'Save something this Member should remember for the current Team. ' +
-          'Use this for Team workflows, relationships, project facts, and local working conventions. ' +
-          'Do not use this as a global personality or preference store.',
+          'Save something this Member should remember long-term. ' +
+          'Use this for durable facts about this Member: working conventions, ' +
+          'relationships, project facts it will need again. ' +
+          'This is one shared memory, not scoped to a Team or a room.',
         risk: 'self-write',
         parameters: z.object({
           content: z
             .string()
             .min(1)
             .max(8000)
-            .describe('Information to remember for the current Team.'),
+            .describe('Information to remember long-term.'),
         }),
         execute: (context, args) =>
           this.host.rememberMember({
             memberId: context.memberId,
-            teamId: context.teamId,
             content: String(args.content),
           }),
       },

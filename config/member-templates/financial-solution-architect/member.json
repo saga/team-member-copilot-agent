@@ -3,7 +3,6 @@
   "handle": "architect",
   "name": "Senior Solution Architect",
   "role": "Senior Financial Services Solution Architect",
-  "description": "负责金融服务领域的端到端解决方案设计、架构评审、技术选型、系统边界定义，以及 AI Agent、数据、集成、安全、运营和治理方面的架构分析。",
   "model": null,
   "systemPromptFile": "SYSTEM_PROMPT.md",
   "memoryFile": "MEMORY.md",

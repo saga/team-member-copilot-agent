@@ -29,6 +29,7 @@ const { CopilotService, isTurnTimeout } = await import('../copilot.js');
 const { DefaultToolPolicy } = await import('../tool-policy.js');
 import type { PolicyService } from '../policy.js';
 import type { MemberCapabilities } from '../domain.js';
+import type { MemberTurnResult } from '../copilot.js';
 const { createTestStack, capabilityContext, permissiveEntitlement, singleExecutionId } = await import(
   './support.js'
 );
@@ -63,19 +64,23 @@ class StubCopilot {
   resolveOnCancel = false;
   private readonly cancelled = new Set<string>();
 
+  persistentSessionExists(): Promise<boolean> {
+    return Promise.resolve(true);
+  }
+
   async runMemberTurn(input: {
     member: { id: string };
     executionId: string;
     prompt: string;
-  }): Promise<string> {
+  }): Promise<MemberTurnResult> {
     this.turns.push(input);
     if (this.hold) await this.hold;
     if (this.cancelled.has(input.executionId)) {
-      if (this.resolveOnCancel) return 'partial output';
+      if (this.resolveOnCancel) return { content: 'partial output', sessionCreated: false };
       throw new Error('aborted by user');
     }
     if (this.failWith) throw new Error(this.failWith);
-    return `stub reply from ${input.member.id}`;
+    return { content: `stub reply from ${input.member.id}`, sessionCreated: false };
   }
 
   async cancelTurn(executionId: string) {
@@ -286,7 +291,6 @@ function turnInput(
       handle: 'alice',
       name: 'Alice',
       role: 'Analyst',
-      description: '',
       style: '',
       systemPrompt: '',
       model: null,
@@ -337,12 +341,43 @@ describe('resumeSession 的降级必须窄', () => {
 
     const result = await copilot.runMemberTurn(turnInput());
 
-    assert.equal(result, 'hello');
+    assert.equal(result.content, 'hello');
+    assert.equal(result.sessionCreated, true, '新建的 session 必须如实报告 —— 调用方靠它决定 checkpoint 能不能往前推');
     assert.equal(fake.calls.resume, 1);
     assert.equal(fake.calls.create, 1);
     assert.equal(fake.calls.metadata, 0, '已经明确匹配就不需要再问一次');
   });
 
+});
+
+describe('persistentSessionExists：查不出来时按「不在了」处理', () => {
+  it('元数据查得到 → 还在', async () => {
+    const fake = createFakeClient({ metadata: async () => ({ sessionId: 'sess-1' }) });
+    const copilot = new CopilotService({ createClient: () => fake.client });
+
+    assert.equal(await copilot.persistentSessionExists('sess-1'), true);
+  });
+
+  it('元数据是 undefined → 不在了', async () => {
+    const fake = createFakeClient({ metadata: async () => undefined });
+    const copilot = new CopilotService({ createClient: () => fake.client });
+
+    assert.equal(await copilot.persistentSessionExists('sess-1'), false);
+  });
+
+  it('查询本身失败 → 也按「不在了」处理', async () => {
+    // 两个方向的代价不对等：按「不在了」处理最坏是多带一遍房间记录（可恢复的
+    // 冗余）；按「还在」处理则是新 session 从 checkpoint 之后开始读，中间那段
+    // 历史悄悄消失。所以这里的失败方向与 isSessionMissing 相反，是刻意的。
+    const fake = createFakeClient({
+      metadata: async () => {
+        throw new Error('test: metadata rpc down');
+      },
+    });
+    const copilot = new CopilotService({ createClient: () => fake.client });
+
+    assert.equal(await copilot.persistentSessionExists('sess-1'), false);
+  });
 });
 
 describe('isolated session 用完即删', () => {

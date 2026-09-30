@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import type { CopilotService } from '../copilot.js';
+import type { CopilotService, MemberTurnResult } from '../copilot.js';
 import type { Member } from '../domain.js';
 
 /**
@@ -48,9 +48,13 @@ interface TurnInput {
 class StubCopilot {
   readonly turns: TurnInput[] = [];
 
-  async runMemberTurn(input: TurnInput): Promise<string> {
+  persistentSessionExists(): Promise<boolean> {
+    return Promise.resolve(true);
+  }
+
+  async runMemberTurn(input: TurnInput): Promise<MemberTurnResult> {
     this.turns.push(input);
-    return `stub reply from ${input.member.id}`;
+    return { content: `stub reply from ${input.member.id}`, sessionCreated: false };
   }
 }
 

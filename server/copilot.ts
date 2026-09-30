@@ -128,6 +128,17 @@ export interface CancelTurnResult {
   idle: boolean;
 }
 
+export interface MemberTurnResult {
+  content: string;
+  /**
+   * 这一轮是在**新建的** session 上跑的（resume 失败且确认不存在，或本来就没有）。
+   *
+   * 调用方需要它来判断 checkpoint 能不能往前推：新建的 session 里没有上一轮的
+   * 上下文，「这一轮成功了」不等于「这个 session 见过 checkpoint 之前的记录」。
+   */
+  sessionCreated: boolean;
+}
+
 /** MCP 工具调用被放行时的通知（给 Activity 的「用过什么」展示用）。 */
 export interface McpToolCallInfo {
   executionId: string;
@@ -325,7 +336,7 @@ export class CopilotService {
     }
   }
 
-  async runMemberTurn(input: RunMemberTurnInput): Promise<string> {
+  async runMemberTurn(input: RunMemberTurnInput): Promise<MemberTurnResult> {
     return this.withLock(input.runtime.id, async () => {
       const client = await this.getClient();
 
@@ -434,7 +445,11 @@ export class CopilotService {
 
       // resumeSession 的第二个参数是 ResumeSessionConfig（没有 sessionId 字段）。
       // 多传一个 sessionId 是无害的：resume RPC 逐字段取值，sessionId 来自第一个参数。
-      const session = await this.acquireSession(client, sessionId, sessionConfig);
+      const { session, created: sessionCreated } = await this.acquireSession(
+        client,
+        sessionId,
+        sessionConfig,
+      );
 
       this.activeSessions.set(input.executionId, session);
 
@@ -523,7 +538,7 @@ export class CopilotService {
           },
           config.executionTimeoutMs,
         );
-        return finalEvent?.data.content || content;
+        return { content: finalEvent?.data.content || content, sessionCreated };
       } catch (error) {
         if (isTurnTimeout(error)) {
           // 超时只是「我们不再等 session.idle」，Agent 很可能还在跑。
@@ -590,12 +605,37 @@ export class CopilotService {
     client: CopilotClient,
     sessionId: string,
     sessionConfig: Parameters<CopilotClient['createSession']>[0],
-  ): Promise<CopilotSession> {
+  ): Promise<{ session: CopilotSession; created: boolean }> {
     try {
-      return await client.resumeSession(sessionId, sessionConfig);
+      return { session: await client.resumeSession(sessionId, sessionConfig), created: false };
     } catch (error) {
       if (!(await this.isSessionMissing(client, sessionId, error))) throw error;
-      return client.createSession(sessionConfig);
+      return { session: await client.createSession(sessionConfig), created: true };
+    }
+  }
+
+  /**
+   * 这个持久 session 还在不在（有没有被 idle TTL 回收、COPILOT_HOME 被清、
+   * 换了一台机器）。
+   *
+   * 判定口径与 isSessionMissing 相同（getSessionMetadata 是权威来源），但
+   * **失败方向相反**：查不出来时按「不在了」返回。
+   *
+   * 两个方向的代价不对等。按「不在了」处理，最坏情况是这一轮多带一遍房间
+   * 记录（可恢复的冗余）；按「还在」处理，新 session 就会从 checkpoint 之后
+   * 开始读，中间那段历史**悄悄消失** —— 表现是「它突然什么都不记得了」，
+   * 而且没有任何地方看得出原因。
+   *
+   * 与 isSessionMissing 的差异是刻意的：那里的「不确定」要保留原始错误，
+   * 不能把「引擎坏了」伪装成「这是一轮全新对话」；这里没有错误要保留，
+   * 只有两种处理方式，所以选可恢复的那一种。
+   */
+  async persistentSessionExists(sessionId: string): Promise<boolean> {
+    try {
+      const client = await this.getClient();
+      return (await client.getSessionMetadata(sessionId)) !== undefined;
+    } catch {
+      return false;
     }
   }
 

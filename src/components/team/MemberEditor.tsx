@@ -15,7 +15,7 @@ interface MemberEditorProps {
  *
  * 字段和数据库一一对应，不做二次抽象：
  *
- *   name / handle / role / description / systemPrompt / model
+ *   name / handle / role / systemPrompt / model
  *
  * role + systemPrompt（工作契约）会拼进 system prompt（见 execution-service
  * buildMemberSystemPrompt）。`model` 只能选策略里的 Member 模型
@@ -41,7 +41,6 @@ export function MemberEditor({ member, modelPolicy, onSaved, onCancel }: MemberE
         // 空 handle 不发：它是 @mention 的锚点，不能清空
         ...(values.handle.trim() ? { handle: values.handle.trim() } : {}),
         role: values.role.trim(),
-        description: values.description.trim(),
         systemPrompt: values.systemPrompt,
         // 空 = 显式回落默认 Member 模型（后端按 !== undefined 判断，不会被 ?? 吃掉）
         model: values.model?.trim() || null,
@@ -87,7 +86,6 @@ export function MemberEditor({ member, modelPolicy, onSaved, onCancel }: MemberE
         name: member.name,
         handle: member.handle,
         role: member.role,
-        description: member.description,
         systemPrompt: member.systemPrompt,
         model: member.model ?? '',
       }}
@@ -101,9 +99,6 @@ export function MemberEditor({ member, modelPolicy, onSaved, onCancel }: MemberE
       </Form.Item>
       <Form.Item name="role" label="Role" rules={[{ required: true }]}>
         <Input />
-      </Form.Item>
-      <Form.Item name="description" label="Description">
-        <Input.TextArea placeholder="负责投资研究和事实核查" autoSize />
       </Form.Item>
       <Form.Item
         name="systemPrompt"

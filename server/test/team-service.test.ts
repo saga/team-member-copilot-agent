@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import type { CopilotService } from '../copilot.js';
+import type { CopilotService, MemberTurnResult } from '../copilot.js';
 
 /**
  * 业务控制测试。这里刻意不碰真实的 Copilot runtime：
@@ -39,10 +39,14 @@ class StubCopilot {
   /** 挂住 turn，把一个 execution 稳定地钉在 running 上。 */
   hold: Promise<void> | null = null;
 
-  async runMemberTurn(input: RunTurnInput): Promise<string> {
+  persistentSessionExists(): Promise<boolean> {
+    return Promise.resolve(true);
+  }
+
+  async runMemberTurn(input: RunTurnInput): Promise<MemberTurnResult> {
     this.turns.push(input);
     if (this.hold) await this.hold;
-    return `stub reply from ${input.member.id}`;
+    return { content: `stub reply from ${input.member.id}`, sessionCreated: false };
   }
 }
 
@@ -176,19 +180,13 @@ describe('Member 是跨 conversation 的长期身份', () => {
     assert.ok(fs.existsSync(path.join(home, 'skills')));
   });
 
-  it('remember_member 只写入这个 Team 的上下文，不进全局记忆', async () => {
-    const teamId = team.getConversation(teamConversationId).teamId;
+  it('remember_member 写进这个 Member 的长期记忆', async () => {
     const result = await team.rememberMember({
       memberId: researcher.id,
-      teamId,
-      content: '这个 Team 的 review 输出要求先给 P0/P1 风险。',
+      content: 'review 输出要求先给 P0/P1 风险。',
     });
-    assert.match(result, /Team/);
-    assert.match(memberService.readTeamMemory(researcher.id, teamId), /P0\/P1/);
-    assert.ok(
-      !memberService.readMemory(researcher.id).includes('P0/P1'),
-      'Team 上下文不能漏进全局记忆',
-    );
+    assert.match(result, /长期记忆/);
+    assert.match(memberService.readMemory(researcher.id), /P0\/P1/);
   });
 
   it('Member 视角能查到参与过的 conversation 与所属 Team', () => {

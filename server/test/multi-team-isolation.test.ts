@@ -35,8 +35,10 @@ process.env.COPILOT_WARMUP = 'false';
 
 const { db, now } = await import('../db.js');
 const { MemberService } = await import('../member-service.js');
+const { SkillService } = await import('../skill-service.js');
 const { membersRouter } = await import('../routes/members.js');
 const { conversationsRouter } = await import('../routes/conversations.js');
+const { capabilitiesRouter } = await import('../routes/capabilities.js');
 const { initTeamScope, requestTeamId } = await import('../middleware/teamScope.js');
 const { StubCopilot, createTestStack } = await import('./support.js');
 
@@ -96,6 +98,12 @@ before(async () => {
     next();
   });
   app.use('/api/members', membersRouter(stack.team));
+  app.use(
+    '/api/capabilities',
+    capabilitiesRouter(stack.team, stack.registry, new SkillService(db), stack.knowledge, {
+      hostToolsEnabled: false,
+    }),
+  );
   app.use(
     '/api/conversations',
     conversationsRouter(stack.team, stack.conversationFiles, stack.processor, stack.knowledge),
@@ -228,6 +236,106 @@ describe('一个 Member 只属于一个 Team', () => {
       before,
       '建 Member / provisioning / 加人都会走到这里，重复调用不能新增一行',
     );
+  });
+});
+
+describe('多 Team 隔离：Member 写入路径', () => {
+  it('HTTP：PATCH 别的 Team 的 Member 被拒，名字没被改掉', async () => {
+    // member 表没有 team_id，PATCH 又不带 Team 信息 —— 少了归属校验，
+    // 「改别人 Team 的人」是一次成功的 200，看不出来是越权。
+    const response = await fetch(`${base}/api/members/${memberInB}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Hijacked' }),
+    });
+
+    assert.equal(response.status, 403, await response.text());
+    assert.equal(stack.team.getMember(memberInB).name, 'Member B');
+  });
+
+  it('HTTP：PATCH 本 Team 的 Member 正常', async () => {
+    const patch = (body: unknown) =>
+      fetch(`${base}/api/members/${memberInA}?teamId=${teamA}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+    const renamed = await patch({ name: 'Member A (edited)' });
+    assert.equal(renamed.status, 200, await renamed.text());
+    assert.equal(stack.team.getMember(memberInA).name, 'Member A (edited)');
+
+    const restored = await patch({ name: 'Member A' });
+    assert.equal(restored.status, 200, await restored.text());
+  });
+
+  it('归档的 Member 仍然能恢复：归属校验不看 status', () => {
+    // 恢复归档要能走通。PATCH 如果改用 requireMemberInTeam（它跑
+    // requireActiveMembership），归档的人 membership 是 inactive，
+    // 「恢复」会和「跨 Team 越权」一起被 403 掉 —— 归档变成不可逆。
+    stack.team.updateMember(memberInB, { status: 'archived' }, teamB);
+
+    assert.throws(() => stack.team.requireMemberInTeam(teamB, memberInB), /不属于这个 Team/);
+    assert.equal(stack.team.requireMemberBelongsToTeam(teamB, memberInB).id, memberInB);
+
+    // 归档同步的是**传进来的** Team 的 membership，不是默认 Team。
+    // 用 defaultTeam() 的话这里会撞上「只能属于一个 Team」。
+    assert.equal(
+      stack.structure.getMembership(teamB, 'agent', memberInB).status,
+      'inactive',
+    );
+
+    stack.team.updateMember(memberInB, { status: 'active' }, teamB);
+    assert.equal(stack.team.getMember(memberInB).status, 'active');
+    assert.equal(stack.structure.getMembership(teamB, 'agent', memberInB).status, 'active');
+  });
+});
+
+describe('多 Team 隔离：Member 能力边界', () => {
+  it('HTTP：读/写别的 Team 的 member 层能力都被拒', async () => {
+    const read = await fetch(
+      `${base}/api/capabilities/catalog?scope=member&memberId=${memberInB}`,
+    );
+    assert.equal(read.status, 403, await read.text());
+
+    const write = await fetch(`${base}/api/capabilities/catalog`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        scope: 'member',
+        memberId: memberInB,
+        skills: [],
+        knowledge: [],
+        tools: [],
+        mcp: [],
+      }),
+    });
+    assert.equal(write.status, 403, await write.text());
+
+    // 边界先于解读 payload：同一个请求带上一个「这一层没装过」的 skill，结果仍然
+    // 是 403 而不是 400 —— 说明这一轮压根没走到「解析这个 Member 装了什么」。
+    // 顺序反过来就成了一次探测：400 与 403 的差别就是「别的 Team 有没有这个 skill」。
+    const ordering = await fetch(`${base}/api/capabilities/catalog`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        scope: 'member',
+        memberId: memberInB,
+        skills: ['member.never-installed'],
+        knowledge: [],
+        tools: [],
+        mcp: [],
+      }),
+    });
+    assert.equal(ordering.status, 403, await ordering.text());
+
+    // 没写进去 —— 403 之后必须真的没有副作用。
+    assert.deepEqual(stack.team.getMemberCapabilities(teamB, memberInB), {
+      skills: [],
+      knowledge: [],
+      tools: [],
+      mcp: [],
+    });
   });
 });
 

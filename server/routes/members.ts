@@ -14,7 +14,6 @@ const createMemberSchema = z.object({
   name: z.string().trim().min(1).max(100),
   handle: z.string().trim().min(1).max(50).optional(),
   role: z.string().trim().min(1).max(200),
-  description: z.string().max(2000).optional(),
   systemPrompt: z.string().max(12000).optional(),
   model: z.string().trim().min(1).max(100).optional(),
 });
@@ -36,7 +35,6 @@ const updateMemberSchema = z.object({
   name: z.string().trim().min(1).max(100).optional(),
   handle: z.string().trim().min(1).max(50).optional(),
   role: z.string().trim().min(1).max(200).optional(),
-  description: z.string().max(2000).optional(),
   systemPrompt: z.string().max(12000).optional(),
   model: z.string().trim().max(100).nullable().optional(),
   status: z.enum(['active', 'archived']).optional(),
@@ -103,7 +101,13 @@ export function membersRouter(team: TeamService) {
       return;
     }
     try {
-      res.json({ member: team.updateMember(req.params.id, parsed.data) });
+      // 归属校验在写入之前：member 表没有 team_id，PATCH 又不带 Team 信息，
+      // 少了这一步就能改到别的 Team 的人（改名、改人设、改 model、归档）。
+      // 用 requireMemberBelongsToTeam 而不是 requireMemberInTeam：归档的人
+      // membership 是 inactive，后者会把「恢复归档」这条路一起关掉。
+      const teamId = requestTeamId(req);
+      team.requireMemberBelongsToTeam(teamId, req.params.id);
+      res.json({ member: team.updateMember(req.params.id, parsed.data, teamId) });
     } catch (error) {
       sendError(res, error);
     }
@@ -146,51 +150,6 @@ export function membersRouter(team: TeamService) {
       team.requireMemberInTeam(requestTeamId(req), req.params.id);
       res.json(
         team.replaceMemberMemory(req.params.id, parsed.data.content, parsed.data.expectedVersion),
-      );
-    } catch (error) {
-      sendError(res, error);
-    }
-  });
-
-  /**
-   * 这个 Member 在某一个 Team 的上下文（全文，不是给 prompt 用的截断版）。
-   *
-   * `teamId` 走 query，省略 = 当前默认 Team：单 Team 部署下调用方不需要知道
-   * Team 的存在。多 Team 后按显式 teamId 读写 —— 未来形如
-   * `/api/teams/:teamId/members/:memberId/context` 的嵌套路由出现时，
-   * 这个 query 参数直接变成路径参数，不留两套。
-   */
-  router.get('/:id/team-context', (req, res) => {
-    try {
-      const teamId = typeof req.query.teamId === 'string' ? req.query.teamId : requestTeamId(req);
-      team.requireMemberInTeam(teamId, req.params.id);
-      res.json(team.getMemberTeamContext(req.params.id, teamId));
-    } catch (error) {
-      sendError(res, error);
-    }
-  });
-
-  router.put('/:id/team-context', (req, res) => {
-    if (!canAdmin(req)) {
-      res.status(403).json({ error: '需要 Team owner 或 admin 权限' });
-      return;
-    }
-    const parsed = memorySchema.safeParse(req.body ?? {});
-    if (!parsed.success) {
-      res.status(400).json({ error: 'content 必须是 string（expectedVersion 可选）' });
-      return;
-    }
-    try {
-      const body = req.body as { teamId?: unknown };
-      const teamId = typeof body.teamId === 'string' ? body.teamId : requestTeamId(req);
-      team.requireMemberInTeam(teamId, req.params.id);
-      res.json(
-        team.replaceMemberTeamContext(
-          req.params.id,
-          parsed.data.content,
-          teamId,
-          parsed.data.expectedVersion,
-        ),
       );
     } catch (error) {
       sendError(res, error);

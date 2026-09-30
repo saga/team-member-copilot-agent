@@ -5,17 +5,15 @@ import { config } from './config.js';
 import { hashText } from './content-hash.js';
 
 /**
- * Member 记忆的文件层：全局记忆 + Team 上下文。
+ * Member 长期记忆的文件层。
  *
- * 同一个 Member 在不同 Team 里是同一个人（身份稳定），但知道的东西必须隔离：
- * Team A 的客户项目写进全局记忆，Team B 的同一 Member 也会看到 —— 这是上下文
- * 泄漏，不是人格稳定。所以只有两层，没有 Personality Engine 那类东西：
- *
- *   全局记忆  `.data/members/<id>/memory/MEMORY.md`         跨 Team 稳定
- *   Team 上下文 `.data/members/<id>/teams/<teamId>/MEMORY.md` 只属于这个 Team
+ * 一个 Member 只有**一份**记忆：`.data/members/<id>/memory/MEMORY.md`。
+ * 它描述的是「这个人知道什么」，跨 Conversation 稳定 —— 不按房间、也不按 Team
+ * 分片。分片会带来两个说不清的问题：同一个事实要在哪一份里记；以及改一次
+ * Team 归属之后，之前记下的东西还在不在。
  *
  * 不进数据库：记忆是自然语言文本，用户会想直接看 / 直接改，一个文件比一张
- * 两列表更好用。Team 上下文也不例外 —— 多一个表只会多一套没人验证的读写路径。
+ * 两列表更好用。
  */
 
 export interface MemoryDocument {
@@ -24,8 +22,9 @@ export interface MemoryDocument {
   version: string;
 }
 
-const GLOBAL_TITLE = /^\s*#\s*Long-?term Memory\s*/i;
-const TEAM_TITLE = /^\s*#\s*Team Context\s*/i;
+const TITLE = /^\s*#\s*Long-?term Memory\s*/i;
+const TITLE_LINE = '# Long-term Memory';
+const SEED = `${TITLE_LINE}\n\n`;
 
 /** 拼进 system prompt 的截断长度：全文用于编辑，尾部用于注入。 */
 const PROMPT_TAIL_CHARS = 16000;
@@ -38,10 +37,6 @@ export function globalMemoryFile(memberId: string): string {
   return path.join(memberHomeDir(memberId), 'memory', 'MEMORY.md');
 }
 
-export function teamMemoryFile(memberId: string, teamId: string): string {
-  return path.join(memberHomeDir(memberId), 'teams', teamId, 'MEMORY.md');
-}
-
 /**
  * 建 member home 的目录形状。skill 目录也在这里兜底建：home 的形状是统一的
  * 契约，即使 skill 的读写已经搬去 SkillService。
@@ -51,13 +46,7 @@ export function ensureMemberHome(memberId: string): void {
   fs.mkdirSync(home, { recursive: true });
   fs.mkdirSync(path.dirname(globalMemoryFile(memberId)), { recursive: true });
   fs.mkdirSync(path.join(home, 'skills'), { recursive: true });
-  ensureDocument(globalMemoryFile(memberId), '# Long-term Memory\n\n');
-}
-
-export function ensureTeamMemoryFile(memberId: string, teamId: string): void {
-  ensureMemberHome(memberId);
-  fs.mkdirSync(path.dirname(teamMemoryFile(memberId, teamId)), { recursive: true });
-  ensureDocument(teamMemoryFile(memberId, teamId), '# Team Context\n\n');
+  ensureDocument(globalMemoryFile(memberId), SEED);
 }
 
 function ensureDocument(file: string, seed: string): void {
@@ -100,15 +89,8 @@ function writeDocument(file: string, content: string): void {
 }
 
 /** 全文带版本冲突校验的覆盖；不匹配抛 409 且不写盘。 */
-function replaceDocument(
-  file: string,
-  seed: string,
-  title: RegExp,
-  titleLine: string,
-  content: string,
-  expectedVersion?: string,
-): MemoryDocument {
-  ensureDocument(file, seed);
+function replaceDocument(file: string, content: string, expectedVersion?: string): MemoryDocument {
+  ensureDocument(file, SEED);
   if (expectedVersion !== undefined) {
     const current = readDocument(file);
     if (expectedVersion !== current.version) {
@@ -121,21 +103,19 @@ function replaceDocument(
       );
     }
   }
-  const body = content.replace(title, '').trim();
-  writeDocument(file, body ? `${titleLine}\n\n${body}\n` : `${titleLine}\n\n`);
+  const body = content.replace(TITLE, '').trim();
+  writeDocument(file, body ? `${TITLE_LINE}\n\n${body}\n` : `${TITLE_LINE}\n\n`);
   return readDocument(file);
 }
 
 /** 追加一条带时间戳的记录；读-改-写走同一个原子写路径。 */
-function appendDocument(file: string, seed: string, content: string): void {
-  ensureDocument(file, seed);
+function appendDocument(file: string, content: string): void {
+  ensureDocument(file, SEED);
   const line = content.trim();
   if (!line) throw new Error('memory 内容不能为空');
   const current = fs.readFileSync(file, 'utf8');
   writeDocument(file, `${current}\n\n## ${new Date().toISOString()}\n\n${line}\n`);
 }
-
-// ------------------------------------------------------------- 全局记忆
 
 export function readGlobalMemory(memberId: string): string {
   ensureMemberHome(memberId);
@@ -153,51 +133,10 @@ export function replaceGlobalMemory(
   expectedVersion?: string,
 ): MemoryDocument {
   ensureMemberHome(memberId);
-  return replaceDocument(
-    globalMemoryFile(memberId),
-    '# Long-term Memory\n\n',
-    GLOBAL_TITLE,
-    '# Long-term Memory',
-    content,
-    expectedVersion,
-  );
+  return replaceDocument(globalMemoryFile(memberId), content, expectedVersion);
 }
 
 export function appendGlobalMemory(memberId: string, content: string): void {
   ensureMemberHome(memberId);
-  appendDocument(globalMemoryFile(memberId), '# Long-term Memory\n\n', content);
-}
-
-// ------------------------------------------------------------- Team 上下文
-
-export function readTeamMemory(memberId: string, teamId: string): string {
-  ensureTeamMemoryFile(memberId, teamId);
-  return readTail(teamMemoryFile(memberId, teamId));
-}
-
-export function getTeamMemory(memberId: string, teamId: string): MemoryDocument {
-  ensureTeamMemoryFile(memberId, teamId);
-  return readDocument(teamMemoryFile(memberId, teamId));
-}
-
-export function replaceTeamMemory(
-  memberId: string,
-  teamId: string,
-  content: string,
-  expectedVersion?: string,
-): MemoryDocument {
-  ensureTeamMemoryFile(memberId, teamId);
-  return replaceDocument(
-    teamMemoryFile(memberId, teamId),
-    '# Team Context\n\n',
-    TEAM_TITLE,
-    '# Team Context',
-    content,
-    expectedVersion,
-  );
-}
-
-export function appendTeamMemory(memberId: string, teamId: string, content: string): void {
-  ensureTeamMemoryFile(memberId, teamId);
-  appendDocument(teamMemoryFile(memberId, teamId), '# Team Context\n\n', content);
+  appendDocument(globalMemoryFile(memberId), content);
 }

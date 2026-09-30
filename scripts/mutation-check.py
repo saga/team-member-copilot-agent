@@ -83,7 +83,7 @@ MUTATIONS = [
         "steps": [
             (
                 "server/capabilities/providers/filesystem-knowledge.ts",
-                "    if (kb.scope === 'personal' && kb.memberId !== memberId) {\n      throw forbidden('这是别人的个人资料库，没有权限查看');\n    }\n",
+                "    if (kb.scope === 'personal' && kb.memberId !== memberId) {\n      return '这是别人的个人资料库，没有权限查看';\n    }\n",
                 "",
             )
         ],
@@ -234,7 +234,7 @@ MUTATIONS = [
         "steps": [
             (
                 "server/team-service.ts",
-                "    if (this.structure && input.status && input.status !== before.status) {\n      const team = this.defaultTeam();\n      this.structure.ensureAgentMembership(team.id, member.id);\n      this.structure.updateMembership(team.id, 'agent', member.id, {\n        status: member.status === 'active' ? 'active' : 'inactive',\n      });\n    }",
+                "    if (this.structure && input.status && input.status !== before.status) {\n      const team = teamId ?? this.defaultTeam().id;\n      this.structure.ensureAgentMembership(team, member.id);\n      this.structure.updateMembership(team, 'agent', member.id, {\n        status: member.status === 'active' ? 'active' : 'inactive',\n      });\n    }",
                 "",
             )
         ],
@@ -339,16 +339,23 @@ MUTATIONS = [
         ],
     },
     # ── 唤醒原因的持久化读回 ──────────────────────────────────────────────
-    # ── Member 记忆隔离：Team 上下文不出 Team ─────────────────────────────
+    # ── Member 记忆：只有一份，两个写者共用同一个版本校验 ─────────────────
     {
-        "name": "remember_member 写全局（Team 上下文漏进所有 Team）",
+        "name": "remember_member 不落盘（Agent 记下的东西丢掉）",
         "test": "server/test/member-memory.test.ts",
         "steps": [
             (
-                "server/collaboration-service.ts",
-                "    return Promise.resolve(this.internals.members.appendTeamMemory(input.memberId, teamId, input.content));",
+                "server/team-service.ts",
                 "    return Promise.resolve(this.members.appendMemory(input.memberId, input.content));",
+                "    return Promise.resolve('已保存。');",
             )
+        ],
+    },
+    {
+        "name": "保存记忆不做版本校验（覆盖掉 Agent 中间写入的那句）",
+        "test": "server/test/member-memory.test.ts",
+        "steps": [
+            ("server/member-memory.ts", "  if (expectedVersion !== undefined) {", "  if (false) {")
         ],
     },
     # ── 哨兵不能泄漏到客户端 ──────────────────────────────────────────────
@@ -582,8 +589,8 @@ MUTATIONS = [
         "test": "server/test/task-service.test.ts",
         "steps": [
             (
-                "server/team-service.ts",
-                "        this.tasks.markFailed(taskAfterTurn.id, 'Agent turn 结束时没有调用 update_task 报告任务完成或阻塞');\n        this.orchestrator.onTaskChanged(taskAfterTurn.id);\n",
+                "server/execution-service.ts",
+                "        this.internals.tasks.markFailed(taskAfterTurn.id, 'Agent turn 结束时没有调用 update_task 报告任务完成或阻塞');\n        this.internals.orchestrator.onTaskChanged(taskAfterTurn.id);\n",
                 "",
             )
         ],
@@ -593,9 +600,9 @@ MUTATIONS = [
         "test": "server/test/team-service.test.ts",
         "steps": [
             (
-                "server/team-service.ts",
-                "        const seenThrough = message\n          ? message.messageSequence\n          : this.states.get(input.conversation.id, input.member.id).lastSeenMessageSequence;\n",
-                "        const seenThrough = this.states.get(input.conversation.id, input.member.id).lastSeenMessageSequence;\n",
+                "server/execution-service.ts",
+                "        const seenThrough = message\n          ? message.messageSequence\n          : this.internals.states.get(input.conversation.id, input.member.id).lastSeenMessageSequence;\n",
+                "        const seenThrough = this.internals.states.get(input.conversation.id, input.member.id).lastSeenMessageSequence;\n",
             )
         ],
     },
@@ -605,8 +612,8 @@ MUTATIONS = [
         "steps": [
             (
                 "server/recovery-service.ts",
-                "          WHERE status = 'running'\n          `,\n        )\n        .run('服务重启导致执行中断，检查后可重试', timestamp);",
-                "          WHERE status = 'never-running'\n          `,\n        )\n        .run('服务重启导致执行中断，检查后可重试', timestamp);",
+                "          UPDATE conversation_task\n          SET status = 'blocked', blocker = ?, updated_at = ?\n          WHERE status = 'running'",
+                "          UPDATE conversation_task\n          SET status = 'blocked', blocker = ?, updated_at = ?\n          WHERE status = 'never-running'",
             )
         ],
     },
@@ -753,8 +760,8 @@ MUTATIONS = [
         "steps": [
             (
                 "server/execution-service.ts",
-                "      turnMode,\n      policyRevision,\n      entitlementRevision,\n",
-                "      turnMode,\n      entitlementRevision,\n",
+                "      modelPurpose,\n      policyRevision,\n      entitlementRevision,\n",
+                "      modelPurpose,\n      entitlementRevision,\n",
             )
         ],
     },
@@ -774,9 +781,9 @@ MUTATIONS = [
         "test": "server/test/task-service.test.ts",
         "steps": [
             (
-                "server/team-service.ts",
-                "        this.tasks.markFailed(taskAfterTurn.id, 'Agent turn 结束时没有调用 update_task 报告任务完成或阻塞');",
-                "        this.tasks.markCompleted(taskAfterTurn.id, content || undefined);",
+                "server/execution-service.ts",
+                "        this.internals.tasks.markFailed(taskAfterTurn.id, 'Agent turn 结束时没有调用 update_task 报告任务完成或阻塞');",
+                "        this.internals.tasks.markCompleted(taskAfterTurn.id, content || undefined);",
             )
         ],
     },
@@ -903,24 +910,24 @@ MUTATIONS = [
         ],
     },
     {
-        "name": "编辑元数据时清空已存 secret（读不回显就别碰）",
+        "name": "编辑时没传 secretRef 就当成清空（改个工具名把凭证指向弄丢）",
         "test": "server/test/mcp.test.ts",
         "steps": [
             (
                 "server/mcp/service.ts",
-                "  if (input.authType === undefined) {\n    return { ...(current ?? {}) };\n  }\n",
-                "  if (input.authType === undefined) {\n    return {};\n  }\n",
+                "      parsed.data.secretRef === undefined ? current.secret_ref : parsed.data.secretRef === '' ? null : parsed.data.secretRef;",
+                "      parsed.data.secretRef === undefined ? null : parsed.data.secretRef === '' ? null : parsed.data.secretRef;",
             )
         ],
     },
     {
-        "name": "旧 secret 跨认证类型复用（换个头继续用）",
+        "name": "认证头写进 headers 不被拒（凭证又能存进数据库）",
         "test": "server/test/mcp.test.ts",
         "steps": [
             (
                 "server/mcp/service.ts",
-                "    throw badRequest(`MCP Server ${serverId} 切换认证方式必须提供新的 secret`);\n",
-                "",
+                "      (headers) => !headers || !Object.keys(headers).some((key) => CREDENTIAL_HEADERS.has(key.toLowerCase())),",
+                "      () => true,",
             )
         ],
     },
@@ -1017,7 +1024,7 @@ MUTATIONS = [
         "test": "server/test/goal-revision.test.ts",
         "steps": [
             (
-                "server/team-service.ts",
+                "server/execution-service.ts",
                 "      if (content && userFacingTurn && !goalStale) {\n",
                 "      if (content && userFacingTurn) {\n",
             )
@@ -1073,7 +1080,7 @@ MUTATIONS = [
         "steps": [
             (
                 "server/conversation-service.ts",
-                "    // 用户真正开始交互时，取消尚未完成的自动 bootstrap。\n    await this.internals.cancelLeadBootstrap(fresh);\n",
+                "    // 用户真正开始交互时，取消尚未完成的自动 bootstrap。\n    await this.cancelLeadBootstrap(fresh);\n",
                 "",
             )
         ],
@@ -1281,6 +1288,94 @@ MUTATIONS = [
                 "server/capabilities/providers/filesystem-knowledge.ts",
                 "    if (kb.scope !== 'team') {\n      throw badRequest('只有团队资料库能设置来源等级，个人资料库固定是「参考」');\n    }\n",
                 "",
+            )
+        ],
+    },
+    {
+        "name": "PATCH Member 不校验 Team 归属（改到别的 Team 的人）",
+        "test": "server/test/multi-team-isolation.test.ts",
+        "steps": [
+            (
+                "server/routes/members.ts",
+                "      const teamId = requestTeamId(req);\n      team.requireMemberBelongsToTeam(teamId, req.params.id);",
+                "      const teamId = requestTeamId(req);",
+            )
+        ],
+    },
+    {
+        "name": "归属校验退化成 requireActiveMembership（归档的人再也恢复不了）",
+        "test": "server/test/multi-team-isolation.test.ts",
+        "steps": [
+            (
+                "server/team-service.ts",
+                "      try {\n        this.structure.getMembership(teamId, 'agent', memberId);\n      } catch {\n        throw forbidden('Member 不属于这个 Team');\n      }",
+                "      this.structure.requireActiveMembership(teamId, 'agent', memberId);",
+            )
+        ],
+    },
+    {
+        "name": "updateMember 忽略传入的 teamId（归档写回默认 Team）",
+        "test": "server/test/multi-team-isolation.test.ts",
+        "steps": [
+            (
+                "server/team-service.ts",
+                "    if (this.structure && input.status && input.status !== before.status) {\n      const team = teamId ?? this.defaultTeam().id;",
+                "    if (this.structure && input.status && input.status !== before.status) {\n      const team = this.defaultTeam().id;",
+            )
+        ],
+    },
+    {
+        "name": "member 能力写入不校验 Team 归属（服务层可绕过）",
+        "test": "server/test/capabilities.test.ts",
+        "steps": [
+            (
+                "server/team-service.ts",
+                "    this.requireMemberBelongsToTeam(teamId, memberId);\n    this.capabilityResolver.validate(capabilities);",
+                "    this.capabilityResolver.validate(capabilities);",
+            )
+        ],
+    },
+    {
+        "name": "session 丢了也不重读历史（checkpoint 停在旧值上）",
+        "test": "server/test/runtime-reliability.test.ts",
+        "steps": [
+            (
+                "server/execution-service.ts",
+                "    const freshSession =\n      input.execution.sessionMode !== 'isolated' &&\n      runtime.lastContextMessageSequence > 0 &&\n      !(await this.internals.copilot.persistentSessionExists(runtime.copilotSessionId));",
+                "    const freshSession = false;",
+            )
+        ],
+    },
+    {
+        "name": "新 session 也把 checkpoint 往前推（洞被永久留下）",
+        "test": "server/test/runtime-reliability.test.ts",
+        "steps": [
+            (
+                "server/execution-service.ts",
+                "      const sessionHoldsEarlierHistory = !result.sessionCreated || freshSession;",
+                "      const sessionHoldsEarlierHistory = true;",
+            )
+        ],
+    },
+    {
+        "name": "全新 session 里仍过滤自己发过的消息（自己说过什么都看不见）",
+        "test": "server/test/runtime-reliability.test.ts",
+        "steps": [
+            (
+                "server/context-assembler.ts",
+                "          if (\n            !input.freshSession &&\n            message.senderType === 'member' &&",
+                "          if (\n            message.senderType === 'member' &&",
+            )
+        ],
+    },
+    {
+        "name": "探针查不出来时按「session 还在」处理（新 session 从中间开始读）",
+        "test": "server/test/runtime-correctness.test.ts",
+        "steps": [
+            (
+                "server/copilot.ts",
+                "      return (await client.getSessionMetadata(sessionId)) !== undefined;\n    } catch {\n      return false;\n    }",
+                "      return (await client.getSessionMetadata(sessionId)) !== undefined;\n    } catch {\n      return true;\n    }",
             )
         ],
     },

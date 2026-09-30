@@ -35,7 +35,6 @@ CREATE TABLE member (
   handle TEXT NOT NULL UNIQUE,
   name TEXT NOT NULL,
   role TEXT NOT NULL,
-  description TEXT NOT NULL DEFAULT '',
   system_prompt TEXT NOT NULL DEFAULT '',
   model TEXT,
   status TEXT NOT NULL DEFAULT 'active'

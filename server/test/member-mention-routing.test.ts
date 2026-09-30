@@ -316,6 +316,20 @@ describe('findMentionedMembers：只认 @handle', () => {
     assert.deepEqual(findMentionedMembers('@nobody 在吗', members), []);
   });
 
+  it('顺序按 @ 出现的先后，不按 roster 排序', () => {
+    const first = team.createMember({ name: 'Order First', role: 'First' });
+    const second = team.createMember({ name: 'Order Second', role: 'Second' });
+
+    // roster 顺序是 [first, second]，@ 顺序里 second 在前：返回值必须跟着 @ 走。
+    // 同一条消息的多个 @ 是一条有序 mention chain，先被点名的先回答。
+    assert.deepEqual(
+      findMentionedMembers(`@${second.handle} @${first.handle} 请分别看看`, [first, second]).map(
+        (member) => member.id,
+      ),
+      [second.id, first.id],
+    );
+  });
+
   it('非 active 成员即使 handle 对上也不唤醒', async () => {
     const ghost = team.createMember({ name: 'Parse Ghost', role: 'Ghost' });
     memberService.archive(ghost.id);

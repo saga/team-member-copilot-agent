@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { config } from '../config.js';
-import type { CopilotService, RunMemberTurnInput } from '../copilot.js';
+import type { CopilotService, MemberTurnResult, RunMemberTurnInput } from '../copilot.js';
 import type { WakePlan } from '../team-service.js';
 import { TeamService } from '../team-service.js';
 import type { CapabilityContext } from '../capabilities/types.js';
@@ -420,7 +420,18 @@ export class StubCopilot {
    */
   onTurnStart: ((input: RunMemberTurnInput) => void) | null = null;
 
-  async runMemberTurn(input: RunMemberTurnInput): Promise<string> {
+  /**
+   * 「这些 session 已经不在引擎里了」——模拟 idle TTL 回收 / COPILOT_HOME 被清。
+   *
+   * 默认空集合 = 所有 session 都还在，也就是绝大多数用例的默认世界。
+   */
+  readonly missingSessionIds = new Set<string>();
+
+  persistentSessionExists(sessionId: string): Promise<boolean> {
+    return Promise.resolve(!this.missingSessionIds.has(sessionId));
+  }
+
+  async runMemberTurn(input: RunMemberTurnInput): Promise<MemberTurnResult> {
     this.turns.push({
       executionId: input.executionId,
       memberId: input.member.id,
@@ -449,7 +460,7 @@ export class StubCopilot {
     if (this.streamDeltas) {
       for (const char of reply) input.onDelta?.(char);
     }
-    return reply;
+    return { content: reply, sessionCreated: false };
   }
 
   reset(): void {
@@ -461,6 +472,7 @@ export class StubCopilot {
     this.streamDeltas = false;
     this.skipMemberIds.clear();
     this.speakOnlyOnReasons = null;
+    this.missingSessionIds.clear();
     // wakeReasonOf 是用例在 before() 里接上的接线，reset 不动它
   }
 

@@ -406,6 +406,130 @@ describe('Goal revision', () => {
     assert.equal(leadTurns.n, 1, '旧 Goal 的 turn 不能再唤醒出新 turn');
   });
 
+  it('turn 内自己调 update_goal 建 v1：回复照常落库，任务照常推进', async () => {
+    // 回归：新工作区首轮澄清时顺手定 Goal（0→1），收尾不能拿开局快照判自己过期。
+    // update_goal 必须走 adapter（和生产同一条路），audit 行是归因依据。
+    stub.reset();
+    const room = makeRoom('GoalSelfBump');
+    // bob 不静音：replan 出来的任务要能跑完，验证 startReadyTasks 照常执行。
+    let holdRelease!: () => void;
+    stub.hold = new Promise<void>((resolve) => {
+      holdRelease = resolve;
+    });
+    stub.holdMemberIds = new Set([alice.id]);
+    try {
+      await team.sendMessage({ actorId: 'test-user', conversationId: room.id, content: '帮我看看这个项目' });
+      let leadExecutionId: string | null = null;
+      for (let attempt = 0; attempt < 400; attempt += 1) {
+        const row = db
+          .prepare(
+            `SELECT id FROM execution WHERE conversation_id = ? AND member_id = ? AND task_id IS NULL
+             AND status = 'running' ORDER BY created_at DESC LIMIT 1`,
+          )
+          .get(room.id, alice.id) as unknown as { id: string } | undefined;
+        if (row) {
+          leadExecutionId = row.id;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.ok(leadExecutionId);
+      assert.equal(team.getConversation(room.id).goalRevision, 0, '改之前还没有正式 Goal');
+
+      // 和生产完全同一条路：adapter handler → 授权 → audit → updateGoalTool。
+      const { CopilotCapabilityAdapter } = await import('../capabilities/copilot-adapter.js');
+      const { CoreTeamToolProvider } = await import(
+        '../capabilities/providers/core-tools.js'
+      );
+      type CoreToolHost = import('../capabilities/providers/core-tools.js').CoreToolHost;
+      type UpdateGoalInput = Parameters<CoreToolHost['updateGoal']>[0];
+      const { AuditService } = await import('../audit-service.js');
+      const { DefaultToolPolicy } = await import('../tool-policy.js');
+      const { DenyHighRiskPolicyService } = await import('../policy.js');
+      const { EntitlementService } = await import('../entitlement-service.js');
+      const provider = new CoreTeamToolProvider({
+        updateGoal: (input: UpdateGoalInput) => team.updateGoalTool(input),
+      } as unknown as CoreToolHost);
+      const tools = await provider.resolve({} as never, {} as never);
+      const updateGoalTool = tools.find((tool) => tool.name === 'update_goal');
+      assert.ok(updateGoalTool);
+      const adapter = new CopilotCapabilityAdapter(
+        new DefaultToolPolicy(
+          { allowHostTools: false },
+          new DenyHighRiskPolicyService(),
+          new EntitlementService(db),
+        ),
+        new AuditService(db),
+      );
+      const built = adapter.build(
+        {
+          skills: [],
+          knowledge: [],
+          tools: [updateGoalTool],
+          mcpServers: [],
+          toolIndex: new Map([['update_goal', updateGoalTool]]),
+          mcpToolIndex: new Map(),
+          manifestHash: 'goal-self-bump-test',
+        },
+        {
+          teamId: team.getConversation(room.id).teamId,
+          memberId: alice.id,
+          conversationId: room.id,
+          executionId: leadExecutionId,
+          userId: 'test-user',
+        },
+      );
+      const handler = built.tools.find((tool) => tool.name === 'update_goal')?.handler;
+      assert.ok(handler, 'update_goal 必须带 handler');
+      const reply = await handler(
+        { objective: '评审这个项目', changeKind: 'clarification' },
+        {} as never,
+      );
+      assert.match(String(reply), /v1/);
+      assert.equal(team.getConversation(room.id).goalRevision, 1);
+
+      // audit 行是生产归因的依据：必须存在，否则下面测的就不是生产路径。
+      const auditRows = db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM tool_execution_audit
+           WHERE execution_id = ? AND tool_name = 'update_goal' AND allowed = 1`,
+        )
+        .get(leadExecutionId) as unknown as { n: number };
+      assert.equal(auditRows.n, 1, 'update_goal 必须经过 adapter 留下 audit 行');
+
+      await team.replanTasks({
+        conversationId: room.id,
+        memberId: alice.id,
+        tasks: [{ key: 'a', title: 'A', assigneeMemberId: bob.id }],
+      });
+
+      holdRelease();
+    } finally {
+      holdRelease();
+      stub.hold = null;
+      stub.holdMemberIds = null;
+    }
+    await waitForConversationIdle(room.id);
+
+    // 回复落库：内容是 stub 的固定回复。
+    const messages = db
+      .prepare(`SELECT content FROM conversation_message WHERE execution_id = ?`)
+      .all(
+        (
+          db
+            .prepare(
+              `SELECT id FROM execution WHERE conversation_id = ? AND member_id = ? AND task_id IS NULL
+               ORDER BY created_at DESC LIMIT 1`,
+            )
+            .get(room.id, alice.id) as unknown as { id: string }
+        ).id,
+      ) as unknown as Array<{ content: string }>;
+    assert.equal(messages.length, 1, '自己推进的 Goal，回复必须落库');
+    assert.match(messages[0].content, /reply from Goal Alice/);
+    // 任务照常推进：replan 建出来的任务跑完了。
+    assert.equal(team.listTasks(room.id)[0].status, 'completed');
+  });
+
   it('completed v1 tasks remain historical', async () => {
     stub.reset();
     const room = makeRoom('GoalHistory');

@@ -86,7 +86,7 @@ Lead 只负责澄清与规划，执行由各 Task 的执行人推进，依赖由
 
 | 概念 | 含义 |
 |------|------|
-| **Member** | 持久的 specialized agent worker。持久身份 + role + work contract + model + 能力组成 + 全局长期记忆 + Team 上下文。身份跨 Team 稳定，记忆按 Team 隔离。 |
+| **Member** | 持久的 specialized agent worker。持久身份 + role + work contract + model + 能力组成 + 长期记忆。身份与记忆都跨 Team 稳定 —— 只有一份记忆，不按 Team 分片。 |
 | **Capability** | 三层能力引用：`global` / `team` / `member`，存在同一张 `capability_binding` 表里（`scope_type` + `scope_id`）。**`effective = global + team + member` 才是「能用什么」的唯一答案**，任何单层都不是。 |
 | **Conversation** | Task 工作区。`task`（用户真正使用的工作会话，有 `objective` / `leadMemberId` / `status` / `requirements` / `openQuestions`，可挂 Jira）/ `direct`（Member ↔ Member 内部私聊）。状态机：`intake → waiting_user → running → completed`，异常 `blocked`，终止 `cancelled`。完成条件由 Task 状态决定，不由 LLM 宣布。 |
 | **Task** | `conversation_task` 表。`pending → ready → running → completed`（异常 `blocked` / `failed`，终止 `cancelled`）；依赖用 `dependencies_json` 表达（第一版只要列表，不要树）；上限 20 个；循环依赖拒绝落库；只能由执行人自己 `update_task`；同一个 Member 同时只跑一个 Task。初始计划一次性 `plan_tasks`，之后缺失的工作由 Lead `add_task` 补充，未开始任务的错误分派由 Lead `reassign_task` 纠正（running 及终态不能换人）。单个任务可锁模型档位（`modelTier`：null 跟执行人默认，`strong` 升级 Strong；只有 Lead 能定，执行人改不到）。每个任务属于创建时的 Goal 版本（`goal_revision`），旧版本任务只读历史，不能 update / retry / reassign。 |
@@ -178,7 +178,7 @@ Member       = 应用层业务身份（跨 Conversation 稳定）
 - skills（`skillDirectories` = 各 Skill Provider 解析出来的目录）
 - Member 身份（`systemMessage` append）
 - delegation（`ask_member`）
-- memory（全局 `.data/members/<member-id>/memory/MEMORY.md` + Team 上下文 `.data/members/<member-id>/teams/<team-id>/MEMORY.md`，分段注入）
+- memory（`.data/members/<member-id>/memory/MEMORY.md`）
 
 ### 能力解析：一条单向链路
 
@@ -509,21 +509,19 @@ sendMessage({ content, clientRequestId })
 `replyToMessageId` 同理不能只信请求体：引用的消息不存在 → `400`，属于另一个房间 → `400`。
 不校验的话，前端拿到的一个过期 id 会把它变成一个跨房间的信息泄露口。
 
-### 8. 两层记忆与乐观并发
+### 8. 一份记忆与乐观并发
 
-同一个 Member 在不同 Team 里是同一个人，但知道的东西必须隔离：
+一个 Member 只有**一份**长期记忆，跨 Team、跨工作区稳定：
 
 ```
 .data/members/<id>/
-├── memory/MEMORY.md            # 全局记忆：跨 Team 稳定的习惯，只放长期事实
-└── teams/<team-id>/MEMORY.md   # Team 上下文：这个 Team 的工作方式 / 成员关系 / 项目事实
+└── memory/MEMORY.md            # 长期记忆：稳定的事实与工作习惯
 ```
 
-`remember_member({ content, scope })` 默认写 Team 上下文（`scope = "team"`）；
-只有明确跨 Team 稳定的工作习惯才用 `scope = "global"`。两段在 prompt 里分段
-注入（`Long-term memory` / `Team context`），切换 Team 后另一份不会被读到。
+`remember_member({ content })` 追加到这一份里，人在 Member Profile 的 Memory 页签里
+整体编辑。记忆作为 `Long-term memory` 段拼进 system prompt。
 
-两份文件各有两个写者：用户在 UI 里改、Agent 调 `remember_member`。
+两个写者共用同一个文件：用户在 UI 里改、Agent 调 `remember_member`。
 后写的直接覆盖先写的，会安静地丢掉一段记忆。
 
 ```ts
@@ -905,7 +903,6 @@ npm run dev            # 同时启动 client(:5173) + server(:3001)
 | GET | `/api/members/:id/conversations` | 该 Member 参与过的 conversation（按最后活动倒序，Member Profile 的 Recent activity 只读它） |
 | GET | `/api/members/:id/teams` | 该 Member 所属的 Team |
 | GET | `/api/members/:id/memory` · `PUT` | 该 Member 的全局长期记忆 → `{ content, version }`；`PUT` 可带 `expectedVersion`，不匹配 `409` |
-| GET | `/api/members/:id/team-context` · `PUT` | 该 Member 在某一个 Team 的上下文（`?teamId=` 省略 = 默认 Team；`PUT` 可带 `teamId` + `expectedVersion`） |
 | GET · POST · DELETE | `/api/capabilities/skills/global[/:name]` | global skill 文件（zip 上传 / 卸载）。**owner/admin** |
 | GET · POST · DELETE | `/api/capabilities/skills/team[/:name]` | team skill 文件。**owner/admin** |
 | GET · POST · DELETE | `/api/capabilities/skills/members/:memberId[/:name]` | member skill 文件。**owner/admin** |
@@ -1024,8 +1021,6 @@ Content-Type: application/json
   "name": "Researcher",
   "handle": "researcher",
   "role": "Research Analyst",
-  "description": "负责研究资料分析、事实核查和研究总结",
-  "style": "严谨、简洁、引用证据",
   "systemPrompt": "优先区分事实、推论和不确定性。",
   "model": "gpt-5-mini"
 }
@@ -1036,10 +1031,11 @@ Task 时用的模型。担任 Lead 时不用这个字段 —— 服务端按规�
 Strong 两档之间自动选择（普通工作 Standard，规划 / 澄清 / 恢复 / 综合才升级
 Strong）。填 Strong 模型或拼错的名字会被拒绝（`400`）。
 
-新建的 Member 自动获得默认能力组成（团队 skill、个人 skill、个人资料库、协作与检索
-工具）。要调整它（比如给它开宿主工具），走能力目录接口（用户语言的 ID，
-无 providerId / selector；拼错直接 `400`，而不是等到下一轮 turn 才发现
-「这个人少了检索能力」）：
+`role` 与 `systemPrompt` 就是这个人格的全部：前者是工作职责，后者是工作契约。
+新建的 Member **不写任何能力绑定** —— 能力是 global + team + member 三层叠加，
+新建的人自动继承前两层。要给它加 member 层的增量（比如开宿主工具），走能力目录
+接口（用户语言的 ID，无 providerId / selector；拼错直接 `400`，而不是等到下一轮
+turn 才发现「这个人少了检索能力」）：
 
 ```json
 PUT /api/capabilities/catalog
@@ -1093,9 +1089,8 @@ update_task             执行人上报自己任务的进展（只能动自己�
 │   └── skills/                        # global.filesystem-skills 的根目录
 ├── members/
 │   └── <member-id>/
-│       ├── SOUL.md                    # role / description / style / system prompt
-│       ├── memory/MEMORY.md           # 全局记忆（remember_member scope=global 写入）
-│       ├── teams/<team-id>/MEMORY.md  # Team 上下文（remember_member 默认写入）
+│       ├── SOUL.md                    # role / system prompt
+│       ├── memory/MEMORY.md           # 长期记忆（人在这里编辑，Agent 用 remember_member 追加）
 │       ├── skills/                    # member.filesystem-skills 的根目录
 │       └── knowledge/                 # 该 Member 的 personal KB（$personal）
 ├── team/
@@ -1190,9 +1185,9 @@ src/                          # Vite + React + Ant Design 前端
       ConversationHeader.tsx  # 标题 + 状态 + Lead + Jira + 成员
       MemberManager.tsx       # antd Table：加人 / 移人 / 静音（有未完成工作时禁止 Remove）
       MemberEditor.tsx        # antd Form + Popconfirm Archive（能力已移到 Capabilities）
-      MemberMemory.tsx        # 记忆编辑器（global / team 复用同一套全文 + 版本 + 409）
+      MemberMemory.tsx        # 记忆编辑器（全文 + 版本 + 409）
       MemberActivity.tsx      # Member 视角的动态（参与过的 conversation / 所属 Team）
-      MemberProfile.tsx       # antd Drawer + Tabs（Profile / Memory / Team Context / Skills）+ Recent activity
+      MemberProfile.tsx       # antd Drawer + Tabs（Profile / Memory / Skills）+ Recent activity
       ...
   lib/api.ts                  # 后端 API 客户端（含 SSE 解析）
 
@@ -1207,7 +1202,7 @@ server/                       # Express + Copilot SDK 后端
   context-assembler.ts        # 增量上下文（message_sequence checkpoint）
   recovery-service.ts         # 启动恢复（保守策略，不自动重跑 running）
   member-service.ts           # 长期 Member 身份 + member home + seedKey（文件读写在 member-memory.ts）
-  member-memory.ts            # 全局记忆 + Team 上下文的文件层（全文 + 版本 + 原子写 + 409）
+  member-memory.ts            # 长期记忆的文件层（全文 + 版本 + 原子写 + 409）
   member-template-seeder.ts   # Member 层模板 provisioning（不含任何业务内容，也不认识任何后端）
   skill-service.ts            # skill 内容投放的唯一入口（三个 scope + zip 安全闸）
   evidence-service.ts         # 依据链：这一轮看过什么 → 结论+引用 → 打分 → 人工审核
@@ -1357,7 +1352,7 @@ runtime 仍然是宿主机上的进程 —— 没有沙箱时 `bash` 能走到 w
 - **Execution UI**：`ExecutionStrip` / `ExecutionTree`（客户端按 `parentExecutionId` 组树）+ retry / cancel 按钮。`TeamChat.tsx` 已拆到 `src/components/team/`，但 execution 视图还没有独立组件。
 - **多副本**：`RecoveryService` 与 `cancelRequests` 目前都假设单进程。多副本前要把「谁是 owner」和取消信号都升级成 DB lease / 跨进程通道（且数据库要先换成 PostgreSQL，见上一节作者判断）。
 - **认证**：`local-user` 是占位，仅 `AUTH_DEV_MODE=true` 时生效。生产走 OIDC/JWT（`requireHumanAuth`）+ Team Membership + Conversation ACL 三层。
-- **会话记忆 vs Member 记忆**：`conversation_message` 是会话上下文，全局 `members/<id>/memory/MEMORY.md` 是跨 Team 的长期记忆，`members/<id>/teams/<teamId>/MEMORY.md` 是 Team 上下文，三者不要混。
+- **会话记忆 vs Member 记忆**：`conversation_message` 是会话上下文，`members/<id>/memory/MEMORY.md` 是跨 Team、跨工作区稳定的长期记忆，两者不要混。
 - **Member 记忆提案**：让模型用 `propose_member_memory` 提议、由应用审核后再落盘，而不是让 `remember_member` 直接写。
 - **Restore to template**：把某个 Member 恢复成模板 baseline（含 preview diff）。provisioning 刻意不做这件事 —— 它必须是显式操作，不能是启动副作用。届时再引入 `templateRevision` / `profileRevision`。
 - 只在真正出现「谁该接这个问题」的规模后，再引入 Member Router（LLM 路由会多一层概率性决策）。

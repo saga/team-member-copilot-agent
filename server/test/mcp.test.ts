@@ -385,7 +385,7 @@ describe('MCP 目录：展示 + 选择 → 绑定', () => {
     });
     assert.deepEqual(bindings.mcp, [{ providerId: 'mcp.github', selector: 'search_code' }]);
 
-    stack.team.updateMemberCapabilities(member.id, bindings);
+    stack.team.updateMemberCapabilities(defaultTeam.id, member.id, bindings);
     const filled = await buildCatalog(deps(), query);
     const server = filled.mcp.find((item) => item.id === 'mcp.github')!;
     assert.equal(server.tools.find((tool) => tool.name === 'search_code')?.enabled, true);

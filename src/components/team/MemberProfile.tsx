@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Drawer, Tabs, Tag, Typography } from 'antd';
+import { Drawer, Tabs, Typography } from 'antd';
 import type { Member, ModelPolicy } from '../../lib/api';
 import { MemberEditor } from './MemberEditor';
 import { MemberMemory } from './MemberMemory';
@@ -14,18 +14,20 @@ interface MemberProfileProps {
   onClose: () => void;
 }
 
-type TabKey = 'profile' | 'memory' | 'team' | 'skills';
+type TabKey = 'profile' | 'memory' | 'skills';
 
 /**
  * Member 的详情抽屉。用 Drawer 而不用 Modal：这是「对象详情」，
  * 不是一次性对话框 —— 用户会开着它对照工作区内容改。
  *
- * 四个页签对应 Member 模型的四块：
+ * 三个页签对应 Member 模型的三块：
  *
  *   Profile —— Identity & Work Contract
- *   Memory  —— 跨 Team 稳定的长期习惯
- *   Team Context —— 只属于当前 Team 的上下文
+ *   Memory  —— 跨 Team 稳定的长期记忆
  *   Skills  —— 这个 Member 自己的 skill 目录
+ *
+ * `seedKey` 是 provisioning 元数据（这一行最初由哪份模板建出来），只存在库里，
+ * 不在这里显示：它是给「重装 / 排查」用的，不是这个人的身份。
  */
 export function MemberProfile({ member, modelPolicy, onSaved, onClose }: MemberProfileProps) {
   const [tab, setTab] = useState<TabKey>('profile');
@@ -41,12 +43,7 @@ export function MemberProfile({ member, modelPolicy, onSaved, onClose }: MemberP
           {member.name}{' '}
           <span style={{ color: '#999', fontWeight: 400, fontSize: 13 }}>
             @{member.handle} · {member.role}
-          </span>{' '}
-          {member.seedKey && (
-            <Tag title="由 member template provision；修改 Profile 不会回写模板">
-              from {member.seedKey}
-            </Tag>
-          )}
+          </span>
         </>
       }
     >
@@ -56,7 +53,6 @@ export function MemberProfile({ member, modelPolicy, onSaved, onClose }: MemberP
         items={[
           { key: 'profile', label: 'Profile' },
           { key: 'memory', label: 'Memory' },
-          { key: 'team', label: 'Team Context' },
           { key: 'skills', label: 'Skills' },
         ]}
       />
@@ -71,8 +67,7 @@ export function MemberProfile({ member, modelPolicy, onSaved, onClose }: MemberP
           <MemberEditor member={member} modelPolicy={modelPolicy} onSaved={onSaved} onCancel={onClose} />
         </>
       )}
-      {tab === 'memory' && <MemberMemory member={member} kind="global" />}
-      {tab === 'team' && <MemberMemory member={member} kind="team" />}
+      {tab === 'memory' && <MemberMemory member={member} />}
       {tab === 'skills' && <MemberSkills member={member} />}
       <div style={{ marginTop: 16 }}>
         <MemberActivity member={member} />

@@ -962,7 +962,7 @@ describe('TeamService 的能力读写入口', () => {
     // 能力，这些人的私有层里还留着旧值，覆盖掉继承结果，而且看不出原因。
     const member = stack.team.createMember({ name: 'Inheritor', role: 'T' });
 
-    assert.deepEqual(stack.team.getMemberCapabilities(member.id), {
+    assert.deepEqual(stack.team.getMemberCapabilities(defaultTeam.id, member.id), {
       skills: [],
       knowledge: [],
       tools: [],
@@ -972,11 +972,11 @@ describe('TeamService 的能力读写入口', () => {
 
   it('updateMemberCapabilities 先校验再落库：拼错的 ID 报错且不改动已有绑定', () => {
     const member = stack.team.createMember({ name: 'Typo', role: 'T' });
-    const before = stack.team.getMemberCapabilities(member.id);
+    const before = stack.team.getMemberCapabilities(defaultTeam.id, member.id);
 
     assert.throws(
       () =>
-        stack.team.updateMemberCapabilities(member.id, {
+        stack.team.updateMemberCapabilities(defaultTeam.id, member.id, {
           skills: [{ providerId: 'team.filesystem-skill' }],
           knowledge: [],
           tools: [],
@@ -984,6 +984,33 @@ describe('TeamService 的能力读写入口', () => {
       /未注册/,
     );
 
-    assert.deepEqual(stack.team.getMemberCapabilities(member.id), before);
+    assert.deepEqual(stack.team.getMemberCapabilities(defaultTeam.id, member.id), before);
+  });
+
+  it('member 层能力有 Team 边界：别的 Team 的 Member 读不到也写不了', () => {
+    // member 表没有 team_id，边界全在 team_membership。少了这一步，拿到
+    // memberId 就能读、能改别的 Team 里那个人的能力。
+    const otherTeamId = randomUUID();
+    const timestamp = new Date().toISOString();
+    db.prepare(
+      `INSERT INTO team (id, name, description, created_by, created_at, updated_at)
+       VALUES (?, 'Other Team', '', 'cap-owner', ?, ?)`,
+    ).run(otherTeamId, timestamp, timestamp);
+
+    const mine = stack.team.createMember({ name: 'Mine', role: 'T' });
+
+    assert.throws(
+      () => stack.team.getMemberCapabilities(otherTeamId, mine.id),
+      /不属于这个 Team/,
+    );
+    assert.throws(
+      () =>
+        stack.team.updateMemberCapabilities(otherTeamId, mine.id, {
+          skills: [],
+          knowledge: [],
+          tools: [],
+        }),
+      /不属于这个 Team/,
+    );
   });
 });

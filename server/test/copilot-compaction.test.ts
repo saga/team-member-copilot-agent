@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { CopilotService } from '../copilot.js';
+import type { CopilotService, MemberTurnResult } from '../copilot.js';
 import type { Member } from '../domain.js';
 
 /**
@@ -50,8 +50,11 @@ const repoRoot = fileURLToPath(new URL('../..', import.meta.url));
 const memberService = new MemberService(db);
 /** 只回一句话：这一组不测引擎行为，测的是配置与上下文装配。 */
 const stub = {
-  async runMemberTurn(): Promise<string> {
-    return 'stub reply';
+  persistentSessionExists(): Promise<boolean> {
+    return Promise.resolve(true);
+  },
+  async runMemberTurn(): Promise<MemberTurnResult> {
+    return { content: 'stub reply', sessionCreated: false };
   },
 };
 const { team } = createTestStack(db, memberService, stub as unknown as CopilotService);

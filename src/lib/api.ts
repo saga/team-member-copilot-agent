@@ -31,18 +31,9 @@ export interface Member {
   handle: string;
   name: string;
   role: string;
-  description: string;
   systemPrompt: string;
   model: string | null;
   status: 'active' | 'archived';
-  /**
-   * 非空表示这个 Member 由 `config/member-templates` 里的某份模板 provision。
-   *
-   * 只读：它是 provisioning identity，不是业务身份。UI 只用来显示来源
-   * （改了名字之后还能看出「这个人最初是哪份模板建出来的」），
-   * 服务端也刻意不允许通过 create / update 设置它。
-   */
-  seedKey: string | null;
 }
 
 /**
@@ -891,7 +882,6 @@ export const api = {
     name: string;
     handle?: string;
     role: string;
-    description?: string;
     systemPrompt?: string;
     model?: string;
   }): Promise<{ member: Member }> {
@@ -912,7 +902,6 @@ export const api = {
       name?: string;
       handle?: string;
       role?: string;
-      description?: string;
       systemPrompt?: string;
       model?: string | null;
       status?: 'active' | 'archived';
@@ -995,36 +984,6 @@ export const api = {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(expectedVersion ? { content, expectedVersion } : { content }),
-    }).then(json<MemberMemory>);
-  },
-
-  /**
-   * 这个 Member 在某一个 Team 的上下文全文。teamId 省略 = 当前默认 Team。
-   *
-   * 与全局记忆同一套语义（全文 + sha256 版本 + 409），只是落盘位置不同：
-   * `.data/members/<id>/teams/<teamId>/MEMORY.md`。
-   */
-  getMemberTeamContext(memberId: string, teamId?: string): Promise<MemberMemory> {
-    const query = teamId ? `?teamId=${encodeURIComponent(teamId)}` : '';
-    return fetch(
-      `${API_BASE}/api/members/${encodeURIComponent(memberId)}/team-context${query}`,
-    ).then(json<MemberMemory>);
-  },
-
-  replaceMemberTeamContext(
-    memberId: string,
-    content: string,
-    expectedVersion?: string,
-    teamId?: string,
-  ): Promise<MemberMemory> {
-    return fetch(`${API_BASE}/api/members/${encodeURIComponent(memberId)}/team-context`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(
-        expectedVersion || teamId
-          ? { content, ...(expectedVersion ? { expectedVersion } : {}), ...(teamId ? { teamId } : {}) }
-          : { content },
-      ),
     }).then(json<MemberMemory>);
   },
 

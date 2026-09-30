@@ -625,6 +625,54 @@ export class ExecutionService {
     };
   }
 
+  /**
+   * 当前 Goal 版本是不是本轮自己推进的。
+   *
+   * 只在版本号对不上的时候调用：调用方已经确认「Goal 在本轮运行期间变了」，
+   * 这里回答「是不是自己变的」。是自己变的 → 回复新鲜，照常落库；
+   * 否则（别的 turn、用户路由）→ 维持原判，依然按 stale 丢弃。
+   *
+   * 判定三条缺一不可：
+   * 1. 最新 revision 是 member 行为且就是这个 member 干的
+   *    —— user 路由改的（changed_by_type='user'）一定是别人；
+   * 2. tool_execution_audit 里有本轮放行过的 update_goal / plan_tasks，
+   *    且发生在 turn 开始之后 —— 这是生产路径的精确归因
+   *    （工具走 adapter 必留痕，audit 就是干这个的）；
+   * 3. 在本轮那次推进之后，没有别的 execution 再动过 Goal。
+   */
+  private isOwnGoalBump(conversationId: string, execution: ExecutionRecord): boolean {
+    const rev = this.internals.db
+      .prepare(
+        `SELECT changed_by_type, changed_by_id, created_at FROM conversation_goal_revision
+         WHERE conversation_id = ? ORDER BY revision DESC LIMIT 1`,
+      )
+      .get(conversationId) as unknown as
+      | { changed_by_type: string; changed_by_id: string; created_at: string }
+      | undefined;
+    if (!rev || rev.changed_by_type !== 'member' || rev.changed_by_id !== execution.memberId) {
+      return false;
+    }
+    const turnStart = execution.startedAt ?? execution.createdAt;
+    const mine = this.internals.db
+      .prepare(
+        `SELECT MAX(started_at) AS last_bump FROM tool_execution_audit
+         WHERE conversation_id = ? AND execution_id = ?
+           AND tool_name IN ('update_goal', 'plan_tasks') AND allowed = 1
+           AND started_at >= ?`,
+      )
+      .get(conversationId, execution.id, turnStart) as unknown as { last_bump: string | null };
+    if (!mine.last_bump) return false;
+    const others = this.internals.db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM tool_execution_audit
+         WHERE conversation_id = ? AND execution_id != ?
+           AND tool_name IN ('update_goal', 'plan_tasks') AND allowed = 1
+           AND started_at > ?`,
+      )
+      .get(conversationId, execution.id, mine.last_bump) as unknown as { n: number };
+    return others.n === 0;
+  }
+
   private async runTurn(input: {
     conversation: Conversation;
     member: Member;
@@ -738,6 +786,21 @@ export class ExecutionService {
 
     const currentTask = input.taskId ? this.safeGetTask(input.taskId) : null;
     const allTasks = this.safeListTasks(input.conversation.id);
+
+    // Copilot session 是这个 Member 的工作上下文，它可能已经不在了（idle TTL 回收、
+    // COPILOT_HOME 被清、换了一台机器）。session 不在时 runtime 上的 checkpoint 就
+    // 失效了：它记的是「旧 session 已经看过哪条消息」，而新 session 一条都没看过。
+    // 不处理的话，新 session 只会拿到触发这一轮的那条消息，中间整段历史悄悄消失 ——
+    // 看起来像「它突然什么都不记得了」，而且没有任何地方看得出原因。
+    //
+    // 只在 checkpoint > 0 时探一次：checkpoint 是 0 就没有可丢的东西，没必要每轮
+    // 多付一次查询。isolated 轮次不适用 —— 它每轮都是新 session，本来就不读共享
+    // 记录、也不推进 checkpoint（见 context-assembler 的 isolatedTask）。
+    const freshSession =
+      input.execution.sessionMode !== 'isolated' &&
+      runtime.lastContextMessageSequence > 0 &&
+      !(await this.internals.copilot.persistentSessionExists(runtime.copilotSessionId));
+
     const context = this.internals.contextAssembler.assemble({
       runtime,
       conversation: input.conversation,
@@ -752,6 +815,7 @@ export class ExecutionService {
       // key，而不是建会话那天记下的那个。
       work: this.workContextFor(workSnapshot?.ref ?? input.execution.externalWorkRef),
       referencedFiles: referencedFiles.map((file) => ({ originalName: file.originalName })),
+      freshSession,
     });
 
     // 被取消时把已产出的半截内容留在 execution.response 里，便于 UI 展示与排查。
@@ -843,7 +907,7 @@ export class ExecutionService {
           });
         },
       });
-      partial = result;
+      partial = result.content;
 
       // abort 会让 sendAndWait **正常返回**半截结果（不是抛错），所以取消检查
       // 不能只放在 catch 里，否则被取消的 execution 会被记成 completed。
@@ -851,12 +915,22 @@ export class ExecutionService {
         throw new ExecutionCancelledError();
       }
 
-      const content = result.trim();
+      const content = result.content.trim();
 
+      // checkpoint 的语义是「这个 Member 的持久 session 已经看过房间记录的哪一条」，
+      // 所以只有「这一轮确实是在那个 session 上跑的」时才允许往前推。
+      //
+      // session 是本轮新建的、而这一轮又没有按「全新 session」组装上下文（探针说
+      // 它还在、resume 时才发现已经没了 —— 探针与 resume 之间的窗口），新 session
+      // 里就没有 checkpoint 之前那段历史。这时退回 0，让下一轮把整段记录重放一遍，
+      // 而不是把这个洞永久留下。
+      const sessionHoldsEarlierHistory = !result.sessionCreated || freshSession;
       this.updateRuntime(runtime.id, {
         status: 'idle',
         activeExecutionId: null,
-        lastContextMessageSequence: context.consumedThroughSequence,
+        lastContextMessageSequence: sessionHoldsEarlierHistory
+          ? context.consumedThroughSequence
+          : 0,
         lastUsedAt: now(),
       });
 
@@ -868,11 +942,15 @@ export class ExecutionService {
       // Task 面板是它的事实源。
       // 两边都写会让同一个回答在 Activity 与 Task 里各出现一次。
       const taskAfterTurn = input.taskId ? this.safeGetTask(input.taskId) : null;
-      // Goal 在本轮中途被改掉（user 改 Goal / Lead 调 update_goal）：这一轮看到
+      // Goal 在本轮中途被改掉（user 改 Goal / 别的 turn 调 update_goal）：这一轮看到
       // 的全是旧世界。cancel 是第一道闸，但它有 race —— execution 跑完才发现
       // Goal 已经往前走时，旧 Goal 的 Lead 回复不再落库，也不再触发下一轮。
+      //
+      // 但本轮自己调 update_goal / plan_tasks 推进的不算：它的回复恰恰是在新
+      // Goal 下写出来的，是最新鲜的（见 isOwnGoalBump）。
       const goalStale =
-        input.execution.goalRevision !== this.internals.currentGoalRevision(input.conversation.id);
+        input.execution.goalRevision !== this.internals.currentGoalRevision(input.conversation.id) &&
+        !this.isOwnGoalBump(input.conversation.id, input.execution);
       let message: ConversationMessage | null = null;
       const userFacingTurn =
         input.turnMode === 'lead' ||
@@ -1235,9 +1313,6 @@ export class ExecutionService {
       .join('\n');
 
     const memory = this.internals.members.readMemory(member.id);
-    // Team 上下文随当前 conversation 的归属 Team 变化：只注入这一份，
-    // 其他 Team 的上下文不读、不拼、不泄漏。
-    const teamMemory = this.internals.members.readTeamMemory(member.id, conversation.teamId);
 
     const describeSources = (scope: 'team' | 'personal'): string => {
       const sources = knowledge
@@ -1322,11 +1397,8 @@ export class ExecutionService {
       'Use search_knowledge to find material across the sources listed above;',
       'use open_knowledge_document when a snippet is not enough.',
       '',
-      'Long-term memory (stable habits, applies across all Teams):',
+      'Long-term memory (stable facts and working habits about this Member):',
       memory || '(no stored memory yet)',
-      '',
-      'Team context (this Team only — never carry it into another Team):',
-      teamMemory || '(no Team context yet)',
     ]
       .filter(Boolean)
       .join('\n');
@@ -1609,9 +1681,7 @@ export class ExecutionService {
       policyRevision,
       entitlementRevision,
       systemPromptHash: hashText(systemPrompt),
-      memoryHash: hashText(
-        `${this.internals.members.getMemory(member.id).content}\0${this.internals.members.getTeamMemory(member.id, teamId).content}`,
-      ),
+      memoryHash: hashText(this.internals.members.getMemory(member.id).content),
       capabilityManifestHash: capabilities.manifestHash,
       hostToolsEnabled: config.allowHostCodingTools,
       effectiveConfig,

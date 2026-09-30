@@ -3,17 +3,12 @@ import type { DatabaseSync } from 'node:sqlite';
 import { now } from './db.js';
 import {
   appendGlobalMemory,
-  appendTeamMemory,
   ensureMemberHome,
   getGlobalMemory,
-  getTeamMemory,
   memberHomeDir,
   globalMemoryFile,
   readGlobalMemory,
-  readTeamMemory,
   replaceGlobalMemory,
-  replaceTeamMemory,
-  teamMemoryFile,
   type MemoryDocument,
 } from './member-memory.js';
 import type { Member } from './domain.js';
@@ -23,7 +18,6 @@ interface MemberRow {
   handle: string;
   name: string;
   role: string;
-  description: string;
   system_prompt: string;
   model: string | null;
   status: 'active' | 'archived';
@@ -37,7 +31,6 @@ export interface CreateMemberInput {
   name: string;
   handle?: string;
   role: string;
-  description?: string;
   systemPrompt?: string;
   model?: string;
 }
@@ -58,7 +51,6 @@ export interface UpdateMemberInput {
   name?: string;
   handle?: string;
   role?: string;
-  description?: string;
   systemPrompt?: string;
   model?: string | null;
   status?: 'active' | 'archived';
@@ -70,7 +62,6 @@ function mapRow(row: MemberRow): Member {
     handle: row.handle,
     name: row.name,
     role: row.role,
-    description: row.description,
     systemPrompt: row.system_prompt,
     model: row.model,
     status: row.status,
@@ -157,7 +148,6 @@ export class MemberService {
           handle,
           name,
           role,
-          description,
           system_prompt,
           model,
           status,
@@ -165,7 +155,7 @@ export class MemberService {
           created_at,
           updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
         `,
       )
       .run(
@@ -173,7 +163,6 @@ export class MemberService {
         handle,
         input.name.trim(),
         role,
-        input.description?.trim() ?? '',
         input.systemPrompt?.trim() ?? '',
         input.model?.trim() || null,
         options.seedKey ?? null,
@@ -198,7 +187,6 @@ export class MemberService {
       name: input.name ?? current.name,
       handle: input.handle === undefined ? current.handle : this.resolveHandle(input.handle, id),
       role: input.role ?? current.role,
-      description: input.description ?? current.description,
       systemPrompt: input.systemPrompt ?? current.systemPrompt,
       model: input.model === undefined ? current.model : input.model?.trim() || null,
       status: input.status ?? current.status,
@@ -213,7 +201,6 @@ export class MemberService {
           name = ?,
           handle = ?,
           role = ?,
-          description = ?,
           system_prompt = ?,
           model = ?,
           status = ?,
@@ -225,7 +212,6 @@ export class MemberService {
         next.name,
         next.handle,
         next.role,
-        next.description,
         next.systemPrompt,
         next.model,
         next.status,
@@ -248,23 +234,13 @@ export class MemberService {
     return globalMemoryFile(memberId);
   }
 
-  teamMemoryPath(memberId: string, teamId: string): string {
-    return teamMemoryFile(memberId, teamId);
-  }
-
   /**
-   * 给 prompt 用的全局记忆尾部。Team 上下文不在这里 —— 它随 Team 变化，
-   * 由调用方按当前 conversation 的 teamId 另取并分段注入。
+   * 给 prompt 用的长期记忆尾部。全文（编辑器用的那份）走 getMemory()，
+   * 两者的差别是刻意的：见下面 getMemory 的注释。
    */
   readMemory(memberId: string): string {
     this.get(memberId);
     return readGlobalMemory(memberId);
-  }
-
-  /** 给 prompt 用的 Team 上下文尾部；换 Team 就换一份，不会泄漏到别的 Team。 */
-  readTeamMemory(memberId: string, teamId: string): string {
-    this.get(memberId);
-    return readTeamMemory(memberId, teamId);
   }
 
   /**
@@ -303,33 +279,6 @@ export class MemberService {
     const member = this.get(memberId);
     appendGlobalMemory(member.id, content);
     return `已保存到 ${member.name} 的长期记忆。`;
-  }
-
-  /**
-   * 只属于某一个 Team 的上下文（工作方式、成员关系、项目事实）。
-   *
-   * 和全局记忆共用同一套文件语义（全文 + 版本 + 409），只是落盘位置不同。
-   * Team 是否存在由 TeamService 守，这里只管文件。
-   */
-  getTeamMemory(memberId: string, teamId: string): MemberMemory {
-    this.get(memberId);
-    return getTeamMemory(memberId, teamId);
-  }
-
-  replaceTeamMemory(
-    memberId: string,
-    teamId: string,
-    content: string,
-    expectedVersion?: string,
-  ): MemberMemory {
-    this.get(memberId);
-    return replaceTeamMemory(memberId, teamId, content, expectedVersion);
-  }
-
-  appendTeamMemory(memberId: string, teamId: string, content: string): string {
-    const member = this.get(memberId);
-    appendTeamMemory(member.id, teamId, content);
-    return `已保存到 ${member.name} 在这个 Team 的上下文。`;
   }
 
   /**

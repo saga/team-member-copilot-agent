@@ -61,12 +61,17 @@ export function capabilitiesRouter(
 ) {
   const router = Router();
 
-  function deps(): CatalogDeps {
+  /**
+   * `teamId` 是必传的：member 层能力的读写都要落在某个 Team 的边界内。
+   * 之前这里不带 Team，`memberId` 是唯一输入 —— 拿到别人的 id 就能读、能写
+   * 别人 Team 里那个人的能力。
+   */
+  function deps(teamId: string): CatalogDeps {
     return {
       capabilities: {
         getGlobal: () => team.getGlobalCapabilities(),
-        getTeam: (teamId: string) => team.getTeamCapabilities(teamId),
-        getMember: (memberId: string) => team.getMemberCapabilities(memberId),
+        getTeam: (id: string) => team.getTeamCapabilities(id),
+        getMember: (memberId: string) => team.getMemberCapabilities(teamId, memberId),
       },
       skills,
       knowledge,
@@ -89,7 +94,8 @@ export function capabilitiesRouter(
             ? req.query.memberId
             : undefined;
         const teamId = currentTeamId();
-        res.json({ teamId, catalog: await buildCatalog(deps(), { scope, teamId, memberId }) });
+        if (scope === 'member' && memberId) team.requireMemberBelongsToTeam(teamId, memberId);
+        res.json({ teamId, catalog: await buildCatalog(deps(teamId), { scope, teamId, memberId }) });
       } catch (error) {
         sendError(res, error);
       }
@@ -113,12 +119,23 @@ export function capabilitiesRouter(
           return;
         }
         const teamId = currentTeamId();
+        const memberId = parsed.data.memberId;
+        if (parsed.data.scope === 'member') {
+          // 归属校验放在读之前，不是只在写之前：assignmentsToBindings 会去列这个
+          // Member 已装的 skill，那已经是一次跨 Team 读了。同一个 memberId 既能
+          // 读又能写，所以两道都必须挡住。
+          if (!memberId) {
+            res.status(400).json({ error: 'member scope 需要 memberId' });
+            return;
+          }
+          team.requireMemberBelongsToTeam(teamId, memberId);
+        }
         const query = {
           scope: parsed.data.scope,
           teamId,
-          memberId: parsed.data.memberId,
+          memberId,
         };
-        const bindings = await assignmentsToBindings(deps(), query, {
+        const bindings = await assignmentsToBindings(deps(teamId), query, {
           skills: parsed.data.skills,
           knowledge: parsed.data.knowledge,
           tools: parsed.data.tools,
@@ -127,15 +144,10 @@ export function capabilitiesRouter(
 
         if (parsed.data.scope === 'global') team.updateGlobalCapabilities(bindings);
         else if (parsed.data.scope === 'team') team.updateTeamCapabilities(teamId, bindings);
-        else {
-          if (!parsed.data.memberId) {
-            res.status(400).json({ error: 'member scope 需要 memberId' });
-            return;
-          }
-          team.updateMemberCapabilities(parsed.data.memberId, bindings);
-        }
+        // scope === 'member' 时 memberId 一定存在：上面那个分支已经 400 掉了空值。
+        else if (memberId) team.updateMemberCapabilities(teamId, memberId, bindings);
 
-        res.json({ teamId, catalog: await buildCatalog(deps(), query) });
+        res.json({ teamId, catalog: await buildCatalog(deps(teamId), query) });
       } catch (error) {
         sendError(res, error);
       }

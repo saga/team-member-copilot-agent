@@ -5,12 +5,11 @@ import os from 'node:os';
 import path from 'node:path';
 
 /**
- * Member 记忆隔离：Global + Team 两层。
+ * Member 长期记忆：**只有一份**。
  *
- *   Global（memory/MEMORY.md）—— 人工维护的长期习惯，跨 Team 稳定，
- *     Agent 写不到（remember_member 没有 global 入口）。
- *   Team（teams/<teamId>/MEMORY.md）—— 当前 Team 的上下文，
- *     Agent 与人都可写，换 Team 看不到。
+ * `.data/members/<id>/memory/MEMORY.md`，跨 Conversation、跨 Team 稳定。
+ * 人和 Agent 写的是同一个文件：人在 UI 里整体覆盖，Agent 在 turn 里调
+ * remember_member 追加 —— 所以保存必须带版本校验，否则中间那次写入会无声消失。
  */
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tmca-memory-'));
@@ -30,74 +29,56 @@ after(() => {
   fs.rmSync(dataDir, { recursive: true, force: true });
 });
 
-describe('Member memory 隔离', () => {
-  it('全局记忆在任何 Team 都可见（它是跨 Team 的）', () => {
-    const member = team.createMember({ name: 'Global Gal', role: 'Analyst' });
-    team.replaceMemberMemory(member.id, '# Long-term Memory\n\n习惯把事实和推论分开写。');
-
-    assert.match(memberService.readMemory(member.id), /事实和推论/);
-    assert.match(team.getMemberMemory(member.id).content, /事实和推论/);
-  });
-
-  it('Team A 的上下文在 Team B 看不到', () => {
-    const member = team.createMember({ name: 'Team Tom', role: 'Engineer' });
-    memberService.replaceTeamMemory(
-      member.id,
-      'team-a',
-      '# Team Context\n\n这个 Team 的站会是每天早上十点。',
-    );
-    memberService.replaceTeamMemory(
-      member.id,
-      'team-b',
-      '# Team Context\n\n这个 Team 每周五做发布回顾。',
-    );
-
-    assert.match(memberService.readTeamMemory(member.id, 'team-a'), /早上十点/);
-    assert.ok(!memberService.readTeamMemory(member.id, 'team-a').includes('发布回顾'));
-    assert.match(memberService.readTeamMemory(member.id, 'team-b'), /发布回顾/);
-    assert.ok(!memberService.readTeamMemory(member.id, 'team-b').includes('早上十点'));
-  });
-
-  it('remember_member 只写当前 Team，从不碰全局记忆', async () => {
-    const member = team.createMember({ name: 'Agent Amy', role: 'Reviewer' });
-    const conversation = team.createConversation({ kind: 'task', memberIds: [member.id], leadMemberId: member.id });
-    const teamId = team.getConversation(conversation.id).teamId;
-
-    const result = await team.rememberMember({
-      memberId: member.id,
-      teamId,
-      content: '这个 Team 的 review 输出要求先给 P0/P1 风险。',
-    });
-    assert.match(result, /Team/);
-    assert.match(memberService.readTeamMemory(member.id, teamId), /P0\/P1/);
-    assert.ok(
-      !memberService.readMemory(member.id).includes('P0/P1'),
-      'Agent 的写入进了全局记忆就是泄漏',
-    );
-  });
-
-  it('人仍然可以直接改全局记忆（人工维护的长期习惯）', () => {
+describe('Member 长期记忆', () => {
+  it('人在 UI 里保存的内容，prompt 读取与编辑器读取是同一份', () => {
     const member = team.createMember({ name: 'Human Hal', role: 'Analyst' });
     const saved = team.replaceMemberMemory(
       member.id,
       '# Long-term Memory\n\n用户偏好先看风险再看收益。',
     );
+
     assert.match(saved.content, /先看风险再看收益/);
-    const reloaded = team.getMemberMemory(member.id);
-    assert.equal(reloaded.version, saved.version);
+    assert.match(memberService.readMemory(member.id), /先看风险再看收益/);
+    assert.equal(team.getMemberMemory(member.id).version, saved.version);
   });
 
-  it('全局记忆与 Team 上下文版本相互独立', () => {
-    const member = team.createMember({ name: 'Version Vera', role: 'Analyst' });
-    const conversation = team.createConversation({ kind: 'task', memberIds: [member.id], leadMemberId: member.id });
-    const teamId = team.getConversation(conversation.id).teamId;
+  it('remember_member 写进同一份记忆，不另开一份', async () => {
+    const member = team.createMember({ name: 'Agent Amy', role: 'Reviewer' });
+    const result = await team.rememberMember({
+      memberId: member.id,
+      content: 'review 输出要求先给 P0/P1 风险。',
+    });
 
-    const globalBefore = team.getMemberMemory(member.id).version;
-    team.replaceMemberTeamContext(member.id, '# Team Context\n\n只改 Team。', teamId);
+    assert.match(result, /长期记忆/);
+    assert.match(memberService.readMemory(member.id), /P0\/P1/);
+    assert.match(team.getMemberMemory(member.id).content, /P0\/P1/);
+  });
+
+  it('版本不匹配时拒绝写入（409），不覆盖中间那次写入', () => {
+    const member = team.createMember({ name: 'Version Vera', role: 'Analyst' });
+    const first = team.replaceMemberMemory(member.id, '# Long-term Memory\n\n第一条。');
+    // Agent 在两次保存之间记下了一句。
+    memberService.appendMemory(member.id, 'Agent 中间记下的一句。');
+
+    assert.throws(
+      () => team.replaceMemberMemory(member.id, '# Long-term Memory\n\n第二条。', first.version),
+      (error: unknown) => (error as { status?: number }).status === 409,
+    );
+    assert.match(
+      memberService.readMemory(member.id),
+      /Agent 中间记下的一句/,
+      '409 之后不能有副作用：那次写入必须还在',
+    );
+  });
+
+  it('只有一个记忆文件：不存在按 Team 分片的第二份', () => {
+    const member = team.createMember({ name: 'Single Sam', role: 'Engineer' });
+
+    assert.equal(fs.existsSync(path.join(dataDir, 'members', member.id, 'memory', 'MEMORY.md')), true);
     assert.equal(
-      team.getMemberMemory(member.id).version,
-      globalBefore,
-      '改 Team 上下文不能漂移全局记忆的版本',
+      fs.existsSync(path.join(dataDir, 'members', member.id, 'teams')),
+      false,
+      '记忆不按 Team 分片 —— 多一份就多一个「这个事实该记在哪」的问题',
     );
   });
 });

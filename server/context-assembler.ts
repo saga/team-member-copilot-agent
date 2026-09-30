@@ -103,7 +103,21 @@ export class ContextAssembler {
      * 什么** —— 房间里的其它文件是搜索的结果，不是默认上下文。
      */
     referencedFiles?: Array<{ originalName: string }>;
+    /**
+     * 这个 Member 的持久 session 是**新建的**：它里面一条历史都没有。
+     *
+     * 两件事一起变：
+     *
+     *   1. checkpoint 失效。`lastContextMessageSequence` 记的是「旧 session
+     *      已经看过哪条消息」，而新 session 一条都没看过 —— 从它往后读，
+     *      checkpoint 之前那段历史就悄悄没了。所以从 0 读。
+     *   2. 自己发过的消息不能再过滤。那条过滤的前提是「它们已经在 session
+     *      history 里」，新 session 里没有，滤掉就等于这个人看不到自己之前
+     *      说过什么。
+     */
+    freshSession?: boolean;
   }): MemberContext {
+    const checkpoint = input.freshSession ? 0 : input.runtime.lastContextMessageSequence;
     const rows = this.db
       .prepare(
         `
@@ -114,8 +128,7 @@ export class ContextAssembler {
         ORDER BY message_sequence
         `,
       )
-      .all(input.runtime.conversationId, input.runtime.lastContextMessageSequence) as unknown as
-      MessageRow[];
+      .all(input.runtime.conversationId, checkpoint) as unknown as MessageRow[];
 
     const messages = rows.map(mapMessage);
     // 独立分析的 Task（independentContext）与 delegation 不读共享房间记录：
@@ -137,13 +150,18 @@ export class ContextAssembler {
       ? input.runtime.lastContextMessageSequence
       : messages.length > 0
         ? messages[messages.length - 1].messageSequence
-        : input.runtime.lastContextMessageSequence;
+        : checkpoint;
 
     const relevant = isolatedTask
       ? []
       : messages.filter((message) => {
-          // 当前 runtime 自己产出的历史消息已经在 session history 里（assistant turn）
-          if (message.senderType === 'member' && message.senderId === input.runtime.memberId) {
+          // 当前 runtime 自己产出的历史消息已经在 session history 里（assistant turn）。
+          // 全新 session 例外：它里面没有，滤掉就丢了。
+          if (
+            !input.freshSession &&
+            message.senderType === 'member' &&
+            message.senderId === input.runtime.memberId
+          ) {
             return false;
           }
           return message.messageSequence !== input.triggerMessageSequence;

@@ -64,7 +64,6 @@ export function useWorkspaceActions(deps: WorkspaceActionDeps) {
     const result = await api.createMember({
       name: input.name,
       role: input.role,
-      description: '',
     });
     data.addMember(result.member);
     deps.setNewMemberOpen(false);

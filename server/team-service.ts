@@ -81,7 +81,6 @@ interface MemberRow {
   handle: string;
   name: string;
   role: string;
-  description: string;
   system_prompt: string;
   model: string | null;
   status: 'active' | 'archived';
@@ -553,6 +552,29 @@ export class TeamService {
   }
 
   /**
+   * 归属校验：这个人**必须已经是**这个 Team 的成员，但**不看 status**。
+   *
+   * 和 requireMemberInTeam 的差别只有一处，但这一处是必需的：归档会把
+   * membership 置成 inactive，而恢复归档要能走通 —— 用 requireActiveMembership
+   * 会把「恢复」这条路和「跨 Team 越权」一起关掉，Archived Member 再也回不来。
+   * 所以这里只查 membership 行在不在。
+   *
+   * 写入路径（PATCH member、改 member 层能力）走这里；只读子资源仍走
+   * requireMemberInTeam —— 归档的人不该能发消息、查对话。
+   */
+  requireMemberBelongsToTeam(teamId: string, memberId: string): Member {
+    const member = this.members.get(memberId);
+    if (this.structure) {
+      try {
+        this.structure.getMembership(teamId, 'agent', memberId);
+      } catch {
+        throw forbidden('Member 不属于这个 Team');
+      }
+    }
+    return member;
+  }
+
+  /**
    * 手工创建 Member。
    *
    * 刻意**不写任何能力绑定**：能力现在是 global + team + member 三层叠加，
@@ -584,8 +606,8 @@ export class TeamService {
   // --------------------------------------------------------------- 能力
 
   /** 这个 Member 的**私有增量**能力。上面两层继承来的不在这里，看目录接口。 */
-  getMemberCapabilities(memberId: string): MemberCapabilities {
-    this.members.get(memberId);
+  getMemberCapabilities(teamId: string, memberId: string): MemberCapabilities {
+    this.requireMemberBelongsToTeam(teamId, memberId);
     return this.capabilities.getMember(memberId);
   }
 
@@ -619,14 +641,29 @@ export class TeamService {
    *
    * 只动 member 层：global / team 两层是继承来的，不属于这个人。所以「把某人
    * 的能力清空」= 它退回团队基线，而不是变成一个什么都不会的人。
+   *
+   * 归属校验放在这里而不是只放在路由上：`CapabilityService.replaceMember` 按
+   * memberId 写行，多一条绕过路由的调用路径就等于没有边界。路由上的那次校验
+   * 是为了在写之前就失败，不是唯一一道闸。
    */
-  updateMemberCapabilities(memberId: string, capabilities: MemberCapabilities): MemberCapabilities {
-    this.members.get(memberId);
+  updateMemberCapabilities(
+    teamId: string,
+    memberId: string,
+    capabilities: MemberCapabilities,
+  ): MemberCapabilities {
+    this.requireMemberBelongsToTeam(teamId, memberId);
     this.capabilityResolver.validate(capabilities);
     return this.capabilities.replaceMember(memberId, capabilities);
   }
 
-  updateMember(id: string, input: UpdateMemberInput): Member {
+  /**
+   * 更新 Member 身份 / 状态。`teamId` 决定归档/恢复时同步哪个 Team 的 membership。
+   *
+   * 不传 `teamId` 时回落到默认 Team（单 Team 部署与测试路径）。传了就必须用传的
+   * —— 以前这里**只认**默认 Team，多 Team 部署下 PATCH B 团队的人会把 A 团队
+   * 的 membership 改掉，而那个人在 B 团队的 membership 一动不动。
+   */
+  updateMember(id: string, input: UpdateMemberInput, teamId?: string): Member {
     // 普通任务模型只能是 Member 列表里的低档模型：Lead 模型与拼错的名字在这里就拒绝，
     // 不能等到下一轮 turn 才发现这个人跑不起来。null/省略 = 回落默认，不校验。
     if (input.model?.trim()) resolveMemberModel(modelPolicy, input.model);
@@ -640,9 +677,9 @@ export class TeamService {
     // 成员归档/恢复后同步 TeamMembership：Member.status 与 membership.status
     // 不能漂移成「已归档但仍 active」。
     if (this.structure && input.status && input.status !== before.status) {
-      const team = this.defaultTeam();
-      this.structure.ensureAgentMembership(team.id, member.id);
-      this.structure.updateMembership(team.id, 'agent', member.id, {
+      const team = teamId ?? this.defaultTeam().id;
+      this.structure.ensureAgentMembership(team, member.id);
+      this.structure.updateMembership(team, 'agent', member.id, {
         status: member.status === 'active' ? 'active' : 'inactive',
       });
     }
@@ -1273,12 +1310,9 @@ export class TeamService {
     return this.collaboration.delegateMember(input);
   }
 
-  rememberMember(input: {
-    memberId: string;
-    teamId: string;
-    content: string;
-  }): Promise<string> {
-    return this.collaboration.rememberMember(input);
+  /** Agent 在 turn 里记下一条长期记忆（`remember_member` 工具）。 */
+  rememberMember(input: { memberId: string; content: string }): Promise<string> {
+    return Promise.resolve(this.members.appendMemory(input.memberId, input.content));
   }
 
   /**
@@ -1297,36 +1331,6 @@ export class TeamService {
 
   replaceMemberMemory(memberId: string, content: string, expectedVersion?: string): MemberMemory {
     return this.members.replaceMemory(memberId, content, expectedVersion);
-  }
-
-  /**
-   * 某 Member 在某 Team 的上下文（全文 + 版本，供 UI 编辑）。
-   *
-   * teamId 省略 = 当前默认 Team：单 Team 部署下调用方不需要知道 Team 的存在，
-   * 多 Team 后按显式 teamId 读写。Team 不存在时 404，而不是建一个空文件。
-   */
-  getMemberTeamContext(memberId: string, teamId?: string): MemberMemory {
-    return this.members.getTeamMemory(memberId, this.resolveTeamId(teamId));
-  }
-
-  replaceMemberTeamContext(
-    memberId: string,
-    content: string,
-    teamId?: string,
-    expectedVersion?: string,
-  ): MemberMemory {
-    return this.members.replaceTeamMemory(
-      memberId,
-      this.resolveTeamId(teamId),
-      content,
-      expectedVersion,
-    );
-  }
-
-  private resolveTeamId(teamId?: string): string {
-    const resolved = teamId ?? this.defaultTeam().id;
-    if (this.structure) this.structure.getTeam(resolved);
-    return resolved;
   }
 
   // ------------------------------------------------------------- Execution
@@ -2045,7 +2049,6 @@ export class TeamService {
         handle: member.handle,
         name: member.name,
         role: member.role,
-        description: member.description,
         systemPrompt: member.system_prompt,
         model: member.model,
         status: member.status,

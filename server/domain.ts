@@ -86,8 +86,6 @@ export interface Member {
   name: string;
   /** 工作职责，不等于能力。 */
   role: string;
-  /** 给 UI 展示的简短说明，不作为授权，也不作为主要模型指令。 */
-  description: string;
   /**
    * Member 的工作契约 / system prompt。
    *

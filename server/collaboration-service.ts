@@ -256,14 +256,4 @@ export class CollaborationService {
     this.internals.emit(conversation.id, { type: 'conversation.updated', data: this.internals.getConversation(conversation.id) });
     return `已记录 ${input.questions.length} 个待确认问题，工作区进入 waiting_user`;
   }
-
-  rememberMember(input: {
-    memberId: string;
-    teamId: string;
-    content: string;
-  }): Promise<string> {
-    const teamId = input.teamId;
-    if (this.internals.structure) this.internals.structure.getTeam(teamId);
-    return Promise.resolve(this.internals.members.appendTeamMemory(input.memberId, teamId, input.content));
-  }
 }

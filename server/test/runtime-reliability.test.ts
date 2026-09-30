@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import type { CopilotService } from '../copilot.js';
+import type { CopilotService, MemberTurnResult } from '../copilot.js';
 
 /**
  * Runtime reliability 测试（Commit 1 + Commit 2）。
@@ -62,12 +62,23 @@ class StubCopilot {
   failWith: string | null = null;
   /** 挂住 turn，用来把 execution 稳定地停在 running 状态做断言。 */
   hold: Promise<void> | null = null;
+  /** 「这些 session 已经不在引擎里了」——模拟 idle TTL 回收 / COPILOT_HOME 被清。 */
+  readonly missingSessionIds = new Set<string>();
+  /** 让 turn 报告「session 是本轮新建的」——模拟探针与 resume 之间的窗口。 */
+  reportSessionCreated = false;
 
-  async runMemberTurn(input: TurnInput): Promise<string> {
+  persistentSessionExists(sessionId: string): Promise<boolean> {
+    return Promise.resolve(!this.missingSessionIds.has(sessionId));
+  }
+
+  async runMemberTurn(input: TurnInput): Promise<MemberTurnResult> {
     this.turns.push(input);
     if (this.hold) await this.hold;
     if (this.failWith) throw new Error(this.failWith);
-    return `stub reply from ${input.member.id}`;
+    return {
+      content: `stub reply from ${input.member.id}`,
+      sessionCreated: this.reportSessionCreated,
+    };
   }
 
   /** 这一轮真正交给引擎的 session id（不传 = 复用 runtime 上的长期 session）。 */
@@ -111,6 +122,7 @@ function runtimeRow(conversationId: string, memberId: string) {
         id: string;
         status: string;
         active_execution_id: string | null;
+        copilot_session_id: string;
         last_context_message_sequence: number;
       }
     | undefined;
@@ -286,7 +298,6 @@ describe('schema 就位（PRAGMA user_version）', () => {
             'handle',
             'name',
             'role',
-            'description',
             'system_prompt',
             'model',
             'status',
@@ -1022,6 +1033,124 @@ describe('checkpoint 只在 turn 成功后推进', () => {
     );
     assert.equal(afterFailure.status, 'error');
     assert.equal(afterFailure.active_execution_id, null, '失败后必须释放单写者占用');
+  });
+});
+
+describe('session 丢失后 checkpoint 归零，历史重新注入', () => {
+  /**
+   * 造一个「房间里有旧消息、checkpoint 已经推进过」的状态。
+   *
+   * 用 task 房间 + Lead 单成员：用户消息只唤醒 Lead，所以「谁在什么时候读到
+   * 了什么」是确定的。
+   */
+  async function conversationWithHistory(title: string) {
+    const conv = team.createConversation({
+      kind: 'task',
+      title,
+      memberIds: [bob.id],
+      leadMemberId: bob.id,
+    });
+    const first = await sendMessage({
+      actorId: 'test-user',
+      conversationId: conv.id,
+      content: 'HISTORY-MARKER',
+    });
+    await waitForStatus(first.executionId, 'completed');
+
+    const second = await sendMessage({
+      actorId: 'test-user',
+      conversationId: conv.id,
+      content: 'SECOND-MARKER',
+    });
+    await waitForStatus(second.executionId, 'completed');
+
+    // 第二轮里 HISTORY-MARKER 不该再出现：它在 session history 里已经有了。
+    assert.doesNotMatch(
+      stub.turnsFor(bob.id).at(-1)!.prompt,
+      /HISTORY-MARKER/,
+      '前提：增量注入正常工作，否则这组用例证明不了任何事',
+    );
+
+    const runtime = runtimeRow(conv.id, bob.id);
+    assert.ok(runtime);
+    assert.ok(runtime.last_context_message_sequence > 0, '前提：checkpoint 已经推进');
+    return { conv, runtime };
+  }
+
+  it('引擎里的 session 不在了 → 从 0 重读，自己发过的消息也不再被过滤', async () => {
+    const { conv, runtime } = await conversationWithHistory('LostSession');
+    stub.missingSessionIds.add(runtime.copilot_session_id);
+
+    const third = await sendMessage({
+      actorId: 'test-user',
+      conversationId: conv.id,
+      content: 'AFTER-LOSS',
+    });
+    await waitForStatus(third.executionId, 'completed');
+
+    const prompt = stub.turnsFor(bob.id).at(-1)!.prompt;
+    assert.match(
+      prompt,
+      /HISTORY-MARKER/,
+      '新 session 里一条历史都没有，checkpoint 之前那段必须重新注入',
+    );
+    assert.match(
+      prompt,
+      new RegExp(`stub reply from ${bob.id}`),
+      '自己之前发过的消息也不能再过滤 —— 过滤的前提是「已经在 session history 里」，而新 session 里没有',
+    );
+
+    // checkpoint 重新回到「真的处理到哪」，而不是停在旧值上。
+    const after = runtimeRow(conv.id, bob.id);
+    assert.ok(after);
+    assert.ok(
+      after.last_context_message_sequence > runtime.last_context_message_sequence,
+      '重读之后 checkpoint 必须重新覆盖整段历史',
+    );
+  });
+
+  it('session 是本轮新建的、但没按「全新 session」组装 → checkpoint 退回 0', async () => {
+    // 探针说 session 还在、resume 时才发现已经没了：这一轮只拿到了 checkpoint
+    // 之后的尾部。checkpoint 这时不能往前推 —— 推了，前面那段历史就永久留在
+    // 洞外，而且没有任何地方看得出来。
+    const { conv } = await conversationWithHistory('RaceSession');
+
+    stub.reportSessionCreated = true;
+    try {
+      const third = await sendMessage({
+        actorId: 'test-user',
+        conversationId: conv.id,
+        content: 'RACE-TURN',
+      });
+      await waitForStatus(third.executionId, 'completed');
+    } finally {
+      stub.reportSessionCreated = false;
+    }
+
+    const afterRace = runtimeRow(conv.id, bob.id);
+    assert.ok(afterRace);
+    assert.equal(
+      afterRace.last_context_message_sequence,
+      0,
+      '不能证明这个 session 见过前面的记录时，checkpoint 必须退回 0',
+    );
+
+    // 下一轮从 0 重放，把洞补回来。
+    const fourth = await sendMessage({
+      actorId: 'test-user',
+      conversationId: conv.id,
+      content: 'HEAL-TURN',
+    });
+    await waitForStatus(fourth.executionId, 'completed');
+
+    assert.match(
+      stub.turnsFor(bob.id).at(-1)!.prompt,
+      /HISTORY-MARKER/,
+      '下一轮必须把整段房间记录重放一遍，否则那个洞就永久留下了',
+    );
+    const healed = runtimeRow(conv.id, bob.id);
+    assert.ok(healed);
+    assert.ok(healed.last_context_message_sequence > 0, '补回来之后 checkpoint 正常推进');
   });
 });
 
