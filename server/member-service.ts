@@ -18,6 +18,7 @@ interface MemberRow {
   handle: string;
   name: string;
   role: string;
+  description: string;
   system_prompt: string;
   model: string | null;
   status: 'active' | 'archived';
@@ -31,6 +32,8 @@ export interface CreateMemberInput {
   name: string;
   handle?: string;
   role: string;
+  /** 给人看的职责摘要（列表 / picker / Profile），不进 system prompt。 */
+  description?: string;
   systemPrompt?: string;
   model?: string;
 }
@@ -51,6 +54,7 @@ export interface UpdateMemberInput {
   name?: string;
   handle?: string;
   role?: string;
+  description?: string;
   systemPrompt?: string;
   model?: string | null;
   status?: 'active' | 'archived';
@@ -62,6 +66,7 @@ function mapRow(row: MemberRow): Member {
     handle: row.handle,
     name: row.name,
     role: row.role,
+    description: row.description,
     systemPrompt: row.system_prompt,
     model: row.model,
     status: row.status,
@@ -148,6 +153,7 @@ export class MemberService {
           handle,
           name,
           role,
+          description,
           system_prompt,
           model,
           status,
@@ -155,7 +161,7 @@ export class MemberService {
           created_at,
           updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
         `,
       )
       .run(
@@ -163,6 +169,7 @@ export class MemberService {
         handle,
         input.name.trim(),
         role,
+        input.description?.trim() ?? '',
         input.systemPrompt?.trim() ?? '',
         input.model?.trim() || null,
         options.seedKey ?? null,
@@ -187,6 +194,7 @@ export class MemberService {
       name: input.name ?? current.name,
       handle: input.handle === undefined ? current.handle : this.resolveHandle(input.handle, id),
       role: input.role ?? current.role,
+      description: input.description ?? current.description,
       systemPrompt: input.systemPrompt ?? current.systemPrompt,
       model: input.model === undefined ? current.model : input.model?.trim() || null,
       status: input.status ?? current.status,
@@ -201,6 +209,7 @@ export class MemberService {
           name = ?,
           handle = ?,
           role = ?,
+          description = ?,
           system_prompt = ?,
           model = ?,
           status = ?,
@@ -212,6 +221,7 @@ export class MemberService {
         next.name,
         next.handle,
         next.role,
+        next.description,
         next.systemPrompt,
         next.model,
         next.status,

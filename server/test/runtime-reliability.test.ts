@@ -298,6 +298,7 @@ describe('schema 就位（PRAGMA user_version）', () => {
             'handle',
             'name',
             'role',
+            'description',
             'system_prompt',
             'model',
             'status',

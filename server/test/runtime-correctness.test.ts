@@ -291,7 +291,7 @@ function turnInput(
       handle: 'alice',
       name: 'Alice',
       role: 'Analyst',
-      style: '',
+      description: '',
       systemPrompt: '',
       model: null,
       status: 'active' as const,

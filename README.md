@@ -86,7 +86,7 @@ Lead 只负责澄清与规划，执行由各 Task 的执行人推进，依赖由
 
 | 概念 | 含义 |
 |------|------|
-| **Member** | 持久的 specialized agent worker。持久身份 + role + work contract + model + 能力组成 + 长期记忆。身份与记忆都跨 Team 稳定 —— 只有一份记忆，不按 Team 分片。 |
+| **Member** | 持久的 specialized agent worker。持久身份 + role + description + work contract（systemPrompt）+ model + 能力组成 + 长期记忆。`role` / `description` / `systemPrompt` 分工见「Member 身份」一节。身份与记忆都跨 Team 稳定 —— 只有一份记忆，不按 Team 分片。 |
 | **Capability** | 三层能力引用：`global` / `team` / `member`，存在同一张 `capability_binding` 表里（`scope_type` + `scope_id`）。**`effective = global + team + member` 才是「能用什么」的唯一答案**，任何单层都不是。 |
 | **Conversation** | Task 工作区。`task`（用户真正使用的工作会话，有 `objective` / `leadMemberId` / `status` / `requirements` / `openQuestions`，可挂 Jira）/ `direct`（Member ↔ Member 内部私聊）。状态机：`intake → waiting_user → running → completed`，异常 `blocked`，终止 `cancelled`。完成条件由 Task 状态决定，不由 LLM 宣布。 |
 | **Task** | `conversation_task` 表。`pending → ready → running → completed`（异常 `blocked` / `failed`，终止 `cancelled`）；依赖用 `dependencies_json` 表达（第一版只要列表，不要树）；上限 20 个；循环依赖拒绝落库；只能由执行人自己 `update_task`；同一个 Member 同时只跑一个 Task。初始计划一次性 `plan_tasks`，之后缺失的工作由 Lead `add_task` 补充，未开始任务的错误分派由 Lead `reassign_task` 纠正（running 及终态不能换人）。单个任务可锁模型档位（`modelTier`：null 跟执行人默认，`strong` 升级 Strong；只有 Lead 能定，执行人改不到）。每个任务属于创建时的 Goal 版本（`goal_revision`），旧版本任务只读历史，不能 update / retry / reassign。 |
@@ -1021,6 +1021,7 @@ Content-Type: application/json
   "name": "Researcher",
   "handle": "researcher",
   "role": "Research Analyst",
+  "description": "负责研究资料分析、事实核查和研究总结",
   "systemPrompt": "优先区分事实、推论和不确定性。",
   "model": "gpt-5-mini"
 }
@@ -1031,7 +1032,18 @@ Task 时用的模型。担任 Lead 时不用这个字段 —— 服务端按规�
 Strong 两档之间自动选择（普通工作 Standard，规划 / 澄清 / 恢复 / 综合才升级
 Strong）。填 Strong 模型或拼错的名字会被拒绝（`400`）。
 
-`role` 与 `systemPrompt` 就是这个人格的全部：前者是工作职责，后者是工作契约。
+`role` / `description` / `systemPrompt` 是三件不同的事，不要混：
+
+| 字段 | 给谁看 | 写什么 | 进 system prompt |
+|------|--------|--------|------------------|
+| `role` | UI / 路由 / Task assignment | 短职责标签（`Security Reviewer`） | 是 |
+| `description` | 人 | 职责范围摘要，一眼知道这个人是干什么的 | **否** |
+| `systemPrompt` | 模型 | 工作契约：负责什么、如何分析、输出什么、哪些不负责 | 是 |
+
+所以 `description` 里写「负责从安全、授权、数据保护角度独立审查方案与实现」，
+不写「你是一个严谨、友好、富有同理心的专家」—— 那是人格，人格不是字段，
+而且两处重复写之后，改一处忘一处就没人知道哪份才是真实职责。
+
 新建的 Member **不写任何能力绑定** —— 能力是 global + team + member 三层叠加，
 新建的人自动继承前两层。要给它加 member 层的增量（比如开宿主工具），走能力目录
 接口（用户语言的 ID，无 providerId / selector；拼错直接 `400`，而不是等到下一轮
@@ -1089,7 +1101,6 @@ update_task             执行人上报自己任务的进展（只能动自己�
 │   └── skills/                        # global.filesystem-skills 的根目录
 ├── members/
 │   └── <member-id>/
-│       ├── SOUL.md                    # role / system prompt
 │       ├── memory/MEMORY.md           # 长期记忆（人在这里编辑，Agent 用 remember_member 追加）
 │       ├── skills/                    # member.filesystem-skills 的根目录
 │       └── knowledge/                 # 该 Member 的 personal KB（$personal）

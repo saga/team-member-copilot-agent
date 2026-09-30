@@ -31,6 +31,8 @@ export interface Member {
   handle: string;
   name: string;
   role: string;
+  /** 给人看的职责摘要（列表 / picker / Profile）。不是人格提示，也不进 system prompt。 */
+  description: string;
   systemPrompt: string;
   model: string | null;
   status: 'active' | 'archived';
@@ -882,6 +884,7 @@ export const api = {
     name: string;
     handle?: string;
     role: string;
+    description?: string;
     systemPrompt?: string;
     model?: string;
   }): Promise<{ member: Member }> {
@@ -902,6 +905,7 @@ export const api = {
       name?: string;
       handle?: string;
       role?: string;
+      description?: string;
       systemPrompt?: string;
       model?: string | null;
       status?: 'active' | 'archived';

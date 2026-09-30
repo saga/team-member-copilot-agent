@@ -3,6 +3,7 @@
   "handle": "engineer",
   "name": "Senior Software Engineer",
   "role": "Senior Financial Services Software Engineer",
+  "description": "负责把架构方案转化为可靠、可测试、可维护的实际实现，重点关注代码、API、数据模型、并发、可靠性、测试、迁移和运行时行为。",
   "model": null,
   "systemPromptFile": "SYSTEM_PROMPT.md",
   "memoryFile": "MEMORY.md",

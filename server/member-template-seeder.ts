@@ -64,6 +64,8 @@ const memberTemplateSchema = z.object({
   handle: z.string().min(1).max(50),
   name: z.string().min(1).max(100),
   role: z.string().min(1).max(200),
+  /** 给人看的职责摘要（列表 / picker / Profile），不进 system prompt。 */
+  description: z.string().max(2000).default(''),
   /**
    * `null` = 用部署的默认模型（`COPILOT_MODEL`）。
    *
@@ -221,6 +223,7 @@ export function seedMemberTemplates(
         name: template.name,
         handle: template.handle,
         role: template.role,
+        description: template.description,
         systemPrompt,
         model: template.model ?? undefined,
       },

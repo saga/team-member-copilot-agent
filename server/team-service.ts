@@ -81,6 +81,7 @@ interface MemberRow {
   handle: string;
   name: string;
   role: string;
+  description: string;
   system_prompt: string;
   model: string | null;
   status: 'active' | 'archived';
@@ -2049,6 +2050,7 @@ export class TeamService {
         handle: member.handle,
         name: member.name,
         role: member.role,
+        description: member.description,
         systemPrompt: member.system_prompt,
         model: member.model,
         status: member.status,

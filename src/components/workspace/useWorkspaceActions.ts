@@ -64,10 +64,11 @@ export function useWorkspaceActions(deps: WorkspaceActionDeps) {
     const result = await api.createMember({
       name: input.name,
       role: input.role,
+      description: '',
     });
     data.addMember(result.member);
     deps.setNewMemberOpen(false);
-    // 新建只拿到 name + role，work contract / model 还是空的。
+    // 新建只拿到 name + role，description / work contract / model 还是空的。
     // 直接开一个单聊等于让一个空壳人格开始干活，所以先把档案页打开。
     deps.setEditingMemberId(result.member.id);
   }

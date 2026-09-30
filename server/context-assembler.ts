@@ -34,7 +34,7 @@ import type {
  * **保留最新的，明确说出略过了多少条**，而不是悄悄砍掉一截再假装读全了。
  *
  * prompt 的结尾按 TurnMode 分三种写法。**身份和房间上下文必须分开**：
- * 身份（role / style / memory）在 system prompt 里稳定不变，房间上下文每轮动态
+ * 身份（role / systemPrompt / memory）在 system prompt 里稳定不变，房间上下文每轮动态
  * 拼在 user prompt 里。把房间历史写进 persona 会让同一个 Member 在不同房间里
  * 表现出不同的「人格」。
  */

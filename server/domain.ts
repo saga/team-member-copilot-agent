@@ -87,6 +87,15 @@ export interface Member {
   /** 工作职责，不等于能力。 */
   role: string;
   /**
+   * 给人看的职责范围摘要：列表、picker、Profile 里一眼知道这个人是干什么的。
+   *
+   * 它**不是人格提示，也不进 system prompt** —— 工作契约在 systemPrompt 里。
+   * 所以这里写「负责哪一块」，不写「你是一个严谨、友好、富有同理心的专家」，
+   * 也不要把 systemPrompt 那段抄一遍：两处重复写，改一处忘一处之后
+   * 谁也不知道哪份才是这个人的真实职责。
+   */
+  description: string;
+  /**
    * Member 的工作契约 / system prompt。
    *
    * 描述它负责什么、如何工作、输出什么、哪些事情不负责。

@@ -15,12 +15,14 @@ interface MemberEditorProps {
  *
  * 字段和数据库一一对应，不做二次抽象：
  *
- *   name / handle / role / systemPrompt / model
+ *   name / handle / role / description / systemPrompt / model
  *
  * role + systemPrompt（工作契约）会拼进 system prompt（见 execution-service
- * buildMemberSystemPrompt）。`model` 只能选策略里的 Member 模型
- * （Standard / Cheap，Strong 不在下拉里），留空 = 显式回落默认 Member 模型，
- * 所以提交时要用 null 而不是空串。
+ * buildMemberSystemPrompt）。`description` **不进去** —— 它是给人看的职责摘要
+ * （列表 / picker / Profile 里一眼知道这个人是干什么的），所以这里只写「负责
+ * 哪一块」，不写人格，也不要和 systemPrompt 重复。`model` 只能选策略里的
+ * Member 模型（Standard / Cheap，Strong 不在下拉里），留空 = 显式回落默认
+ * Member 模型，所以提交时要用 null 而不是空串。
  *
  * 「能用什么」**不在这里**：能力现在是三层继承的（global + team + member），
  * 而这个表单只描述一个人。把能力和身份混在一个表单里，会让「改个名字」和
@@ -41,6 +43,7 @@ export function MemberEditor({ member, modelPolicy, onSaved, onCancel }: MemberE
         // 空 handle 不发：它是 @mention 的锚点，不能清空
         ...(values.handle.trim() ? { handle: values.handle.trim() } : {}),
         role: values.role.trim(),
+        description: values.description.trim(),
         systemPrompt: values.systemPrompt,
         // 空 = 显式回落默认 Member 模型（后端按 !== undefined 判断，不会被 ?? 吃掉）
         model: values.model?.trim() || null,
@@ -86,6 +89,7 @@ export function MemberEditor({ member, modelPolicy, onSaved, onCancel }: MemberE
         name: member.name,
         handle: member.handle,
         role: member.role,
+        description: member.description,
         systemPrompt: member.systemPrompt,
         model: member.model ?? '',
       }}
@@ -99,6 +103,13 @@ export function MemberEditor({ member, modelPolicy, onSaved, onCancel }: MemberE
       </Form.Item>
       <Form.Item name="role" label="Role" rules={[{ required: true }]}>
         <Input />
+      </Form.Item>
+      <Form.Item
+        name="description"
+        label="Description"
+        extra="给人看的一句话职责摘要（列表 / Profile 里显示）。不是人格提示，也不进 system prompt —— 工作契约写在下面。"
+      >
+        <Input.TextArea placeholder="负责投资研究和事实核查" autoSize />
       </Form.Item>
       <Form.Item
         name="systemPrompt"

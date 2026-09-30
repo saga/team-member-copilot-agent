@@ -35,6 +35,12 @@ CREATE TABLE member (
   handle TEXT NOT NULL UNIQUE,
   name TEXT NOT NULL,
   role TEXT NOT NULL,
+  -- 给人看的职责摘要（列表 / picker / Profile），**不进 system prompt**。
+  --
+  -- 它是 INSERT/UPDATE 的必需列，不是可选装饰：删掉这一列，member-service 的写入
+  -- 会直接报 no such column。而 schema 只有「空库才建」这一条路、没有升级代码，
+  -- 版本号就是形状的唯一身份 —— 动这一列等于动形状，别当成顺手清理。
+  description TEXT NOT NULL DEFAULT '',
   system_prompt TEXT NOT NULL DEFAULT '',
   model TEXT,
   status TEXT NOT NULL DEFAULT 'active'
