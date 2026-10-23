@@ -427,6 +427,14 @@ export class CopilotService {
         // 不是由工具调用引起的权限请求（url / mcp / 扩展管理……），见 answerPermissionRequest。
         onPermissionRequest: (request: PermissionRequest, invocation: PermissionInvocation) =>
           this.answerPermissionRequest(request, invocation),
+        // This service has no host-side OAuth token broker or MCP login UI.
+        // Fail closed and let the tool error explain that external login is required.
+        onMcpAuthRequest: async (request) => {
+          console.warn(
+            `[copilot] MCP OAuth request for "${request.serverName}" cancelled: no host token broker is configured.`,
+          );
+          return { kind: 'cancelled' as const };
+        },
         // SDK 默认 false。不打开的话 assistant.message_delta 根本不会发，
         // 前端的实时增量就永远是空的。
         streaming: true,
