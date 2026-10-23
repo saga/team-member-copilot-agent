@@ -225,6 +225,8 @@ export class CopilotService {
   private client: CopilotClient | null = null;
   private starting: Promise<CopilotClient> | null = null;
   private lastError: string | null = null;
+  /** Invalidates a client startup that races with service shutdown. */
+  private lifecycleGeneration = 0;
   /** 同一 runtime 的 turn 串行化：一个 Copilot session 一次只能跑一个 turn。 */
   private locks = new Map<string, Promise<unknown>>();
   /**
@@ -257,7 +259,8 @@ export class CopilotService {
     if (this.client) return this.client;
     if (this.starting) return this.starting;
 
-    this.starting = (async () => {
+    const generation = this.lifecycleGeneration;
+    const starting = (async () => {
       const client =
         this.options.createClient?.() ??
         new CopilotClient({
@@ -295,17 +298,30 @@ export class CopilotService {
               }),
         });
       await client.start();
+      if (generation !== this.lifecycleGeneration) {
+        try {
+          await client.stop();
+        } catch {
+          // Shutdown already invalidated this startup; never publish its client.
+        }
+        throw new Error('Copilot service was stopped while the client was starting.');
+      }
       this.client = client;
       this.lastError = null;
-      this.starting = null;
       return client;
-    })().catch((error) => {
-      this.starting = null;
-      this.lastError = error instanceof Error ? error.message : String(error);
-      throw error;
-    });
+    })();
 
-    return this.starting;
+    this.starting = starting;
+    try {
+      return await starting;
+    } catch (error) {
+      if (generation === this.lifecycleGeneration) {
+        this.lastError = error instanceof Error ? error.message : String(error);
+      }
+      throw error;
+    } finally {
+      if (this.starting === starting) this.starting = null;
+    }
   }
 
   /** connected = 已建连；idle = 尚未建连（懒加载）；error = 建连失败。 */
@@ -815,15 +831,20 @@ export class CopilotService {
   }
 
   async stop(): Promise<void> {
-    this.activeSessions.clear();
-    this.locks.clear();
-    if (this.client) {
+    // Prevent an in-flight getClient() from publishing a new client after shutdown.
+    this.lifecycleGeneration += 1;
+    this.starting = null;
+    const client = this.client;
+    this.client = null;
+
+    // Keep active sessions and lock chains until runMemberTurn() finalizers retire them.
+    // Clearing them here could let a restarted service run a second turn concurrently.
+    if (client) {
       try {
-        await this.client.stop();
+        await client.stop();
       } catch {
         // 关闭失败忽略，进程仍要退出
       }
-      this.client = null;
     }
   }
 }
