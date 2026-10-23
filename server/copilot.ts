@@ -429,10 +429,8 @@ export class CopilotService {
           this.answerPermissionRequest(request, invocation),
         // This service has no host-side OAuth token broker or MCP login UI.
         // Fail closed and let the tool error explain that external login is required.
-        onMcpAuthRequest: async (request) => {
-          console.warn(
-            `[copilot] MCP OAuth request for "${request.serverName}" cancelled: no host token broker is configured.`,
-          );
+        onMcpAuthRequest: async () => {
+          console.warn('[copilot] MCP OAuth request cancelled: no host token broker is configured.');
           return { kind: 'cancelled' as const };
         },
         // SDK 默认 false。不打开的话 assistant.message_delta 根本不会发，
